@@ -64,10 +64,13 @@ public:
     using Phase = MovePrimaryCoordinatorPhaseEnum;
 
     MovePrimaryCoordinator(ShardingDDLCoordinatorService* service, const BSONObj& initialState);
-    virtual ~MovePrimaryCoordinator() = default;
+    ~MovePrimaryCoordinator() override = default;
 
     void checkIfOptionsConflict(const BSONObj& doc) const override;
     bool canAlwaysStartWhenUserWritesAreDisabled() const override;
+
+protected:
+    logv2::DynamicAttributes getCoordinatorLogAttrs() const override;
 
 private:
     StringData serializePhase(const Phase& phase) const override;
@@ -88,6 +91,13 @@ private:
     void cloneData(OperationContext* opCtx);
 
     /**
+     * Requests to the recipient to clone all the collections of the given database currently owned
+     * by this shard. Once the cloning is complete, the recipient returns the list of the actually
+     * cloned collections.
+     */
+    std::vector<NamespaceString> cloneDataToRecipient(OperationContext* opCtx);
+
+    /**
      * Logs in the `config.changelog` collection a specific event for `movePrimary` operations.
      */
     void logChange(OperationContext* opCtx,
@@ -106,14 +116,6 @@ private:
      */
     void assertNoOrphanedDataOnRecipient(
         OperationContext* opCtx, const std::vector<NamespaceString>& collectionsToClone) const;
-
-
-    /**
-     * Requests to the recipient to clone all the collections of the given database currently owned
-     * by this shard. Once the cloning is complete, the recipient returns the list of the actually
-     * cloned collections.
-     */
-    std::vector<NamespaceString> cloneDataToRecipient(OperationContext* opCtx) const;
 
     /**
      * Ensures that the list of actually cloned collections (returned by the cloning command)
@@ -142,6 +144,11 @@ private:
      */
     void clearDbMetadataOnPrimary(OperationContext* opCtx) const;
 
+    /*
+     * Clears the filtering metadata in the local catalog cache for every cloned collection.
+     */
+    void clearFilteringMetadata(OperationContext* opCtx) const;
+
     /**
      * Drops stale collections on the donor.
      */
@@ -156,21 +163,11 @@ private:
     /**
      * Blocks write operations on the database, causing them to fail with the
      * `MovePrimaryInProgress` error.
-     *
-     * TODO (SERVER-71566): This is a synchronization mechanism specifically designed for
-     * `movePrimary` operations. It will likely be replaced by the critical section once the time
-     * frame in which writes are blocked is reduced. Writes are already blocked in the `kCatchup`
-     * phase.
      */
     void blockWritesLegacy(OperationContext* opCtx) const;
 
     /**
      * Unblocks write operations on the database.
-     *
-     * TODO (SERVER-71566): This is a synchronization mechanism specifically designed for
-     * `movePrimary` operations. It will likely be replaced by the critical section once the time
-     * frame in which writes are blocked is reduced. Reads and writes are already unblocked in the
-    // `kExitCriticalSection` phase.
      */
     void unblockWritesLegacy(OperationContext* opCtx) const;
 

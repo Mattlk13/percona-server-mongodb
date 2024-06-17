@@ -41,6 +41,7 @@
 #include "mongo/db/query/allowed_contexts.h"
 #include "mongo/idl/idl_parser.h"
 #include "mongo/s/query/cluster_query_result.h"
+#include "mongo/s/resource_yielders.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/intrusive_counter.h"
 
@@ -98,7 +99,8 @@ void DocumentSourceMergeCursors::populateMerger() {
         // Assumes this is only called from the 'aggregate' or 'getMore' commands.  The code which
         // relies on this parameter does not distinguish/care about the difference so we simply
         // always pass 'aggregate'.
-        pExpCtx->mongoProcessInterface->getResourceYielder("aggregate"_sd));
+        ResourceYielderFactory::get(*pExpCtx->opCtx->getService())
+            .make(pExpCtx->opCtx, "aggregate"_sd));
     _armParams = boost::none;
     // '_blockingResultsMerger' now owns the cursors.
     _ownCursors = false;
@@ -116,6 +118,7 @@ DocumentSource::GetNextResult DocumentSourceMergeCursors::doGetNext() {
     }
 
     auto next = uassertStatusOK(_blockingResultsMerger->next(pExpCtx->opCtx));
+    _stats.dataBearingNodeMetrics.add(_blockingResultsMerger->takeMetrics());
     if (next.isEOF()) {
         return GetNextResult::makeEOF();
     }
@@ -135,7 +138,12 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceMergeCursors::createFromBson(
             elem.type() == BSONType::Object);
     auto ownedObj = elem.embeddedObject().getOwned();
     auto armParams = AsyncResultsMergerParams::parse(
-        IDLParserContext(kStageName, false /*apiStrict*/, expCtx->ns.tenantId()), ownedObj);
+        IDLParserContext(kStageName,
+                         false /*apiStrict*/,
+                         auth::ValidatedTenancyScope::get(expCtx->opCtx),
+                         expCtx->ns.tenantId(),
+                         SerializationContext::stateDefault()),
+        ownedObj);
     return new DocumentSourceMergeCursors(expCtx, std::move(armParams), std::move(ownedObj));
 }
 

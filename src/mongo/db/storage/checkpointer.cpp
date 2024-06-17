@@ -84,7 +84,7 @@ void Checkpointer::set(ServiceContext* serviceCtx, std::unique_ptr<Checkpointer>
 }
 
 void Checkpointer::run() {
-    ThreadClient tc(name(), getGlobalServiceContext()->getService());
+    ThreadClient tc(name(), getGlobalServiceContext()->getService(ClusterRole::ShardServer));
     LOGV2_DEBUG(22307, 1, "Starting thread", "threadName"_attr = name());
 
     {
@@ -136,7 +136,7 @@ void Checkpointer::run() {
         pauseCheckpointThread.pauseWhileSet();
 
         const Date_t startTime = Date_t::now();
-        opCtx->getServiceContext()->getStorageEngine()->checkpoint(opCtx.get());
+        opCtx->getServiceContext()->getStorageEngine()->checkpoint();
 
         const auto secondsElapsed = durationCount<Seconds>(Date_t::now() - startTime);
         if (secondsElapsed >= 30) {

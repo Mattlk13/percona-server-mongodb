@@ -278,6 +278,8 @@ roles:
                   - getDatabaseVersion
                   - getShardVersion
                   - indexStats
+            - matchType: any_system_buckets
+              actions: *clusterMonitorRoleDatabaseActions
             - matchType: database
               db: 'config'
               actions: *clusterMonitorRoleDatabaseActions
@@ -311,6 +313,7 @@ roles:
               actions: &hostManagerRoleClusterActions
                   - applicationMessage # clusterManager gets this also
                   - auditConfigure
+                  - compact
                   - connPoolSync
                   - dropConnections
                   - logRotate
@@ -595,7 +598,7 @@ roles:
                   - createIndex # Create index on the roles collection.
             - matchType: exact_namespace
               collection: 'system.views'
-              actions: 
+              actions:
                   - dropCollection
 
     root:
@@ -611,10 +614,11 @@ roles:
         privileges:
             - matchType: any
               actions:
+                  - bypassDefaultMaxTimeMS
                   - validate
             - matchType: cluster
               actions:
-                  - useTenant # Specify {$tenant:...} on commands
+                  - useTenant # Specify tenant id with unsigned security token on commands
             - matchType: exact_namespace
               db: 'config'
               collection: 'system.preimages'

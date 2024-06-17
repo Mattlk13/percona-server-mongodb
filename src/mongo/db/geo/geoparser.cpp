@@ -70,19 +70,24 @@ namespace mongo {
 
 namespace dps = ::mongo::dotted_path_support;
 
-static Status parseFlatPoint(const BSONElement& elem, Point* out, bool allowAddlFields = false) {
+// Convenience function to extract flat point coordinates from enclosing element.
+// Note, coordinate elements must not outlive the parent element.
+Status GeoParser::parseFlatPointCoordinates(const BSONElement& elem,
+                                            BSONElement& x,
+                                            BSONElement& y,
+                                            bool allowAddlFields /* = false */) {
     if (!elem.isABSONObj()) {
         return BAD_VALUE("Point must be an array or object, instead got type "
                          << typeName(elem.type()));
     }
 
     BSONObjIterator it(elem.Obj());
-    BSONElement x = it.next();
+    x = it.next();
     if (!x.isNumber()) {
         return BAD_VALUE("Point must only contain numeric elements, instead got type "
                          << typeName(x.type()));
     }
-    BSONElement y = it.next();
+    y = it.next();
     if (!y.isNumber()) {
         return BAD_VALUE("Point must only contain numeric elements, instead got type "
                          << typeName(y.type()));
@@ -90,6 +95,16 @@ static Status parseFlatPoint(const BSONElement& elem, Point* out, bool allowAddl
     if (!allowAddlFields && it.more()) {
         return BAD_VALUE("Point must only contain two numeric elements");
     }
+    return Status::OK();
+}
+
+static Status parseFlatPoint(const BSONElement& elem, Point* out, bool allowAddlFields = false) {
+    BSONElement x, y;
+    auto status = GeoParser::parseFlatPointCoordinates(elem, x, y, allowAddlFields);
+    if (!status.isOK()) {
+        return status;
+    }
+
     out->x = x.number();
     out->y = y.number();
     // Point coordinates must be finite numbers, neither NaN or infinite.
@@ -489,6 +504,15 @@ Status GeoParser::parseLegacyPolygon(const BSONObj& obj, PolygonWithCRS* out) {
 
 // { "type": "Point", "coordinates": [100.0, 0.0] }
 Status GeoParser::parseGeoJSONPoint(const BSONObj& obj, PointWithCRS* out) {
+    if (obj.hasField(GEOJSON_TYPE)) {
+        // GeoJSON Point must explicitly specify the type as "Point".
+        auto typeVal = GeoParser::parseGeoJSONType(obj);
+        if (GeoParser::GEOJSON_POINT != typeVal) {
+            return BAD_VALUE("Expected geojson geometry with type Point, but got type "
+                             << GeoParser::geoJSONTypeEnumToString(typeVal));
+        }
+    }
+
     Status status = Status::OK();
     // "crs"
     status = parseGeoJSONCRS(obj, &out->crs);
@@ -822,23 +846,61 @@ GeoParser::GeoJSONType GeoParser::parseGeoJSONType(const BSONObj& obj) {
     if (String != type.type()) {
         return GeoParser::GEOJSON_UNKNOWN;
     }
-    const string& typeString = type.String();
-    if (GEOJSON_TYPE_POINT == typeString) {
+    return geoJSONTypeStringToEnum(type.checkAndGetStringData());
+}
+
+// TODO: SERVER-86141 audit if this method is needed else remove.
+void GeoParser::assertValidGeoJSONType(const BSONObj& obj) {
+    BSONElement type = dps::extractElementAtPath(obj, GEOJSON_TYPE);
+    uassert(8459801,
+            str::stream() << "Expected valid geojson of type string, got non-string type of value "
+                          << type,
+            String == type.type());
+    auto str = type.checkAndGetStringData();
+    uassert(8459800,
+            str::stream() << "Expected valid geojson type, got " << str,
+            geoJSONTypeStringToEnum(str) != GeoParser::GEOJSON_UNKNOWN);
+}
+
+GeoParser::GeoJSONType GeoParser::geoJSONTypeStringToEnum(StringData type) {
+    if (GEOJSON_TYPE_POINT == type) {
         return GeoParser::GEOJSON_POINT;
-    } else if (GEOJSON_TYPE_LINESTRING == typeString) {
+    } else if (GEOJSON_TYPE_LINESTRING == type) {
         return GeoParser::GEOJSON_LINESTRING;
-    } else if (GEOJSON_TYPE_POLYGON == typeString) {
+    } else if (GEOJSON_TYPE_POLYGON == type) {
         return GeoParser::GEOJSON_POLYGON;
-    } else if (GEOJSON_TYPE_MULTI_POINT == typeString) {
+    } else if (GEOJSON_TYPE_MULTI_POINT == type) {
         return GeoParser::GEOJSON_MULTI_POINT;
-    } else if (GEOJSON_TYPE_MULTI_LINESTRING == typeString) {
+    } else if (GEOJSON_TYPE_MULTI_LINESTRING == type) {
         return GeoParser::GEOJSON_MULTI_LINESTRING;
-    } else if (GEOJSON_TYPE_MULTI_POLYGON == typeString) {
+    } else if (GEOJSON_TYPE_MULTI_POLYGON == type) {
         return GeoParser::GEOJSON_MULTI_POLYGON;
-    } else if (GEOJSON_TYPE_GEOMETRY_COLLECTION == typeString) {
+    } else if (GEOJSON_TYPE_GEOMETRY_COLLECTION == type) {
         return GeoParser::GEOJSON_GEOMETRY_COLLECTION;
     }
     return GeoParser::GEOJSON_UNKNOWN;
+}
+
+StringData GeoParser::geoJSONTypeEnumToString(GeoParser::GeoJSONType type) {
+    switch (type) {
+        case GEOJSON_UNKNOWN:
+            return "unknown"_sd;
+        case GEOJSON_POINT:
+            return GEOJSON_TYPE_POINT;
+        case GEOJSON_LINESTRING:
+            return GEOJSON_TYPE_LINESTRING;
+        case GEOJSON_POLYGON:
+            return GEOJSON_TYPE_POLYGON;
+        case GEOJSON_MULTI_POINT:
+            return GEOJSON_TYPE_MULTI_POINT;
+        case GEOJSON_MULTI_LINESTRING:
+            return GEOJSON_TYPE_MULTI_LINESTRING;
+        case GEOJSON_MULTI_POLYGON:
+            return GEOJSON_TYPE_MULTI_POLYGON;
+        case GEOJSON_GEOMETRY_COLLECTION:
+            return GEOJSON_TYPE_GEOMETRY_COLLECTION;
+    }
+    MONGO_UNREACHABLE_TASSERT(8459802);
 }
 
 }  // namespace mongo

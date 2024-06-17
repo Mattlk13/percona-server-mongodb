@@ -46,7 +46,6 @@
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -59,6 +58,7 @@
 #include "mongo/db/storage/record_data.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -85,7 +85,7 @@ SkippedRecordTracker::SkippedRecordTracker(OperationContext* opCtx,
     // lazily initialize table when we record the first document.
     _skippedRecordsTable =
         opCtx->getServiceContext()->getStorageEngine()->makeTemporaryRecordStoreFromExistingIdent(
-            opCtx, ident.value());
+            opCtx, ident.value(), KeyFormat::Long);
 }
 
 void SkippedRecordTracker::keepTemporaryTable() {
@@ -138,8 +138,8 @@ Status SkippedRecordTracker::retrySkippedRecords(OperationContext* opCtx,
 
     const bool keyGenerationOnly = mode == RetrySkippedRecordMode::kKeyGeneration;
 
-    dassert(opCtx->lockState()->isCollectionLockedForMode(collection->ns(),
-                                                          keyGenerationOnly ? MODE_IX : MODE_X));
+    dassert(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(
+        collection->ns(), keyGenerationOnly ? MODE_IX : MODE_X));
     if (!_skippedRecordsTable) {
         return Status::OK();
     }

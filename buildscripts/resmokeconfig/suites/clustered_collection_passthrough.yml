@@ -18,17 +18,11 @@ selector:
   - jstests/core/**/list_collections1.js
   - jstests/core/**/explain_shell_helpers.js
   - jstests/core/txns/list_collections_not_blocked_by_txn.js
-  # Doesn't expect clusteredIndex options on the collection.
-  - jstests/core/**/list_collections_filter.js
-  # Compares the result of listIndexes to numIndexesBefore in the createIndex output.
-  - jstests/core/**/index_signature.js
   # Assumes the collection is not clustered by default.
   - jstests/core/timeseries/clustered_index_options.js
   - jstests/core/timeseries/timeseries_expire_collmod.js
   # Doesn't expect a failpoint to be enabled.
   - jstests/core/**/set_param1.js
-  # Expects a correct index count in dbStats.
-  - jstests/core/**/dbstats.js
   # Expects queries on _id to use IDHACK in explain.
   - jstests/core/**/agg_hint.js
   - jstests/core/**/explain_shell_helpers.js
@@ -42,6 +36,7 @@ selector:
   - jstests/core/**/index9.js
   # Expects the collection creation options not to change.
   - jstests/core/**/internal_rename_if_options_and_indexes_match.js
+  - jstests/core/timeseries/timeseries_user_system_buckets.js
   # The _id index is expected to not have a 'unique' field.
   - jstests/core/**/list_indexes.js
   # Expects createIndex with 'clustered' option fails on a non-clustered collection.
@@ -65,9 +60,12 @@ selector:
   - jstests/core/**/fts_projection.js
   # Assumes there is one collection that is not clustered.
   - jstests/core/find_with_resume_after_param.js
+  # Asserts that queries can use the express execution path, which does not support clustered colls.
+  - jstests/core/**/express.js
 
   exclude_with_any_tags:
   - assumes_standalone_mongod
+  - expects_explicit_underscore_id_index
 
 executor:
   archive:

@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <utility>
 #include <vector>
@@ -111,7 +112,13 @@ public:
 
             // Include the number of cpus to simplify client calculations
             ProcessInfo p;
-            subObjBuilder.append("num_cpus", static_cast<int>(p.getNumAvailableCores()));
+            subObjBuilder.append("num_logical_cores", static_cast<int>(p.getNumLogicalCores()));
+            const auto num_cores_avlbl_to_process = p.getNumCoresAvailableToProcess();
+            // Adding the num cores available to process only if API is successful ie. value >=0
+            if (num_cores_avlbl_to_process >= 0) {
+                subObjBuilder.append("num_cores_available_to_process",
+                                     static_cast<int>(num_cores_avlbl_to_process));
+            }
 
             processStatusErrors(
                 procparser::parseProcStatFile("/proc/stat"_sd, kCpuKeys, &subObjBuilder),
@@ -125,6 +132,14 @@ public:
                 procparser::parseProcMemInfoFile("/proc/meminfo"_sd, kMemKeys, &subObjBuilder),
                 &subObjBuilder);
             subObjBuilder.doneFast();
+        }
+
+        {
+            int thpDisabled = prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0);
+            if (thpDisabled >= 0) {
+                BSONObjBuilder subObjBuilder(builder.subobjStart("status"));
+                subObjBuilder.appendNumber("process_opting_into_THP_if_enabled", !thpDisabled);
+            }
         }
 
         {
@@ -182,6 +197,7 @@ public:
             subObjBuilder.doneFast();
         }
 
+        // TODO SERVER-83707 Remove PSI capture, once T2 uses the ServerStatus section of FTDC
         {
             BSONObjBuilder subObjBuilder(builder.subobjStart("pressure"_sd));
             processStatusErrors(
@@ -262,22 +278,26 @@ void collectUlimits(OperationContext*, BSONObjBuilder& builder) {
 
 
 void installSystemMetricsCollector(FTDCController* controller) {
-    controller->addPeriodicCollector(std::make_unique<LinuxSystemMetricsCollector>());
+    controller->addPeriodicCollector(std::make_unique<LinuxSystemMetricsCollector>(),
+                                     ClusterRole::None);
 
     // Total max open files is only collected on rotate, since it changes infrequently
-    controller->addOnRotateCollector(std::make_unique<SimpleFunctionCollector>(
-        "sysMaxOpenFiles", [](OperationContext* ctx, BSONObjBuilder& builder) {
-            auto status = procparser::parseProcSysFsFileNrFile(
-                "/proc/sys/fs/file-nr", procparser::FileNrKey::kMaxFileHandles, &builder);
-            // Handle errors here similarly to system stats.
-            if (!status.isOK()) {
-                builder.append("error", status.toString());
-            }
-        }));
+    controller->addOnRotateCollector(
+        std::make_unique<SimpleFunctionCollector>(
+            "sysMaxOpenFiles",
+            [](OperationContext* ctx, BSONObjBuilder& builder) {
+                auto status = procparser::parseProcSysFsFileNrFile(
+                    "/proc/sys/fs/file-nr", procparser::FileNrKey::kMaxFileHandles, &builder);
+                // Handle errors here similarly to system stats.
+                if (!status.isOK()) {
+                    builder.append("error", status.toString());
+                }
+            }),
+        ClusterRole::None);
 
     // Collect ULimits settings on rotation.
     controller->addOnRotateCollector(
-        std::make_unique<SimpleFunctionCollector>("ulimits", collectUlimits));
+        std::make_unique<SimpleFunctionCollector>("ulimits", collectUlimits), ClusterRole::None);
 }
 
 }  // namespace mongo

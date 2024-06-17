@@ -53,7 +53,6 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/namespace_string.h"
@@ -86,6 +85,7 @@
 #include "mongo/logv2/log_component.h"
 #include "mongo/logv2/redaction.h"
 #include "mongo/platform/compiler.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
@@ -110,6 +110,31 @@ MONGO_FAIL_POINT_DEFINE(skipReconstructPreparedTransactions);
 MONGO_FAIL_POINT_DEFINE(applyPrepareTxnOpsFailsWithWriteConflict);
 
 MONGO_FAIL_POINT_DEFINE(hangBeforeSessionCheckOutForApplyPrepare);
+
+class ScopedSetTxnInfoOnOperationContext {
+public:
+    ScopedSetTxnInfoOnOperationContext(OperationContext* opCtx,
+                                       const LogicalSessionId& lsid,
+                                       const TxnNumber& txnNumber,
+                                       boost::optional<TxnRetryCounter> txnRetryCounter)
+        : _opCtx(opCtx) {
+        stdx::lock_guard<Client> lk(*opCtx->getClient());
+        opCtx->setLogicalSessionId(lsid);
+        opCtx->setTxnNumber(txnNumber);
+        if (txnRetryCounter.has_value()) {
+            opCtx->setTxnRetryCounter(*txnRetryCounter);
+        }
+        opCtx->setInMultiDocumentTransaction();
+    }
+
+    // The opCtx may be used to apply later operations in a batch, clean up before reusing.
+    ~ScopedSetTxnInfoOnOperationContext() {
+        stdx::lock_guard<Client> lk(*_opCtx->getClient());
+        _opCtx->resetMultiDocumentTransactionState();
+    }
+
+    OperationContext* _opCtx;
+};
 
 // Given a vector of OplogEntry pointers, copy and return a vector of OplogEntry's.
 std::vector<OplogEntry> _copyOps(const std::vector<const OplogEntry*>& ops) {
@@ -157,6 +182,10 @@ boost::optional<std::vector<StmtId>> _getCommittedStmtIds(const LogicalSessionId
 Status _applyOperationsForTransaction(OperationContext* opCtx,
                                       const std::vector<OplogEntry>& txnOps,
                                       repl::OplogApplication::Mode oplogApplicationMode) {
+
+    const bool allowCollectionCreatinInPreparedTransactions =
+        feature_flags::gCreateCollectionInPreparedTransactions.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
     // Apply each the operations via repl::applyOperation.
     for (const auto& op : txnOps) {
         try {
@@ -164,9 +193,12 @@ Status _applyOperationsForTransaction(OperationContext* opCtx,
                 continue;
             }
 
-            // Presently, it is not allowed to run a prepared transaction with a command
-            // inside. TODO(SERVER-46105)
-            invariant(!op.isCommand());
+            if (!allowCollectionCreatinInPreparedTransactions) {
+                // Presently, it is not allowed to run a prepared transaction with a command inside.
+                // TODO(SERVER-46105)
+                invariant(!op.isCommand());
+            }
+
             auto coll = acquireCollection(
                 opCtx,
                 CollectionAcquisitionRequest(op.getNss(),
@@ -175,12 +207,22 @@ Status _applyOperationsForTransaction(OperationContext* opCtx,
                                              AcquisitionPrerequisites::kWrite),
                 MODE_IX);
             const bool isDataConsistent = true;
-            auto status = repl::applyOperation_inlock(opCtx,
-                                                      coll,
-                                                      ApplierOperation{&op},
-                                                      false /*alwaysUpsert*/,
-                                                      oplogApplicationMode,
-                                                      isDataConsistent);
+            auto status = [&] {
+                if (op.isCommand()) {
+                    invariant(op.getCommandType() == OplogEntry::CommandType::kCreate ||
+                                  op.getCommandType() == OplogEntry::CommandType::kCreateIndexes,
+                              "Multi-document transactions only support 'create' and "
+                              "'createIndexes' command");
+                    return repl::applyCommand_inlock(
+                        opCtx, ApplierOperation{&op}, oplogApplicationMode);
+                }
+                return repl::applyOperation_inlock(opCtx,
+                                                   coll,
+                                                   ApplierOperation{&op},
+                                                   false /*alwaysUpsert*/,
+                                                   oplogApplicationMode,
+                                                   isDataConsistent);
+            }();
             if (!status.isOK()) {
                 return status;
             }
@@ -244,6 +286,15 @@ Status _applyTransactionFromOplogChain(OperationContext* opCtx,
                                        Timestamp commitTimestamp,
                                        Timestamp durableTimestamp) {
     invariant(repl::OplogApplication::inRecovering(mode));
+    invariant(entry.getSessionId().has_value(),
+              "A transaction operation must always have a session id");
+    invariant(entry.getTxnNumber().has_value(),
+              "A transaction operation must always have a txn number");
+    ScopedSetTxnInfoOnOperationContext scopedTxnInfo(
+        opCtx,
+        *entry.getSessionId(),
+        *entry.getTxnNumber(),
+        entry.getOperationSessionInfo().getTxnRetryCounter());
 
     auto ops = readTransactionOperationsFromOplogChain(opCtx, entry, {});
 
@@ -255,7 +306,7 @@ Status _applyTransactionFromOplogChain(OperationContext* opCtx,
             WriteUnitOfWork wunit(opCtx);
 
             // We might replay a prepared transaction behind oldest timestamp.
-            opCtx->recoveryUnit()->setRoundUpPreparedTimestamps(true);
+            shard_role_details::getRecoveryUnit(opCtx)->setRoundUpPreparedTimestamps(true);
 
             BSONObjBuilder resultWeDontCareAbout;
 
@@ -264,7 +315,7 @@ Status _applyTransactionFromOplogChain(OperationContext* opCtx,
                 // If the transaction was empty then we have no locks, ensure at least Global
                 // IX.
                 Lock::GlobalLock lk(opCtx, MODE_IX);
-                opCtx->recoveryUnit()->setPrepareTimestamp(commitTimestamp);
+                shard_role_details::getRecoveryUnit(opCtx)->setPrepareTimestamp(commitTimestamp);
                 wunit.prepare();
 
                 // Calls setCommitTimestamp() to set commit timestamp of the transaction and
@@ -272,10 +323,11 @@ Status _applyTransactionFromOplogChain(OperationContext* opCtx,
                 // scope. It is necessary that we clear the commit timestamp because there can
                 // be another transaction in the same recovery unit calling setTimestamp().
                 TimestampBlock tsBlock(opCtx, commitTimestamp);
-                opCtx->recoveryUnit()->setDurableTimestamp(durableTimestamp);
+                shard_role_details::getRecoveryUnit(opCtx)->setDurableTimestamp(durableTimestamp);
                 wunit.commit();
             }
         });
+
     return status;
 }
 
@@ -288,20 +340,8 @@ Status _applyCommitTransaction(OperationContext* opCtx,
                                const LogicalSessionId& lsid,
                                TxnNumber txnNumber,
                                Timestamp commitTimestamp) {
-    {
-        stdx::lock_guard<Client> lk(*opCtx->getClient());
-        opCtx->setLogicalSessionId(lsid);
-        opCtx->setTxnNumber(txnNumber);
-        if (auto txnRetryCounter = commitOp.getOperationSessionInfo().getTxnRetryCounter()) {
-            opCtx->setTxnRetryCounter(*txnRetryCounter);
-        }
-        opCtx->setInMultiDocumentTransaction();
-    }
-    // This opCtx can be used to apply later operations in the batch, clean up before reusing.
-    ON_BLOCK_EXIT([opCtx]() {
-        stdx::lock_guard<Client> lk(*opCtx->getClient());
-        opCtx->resetMultiDocumentTransactionState();
-    });
+    ScopedSetTxnInfoOnOperationContext scopedTxnInfo(
+        opCtx, lsid, txnNumber, commitOp.getOperationSessionInfo().getTxnRetryCounter());
 
     // The write on transaction table may be applied concurrently, so refreshing state
     // from disk may read that write, causing starting a new transaction on an existing
@@ -325,20 +365,8 @@ Status _applyAbortTransaction(OperationContext* opCtx,
                               const OplogEntry& abortOp,
                               const LogicalSessionId& lsid,
                               TxnNumber txnNumber) {
-    {
-        stdx::lock_guard<Client> lk(*opCtx->getClient());
-        opCtx->setLogicalSessionId(lsid);
-        opCtx->setTxnNumber(txnNumber);
-        if (auto txnRetryCounter = abortOp.getOperationSessionInfo().getTxnRetryCounter()) {
-            opCtx->setTxnRetryCounter(*txnRetryCounter);
-        }
-        opCtx->setInMultiDocumentTransaction();
-    }
-    // This opCtx can be used to apply later operations in the batch, clean up before reusing.
-    ON_BLOCK_EXIT([opCtx]() {
-        stdx::lock_guard<Client> lk(*opCtx->getClient());
-        opCtx->resetMultiDocumentTransactionState();
-    });
+    ScopedSetTxnInfoOnOperationContext scopedTxnInfo(
+        opCtx, lsid, txnNumber, abortOp.getOperationSessionInfo().getTxnRetryCounter());
 
     // The write on transaction table may be applied concurrently, so refreshing state
     // from disk may read that write, causing starting a new transaction on an existing
@@ -455,7 +483,7 @@ std::pair<std::vector<OplogEntry>, bool> _readTransactionOperationsFromOplogChai
     bool isTransactionWithCommand = false;
     // Ensure future transactions read without a timestamp.
     invariant(RecoveryUnit::ReadSource::kNoTimestamp ==
-              opCtx->recoveryUnit()->getTimestampReadSource());
+              shard_role_details::getRecoveryUnit(opCtx)->getTimestampReadSource());
 
     std::vector<OplogEntry> ops;
 
@@ -565,6 +593,8 @@ Status _applyPrepareTransaction(OperationContext* opCtx,
                                 const std::vector<OplogEntry>& txnOps,
                                 repl::OplogApplication::Mode mode,
                                 boost::optional<std::vector<StmtId>> stmtIds = boost::none) {
+    ScopedSetTxnInfoOnOperationContext scopedTxnInfo(
+        opCtx, lsid, txnNumber, prepareOp.getOperationSessionInfo().getTxnRetryCounter());
 
     // Block application of prepare oplog entries on secondaries when a concurrent
     // background index build is running. This will prevent hybrid index builds from
@@ -597,22 +627,6 @@ Status _applyPrepareTransaction(OperationContext* opCtx,
         }
     }
 
-    {
-        stdx::lock_guard<Client> lk(*opCtx->getClient());
-        opCtx->setLogicalSessionId(lsid);
-        opCtx->setTxnNumber(txnNumber);
-        if (auto txnRetryCounter = prepareOp.getOperationSessionInfo().getTxnRetryCounter()) {
-            opCtx->setTxnRetryCounter(*txnRetryCounter);
-        }
-        opCtx->setInMultiDocumentTransaction();
-    }
-    // This opCtx can be used to apply later operations in the batch, clean up before
-    // reusing.
-    ON_BLOCK_EXIT([opCtx]() {
-        stdx::lock_guard<Client> lk(*opCtx->getClient());
-        opCtx->resetMultiDocumentTransactionState();
-    });
-
     return repl::writeConflictRetryWithLimit(
         opCtx, "applying prepare transaction", prepareOp.getNss(), [&] {
             // The write on transaction table may be applied concurrently, so refreshing
@@ -632,12 +646,13 @@ Status _applyPrepareTransaction(OperationContext* opCtx,
             // prepare conflict if we query for an incomplete key and an adjacent key is
             // prepared. We ignore prepare conflicts on recovering nodes because they may
             // may encounter prepare conflicts that did not occur on the primary.
-            opCtx->recoveryUnit()->setPrepareConflictBehavior(
+            shard_role_details::getRecoveryUnit(opCtx)->setPrepareConflictBehavior(
                 PrepareConflictBehavior::kIgnoreConflictsAllowWrites);
+
             // We might replay a prepared transaction behind oldest timestamp.
             if (repl::OplogApplication::inRecovering(mode) ||
                 mode == repl::OplogApplication::Mode::kInitialSync) {
-                opCtx->recoveryUnit()->setRoundUpPreparedTimestamps(true);
+                shard_role_details::getRecoveryUnit(opCtx)->setRoundUpPreparedTimestamps(true);
             }
 
             // Release WUOW, transaction lock resources and abort storage transaction
@@ -650,7 +665,8 @@ Status _applyPrepareTransaction(OperationContext* opCtx,
             });
 
             // Starts the WUOW.
-            txnParticipant.unstashTransactionResources(opCtx, "prepareTransaction");
+            txnParticipant.unstashTransactionResources(
+                opCtx, "prepareTransaction", repl::OplogApplication::inRecovering(mode));
 
             // Set this in case the application of any ops needs to use the prepare timestamp
             // of this transaction. It should be cleared automatically when the txn finishes.
@@ -681,6 +697,14 @@ Status _applyPrepareTransaction(OperationContext* opCtx,
                 LOGV2(21847, "Hit applyOpsHangBeforePreparingTransaction failpoint");
                 applyOpsHangBeforePreparingTransaction.pauseWhileSet(opCtx);
             }
+
+            // If we are in a recovery mode, we should have set roundUpPreparedTimestamps to true
+            // above, and that setting should have persisted after we unstashed the transaction
+            // resources and started the WUOW above. This setting is necessary for the subsequent
+            // call to prepareTransaction to succeed in the case where the prepare timestamp is
+            // older than the stable timestamp.
+            invariant(!repl::OplogApplication::inRecovering(mode) ||
+                      shard_role_details::getRecoveryUnit(opCtx)->getRoundUpPreparedTimestamps());
 
             txnParticipant.prepareTransaction(opCtx, prepareOp.getOpTime());
 
@@ -803,7 +827,7 @@ void reconstructPreparedTransactions(OperationContext* opCtx, repl::OplogApplica
 
     // Ensure future transactions read without a timestamp.
     invariant(RecoveryUnit::ReadSource::kNoTimestamp ==
-              opCtx->recoveryUnit()->getTimestampReadSource());
+              shard_role_details::getRecoveryUnit(opCtx)->getTimestampReadSource());
 
     DBDirectClient client(opCtx);
     FindCommandRequest findRequest{NamespaceString::kSessionTransactionsTableNamespace};

@@ -67,7 +67,7 @@ public:
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         size_t facetId,
         const boost::intrusive_ptr<TeeBuffer>& bufferSource,
-        const StringData& stageName);
+        StringData stageName);
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         return {StreamType::kStreaming,
@@ -95,7 +95,7 @@ public:
 
     const char* getSourceName() const override;
 
-    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final override;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
 protected:
     GetNextResult doGetNext() final;
@@ -105,7 +105,7 @@ private:
     DocumentSourceTeeConsumer(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                               size_t facetId,
                               const boost::intrusive_ptr<TeeBuffer>& bufferSource,
-                              const StringData& stageName);
+                              StringData stageName);
 
     size_t _facetId;
     boost::intrusive_ptr<TeeBuffer> _bufferSource;

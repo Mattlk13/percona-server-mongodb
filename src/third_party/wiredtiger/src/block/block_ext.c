@@ -32,7 +32,7 @@ static int __block_merge(WT_SESSION_IMPL *, WT_BLOCK *, WT_EXTLIST *, wt_off_t, 
  * __block_off_srch_last --
  *     Return the last element in the list, along with a stack for appending.
  */
-static inline WT_EXT *
+static WT_INLINE WT_EXT *
 __block_off_srch_last(WT_EXT **head, WT_EXT ***stack)
 {
     WT_EXT **extp, *last;
@@ -58,7 +58,7 @@ __block_off_srch_last(WT_EXT **head, WT_EXT ***stack)
  *     Search a by-offset skiplist (either the primary by-offset list, or the by-offset list
  *     referenced by a size entry), for the specified offset.
  */
-static inline void
+static WT_INLINE void
 __block_off_srch(WT_EXT **head, wt_off_t off, WT_EXT ***stack, bool skip_off)
 {
     WT_EXT **extp;
@@ -85,7 +85,7 @@ __block_off_srch(WT_EXT **head, wt_off_t off, WT_EXT ***stack, bool skip_off)
  * __block_first_srch --
  *     Search the skiplist for the first available slot.
  */
-static inline bool
+static WT_INLINE bool
 __block_first_srch(WT_EXT **head, wt_off_t size, WT_EXT ***stack)
 {
     WT_EXT *ext;
@@ -108,7 +108,7 @@ __block_first_srch(WT_EXT **head, wt_off_t size, WT_EXT ***stack)
  * __block_size_srch --
  *     Search the by-size skiplist for the specified size.
  */
-static inline void
+static WT_INLINE void
 __block_size_srch(WT_SIZE **head, wt_off_t size, WT_SIZE ***stack)
 {
     WT_SIZE **szp;
@@ -131,7 +131,7 @@ __block_size_srch(WT_SIZE **head, wt_off_t size, WT_SIZE ***stack)
  * __block_off_srch_pair --
  *     Search a by-offset skiplist for before/after records of the specified offset.
  */
-static inline void
+static WT_INLINE void
 __block_off_srch_pair(WT_EXTLIST *el, wt_off_t off, WT_EXT **beforep, WT_EXT **afterp)
 {
     WT_EXT **head, **extp;
@@ -462,8 +462,9 @@ __wt_block_off_remove_overlap(
  * __block_extend --
  *     Extend the file to allocate space.
  */
-static inline int
-__block_extend(WT_SESSION_IMPL *session, WT_BLOCK *block, wt_off_t *offp, wt_off_t size)
+static WT_INLINE int
+__block_extend(
+  WT_SESSION_IMPL *session, WT_BLOCK *block, WT_EXTLIST *el, wt_off_t *offp, wt_off_t size)
 {
     /*
      * Callers of this function are expected to have already acquired any locks required to extend
@@ -487,8 +488,8 @@ __block_extend(WT_SESSION_IMPL *session, WT_BLOCK *block, wt_off_t *offp, wt_off
     block->size += size;
 
     WT_STAT_DATA_INCR(session, block_extension);
-    __wt_verbose(session, WT_VERB_BLOCK, "file extend %" PRIdMAX "-%" PRIdMAX, (intmax_t)*offp,
-      (intmax_t)(*offp + size));
+    __wt_verbose(session, WT_VERB_BLOCK, "%s: file extend %" PRIdMAX "-%" PRIdMAX, el->name,
+      (intmax_t)*offp, (intmax_t)(*offp + size));
 
     return (0);
 }
@@ -501,6 +502,7 @@ int
 __wt_block_alloc(WT_SESSION_IMPL *session, WT_BLOCK *block, wt_off_t *offp, wt_off_t size)
 {
     WT_EXT *ext, **estack[WT_SKIP_MAXDEPTH];
+    WT_EXTLIST *el;
     WT_SIZE *szp, **sstack[WT_SKIP_MAXDEPTH];
 
     /* The live lock must be locked. */
@@ -539,8 +541,9 @@ __wt_block_alloc(WT_SESSION_IMPL *session, WT_BLOCK *block, wt_off_t *offp, wt_o
         __block_size_srch(block->live.avail.sz, size, sstack);
         if ((szp = *sstack[0]) == NULL) {
 append:
-            WT_RET(__block_extend(session, block, offp, size));
-            WT_RET(__block_append(session, block, &block->live.alloc, *offp, (wt_off_t)size));
+            el = &block->live.alloc;
+            WT_RET(__block_extend(session, block, el, offp, size));
+            WT_RET(__block_append(session, block, el, *offp, (wt_off_t)size));
             return (0);
         }
 
@@ -555,17 +558,18 @@ append:
     /* If doing a partial allocation, adjust the record and put it back. */
     if (ext->size > size) {
         __wt_verbose(session, WT_VERB_BLOCK,
-          "allocate %" PRIdMAX " from range %" PRIdMAX "-%" PRIdMAX ", range shrinks to %" PRIdMAX
-          "-%" PRIdMAX,
-          (intmax_t)size, (intmax_t)ext->off, (intmax_t)(ext->off + ext->size),
-          (intmax_t)(ext->off + size), (intmax_t)(ext->off + size + ext->size - size));
+          "%s: allocate %" PRIdMAX " from range %" PRIdMAX "-%" PRIdMAX
+          ", range shrinks to %" PRIdMAX "-%" PRIdMAX,
+          block->live.avail.name, (intmax_t)size, (intmax_t)ext->off,
+          (intmax_t)(ext->off + ext->size), (intmax_t)(ext->off + size),
+          (intmax_t)(ext->off + size + ext->size - size));
 
         ext->off += size;
         ext->size -= size;
         WT_RET(__block_ext_insert(session, &block->live.avail, ext));
     } else {
-        __wt_verbose(session, WT_VERB_BLOCK, "allocate range %" PRIdMAX "-%" PRIdMAX,
-          (intmax_t)ext->off, (intmax_t)(ext->off + ext->size));
+        __wt_verbose(session, WT_VERB_BLOCK, "%s: allocate range %" PRIdMAX "-%" PRIdMAX,
+          block->live.avail.name, (intmax_t)ext->off, (intmax_t)(ext->off + ext->size));
 
         __wt_block_ext_free(session, ext);
     }
@@ -604,7 +608,7 @@ __wt_block_free(WT_SESSION_IMPL *session, WT_BLOCK *block, const uint8_t *addr, 
     if (objectid != block->objectid)
         return (0);
 
-    __wt_verbose(session, WT_VERB_BLOCK, "free %" PRIu32 ": %" PRIdMAX "/%" PRIdMAX, objectid,
+    __wt_verbose(session, WT_VERB_BLOCK, "block free %" PRIu32 ": %" PRIdMAX "/%" PRIdMAX, objectid,
       (intmax_t)offset, (intmax_t)size);
 
 #ifdef HAVE_DIAGNOSTIC

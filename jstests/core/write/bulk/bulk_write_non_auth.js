@@ -7,12 +7,11 @@
  *
  * The test runs commands that are not allowed with security token: bulkWrite.
  * @tags: [
- *   not_allowed_with_security_token,
+ *   not_allowed_with_signed_security_token,
  *   command_not_supported_in_serverless,
  *   # Contains commands that fail which will fail the entire transaction
  *   does_not_support_transactions,
- *   # TODO SERVER-52419 Remove this tag.
- *   featureFlagBulkWriteCommand,
+ *   requires_fcv_80
  * ]
  */
 import {cursorEntryValidator, cursorSizeValidator} from "jstests/libs/bulk_write_utils.js";
@@ -35,7 +34,7 @@ let res = db.adminCommand({
 
 assert.commandWorked(res);
 cursorSizeValidator(res, 1);
-assert.eq(res.numErrors, 1, "bulkWrite command response: " + tojson(res));
+assert.eq(res.nErrors, 1, "bulkWrite command response: " + tojson(res));
 
 cursorEntryValidator(res.cursor.firstBatch[0],
                      {ok: 0, idx: 0, n: 0, nModified: 0, code: ErrorCodes.InvalidNamespace});
@@ -54,7 +53,7 @@ res = db.adminCommand({
 
 assert.commandWorked(res);
 cursorSizeValidator(res, 1);
-assert.eq(res.numErrors, 1, "bulkWrite command response: " + tojson(res));
+assert.eq(res.nErrors, 1, "bulkWrite command response: " + tojson(res));
 
 cursorEntryValidator(res.cursor.firstBatch[0],
                      {ok: 0, idx: 0, n: 0, code: ErrorCodes.InvalidNamespace});
@@ -76,7 +75,7 @@ res = db.adminCommand({
 
 assert.commandWorked(res);
 cursorSizeValidator(res, 2);
-assert.eq(res.numErrors, 1, "bulkWrite command response: " + tojson(res));
+assert.eq(res.nErrors, 1, "bulkWrite command response: " + tojson(res));
 
 cursorEntryValidator(res.cursor.firstBatch[0],
                      {ok: 0, idx: 0, n: 0, code: ErrorCodes.InvalidNamespace});
@@ -103,7 +102,7 @@ res = db.adminCommand({
 
 assert.commandWorked(res);
 cursorSizeValidator(res, 1);
-assert.eq(res.numErrors, 1, "bulkWrite command response: " + tojson(res));
+assert.eq(res.nErrors, 1, "bulkWrite command response: " + tojson(res));
 
 cursorEntryValidator(res.cursor.firstBatch[0],
                      {ok: 0, idx: 0, n: 0, code: ErrorCodes.InvalidNamespace});
@@ -133,5 +132,5 @@ res = db.adminCommand({
 
 assert.commandWorked(res);
 cursorSizeValidator(res, 7);
-assert.eq(res.numErrors, 3, "bulkWrite command response: " + tojson(res));
+assert.eq(res.nErrors, 3, "bulkWrite command response: " + tojson(res));
 coll.drop();

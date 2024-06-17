@@ -78,6 +78,12 @@ public:
      */
     bool isSharded(OperationContext* opCtx, const NamespaceString& nss) final;
 
+
+    boost::optional<ShardId> determineSpecificMergeShard(OperationContext* opCtx,
+                                                         const NamespaceString& ns) const final {
+        return CommonProcessInterface::findOwningShard(opCtx, ns);
+    }
+
     void checkRoutingInfoEpochOrThrow(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                       const NamespaceString& nss,
                                       ChunkVersion targetCollectionPlacementVersion) const final;
@@ -139,7 +145,8 @@ public:
                           const BSONObj& cmdObj) final;
     void createTempCollection(OperationContext* opCtx,
                               const NamespaceString& nss,
-                              const BSONObj& collectionOptions) final;
+                              const BSONObj& collectionOptions,
+                              boost::optional<ShardId> dataShard) final;
     void createIndexesOnEmptyCollection(OperationContext* opCtx,
                                         const NamespaceString& ns,
                                         const std::vector<BSONObj>& indexSpecs) final;
@@ -153,12 +160,12 @@ public:
      * retry on network errors and also on StaleConfig errors to avoid restarting the entire
      * operation.
      */
-    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+    std::unique_ptr<Pipeline, PipelineDeleter> preparePipelineForExecution(
         Pipeline* pipeline,
         ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
         boost::optional<BSONObj> readConcern = boost::none) final;
 
-    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+    std::unique_ptr<Pipeline, PipelineDeleter> preparePipelineForExecution(
         const AggregateCommandRequest& aggRequest,
         Pipeline* pipeline,
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -181,6 +188,15 @@ public:
                             std::unique_ptr<write_ops::InsertCommandRequest> insertCommand,
                             const WriteConcernOptions& wc,
                             boost::optional<OID> targetEpoch) final;
+
+protected:
+    /**
+     * Utility to share a common collection creation implementation.
+     */
+    void _createCollectionCommon(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj,
+                                 boost::optional<ShardId> dataShard = boost::none);
 
 private:
     boost::optional<TimeseriesOptions> _getTimeseriesOptions(OperationContext* opCtx,

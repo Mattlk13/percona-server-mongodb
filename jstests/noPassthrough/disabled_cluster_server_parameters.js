@@ -3,11 +3,10 @@
  * is false.
  *
  * @tags: [
+ *   disables_test_commands,
  *   does_not_support_stepdowns,
  *   requires_replication,
  *   requires_sharding,
- *   # Tests running with experimental CQF behavior require test commands to be enabled.
- *   cqf_experimental_incompatible,
  *  ]
  */
 import {

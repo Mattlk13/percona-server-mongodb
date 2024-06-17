@@ -89,9 +89,10 @@ namespace {
 MONGO_FAIL_POINT_DEFINE(triggerSendRequestNetworkTimeout);
 MONGO_FAIL_POINT_DEFINE(forceConnectionNetworkTimeout);
 
-CounterMetric numConnectionNetworkTimeouts("operation.numConnectionNetworkTimeouts");
-CounterMetric timeSpentWaitingBeforeConnectionTimeoutMillis(
-    "operation.totalTimeWaitingBeforeConnectionTimeoutMillis");
+auto& numConnectionNetworkTimeouts =
+    *MetricBuilder<Counter64>("operation.numConnectionNetworkTimeouts");
+auto& timeSpentWaitingBeforeConnectionTimeoutMillis =
+    *MetricBuilder<Counter64>("operation.totalTimeWaitingBeforeConnectionTimeoutMillis");
 
 Status appendMetadata(RemoteCommandRequestOnAny* request,
                       const std::unique_ptr<rpc::EgressMetadataHook>& hook) {
@@ -103,11 +104,6 @@ Status appendMetadata(RemoteCommandRequestOnAny* request,
         }
         request->metadata = bob.obj();
     }
-
-    if (!request->opCtx)
-        return Status::OK();
-
-    request->validatedTenancyScope = auth::ValidatedTenancyScope::get(request->opCtx);
 
     return Status::OK();
 }
@@ -130,8 +126,8 @@ bool catchingInvoke(F&& f, EH&& eh, StringData hint) {
     } catch (...) {
         Status err = exceptionToStatus();
         LOGV2(5802401, "Callback failed", "msg"_attr = hint, "error"_attr = err);
-        if (gSuppressNetworkInterfaceTransportLayerExceptions
-                .isEnabledAndIgnoreFCVUnsafeAtStartup())
+        if (gSuppressNetworkInterfaceTransportLayerExceptions.isEnabled(
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot()))
             std::forward<EH>(eh)(err);  // new server parameter protected behavior
         else
             throw;  // old behavior
@@ -482,21 +478,8 @@ void NetworkInterfaceTL::CommandStateBase::setTimer(std::shared_ptr<RequestState
         return;
     }
 
-    const auto timeoutCode = requestOnAny.timeoutCode;
-    if (nowVal >= deadline) {
-        connTimeoutWaitTime = stopwatch.elapsed();
-        if (gEnableDetailedConnectionHealthMetricLogLines) {
-            LOGV2(6496501,
-                  "Operation timed out while waiting to acquire connection",
-                  "requestId"_attr = requestOnAny.id,
-                  "duration"_attr = connTimeoutWaitTime);
-        }
-        uasserted(timeoutCode,
-                  str::stream() << "Remote command timed out while waiting to get a "
-                                   "connection from the pool, took "
-                                << connTimeoutWaitTime << ", timeout was set to "
-                                << requestOnAny.timeout);
-    }
+    const auto timeoutCode =
+        requestOnAny.timeoutCode.get_value_or(ErrorCodes::NetworkInterfaceExceededTimeLimit);
 
     // TODO reform with SERVER-41459
     timer->waitUntil(deadline, baton)
@@ -662,10 +645,22 @@ Status NetworkInterfaceTL::startCommand(const TaskExecutor::CallbackHandle& cbHa
                 rs.status = Status(ErrorCodes::HostUnreachable, rs.status.reason());
             }
 
-            if (rs.status == ErrorCodes::NetworkInterfaceExceededTimeLimit) {
+            // Time limit exceeded from ConnectionPool waiting to acquire a connection.
+            if (rs.status == ErrorCodes::PooledConnectionAcquisitionExceededTimeLimit) {
                 numConnectionNetworkTimeouts.increment(1);
                 timeSpentWaitingBeforeConnectionTimeoutMillis.increment(
                     durationCount<Milliseconds>(cmdState->connTimeoutWaitTime));
+                auto timeoutCode = cmdState->requestOnAny.timeoutCode;
+                if (timeoutCode &&
+                    cmdState->connTimeoutWaitTime >= cmdState->requestOnAny.timeout) {
+                    rs.status = Status(*timeoutCode, rs.status.reason());
+                }
+                if (gEnableDetailedConnectionHealthMetricLogLines.load()) {
+                    LOGV2(6496500,
+                          "Operation timed out while waiting to acquire connection",
+                          "requestId"_attr = cmdState->requestOnAny.id,
+                          "duration"_attr = cmdState->connTimeoutWaitTime);
+                }
             }
 
             LOGV2_DEBUG(22597,
@@ -687,8 +682,7 @@ Status NetworkInterfaceTL::startCommand(const TaskExecutor::CallbackHandle& cbHa
 
     // Attempt to get a connection to every target host
     for (size_t idx = 0; idx < request.target.size(); ++idx) {
-        auto connFuture =
-            _pool->get(request.target[idx], request.sslMode, request.timeout, request.timeoutCode);
+        auto connFuture = _pool->get(request.target[idx], request.sslMode, request.timeout);
 
         // If connection future is ready or requests should be sent in order, send the request
         // immediately.
@@ -750,8 +744,7 @@ void NetworkInterfaceTL::CommandStateBase::doMetadataHook(
     if (auto& hook = interface->_metadataHook; hook && !finishLine.isReady()) {
         invariant(response.target);
 
-        uassertStatusOK(
-            hook->readReplyMetadata(nullptr, response.target->toString(), response.data));
+        uassertStatusOK(hook->readReplyMetadata(nullptr, response.data));
     }
 }
 
@@ -826,8 +819,9 @@ void NetworkInterfaceTL::RequestManager::trySend(
                   "request"_attr = cmdState->requestOnAny.cmdObj.toString());
             // Sleep to make sure the elapsed wait time for connection timeout is > 1 millisecond.
             sleepmillis(100);
-            swConn = Status(ErrorCodes::NetworkInterfaceExceededTimeLimit,
-                            "Couldn't get a connection within the time limit");
+            swConn =
+                Status(ErrorCodes::PooledConnectionAcquisitionExceededTimeLimit,
+                       "PooledConnectionAcquisitionExceededTimeLimit triggered via fail point.");
         },
         [&](const BSONObj& data) {
             return data["collectionNS"].valueStringData() ==
@@ -858,14 +852,8 @@ void NetworkInterfaceTL::RequestManager::trySend(
 
         // We're the last one, set the promise if it hasn't already been set via cancel or timeout
         if (cmdState->finishLine.arriveStrongly()) {
-            if (swConn.getStatus() == cmdState->requestOnAny.timeoutCode) {
+            if (swConn.getStatus() == ErrorCodes::PooledConnectionAcquisitionExceededTimeLimit) {
                 cmdState->connTimeoutWaitTime = cmdState->stopwatch.elapsed();
-                if (gEnableDetailedConnectionHealthMetricLogLines) {
-                    LOGV2(6496500,
-                          "Operation timed out while waiting to acquire connection",
-                          "requestId"_attr = cmdState->requestOnAny.id,
-                          "duration"_attr = cmdState->connTimeoutWaitTime);
-                }
             }
 
             auto& reactor = cmdState->interface->_reactor;
@@ -1026,15 +1014,17 @@ void NetworkInterfaceTL::RequestState::resolve(Future<RemoteCommandResponse> fut
 
             returnConnection(status);
 
-            const auto commandStatus = getStatusFromCommandResult(response.data);
-            if (isHedge && isIgnorableAsHedgeResult(commandStatus)) {
-                LOGV2_DEBUG(4660701,
-                            2,
-                            "Hedged request returned status",
-                            "requestId"_attr = request->id,
-                            "target"_attr = request->target,
-                            "status"_attr = commandStatus);
-                return;
+            if (isHedge) {
+                auto commandStatus = getStatusFromCommandResult(response.data);
+                if (isIgnorableAsHedgeResult(commandStatus)) {
+                    LOGV2_DEBUG(4660701,
+                                2,
+                                "Hedged request returned status",
+                                "requestId"_attr = request->id,
+                                "target"_attr = request->target,
+                                "status"_attr = commandStatus);
+                    return;
+                }
             }
 
             if (!cmdState->finishLine.arriveStrongly()) {
@@ -1043,7 +1033,7 @@ void NetworkInterfaceTL::RequestState::resolve(Future<RemoteCommandResponse> fut
                             "Skipping the response because it was already received from other node",
                             "requestId"_attr = request->id,
                             "target"_attr = request->target,
-                            "status"_attr = commandStatus);
+                            "response"_attr = redact(response.data));
 
                 return;
             }

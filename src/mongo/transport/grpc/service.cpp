@@ -156,11 +156,11 @@ inline Status makeShutdownTerminationStatus() {
 void logClientMetadataDocument(const IngressSession& session) {
     try {
         if (auto metadata = session.getClientMetadata()) {
-            if (session.clientId()) {
+            if (session.getRemoteClientId()) {
                 LOGV2_INFO(7401301,
                            "Received client metadata for gRPC stream",
                            "remote"_attr = session.remote(),
-                           "remoteClientId"_attr = session.clientIdStr(),
+                           "remoteClientId"_attr = session.remoteClientIdToString(),
                            "streamId"_attr = session.id(),
                            "doc"_attr = metadata->getDocument());
             } else {
@@ -168,7 +168,7 @@ void logClientMetadataDocument(const IngressSession& session) {
                             2,
                             "Received client metadata for gRPC stream",
                             "remote"_attr = session.remote(),
-                            "remoteClientId"_attr = session.clientIdStr(),
+                            "remoteClientId"_attr = session.remoteClientIdToString(),
                             "streamId"_attr = session.id(),
                             "doc"_attr = metadata->getDocument());
             }
@@ -177,7 +177,7 @@ void logClientMetadataDocument(const IngressSession& session) {
         LOGV2_WARNING(7401303,
                       "Received invalid client metadata for gRPC stream",
                       "remote"_attr = session.remote(),
-                      "remoteClientId"_attr = session.clientIdStr(),
+                      "remoteClientId"_attr = session.remoteClientIdToString(),
                       "streamId"_attr = session.id(),
                       "error"_attr = e);
     }
@@ -193,9 +193,13 @@ auto makeRpcServiceMethod(CommandService* service, const char* name, HandlerType
                 CommandService* service,
                 ::grpc::ServerContext* nativeServerCtx,
                 ::grpc::ServerReaderWriter<ConstSharedBuffer, SharedBuffer>* nativeServerStream) {
-                GRPCServerContext ctx{nativeServerCtx};
-                GRPCServerStream stream{nativeServerStream};
-                return handler(service, ctx, stream);
+                try {
+                    GRPCServerContext ctx{nativeServerCtx};
+                    GRPCServerStream stream{nativeServerStream};
+                    return handler(service, ctx, stream);
+                } catch (const DBException& e) {
+                    return util::convertStatus(e.toStatus());
+                }
             },
             service));
 }
@@ -204,11 +208,16 @@ auto makeRpcServiceMethod(CommandService* service, const char* name, HandlerType
 
 CommandService::CommandService(TransportLayer* tl,
                                RPCHandler callback,
-                               std::shared_ptr<WireVersionProvider> wvProvider)
+                               std::shared_ptr<WireVersionProvider> wvProvider,
+                               std::shared_ptr<ClientCache> clientCache)
     : _tl{tl},
       _callback{std::move(callback)},
       _wvProvider{std::move(wvProvider)},
-      _clientCache{std::make_unique<ClientCache>()} {
+      _clientCache{std::move(clientCache)} {
+
+    if (!_clientCache) {
+        _clientCache = std::make_shared<ClientCache>();
+    }
 
     AddMethod(makeRpcServiceMethod(
         this,
@@ -257,8 +266,8 @@ CommandService::CommandService(TransportLayer* tl,
     {
         stdx::lock_guard lk{_mutex};
 
-        if (_shutdown) {
-            session->terminate(makeShutdownTerminationStatus());
+        if (_shutdown || !_acceptNewRequests) {
+            session->setTerminationStatus(makeShutdownTerminationStatus());
             return util::convertStatus(*session->terminationStatus());
         }
         it = _sessions.insert(_sessions.begin(), session);
@@ -313,6 +322,11 @@ void CommandService::shutdown() {
                 1,
                 "CommandService shutdown complete",
                 "terminatedSessionsCount"_attr = nSessionsTerminated);
+}
+
+void CommandService::stopAcceptingRequests() {
+    stdx::unique_lock lk{_mutex};
+    _acceptNewRequests = false;
 }
 
 }  // namespace mongo::transport::grpc

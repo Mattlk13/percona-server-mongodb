@@ -59,6 +59,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_executor_impl.h"
+#include "mongo/db/query/stage_types.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/server_options.h"
@@ -67,6 +68,7 @@
 #include "mongo/db/storage/record_data.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/update/path_support.h"
 #include "mongo/db/update/update_oplog_entry_serialization.h"
 #include "mongo/db/update/update_util.h"
@@ -104,11 +106,11 @@ const FieldRef idFieldRef(idFieldName);
  * case of a conflict. Returns false if we should skip the document and keep going.
  */
 bool shouldRestartUpdateIfNoLongerMatches(const UpdateStageParams& params) {
-    // When we're doing a findAndModify with a sort, the sort will have a limit of 1, so it will not
-    // produce any more results even if there is another matching document. Throw a WCE here so that
-    // these operations get another chance to find a matching document. The findAndModify command
-    // should automatically retry if it gets a WCE.
-    return params.request->shouldReturnAnyDocs() && !params.request->getSort().isEmpty();
+    // When we're doing an updateOne or findAndModify with a sort, the sort will have a limit of 1,
+    // so it will not produce any more results even if there is another matching document. Throw a
+    // WCE here so that these operations get another chance to find a matching document. The
+    // updateOne and findAndModify commands should automatically retry if they get a WCE.
+    return !params.request->getSort().isEmpty();
 };
 
 CollectionUpdateArgs::StoreDocOption getStoreDocMode(const UpdateRequest& updateRequest) {
@@ -315,7 +317,8 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj,
                     &indexesAffected,
                     _params.opDebug,
                     &args));
-                invariant(oldObj.snapshotId() == opCtx()->recoveryUnit()->getSnapshotId());
+                invariant(oldObj.snapshotId() ==
+                          shard_role_details::getRecoveryUnit(opCtx())->getSnapshotId());
                 wunit.commit();
             }
         } else {
@@ -346,7 +349,8 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj,
                     &indexesAffected,
                     _params.opDebug,
                     &args);
-                invariant(oldObj.snapshotId() == opCtx()->recoveryUnit()->getSnapshotId());
+                invariant(oldObj.snapshotId() ==
+                          shard_role_details::getRecoveryUnit(opCtx())->getSnapshotId());
                 wunit.commit();
             }
         }
@@ -558,7 +562,8 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
         // Set member's obj to be the doc we want to return.
         if (_params.request->shouldReturnAnyDocs()) {
             if (_params.request->shouldReturnNewDocs()) {
-                member->resetDocument(opCtx()->recoveryUnit()->getSnapshotId(), newObj);
+                member->resetDocument(shard_role_details::getRecoveryUnit(opCtx())->getSnapshotId(),
+                                      newObj);
             } else {
                 invariant(_params.request->shouldReturnOldDocs());
                 member->resetDocument(oldSnapshot, oldObj);
@@ -570,43 +575,54 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
         // This should be after transformAndUpdate to make sure we actually updated this doc.
         _specificStats.nMatched += _params.numStatsForDoc ? _params.numStatsForDoc(newObj) : 1;
 
-        // Restore state after modification. As restoreState may restore (recreate) cursors, make
-        // sure to restore the state outside of the WritUnitOfWork.
-        const auto stageIsEOF = isEOF();
-        const auto restoreStateRet = handlePlanStageYield(
-            expCtx(),
-            "UpdateStage restoreState",
-            [&] {
-                child()->restoreState(&collectionPtr());
-                return PlanStage::NEED_TIME;
-            },
-            [&] {
-                // yieldHandler
-                // Note we don't need to retry updating anything in this case since the update
-                // already was committed. However, we still need to return the updated document (if
-                // it was requested).
-                if (_params.request->shouldReturnAnyDocs()) {
-                    // member->obj should refer to the document we want to return.
-                    invariant(member->getState() == WorkingSetMember::OWNED_OBJ);
+        // Don't restore stage if we do an update with IDHACK. Saves us the work of opening a new
+        // Wuow that we will never use
+        if (child()->stageType() != STAGE_IDHACK) {
+            // Restore state after modification. As restoreState may restore (recreate) cursors,
+            // make sure to restore the state outside of the WritUnitOfWork.
+            const auto stageIsEOF = isEOF();
+            const auto restoreStateRet = handlePlanStageYield(
+                expCtx(),
+                "UpdateStage restoreState",
+                [&] {
+                    child()->restoreState(&collectionPtr());
+                    return PlanStage::NEED_TIME;
+                },
+                [&] {
+                    // yieldHandler
+                    // Note we don't need to retry updating anything in this case since the update
+                    // already was committed. However, we still need to return the updated document
+                    // (if it was requested).
+                    if (_params.request->shouldReturnAnyDocs()) {
+                        // member->obj should refer to the document we want to return.
+                        invariant(member->getState() == WorkingSetMember::OWNED_OBJ);
 
-                    _idReturning = id;
-                    // Keep this member around so that we can return it on the next work() call.
-                    memberFreer.dismiss();
+                        _idReturning = id;
+                        // Keep this member around so that we can return it on the next work() call.
+                        memberFreer.dismiss();
+                    }
+                    *out = WorkingSet::INVALID_ID;
+                });
+
+            if (restoreStateRet != PlanStage::NEED_TIME) {
+                if (restoreStateRet == PlanStage::NEED_YIELD && stageIsEOF &&
+                    !shard_role_details::getLocker(opCtx())->inAWriteUnitOfWork()) {
+                    // If this stage is already exhausted it won't use its children stages anymore
+                    // and therefore it's okay if we failed to restore them. Avoid requesting a
+                    // yield to the plan executor. Restoring from yield could fail due to a sharding
+                    // placement change. Throwing a StaleConfig error is undesirable after an
+                    // "update one" operation has already performed a write because the router would
+                    // retry. Unset _idReturning as we'll return the document in this stage
+                    // iteration.
+                    //
+                    // If this plan is part of a larger encompassing WUOW it would be illegal to
+                    // skip returning NEED_YIELD, so we don't skip it. In this case, such as
+                    // multi-doc transactions, this is okay as the PlanExecutor is not allowed to
+                    // auto-yield.
+                    _idReturning = WorkingSet::INVALID_ID;
+                } else {
+                    return restoreStateRet;
                 }
-                *out = WorkingSet::INVALID_ID;
-            });
-
-        if (restoreStateRet != PlanStage::NEED_TIME) {
-            if (restoreStateRet == PlanStage::NEED_YIELD && stageIsEOF) {
-                // If this stage is already exhausted it won't use its children stages anymore and
-                // therefore it's okay if we failed to restore them. Avoid requesting a yield to the
-                // plan executor. Restoring from yield could fail due to a sharding placement
-                // change. Throwing a StaleConfig error is undesirable after an "update one"
-                // operation has already performed a write because the router would retry. Unset
-                // _idReturning as we'll return the document in this stage iteration.
-                _idReturning = WorkingSet::INVALID_ID;
-            } else {
-                return restoreStateRet;
             }
         }
 
@@ -698,7 +714,7 @@ void UpdateStage::_checkRestrictionsOnUpdatingShardKeyAreNotViolated(
     // retryable write or in a transaction.
     if (_params.request->getAllowShardKeyUpdatesWithoutFullShardKeyInQuery().has_value() &&
         feature_flags::gFeatureFlagUpdateOneWithoutShardKey.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
         bool isInternalThreadOrClient = !cc().session() || cc().isInternalClient();
         uassert(ErrorCodes::InvalidOptions,
                 "$_allowShardKeyUpdatesWithoutFullShardKeyInQuery is an internal parameter",
@@ -711,7 +727,7 @@ void UpdateStage::_checkRestrictionsOnUpdatingShardKeyAreNotViolated(
         // wouldChangeOwningShard error thrown below. If this node is a replica set secondary node,
         // we can skip validation.
         if (!feature_flags::gFeatureFlagUpdateDocumentShardKeyUsingTransactionApi.isEnabled(
-                serverGlobalParams.featureCompatibility)) {
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
             uassert(ErrorCodes::IllegalOperation,
                     "Must run update to shard key field in a multi-statement transaction or with "
                     "retryWrites: true.",
@@ -734,7 +750,7 @@ void UpdateStage::_checkRestrictionsOnUpdatingShardKeyAreNotViolated(
         // wouldChangeOwningShard error thrown below. If this node is a replica set secondary node,
         // we can skip validation.
         if (!feature_flags::gFeatureFlagUpdateDocumentShardKeyUsingTransactionApi.isEnabled(
-                serverGlobalParams.featureCompatibility)) {
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
             uassert(ErrorCodes::IllegalOperation,
                     "Must run update to shard key field in a multi-statement transaction or with "
                     "retryWrites: true.",

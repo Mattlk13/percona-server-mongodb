@@ -44,13 +44,14 @@ UniqueStage::UniqueStage(std::unique_ptr<PlanStage> input,
                          value::SlotVector keys,
                          PlanNodeId planNodeId,
                          bool participateInTrialRunTracking)
-    : PlanStage("unique"_sd, planNodeId, participateInTrialRunTracking), _keySlots(keys) {
+    : PlanStage("unique"_sd, nullptr /* yieldPolicy */, planNodeId, participateInTrialRunTracking),
+      _keySlots(keys) {
     _children.emplace_back(std::move(input));
 }
 
 std::unique_ptr<PlanStage> UniqueStage::clone() const {
     return std::make_unique<UniqueStage>(
-        _children[0]->clone(), _keySlots, _commonStats.nodeId, _participateInTrialRunTracking);
+        _children[0]->clone(), _keySlots, _commonStats.nodeId, participateInTrialRunTracking());
 }
 
 void UniqueStage::prepare(CompileCtx& ctx) {
@@ -66,8 +67,11 @@ value::SlotAccessor* UniqueStage::getAccessor(CompileCtx& ctx, value::SlotId slo
 
 void UniqueStage::open(bool reOpen) {
     auto optTimer(getOptTimer(_opCtx));
-
     ++_commonStats.opens;
+
+    if (reOpen) {
+        _seen.clear();
+    }
     _children[0]->open(reOpen);
 }
 

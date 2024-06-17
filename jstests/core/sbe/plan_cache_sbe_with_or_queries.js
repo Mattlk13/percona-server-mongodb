@@ -9,19 +9,13 @@
 //   does_not_support_stepdowns,
 //   # The SBE plan cache was first enabled in 6.3.
 //   requires_fcv_63,
-//   # Plan cache state is node-local and will not get migrated alongside tenant data.
+//   # Plan cache state is node-local and will not get migrated alongside user data.
 //   tenant_migration_incompatible,
-//   # TODO SERVER-67607: Test plan cache with CQF enabled.
-//   cqf_experimental_incompatible,
+//   assumes_balancer_off,
+//   featureFlagSbeFull,
 // ]
 
 import {getPlanCacheKeyFromShape, getWinningPlan, planHasStage} from "jstests/libs/analyze_plan.js";
-import {checkSBEEnabled} from "jstests/libs/sbe_util.js";
-
-if (!checkSBEEnabled(db)) {
-    jsTest.log("Skip running the test because SBE is not enabled");
-    quit();
-}
 
 function getPlanCacheEntries(query, collection, db) {
     const planCacheKey = getPlanCacheKeyFromShape({query, collection, db});

@@ -5,7 +5,10 @@
  * @tags: [
  *   requires_timeseries,
  *   featureFlagTimeseriesUpdatesSupport,
- *   __TEMPORARILY_DISABLED__,  # TODO (SERVER-79954): Enable this test.
+ *   # Needed to run createUnsplittableCollection
+ *   # TODO (SERVER-87625) Remove feature flag dependency.
+ *   featureFlagAuthoritativeShardCollection,
+ *   requires_fcv_80
  * ]
  */
 

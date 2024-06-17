@@ -236,7 +236,7 @@ public:
         return BSONObj();
     }
 
-    virtual bool existsById(PrfBlock block) const override {
+    bool existsById(PrfBlock block) const override {
         return getRecordById(block).has_value();
     }
 
@@ -304,7 +304,7 @@ public:
         return BSONObj();
     }
 
-    virtual bool existsById(PrfBlock block) const override {
+    bool existsById(PrfBlock block) const override {
         return getRecordById(block).has_value();
     }
 
@@ -322,26 +322,13 @@ private:
 
         incrementRead();
 
-        auto ksEntry = _indexCursor->seekForKeyString(id);
-        if (!ksEntry) {
+        auto loc = _indexCursor->seekExact(id);
+        if (!loc) {
             return boost::none;
         }
 
-        // Seek will almost always give us a document, it just may not be a document we were
-        // looking for. We need to check if seeked to the document we want
-        auto sizeWithoutRecordId = key_string::sizeWithoutRecordIdLongAtEnd(
-            ksEntry->keyString.getBuffer(), ksEntry->keyString.getSize());
-
-        if (key_string::compare(ksEntry->keyString.getBuffer(),
-                                id.getBuffer(),
-                                sizeWithoutRecordId,
-                                id.getSize()) == 0) {
-
-            // Get the document from the base collection
-            return _cursor->seekExact(ksEntry->loc);
-        }
-
-        return boost::none;
+        // Get the document from the base collection
+        return _cursor->seekExact(loc.get());
     }
 
 private:

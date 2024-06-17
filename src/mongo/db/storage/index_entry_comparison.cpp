@@ -40,7 +40,6 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/storage/index_entry_comparison.h"
 #include "mongo/db/storage/key_string.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/str.h"
 #include "mongo/util/text.h"  // IWYU pragma: keep
@@ -166,8 +165,7 @@ key_string::Value IndexEntryComparison::makeKeyStringFromBSONKey(
     key_string::Version version,
     Ordering ord,
     key_string::Discriminator discrim) {
-    BSONObj finalKey = BSONObj::stripFieldNames(bsonKey);
-    key_string::Builder builder(version, finalKey, ord, discrim);
+    key_string::Builder builder(version, bsonKey, ord, discrim);
     return builder.getValueCopy();
 }
 
@@ -241,16 +239,16 @@ Status buildDupKeyErrorStatus(const BSONObj& key,
 
     sb << builderForErrmsg.obj();
 
-    stdx::visit(OverloadedVisitor{
-                    [](stdx::monostate) {},
-                    [&sb](const RecordId& rid) { sb << " found value: " << rid; },
-                    [&sb](const BSONObj& obj) {
-                        if (obj.objsize() < BSONObjMaxUserSize / 2) {
-                            sb << " found value: " << obj;
-                        }
-                    },
-                },
-                foundValue);
+    visit(OverloadedVisitor{
+              [](std::monostate) {},
+              [&sb](const RecordId& rid) { sb << " found value: " << rid; },
+              [&sb](const BSONObj& obj) {
+                  if (obj.objsize() < BSONObjMaxUserSize / 2) {
+                      sb << " found value: " << obj;
+                  }
+              },
+          },
+          foundValue);
 
     return Status(DuplicateKeyErrorInfo(keyPattern,
                                         builderForErrorExtraInfo.obj(),

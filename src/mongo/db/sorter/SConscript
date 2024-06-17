@@ -1,4 +1,5 @@
 Import("env")
+Import('wiredtiger')
 
 env = env.Clone()
 
@@ -10,16 +11,28 @@ sorterEnv.CppUnitTest(
     source=[
         'sorter_test.cpp',
         'sorter_stats_test.cpp',
+        'sorter_checksum_calculator_test.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/exec/document_value/document_value',
         '$BUILD_DIR/mongo/db/query/query_knobs',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/storage/encryption_hooks',
         '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/third_party/shim_snappy',
-        'sorter_idl',
+        'sorter_base',
         'sorter_stats',
+    ],
+)
+
+env.Benchmark(
+    target='sorter_checksum_calculator_bm',
+    source=[
+        'sorter_checksum_calculator_bm.cpp',
+    ],
+    LIBDEPS=[
+        'sorter_base',
     ],
 )
 
@@ -31,14 +44,22 @@ sorterEnv.Library(
         '$BUILD_DIR/mongo/db/commands/server_status_core',
     ])
 
-env.Library(
-    target='sorter_idl',
+sorterBaseEnv = env.Clone()
+if wiredtiger:
+    sorterBaseEnv.InjectThirdParty(libraries=['wiredtiger'])
+
+sorterBaseEnv.Library(
+    target='sorter_base',
     source=[
         'sorter.idl',
+        'sorter_checksum_calculator.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/idl/idl_parser',
+        '$BUILD_DIR/mongo/db/server_feature_flags',
         'sorter_stats',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/server_base',
+        '$BUILD_DIR/third_party/wiredtiger/wiredtiger_checksum' if wiredtiger else [],
     ],
 )

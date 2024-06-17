@@ -17,7 +17,6 @@ selector:
   - jstests/core/**/compact_keeps_indexes.js  # compact.
   - jstests/core/**/currentop.js  # uses fsync.
   - jstests/core/**/dbhash.js  # dbhash.
-  - jstests/core/**/dbhash2.js  # dbhash.
   - jstests/core/**/fsync.js  # uses fsync.
   - jstests/core/**/geo_update_btree2.js  # notablescan.
   - jstests/core/**/index9.js  # "local" database.
@@ -28,7 +27,6 @@ selector:
   - jstests/core/**/tailable_skip_limit.js # capped collections.
   # The following tests fail because mongos behaves differently from mongod when testing certain
   # functionality. The differences are in a comment next to the failing test.
-  - jstests/core/**/explain_missing_database.js  # Behavior with no db different on mongos, SERVER-18047.
   - jstests/core/**/geo_2d_explain.js  # executionSuccess in different spot in explain().
   - jstests/core/**/geo_s2explain.js  # inputStage in different spot in explain().
   - jstests/core/**/geo_s2sparse.js  # keysPerIndex in different spot in validate().
@@ -38,17 +36,14 @@ selector:
   - jstests/core/**/create_indexes.js
   - jstests/core/**/list_indexes_non_existent_ns.js
   - jstests/core/**/mr_preserve_indexes.js
-  # The following tests fail because they expect no databases to be created. However a DB is created
-  # automatically when we shard a collection.
-  - jstests/core/**/dbcase.js
-  - jstests/core/**/dbcase2.js
-  - jstests/core/**/no_db_created.js
-  - jstests/core/**/killop_drop_collection.js # Uses fsyncLock.
   # This test uses `benchRun` which spawns connections which do not inherit the causal session.
   - jstests/core/**/benchrun_pipeline_updates.js
 
 
   exclude_with_any_tags:
+  # This passthrough implicitly shards the accessed collections. Do not run tests where collections
+  # can't be created on `getCollection` call.
+  - assumes_no_implicit_collection_creation_on_get_collection
   # Tests tagged with the following will fail because they assume collections are not sharded.
   - assumes_against_mongod_not_mongos
   - assumes_standalone_mongod
@@ -72,6 +67,8 @@ selector:
   - uses_transactions
   # Parallel shell is not causally consistent because it uses a different session.
   - uses_parallel_shell
+  # Capped collections cannot be sharded
+  - requires_capped
 
 executor:
   archive:

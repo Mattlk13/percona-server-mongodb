@@ -90,7 +90,7 @@ public:
                           StringData ident,
                           const IndexDescriptor* desc,
                           bool isLogged);
-    ~WiredTigerColumnStore() = default;
+    ~WiredTigerColumnStore() override = default;
 
     //
     // CRUD
@@ -106,7 +106,7 @@ public:
     //
     // Whole ColumnStore ops
     //
-    Status compact(OperationContext* opCtx) override;
+    StatusWith<int64_t> compact(OperationContext* opCtx, const CompactOptions& options) override;
     IndexValidateResults validate(OperationContext* opCtx, bool full) const override;
 
     bool appendCustomStats(OperationContext* opCtx,

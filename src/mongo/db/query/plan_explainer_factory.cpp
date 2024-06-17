@@ -29,6 +29,7 @@
 
 #include <utility>
 
+#include <boost/optional/optional.hpp>
 
 #include "mongo/db/exec/plan_cache_util.h"
 #include "mongo/db/query/plan_explainer_factory.h"
@@ -37,8 +38,8 @@
 #include "mongo/util/assert_util_core.h"
 
 namespace mongo::plan_explainer_factory {
-std::unique_ptr<PlanExplainer> make(PlanStage* root) {
-    return std::make_unique<PlanExplainerImpl>(root);
+std::unique_ptr<PlanExplainer> make(PlanStage* root, boost::optional<size_t> cachedPlanHash) {
+    return std::make_unique<PlanExplainerImpl>(root, cachedPlanHash);
 }
 
 std::unique_ptr<PlanExplainer> make(PlanStage* root, const PlanEnumeratorExplainInfo& explainInfo) {
@@ -58,7 +59,6 @@ std::unique_ptr<PlanExplainer> make(sbe::PlanStage* root,
                                     std::vector<sbe::plan_ranker::CandidatePlan> rejectedCandidates,
                                     bool isMultiPlan) {
     // Pre-compute Debugging info for explain use.
-
     auto debugInfoSBE = std::make_shared<const plan_cache_debug_info::DebugInfoSBE>(
         plan_cache_util::buildDebugInfo(solution));
     return std::make_unique<PlanExplainerSBE>(root,
@@ -67,7 +67,8 @@ std::unique_ptr<PlanExplainer> make(sbe::PlanStage* root,
                                               std::move(optimizerData),
                                               std::move(rejectedCandidates),
                                               isMultiPlan,
-                                              false, /* isFromPlanCache */
+                                              false,       /* isCachedPlan */
+                                              boost::none, /* cachedPlanHash */
                                               debugInfoSBE);
 }
 
@@ -79,16 +80,14 @@ std::unique_ptr<PlanExplainer> make(
     std::vector<sbe::plan_ranker::CandidatePlan> rejectedCandidates,
     bool isMultiPlan,
     bool isFromPlanCache,
+    boost::optional<size_t> cachedPlanHash,
     std::shared_ptr<const plan_cache_debug_info::DebugInfoSBE> debugInfoSBE,
+    OptimizerCounterInfo optCounterInfo,
     RemoteExplainVector* remoteExplains) {
-    // If the plan was recovered from the plan cache, we should already have 'debugInfoSBE'.
-    if (isFromPlanCache) {
-        invariant(debugInfoSBE);
-    } else {
+    if (!debugInfoSBE) {
         debugInfoSBE = std::make_shared<const plan_cache_debug_info::DebugInfoSBE>(
             plan_cache_util::buildDebugInfo(solution));
     }
-
     return std::make_unique<PlanExplainerSBE>(root,
                                               data,
                                               solution,
@@ -96,7 +95,35 @@ std::unique_ptr<PlanExplainer> make(
                                               std::move(rejectedCandidates),
                                               isMultiPlan,
                                               isFromPlanCache,
+                                              cachedPlanHash,
                                               debugInfoSBE,
+                                              std::move(optCounterInfo),
                                               remoteExplains);
+}
+
+std::unique_ptr<PlanExplainer> make(
+    sbe::PlanStage* root,
+    const stage_builder::PlanStageData* data,
+    const QuerySolution* solution,
+    bool isMultiPlan,
+    bool isFromPlanCache,
+    boost::optional<size_t> cachedPlanHash,
+    std::shared_ptr<const plan_cache_debug_info::DebugInfoSBE> debugInfoSBE,
+    std::unique_ptr<PlanStage> classicRuntimePlannerStage,
+    RemoteExplainVector* remoteExplains) {
+    if (!debugInfoSBE) {
+        debugInfoSBE = std::make_shared<const plan_cache_debug_info::DebugInfoSBE>(
+            plan_cache_util::buildDebugInfo(solution));
+    }
+    return std::make_unique<PlanExplainerClassicRuntimePlannerForSBE>(
+        root,
+        data,
+        solution,
+        isMultiPlan,
+        isFromPlanCache,
+        cachedPlanHash,
+        debugInfoSBE,
+        std::move(classicRuntimePlannerStage),
+        remoteExplains);
 }
 }  // namespace mongo::plan_explainer_factory

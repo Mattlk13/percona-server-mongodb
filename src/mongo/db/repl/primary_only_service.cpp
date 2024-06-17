@@ -48,7 +48,6 @@
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/query/find_command.h"
 #include "mongo/db/repl/primary_only_service.h"
@@ -57,6 +56,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/vector_clock_metadata_hook.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_factory.h"
@@ -160,6 +160,9 @@ PrimaryOnlyServiceRegistry* PrimaryOnlyServiceRegistry::get(ServiceContext* serv
 
 void PrimaryOnlyServiceRegistry::registerService(std::unique_ptr<PrimaryOnlyService> service) {
     auto ns = service->getStateDocumentsNS();
+    invariant(
+        ns.isConfigDB(),
+        "PrimaryOnlyServices can only register a state documents namespace in the 'config' db");
     auto name = service->getServiceName();
     auto servicePtr = service.get();
 
@@ -373,6 +376,7 @@ void PrimaryOnlyService::startup(OperationContext* opCtx) {
 }
 
 void PrimaryOnlyService::onStepUp(const OpTime& stepUpOpTime) {
+    using namespace fmt::literals;
     SimpleBSONObjUnorderedMap<ActiveInstance> savedInstances;
     invariant(_getHasExecutor());
     auto newThenOldScopedExecutor =
@@ -497,7 +501,7 @@ void PrimaryOnlyService::_interruptInstances(WithLock, Status status) {
     }
 
     for (auto opCtx : _opCtxs) {
-        stdx::lock_guard<Client> clientLock(*opCtx->getClient());
+        ClientLock clientLock(opCtx->getClient());
         _serviceContext->killOperation(clientLock, opCtx, status.code());
     }
 }
@@ -514,14 +518,13 @@ void PrimaryOnlyService::onStepDown() {
                "numInstances"_attr = _activeInstances.size(),
                "numOperationContexts"_attr = _opCtxs.size());
 
+    _onServiceTermination();
     _interruptInstances(lk,
                         {ErrorCodes::InterruptedDueToReplStateChange,
                          "PrimaryOnlyService interrupted due to stepdown"});
 
     _setState(State::kPaused, lk);
     _rebuildStatus = Status::OK();
-
-    _afterStepDown();
 }
 
 void PrimaryOnlyService::shutdown() {
@@ -540,6 +543,7 @@ void PrimaryOnlyService::shutdown() {
 
         // If the _state is already kPaused, the instances have already been interrupted.
         if (_state != State::kPaused) {
+            _onServiceTermination();
             _interruptInstances(lk,
                                 {ErrorCodes::InterruptedAtShutdown,
                                  "PrimaryOnlyService interrupted due to shutdown"});
@@ -624,8 +628,10 @@ std::pair<boost::optional<std::shared_ptr<PrimaryOnlyService::Instance>>, bool>
 PrimaryOnlyService::lookupInstance(OperationContext* opCtx, const InstanceID& id) {
     // If this operation is holding any database locks, then it must have opted into getting
     // interrupted at stepdown to prevent deadlocks.
-    invariant(!opCtx->lockState()->isLocked() || opCtx->shouldAlwaysInterruptAtStepDownOrUp() ||
-              opCtx->lockState()->wasGlobalLockTakenInModeConflictingWithWrites());
+    invariant(
+        !shard_role_details::getLocker(opCtx)->isLocked() ||
+        opCtx->shouldAlwaysInterruptAtStepDownOrUp() ||
+        shard_role_details::getLocker(opCtx)->wasGlobalLockTakenInModeConflictingWithWrites());
 
     stdx::unique_lock lk(_mutex);
     _waitForStateNotRebuilding(opCtx, lk);
@@ -651,8 +657,10 @@ std::vector<std::shared_ptr<PrimaryOnlyService::Instance>> PrimaryOnlyService::g
     OperationContext* opCtx) {
     // If this operation is holding any database locks, then it must have opted into getting
     // interrupted at stepdown to prevent deadlocks.
-    invariant(!opCtx->lockState()->isLocked() || opCtx->shouldAlwaysInterruptAtStepDownOrUp() ||
-              opCtx->lockState()->wasGlobalLockTakenInModeConflictingWithWrites());
+    invariant(
+        !shard_role_details::getLocker(opCtx)->isLocked() ||
+        opCtx->shouldAlwaysInterruptAtStepDownOrUp() ||
+        shard_role_details::getLocker(opCtx)->wasGlobalLockTakenInModeConflictingWithWrites());
 
     std::vector<std::shared_ptr<PrimaryOnlyService::Instance>> instances;
 

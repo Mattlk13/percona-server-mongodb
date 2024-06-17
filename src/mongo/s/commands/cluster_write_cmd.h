@@ -68,8 +68,6 @@ namespace mongo {
  */
 class ClusterWriteCmd : public Command {
 public:
-    virtual ~ClusterWriteCmd() {}
-
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
         return AllowedOnSecondary::kNever;
     }
@@ -104,35 +102,53 @@ public:
                                                   BatchedCommandResponse* response,
                                                   BatchWriteExecStats stats);
 
-protected:
-    class InvocationBase;
-
-    ClusterWriteCmd(StringData name) : Command(name) {}
-
-private:
     /**
      * Executes a write command against a particular database, and targets the command based on
      * a write operation.
      *
      * Does *not* retry or retarget if the metadata is stale.
      */
-    static void _commandOpWrite(OperationContext* opCtx,
-                                const NamespaceString& nss,
-                                const BSONObj& command,
-                                BatchItemRef targetingBatchItem,
-                                std::vector<AsyncRequestsSender::Response>* results);
+    static void commandOpWrite(OperationContext* opCtx,
+                               const NamespaceString& nss,
+                               const BSONObj& command,
+                               BatchItemRef targetingBatchItem,
+                               std::vector<AsyncRequestsSender::Response>* results);
+
+    /**
+     * Runs a two-phase protocol to explain an updateOne/deleteOne without a shard key or _id.
+     * Returns true if we successfully ran the protocol, false otherwise.
+     */
+    static bool runExplainWithoutShardKey(OperationContext* opCtx,
+                                          const BatchedCommandRequest& req,
+                                          const NamespaceString& nss,
+                                          ExplainOptions::Verbosity verbosity,
+                                          BSONObjBuilder* result);
+
+    static void executeWriteOpExplain(OperationContext* opCtx,
+                                      const BatchedCommandRequest& batchedRequest,
+                                      const BSONObj& requestObj,
+                                      ExplainOptions::Verbosity verbosity,
+                                      rpc::ReplyBuilderInterface* result);
+
+protected:
+    class InvocationBase;
+
+    explicit ClusterWriteCmd(StringData name) : Command(name) {}
+
+private:
+    virtual UpdateMetrics* getUpdateMetrics() {
+        return nullptr;
+    }
 };
 
 class ClusterWriteCmd::InvocationBase : public CommandInvocation {
 public:
     InvocationBase(const ClusterWriteCmd* command,
                    const OpMsgRequest& request,
-                   BatchedCommandRequest batchedRequest,
-                   UpdateMetrics* updateMetrics = nullptr)
+                   BatchedCommandRequest batchedRequest)
         : CommandInvocation(command),
           _request{&request},
-          _batchedRequest{std::move(batchedRequest)},
-          _updateMetrics{updateMetrics} {}
+          _batchedRequest{std::move(batchedRequest)} {}
 
     const BatchedCommandRequest& getBatchedRequest() const {
         return _batchedRequest;
@@ -162,6 +178,10 @@ private:
         return _batchedRequest.getNS();
     }
 
+    const DatabaseName& db() const override {
+        return _batchedRequest.getNS().dbName();
+    }
+
     bool supportsWriteConcern() const override {
         return true;
     }
@@ -179,20 +199,8 @@ private:
         return static_cast<const ClusterWriteCmd*>(definition());
     }
 
-    /**
-     * Runs a two-phase protocol to explain an updateOne/deleteOne without a shard key or _id.
-     * Returns true if we successfully ran the protocol, false otherwise.
-     */
-    bool _runExplainWithoutShardKey(OperationContext* opCtx,
-                                    const NamespaceString& nss,
-                                    ExplainOptions::Verbosity verbosity,
-                                    BSONObjBuilder* result);
-
     const OpMsgRequest* _request;
     BatchedCommandRequest _batchedRequest;
-
-    // Update related command execution metrics.
-    UpdateMetrics* const _updateMetrics;
 };
 
 template <typename Impl>
@@ -200,7 +208,7 @@ class ClusterInsertCmdBase final : public ClusterWriteCmd {
 public:
     ClusterInsertCmdBase() : ClusterWriteCmd(Impl::kName) {}
 
-    const std::set<std::string>& apiVersions() const {
+    const std::set<std::string>& apiVersions() const override {
         return Impl::getApiVersions();
     }
 
@@ -248,10 +256,16 @@ private:
 template <typename Impl>
 class ClusterUpdateCmdBase final : public ClusterWriteCmd {
 public:
-    ClusterUpdateCmdBase() : ClusterWriteCmd(Impl::kName), _updateMetrics{Impl::kName} {}
+    ClusterUpdateCmdBase() : ClusterWriteCmd{Impl::kName} {}
 
-    const std::set<std::string>& apiVersions() const {
+    const std::set<std::string>& apiVersions() const override {
         return Impl::getApiVersions();
+    }
+
+protected:
+    void doInitializeClusterRole(ClusterRole role) override {
+        ClusterWriteCmd::doInitializeClusterRole(role);
+        _updateMetrics.emplace(getName(), role);
     }
 
 private:
@@ -277,12 +291,13 @@ private:
     std::unique_ptr<CommandInvocation> parse(OperationContext* opCtx,
                                              const OpMsgRequest& request) final {
         auto parsedRequest = BatchedCommandRequest::parseUpdate(request);
-        uassert(51195,
-                "Cannot specify runtime constants option to a mongos",
-                !parsedRequest.hasLegacyRuntimeConstants());
-        parsedRequest.setLegacyRuntimeConstants(Variables::generateRuntimeConstants(opCtx));
-        return std::make_unique<Invocation>(
-            this, request, std::move(parsedRequest), &_updateMetrics);
+        if (!opCtx->isCommandForwardedFromRouter()) {
+            uassert(51195,
+                    "Cannot specify runtime constants option to a mongos",
+                    !parsedRequest.hasLegacyRuntimeConstants());
+            parsedRequest.setLegacyRuntimeConstants(Variables::generateRuntimeConstants(opCtx));
+        }
+        return std::make_unique<Invocation>(this, request, std::move(parsedRequest));
     }
 
     std::string help() const override {
@@ -297,8 +312,13 @@ private:
         return &::mongo::write_ops::UpdateCommandRequest::kAuthorizationContract;
     }
 
+    UpdateMetrics* getUpdateMetrics() override {
+        invariant(_updateMetrics);
+        return &*_updateMetrics;
+    }
+
     // Update related command execution metrics.
-    UpdateMetrics _updateMetrics;
+    boost::optional<UpdateMetrics> _updateMetrics;
 };
 
 template <typename Impl>
@@ -306,7 +326,7 @@ class ClusterDeleteCmdBase final : public ClusterWriteCmd {
 public:
     ClusterDeleteCmdBase() : ClusterWriteCmd(Impl::kName) {}
 
-    const std::set<std::string>& apiVersions() const {
+    const std::set<std::string>& apiVersions() const override {
         return Impl::getApiVersions();
     }
 

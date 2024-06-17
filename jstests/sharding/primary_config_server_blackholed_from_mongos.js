@@ -2,9 +2,13 @@
  * Ensures that if the primary config server is blackholed from the point of view of mongos, CRUD
  * and read-only config operations continue to work.
  *
- * @tags: [config_shard_incompatible]
+ * @tags: [
+ *    config_shard_incompatible,
+ *    temp_disabled_embedded_router_mongo_bridge,
+ * ]
  */
 
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 import {reconfig} from "jstests/replsets/rslib.js";
 
 // Checking index consistency involves talking to the primary config server which is blackholed from
@@ -82,6 +86,7 @@ assert.throws(function() {
 
 // With secondary read pref config server reads should work
 st.s.setReadPref('secondary');
+FixtureHelpers.awaitReplication(configDB);
 assert.lt(0, configDB.chunks.find().itcount());
 assert.lt(0, configDB.chunks.find().count());
 assert.lt(0, configDB.chunks.aggregate().itcount());

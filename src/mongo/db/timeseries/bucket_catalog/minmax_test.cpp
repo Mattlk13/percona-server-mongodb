@@ -69,9 +69,15 @@ int64_t getElementSize(std::string fieldName,
     return fieldName.capacity() + minDataSize + maxDataSize;
 }
 
+int64_t getEntrySize(std::string fieldName,
+                     boost::optional<BSONElement> minElem,
+                     boost::optional<BSONElement> maxElem) {
+    return sizeof(Entry) + getElementSize(fieldName, minElem, maxElem);
+}
+
 int64_t emptyStoreSize() {
     static const std::string emptyFieldName;
-    return sizeof(Entry) + getElementSize(emptyFieldName, boost::none, boost::none);
+    return getEntrySize(emptyFieldName, boost::none, boost::none);
 }
 
 int64_t emptyMinMaxSize() {
@@ -79,7 +85,8 @@ int64_t emptyMinMaxSize() {
 }
 
 TEST(MinMax, Insert) {
-    MinMaxStore minmax;
+    TrackingContext trackingContext;
+    MinMaxStore minmax{trackingContext};
 
     // No subelements to start
     auto obj = minmax.root();
@@ -142,7 +149,8 @@ TEST(MinMax, Insert) {
 }
 
 TEST(MinMax, MinMaxNoUpdatesAfterFullMinMax) {
-    MinMax minMaxObj;
+    TrackingContext trackingContext;
+    MinMax minMaxObj{trackingContext};
     const auto* strCmp = &simpleStringDataComparator;
     minMaxObj.update(BSON("a" << 2 << "b" << 3 << "meta" << 4), "meta"_sd, strCmp);
     ASSERT_BSONOBJ_EQ(minMaxObj.min(), BSON("a" << 2 << "b" << 3));
@@ -155,7 +163,8 @@ TEST(MinMax, MinMaxNoUpdatesAfterFullMinMax) {
 }
 
 TEST(MinMax, MinMaxNoUpdatesAfterFullMinMaxNested) {
-    MinMax minMaxObj;
+    TrackingContext trackingContext;
+    MinMax minMaxObj{trackingContext};
     const auto* strCmp = &simpleStringDataComparator;
 
     auto obj = BSON("a" << BSON("z" << 1) << "b" << BSON_ARRAY(BSON("z" << 1) << BSON("z" << 2)));
@@ -177,7 +186,8 @@ TEST(MinMax, MinMaxNoUpdatesAfterFullMinMaxNested) {
 }
 
 TEST(MinMax, MinMaxInitialUpdates) {
-    MinMax minMaxObj;
+    TrackingContext trackingContext;
+    MinMax minMaxObj{trackingContext};
     const auto* strCmp = &simpleStringDataComparator;
     minMaxObj.update(BSON("a" << 2 << "b" << 3 << "meta" << 4), "meta"_sd, strCmp);
     ASSERT_BSONOBJ_EQ(minMaxObj.minUpdates(), BSON("u" << BSON("a" << 2 << "b" << 3)));
@@ -187,7 +197,8 @@ TEST(MinMax, MinMaxInitialUpdates) {
 }
 
 TEST(MinMax, MinMaxMixedUpdates) {
-    MinMax minMaxObj;
+    TrackingContext trackingContext;
+    MinMax minMaxObj{trackingContext};
     const auto* strCmp = &simpleStringDataComparator;
     minMaxObj.update(BSON("a" << 2 << "b" << 3 << "meta" << 4), "meta"_sd, strCmp);
     ASSERT_BSONOBJ_EQ(minMaxObj.min(), BSON("a" << 2 << "b" << 3));
@@ -201,7 +212,8 @@ TEST(MinMax, MinMaxMixedUpdates) {
 }
 
 TEST(MinMax, SubObjInsert) {
-    MinMaxStore minmax;
+    TrackingContext trackingContext;
+    MinMaxStore minmax{trackingContext};
     auto obj = minmax.root();
     auto [inserted, _] = obj.insert(obj.end(), "b");
 
@@ -253,7 +265,8 @@ TEST(MinMax, SubObjInsert) {
 }
 
 TEST(MinMax, Search) {
-    MinMaxStore minmax;
+    TrackingContext trackingContext;
+    MinMaxStore minmax{trackingContext};
     auto obj = minmax.root();
     obj.insert(obj.end(), "a");
     obj.insert(obj.end(), "b");
@@ -272,7 +285,8 @@ TEST(MinMax, Search) {
 }
 
 TEST(MinMax, SearchLookupMap) {
-    MinMaxStore minmax;
+    TrackingContext trackingContext;
+    MinMaxStore minmax{trackingContext};
     auto obj = minmax.root();
 
     for (int i = 0; i < 100; ++i) {
@@ -292,127 +306,6 @@ TEST(MinMax, SearchLookupMap) {
     // Map based search is still accurate after inserts
     obj.insert(obj.begin(), "x");
     ASSERT_EQ(obj.search(obj.begin(), "50")->fieldName(), "50");
-}
-
-TEST(MinMax, DataMemoryUsage) {
-    // Check empty Data memory usage.
-    MinMaxStore::Data data;
-    ASSERT_EQ(data.calculateMemUsage(), sizeof(BSONElementValueBuffer));
-
-    // Check non-empty Data memory usage.
-    std::string fieldName("fieldName");
-    BSONObj doc = BSON(fieldName << 1);
-    BSONElement BSONElem = doc[fieldName];
-    data.setValue(BSONElem);
-    ASSERT_EQ(data.calculateMemUsage(),
-              sizeof(BSONElementValueBuffer) + BSONElem.size() - fieldName.size());
-}
-
-TEST(MinMax, ElementMemoryUsage) {
-    MinMaxElement minMaxElem;
-    std::string fieldName;
-
-    // Check empty MinMaxElement memory usage. Must account for empty string which may have memory
-    // allocated.
-    ASSERT_EQ(minMaxElem.calculateMemUsage(), getElementSize(fieldName, boost::none, boost::none));
-
-    // Check non-empty MinMaxElement.
-    fieldName = "fieldName";
-    BSONObj doc = BSON(fieldName << 1);
-    BSONElement BSONElem = doc[fieldName];
-    minMaxElem.min().setValue(BSONElem);
-    minMaxElem.max().setValue(BSONElem);
-    minMaxElem.setFieldName(fieldName.data());
-    ASSERT_EQ(minMaxElem.calculateMemUsage(), getElementSize(fieldName, BSONElem, BSONElem));
-}
-
-TEST(MinMax, StoreMemoryUsage) {
-    Entry entry;
-    std::string fieldName;
-
-    // Empty MinMaxStore has one root Entry with an empty Element.
-    MinMaxStore minmaxStore;
-    ASSERT_EQ(minmaxStore.calculateMemUsage(), emptyStoreSize());
-
-    auto obj = minmaxStore.root();
-
-    // Insert an object with a 20 byte field name. The Obj should have 2 entries, the first is the
-    // empty root and the second is an empty element with just a field name.
-    fieldName = "twentyByteLongString";
-    obj.insert(obj.end(), fieldName);
-    int64_t expectedMemoryUsage =
-        emptyStoreSize() + sizeof(Entry) + getElementSize(fieldName, boost::none, boost::none);
-    ASSERT_GTE(minmaxStore.calculateMemUsage(), expectedMemoryUsage);
-
-    // Insert another identical obj. MinMaxStore has an entries vector that can allocate for more
-    // elements than its size.
-    obj.insert(obj.end(), fieldName);
-    expectedMemoryUsage = emptyStoreSize() +
-        (2 * (sizeof(Entry) + getElementSize(fieldName, boost::none, boost::none)));
-    ASSERT_GTE(minmaxStore.calculateMemUsage(), expectedMemoryUsage);
-}
-
-TEST(MinMax, MinMaxMemoryUsage) {
-    MinMax minmax;
-
-    // Confirm memUsage only reflects the root node before inserting anything.
-    ASSERT_EQ(minmax.calculateMemUsage(), emptyMinMaxSize());
-
-    const auto* strCmp = &simpleStringDataComparator;
-
-    // Insert non-empty element to MinMax which will be both the min and max.
-    std::string fieldA = "a";
-    BSONObj docMin = BSON(fieldA << 1 << "meta" << 4);
-    minmax.update(docMin, "meta"_sd, strCmp);
-    int64_t numericMinMaxSize =
-        emptyMinMaxSize() + sizeof(Entry) + getElementSize(fieldA, docMin[fieldA], docMin[fieldA]);
-    ASSERT_EQ(minmax.calculateMemUsage(), numericMinMaxSize);
-
-    // Update max value with same memory usage.
-    BSONObj docMax = BSON(fieldA << 3 << "meta" << 4);
-    minmax.update(docMax, "meta"_sd, strCmp);
-    ASSERT_EQ(minmax.calculateMemUsage(), numericMinMaxSize);
-
-    // Update max value with larger memory usage.
-    docMax = BSON(fieldA << "Dan likes apples"
-                         << "meta" << 4);
-    minmax.update(docMax, "meta"_sd, strCmp);
-    int64_t minMaxWithStringSize =
-        emptyMinMaxSize() + sizeof(Entry) + getElementSize(fieldA, docMin[fieldA], docMax[fieldA]);
-    ASSERT_EQ(minmax.calculateMemUsage(), minMaxWithStringSize);
-    ASSERT_GT(minMaxWithStringSize, numericMinMaxSize);
-}
-
-TEST(MinMax, NestedMinMaxMemoryUsage) {
-    MinMax minMaxObj;
-    const auto* strCmp = &simpleStringDataComparator;
-
-    auto obj = BSON(
-        "a" << BSON("a1" << 1) << "b"
-            << BSON_ARRAY(BSON("b1" << 1) << BSON_ARRAY(BSON("bc1" << 1) << BSON("bc2" << 1))));
-    minMaxObj.update(obj, "_meta"_sd, strCmp);
-
-    int64_t approxElemSize = sizeof(Entry) + getElementSize("a", obj["a"]["a1"], obj["a"]["a1"]);
-    // 10 elements account for 6 inserted elements and 4 null elements for every array sub-element.
-    int64_t approxMinMaxMemUsage = emptyMinMaxSize() + (10 * approxElemSize);
-    int64_t initialNestedSize = minMaxObj.calculateMemUsage();
-    ASSERT_GTE(initialNestedSize, approxMinMaxMemUsage);
-    ASSERT_LTE(initialNestedSize, approxMinMaxMemUsage * 2);
-
-    // Update max of nested objects should be no-op.
-    minMaxObj.update(BSON("a" << BSON("a1" << 2) << "b"
-                              << BSON_ARRAY(BSON("b1" << 2) << BSON_ARRAY(BSON("bc1" << 2)))),
-                     "_meta"_sd,
-                     strCmp);
-    ASSERT_EQ(minMaxObj.calculateMemUsage(), initialNestedSize);
-
-    // Update with more elements and memory usage should increase.
-    minMaxObj.update(BSON("a" << BSON("a2" << 1) << "b"
-                              << BSON_ARRAY(BSON("b2" << 1) << BSON_ARRAY(BSON("bc3" << 1)))),
-                     "_meta"_sd,
-                     strCmp);
-    ASSERT_GTE(minMaxObj.calculateMemUsage(), initialNestedSize);
-    ASSERT_LTE(minMaxObj.calculateMemUsage(), initialNestedSize * 2);
 }
 
 }  // namespace

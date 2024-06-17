@@ -58,7 +58,6 @@
 #include "mongo/s/client/shard.h"
 #include "mongo/s/query/owned_remote_cursor.h"
 #include "mongo/s/stale_shard_version_helpers.h"
-#include "mongo/stdx/variant.h"
 
 namespace mongo {
 namespace sharded_agg_helpers {
@@ -94,9 +93,9 @@ struct ShardedExchangePolicy {
 };
 
 struct DispatchShardPipelineResults {
-    // True if this pipeline was split, and the second half of the pipeline needs to be run on
-    // the primary shard for the database.
-    bool needsPrimaryShardMerge;
+    // Contains a value when the second half of the pipeline was requested to run on a specific
+    // shard.
+    boost::optional<ShardId> mergeShardId;
 
     // Populated if this *is not* an explain, this vector represents the cursors on the remote
     // shards.
@@ -177,10 +176,12 @@ DispatchShardPipelineResults dispatchShardPipeline(
     bool eligibleForSampling,
     std::unique_ptr<Pipeline, PipelineDeleter> pipeline,
     boost::optional<ExplainOptions::Verbosity> explain,
+    boost::optional<CollectionRoutingInfo> cri = boost::none,
     ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
     boost::optional<BSONObj> readConcern = boost::none,
     AsyncRequestsSender::ShardHostMap designatedHostsMap = {},
-    stdx::unordered_map<ShardId, BSONObj> resumeTokenMap = {});
+    stdx::unordered_map<ShardId, BSONObj> resumeTokenMap = {},
+    std::set<ShardId> shardsToSkip = {});
 
 BSONObj createPassthroughCommandForShard(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -241,11 +242,18 @@ bool checkIfMustRunOnAllShards(const NamespaceString& nss, PipelineDataSource pi
 Shard::RetryPolicy getDesiredRetryPolicy(OperationContext* opCtx);
 
 /**
- * Uses sharded_agg_helpers to split the pipeline and dispatch half to the shards, leaving the
- * merging half executing in this process after attaching a $mergeCursors. Will retry on network
- * errors and also on StaleConfig errors to avoid restarting the entire operation.
+ * Prepares the given pipeline for execution. This involves:
+ * (1) Determining if the pipeline needs to have a cursor source attached.
+ * (2) If a cursor source is needed, attaching one. This may involve a local or remote cursor,
+ * depending on whether or not the pipeline's expression context permits local reads and a local
+ * read could be used to serve the pipeline. (3) Splitting the pipeline if required, and dispatching
+ * half to the shards, leaving the merging half executing in this process after attaching a
+ * $mergeCursors.
+ *
+ * Will retry on network errors and also on StaleConfig errors to avoid restarting the entire
+ * operation. Returns `ownedPipeline`, but made-ready for execution.
  */
-std::unique_ptr<Pipeline, PipelineDeleter> attachCursorToPipeline(
+std::unique_ptr<Pipeline, PipelineDeleter> preparePipelineForExecution(
     Pipeline* ownedPipeline,
     ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
     boost::optional<BSONObj> readConcern = boost::none);
@@ -273,9 +281,9 @@ std::unique_ptr<Pipeline, PipelineDeleter> attachCursorToPipeline(
  */
 std::unique_ptr<Pipeline, PipelineDeleter> targetShardsAndAddMergeCursors(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    stdx::variant<std::unique_ptr<Pipeline, PipelineDeleter>,
-                  AggregateCommandRequest,
-                  std::pair<AggregateCommandRequest, std::unique_ptr<Pipeline, PipelineDeleter>>>
+    std::variant<std::unique_ptr<Pipeline, PipelineDeleter>,
+                 AggregateCommandRequest,
+                 std::pair<AggregateCommandRequest, std::unique_ptr<Pipeline, PipelineDeleter>>>
         targetRequest,
     boost::optional<BSONObj> shardCursorsSortSpec = boost::none,
     ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,

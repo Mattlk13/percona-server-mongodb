@@ -15,7 +15,6 @@ Import([
     'ssl_provider',
 ])
 
-snappySuffix = '-1.1.7'
 icuSuffix = '-57.1'
 tomcryptSuffix = '-1.18.2'
 libarchiveSuffix = '-3.4.0'
@@ -29,6 +28,7 @@ thirdPartyEnvironmentModifications = {
             '#src/third_party/cares/platform/${TARGET_OS}_${TARGET_ARCH}/install/include'
         ],
     },
+    'croaring': {'CPPPATH': ['#src/third_party/croaring/dist'], },
     'percona_incl': {'CPPPATH': ['#/src/third_party/install/include'], },
     'libarchive': {'CPPPATH': ['#/src/third_party/libarchive' + libarchiveSuffix], },
     'libkmip': {'CPPPATH': ['#/src/third_party/libkmip' + libkmipSuffix + '/libkmip/include'], },
@@ -89,9 +89,19 @@ def injectMozJS(thisEnv):
 
 env.AddMethod(injectMozJS, 'InjectMozJS')
 
-if not use_system_version_of_library('tcmalloc'):
+if not use_system_version_of_library('tcmalloc-gperf'):
     # GPerftools does this slightly differently than the others.
     thirdPartyEnvironmentModifications['gperftools'] = {}
+
+if not use_system_version_of_library('tcmalloc-google'):
+    thirdPartyEnvironmentModifications['tcmalloc'] = {
+        'CPPPATH': ['#/src/third_party/tcmalloc/dist'],
+    }
+
+    if get_option('link-model') == 'dynamic':
+        thirdPartyEnvironmentModifications['tcmalloc']['CPPDEFINES'] = [
+            ('MONGO_TCMALLOC_DYNAMIC_BUILD', 1)
+        ]
 
 if not use_system_version_of_library('pcre2'):
     thirdPartyEnvironmentModifications['pcre2'] = {
@@ -121,8 +131,21 @@ if not use_system_version_of_library('boost'):
     }
 
 if not use_system_version_of_library('snappy'):
+    platform_directory = "build_posix"
+
+    if env.TargetOSIs('linux'):
+        platform_directory = "build_linux_" + env['TARGET_ARCH']
+    elif env.TargetOSIs('windows'):
+        platform_directory = "build_windows"
+    elif env.TargetOSIs('darwin'):
+        platform_directory = "build_" + env["TARGET_OS"] + "_" + env["TARGET_ARCH"]
+
     thirdPartyEnvironmentModifications['snappy'] = {
-        'CPPPATH': ['#/src/third_party/snappy' + snappySuffix],
+        'CPPPATH': [
+            '#/src/third_party/snappy/dist',
+            '#/src/third_party/snappy/platform/build_all',
+            '#/src/third_party/snappy/platform/' + platform_directory,
+        ],
     }
 
 # Valgrind is a header only include as valgrind.h includes everything we need
@@ -428,6 +451,12 @@ boostEnv.ShimLibrary(name="boost")
 
 abseilDirectory = 'abseil-cpp'
 abseilEnv = env.Clone()
+
+# We can't depend on the allocator if we are using tcmalloc as its depends
+# on us (abseil-cpp)
+if abseilEnv['MONGO_ALLOCATOR'] in ['tcmalloc-google']:
+    abseilEnv = abseilEnv.Clone(LIBDEPS_NO_INHERIT=['$BUILD_DIR/third_party/shim_allocator'])
+
 abseilEnv.InjectThirdParty(libraries=['abseil-cpp'])
 abseilEnv.SConscript(abseilDirectory + '/SConscript', exports={'env': abseilEnv})
 abseilEnv = abseilEnv.Clone(LIBDEPS_INTERFACE=[
@@ -449,9 +478,9 @@ else:
     snappyEnv = snappyEnv.Clone()
     snappyEnv.InjectThirdParty(libraries=['snappy'])
     snappyEnv.InjectMongoIncludePaths()
-    snappyEnv.SConscript('snappy' + snappySuffix + '/SConscript', exports={'env': snappyEnv})
+    snappyEnv.SConscript('snappy' + '/SConscript', exports={'env': snappyEnv})
     snappyEnv = snappyEnv.Clone(LIBDEPS_INTERFACE=[
-        'snappy' + snappySuffix + '/snappy',
+        'snappy/snappy',
     ])
 
 snappyEnv.ShimLibrary(name="snappy")
@@ -516,17 +545,34 @@ if "tom" in env["MONGO_CRYPTO"]:
 
     tomcryptEnv.ShimLibrary(name="tomcrypt", )
 
-gperftoolsEnv = env.Clone(LIBDEPS_NO_INHERIT=[
+# tcmallocEnv implements this shim, so it rejects the implicit dependency.
+tcmallocEnv = env.Clone(LIBDEPS_NO_INHERIT=[
     '$BUILD_DIR/third_party/shim_allocator',
 ], )
-if gperftoolsEnv['MONGO_ALLOCATOR'] in ["tcmalloc", "tcmalloc-experimental"]:
-    if use_system_version_of_library("tcmalloc"):
-        gperftoolsEnv = gperftoolsEnv.Clone(SYSLIBDEPS=[
+if tcmallocEnv['MONGO_ALLOCATOR'] in ["tcmalloc-google"]:
+    if use_system_version_of_library("tcmalloc-google"):
+        tcmallocEnv = tcmallocEnv.Clone(SYSLIBDEPS=[
             env['LIBDEPS_TCMALLOC_SYSLIBDEP'],
         ])
     else:
-        gperftoolsEnv = gperftoolsEnv.Clone()
-        gperftoolsEnv.InjectThirdParty(libraries=['gperftools'])
+        tcmallocDirectory = 'tcmalloc'
+        tcmallocEnv = tcmallocEnv.Clone()
+        tcmallocEnv.InjectThirdParty(libraries=['tcmalloc'])
+        tcmallocEnv.SConscript(
+            tcmallocDirectory + '/SConscript',
+            exports={'env': tcmallocEnv},
+        )
+        tcmallocEnv = tcmallocEnv.Clone(LIBDEPS_INTERFACE=[
+            'tcmalloc/tcmalloc',
+        ])
+elif tcmallocEnv['MONGO_ALLOCATOR'] in ["tcmalloc-gperf"]:
+    if use_system_version_of_library("tcmalloc-gperf"):
+        tcmallocEnv = tcmallocEnv.Clone(SYSLIBDEPS=[
+            env['LIBDEPS_TCMALLOC_SYSLIBDEP'],
+        ])
+    else:
+        tcmallocEnv = tcmallocEnv.Clone()
+        tcmallocEnv.InjectThirdParty(libraries=['gperftools'])
 
         # Allow gperftools to determine its own consumer-side include/ dirs.
         # Needed because those are in a platform-specific subdirectory.
@@ -534,16 +580,16 @@ if gperftoolsEnv['MONGO_ALLOCATOR'] in ["tcmalloc", "tcmalloc-experimental"]:
             for k, v in kwargs.items():
                 thirdPartyEnvironmentModifications['gperftools'][k] = v
 
-        gperftoolsEnv.AddMethod(registerConsumerModifications, 'RegisterConsumerModifications')
-        gperftoolsEnv.SConscript(
+        tcmallocEnv.AddMethod(registerConsumerModifications, 'RegisterConsumerModifications')
+        tcmallocEnv.SConscript(
             'gperftools' + '/SConscript',
-            exports={'env': gperftoolsEnv},
+            exports={'env': tcmallocEnv},
         )
-        gperftoolsEnv = gperftoolsEnv.Clone(LIBDEPS_INTERFACE=[
+        tcmallocEnv = tcmallocEnv.Clone(LIBDEPS_INTERFACE=[
             'gperftools/tcmalloc_minimal',
         ])
 
-gperftoolsEnv.ShimLibrary(
+tcmallocEnv.ShimLibrary(
     name="allocator",
     LIBDEPS_TAGS=[
         # TODO: Remove when SERVER-48291 is merged into stable build tools.
@@ -630,6 +676,9 @@ else:
     ])
 
 asioEnv.ShimLibrary(name="asio")
+
+croaringEnv = env.Clone()
+croaringEnv.SConscript('croaring/SConscript', exports={'env': croaringEnv})
 
 intelDecimal128Env = env.Clone()
 if use_system_version_of_library("intel_decimal128"):

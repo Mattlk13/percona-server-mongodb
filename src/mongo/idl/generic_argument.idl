@@ -159,13 +159,15 @@ structs:
             mayBypassWriteBlocking:
                 type: IDLAnyType
                 forward_to_shards: true
-            $tenant:
-                type: IDLAnyType
-                cpp_name: "dollarTenant"
-                forward_to_shards: true
             expectPrefix:
                 type: bool
                 forward_to_shards: false
+            requestGossipRoutingCache:
+                type: IDLAnyType
+                forward_to_shards: false
+            startOrContinueTransaction:
+                type: IDLAnyType
+                forward_to_shards: true
 
     generic_reply_fields_api_v1:
         description: "Fields that may appear in any command reply. These are guaranteed backwards-compatible for as long as the server supports API Version 1."
@@ -219,3 +221,6 @@ structs:
             ok:
                 type: IDLAnyType
                 forward_from_shards: true 
+            routingCacheGossip:
+                type: IDLAnyType
+                forward_from_shards: false

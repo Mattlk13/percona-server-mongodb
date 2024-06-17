@@ -20,6 +20,9 @@
  *   server, rather than to the shard.
  * - useLogs: Normally, profiling is used to check behavior.  Set this to true to use slow op log
  *   lines instead.
+ * - skipMultiversion: If this is set to true then the test will be skipped for multiversion suites
+ *   only. This is useful if the command was behind a feature flag in previous versions and is now
+ *   enabled.
  *
  * @tags: [
  *   does_not_support_stepdowns,
@@ -106,7 +109,7 @@ let testCases = {
     _configsvrCreateDatabase: {skip: "internal command"},
     _configsvrDropIndexCatalogEntry: {skip: "internal command"},
     _configsvrEnsureChunkVersionIsGreaterThan: {skip: "internal command"},
-    _configsvrGetHistoricalPlacement: {skip: "internal command"},  // TODO SERVER-73029 remove
+    _configsvrGetHistoricalPlacement: {skip: "internal command"},
     _configsvrMovePrimary: {skip: "internal command"},  // Can be removed once 6.0 is last LTS
     _configsvrMoveRange: {skip: "internal command"},
     _configsvrRefineCollectionShardKey: {skip: "internal command"},
@@ -147,6 +150,8 @@ let testCases = {
     _recvChunkStatus: {skip: "internal command"},
     _refreshQueryAnalyzerConfiguration: {skip: "internal command"},
     _shardsvrAbortReshardCollection: {skip: "internal command"},
+    _shardsvrBeginMigrationBlockingOperation: {skip: "internal command"},
+    _shardsvrChangePrimary: {skip: "internal command"},
     _shardsvrCleanupReshardCollection: {skip: "internal command"},
     _shardsvrCloneCatalogData: {skip: "internal command"},
     _shardsvrRegisterIndex: {skip: "internal command"},
@@ -156,6 +161,7 @@ let testCases = {
     _shardsvrCommitIndexParticipant: {skip: "internal command"},
     _shardsvrCommitReshardCollection: {skip: "internal command"},
     _shardsvrCompactStructuredEncryptionData: {skip: "internal command"},
+    _shardsvrConvertToCapped: {skip: "internal command"},
     _shardsvrCoordinateMultiUpdate: {skip: "internal command"},
     _shardsvrCreateCollection: {skip: "internal command"},
     _shardsvrCreateCollectionParticipant: {skip: "internal command"},
@@ -169,6 +175,7 @@ let testCases = {
     _shardsvrDropIndexes: {skip: "internal command"},
     _shardsvrDropDatabase: {skip: "internal command"},
     _shardsvrDropDatabaseParticipant: {skip: "internal command"},
+    _shardsvrEndMigrationBlockingOperation: {skip: "internal command"},
     _shardsvrGetStatsForBalancing: {skip: "internal command"},
     _shardsvrInsertGlobalIndexKey: {skip: "internal command"},
     _shardsvrDeleteGlobalIndexKey: {skip: "internal command"},
@@ -197,6 +204,7 @@ let testCases = {
     _shardsvrCollMod: {skip: "internal command"},
     _shardsvrCollModParticipant: {skip: "internal command"},
     _shardsvrParticipantBlock: {skip: "internal command"},
+    _shardsvrUntrackUnsplittableCollection: {skip: "internal command"},
     streams_startStreamProcessor: {skip: "internal command"},
     streams_startStreamSample: {skip: "internal command"},
     streams_stopStreamProcessor: {skip: "internal command"},
@@ -205,6 +213,9 @@ let testCases = {
     streams_getStats: {skip: "internal command"},
     streams_testOnlyInsert: {skip: "internal command"},
     streams_getMetrics: {skip: "internal command"},
+    streams_updateFeatureFlags: {skip: "internal command"},
+    streams_testOnlyGetFeatureFlags: {skip: "internal command"},
+    streams_writeCheckpoint: {skip: "internal command"},
     _transferMods: {skip: "internal command"},
     _vectorClockPersist: {skip: "internal command"},
     abortMoveCollection: {skip: "does not accept read or write concern"},
@@ -259,32 +270,32 @@ let testCases = {
     applyOps: {skip: "internal command"},
     auditGetOptions: {skip: "does not accept read or write concern"},
     authenticate: {skip: "does not accept read or write concern"},
-    autoSplitVector: {skip: "internal command"},
+    autoCompact: {skip: "does not accept read or write concern"},
+    autoSplitVector: {skip: "does not accept read or write concern"},
     balancerCollectionStatus: {skip: "does not accept read or write concern"},
     balancerStart: {skip: "does not accept read or write concern"},
     balancerStatus: {skip: "does not accept read or write concern"},
     balancerStop: {skip: "does not accept read or write concern"},
     buildInfo: {skip: "does not accept read or write concern"},
     bulkWrite: {
-        // TODO SERVER-52419: Run this test and remove the skip.
-        // setUp: function(conn) {
-        //     assert.commandWorked(conn.getDB(db).runCommand({create: coll, writeConcern: {w:
-        //     1}}));
-        // },
-        // db: "admin",
-        // command: {
-        //     bulkWrite: 1,
-        //     ops: [{insert: 0, document: {_id: ObjectId()}}],
-        //     nsInfo: [{ns: db + "." + coll}]
-        // },
-        // checkReadConcern: false,
-        // checkWriteConcern: true,
-        // // TODO SERVER-23266: If the overall batch command if profiled, then it would be better
-        // // to use profiling.  In the meantime, use logs.
-        // useLogs: true,
-        skip: "requires feature flag"
+        setUp: function(conn) {
+            assert.commandWorked(conn.getDB(db).runCommand({create: coll, writeConcern: {w: 1}}));
+        },
+        db: "admin",
+        command: {
+            bulkWrite: 1,
+            ops: [{insert: 0, document: {_id: ObjectId()}}],
+            nsInfo: [{ns: db + "." + coll}]
+        },
+        checkReadConcern: false,
+        checkWriteConcern: true,
+        // TODO SERVER-23266: If the overall batch command if profiled, then it would be better
+        // to use profiling.  In the meantime, use logs.
+        useLogs: true,
+        skipMultiversion: true,
     },
     captrunc: {skip: "test command"},
+    changePrimary: {skip: "does not accept read or write concern"},
     checkMetadataConsistency: {skip: "does not accept read or write concern"},
     checkShardingIndex: {skip: "does not accept read or write concern"},
     cleanupOrphaned: {skip: "only on shard server"},
@@ -769,6 +780,7 @@ let testCases = {
     startRecordingTraffic: {skip: "does not accept read or write concern"},
     startSession: {skip: "does not accept read or write concern"},
     stopRecordingTraffic: {skip: "does not accept read or write concern"},
+    sysprofile: {skip: "internal command"},
     testDeprecation: {skip: "does not accept read or write concern"},
     testDeprecationInVersion2: {skip: "does not accept read or write concern"},
     testInternalTransactions: {skip: "internal command"},
@@ -780,6 +792,7 @@ let testCases = {
     top: {skip: "does not accept read or write concern"},
     transitionFromDedicatedConfigServer: {skip: "does not accept read or write concern"},
     transitionToDedicatedConfigServer: {skip: "does not accept read or write concern"},
+    transitionToShardedCluster: {skip: "accepts only majority"},
     unshardCollection: {skip: "does not accept read or write concern"},
     update: {
         setUp: function(conn) {
@@ -952,6 +965,14 @@ function runScenario(
             print("skipping " + cmdName + ": " + test.skip);
             return;
         }
+
+        const isMultiversion = jsTest.options().shardMixedBinVersions ||
+            jsTest.options().useRandomBinVersionsWithinReplicaSet;
+        if (isMultiversion && test.skipMultiversion) {
+            print("skipping " + cmdName + " since we are in a multiversion suite.");
+            return;
+        }
+
         validateTestCase(test);
 
         let sharded = !!configSvrCheckConn;

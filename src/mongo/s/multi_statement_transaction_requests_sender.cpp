@@ -36,6 +36,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/s/multi_statement_transaction_requests_sender.h"
+#include "mongo/s/resource_yielders.h"
 #include "mongo/s/transaction_router.h"
 #include "mongo/s/transaction_router_resource_yielder.h"
 #include "mongo/util/assert_util_core.h"
@@ -46,10 +47,19 @@ namespace mongo {
 namespace {
 
 std::vector<AsyncRequestsSender::Request> attachTxnDetails(
-    OperationContext* opCtx, const std::vector<AsyncRequestsSender::Request>& requests) {
+    OperationContext* opCtx,
+    const std::vector<AsyncRequestsSender::Request>& requests,
+    bool activeTxnParticipantAddParticipants) {
     auto txnRouter = TransactionRouter::get(opCtx);
     if (!txnRouter) {
         return requests;
+    }
+
+    if (activeTxnParticipantAddParticipants) {
+        auto opCtxTxnNum = opCtx->getTxnNumber();
+        invariant(opCtxTxnNum);
+        txnRouter.beginOrContinueTxn(
+            opCtx, *opCtxTxnNum, TransactionRouter::TransactionActions::kStartOrContinue);
     }
 
     std::vector<AsyncRequestsSender::Request> newRequests;
@@ -93,10 +103,13 @@ MultiStatementTransactionRequestsSender::MultiStatementTransactionRequestsSender
           opCtx,
           std::move(executor),
           dbName,
-          attachTxnDetails(opCtx, requests),
+          attachTxnDetails(
+              opCtx,
+              requests,
+              (opCtx->isActiveTransactionParticipant() && opCtx->inMultiDocumentTransaction())),
           readPreference,
           retryPolicy,
-          TransactionRouterResourceYielder::makeForRemoteCommand(),
+          ResourceYielderFactory::get(*opCtx->getService()).make(opCtx, "request-sender"),
           designatedHostsMap)) {}
 
 MultiStatementTransactionRequestsSender::~MultiStatementTransactionRequestsSender() {

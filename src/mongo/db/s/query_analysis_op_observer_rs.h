@@ -51,7 +51,7 @@ class QueryAnalysisOpObserverRS final : public QueryAnalysisOpObserver {
 
 public:
     QueryAnalysisOpObserverRS() = default;
-    ~QueryAnalysisOpObserverRS() = default;
+    ~QueryAnalysisOpObserverRS() override = default;
 
     NamespaceFilters getNamespaceFilters() const final {
         return {NamespaceFilter::kAll, NamespaceFilter::kConfig};
@@ -61,6 +61,7 @@ public:
                    const CollectionPtr& coll,
                    std::vector<InsertStatement>::const_iterator first,
                    std::vector<InsertStatement>::const_iterator last,
+                   const std::vector<RecordId>& recordIds,
                    std::vector<bool> fromMigrate,
                    bool defaultFromMigrate,
                    OpStateAccumulator* opAccumulator = nullptr) final;

@@ -73,6 +73,7 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/future_impl.h"
 #include "mongo/util/read_through_cache.h"
@@ -109,6 +110,18 @@ std::vector<AsyncRequestsSender::Response> sendAuthenticatedCommandWithOsiToShar
     async_rpc::AsyncRPCCommandHelpers::appendOSI(opts->genericArgs, osi);
     return sharding_ddl_util::sendAuthenticatedCommandToShards(
         opCtx, opts, shardIds, ignoreResponses);
+}
+
+// Extract the first response from the list of shardResponses, and propagate to the global level of
+// the response
+void _appendResponseCollModIndexChanges(
+    const std::vector<AsyncRequestsSender::Response>& shardResponses, BSONObjBuilder& result) {
+    if (shardResponses.empty() || !shardResponses[0].swResponse.isOK()) {
+        return;
+    }
+
+    auto& firstShardResponse = shardResponses[0].swResponse.getValue().data;
+    result.appendElements(CommandHelpers::filterCommandReplyForPassthrough(firstShardResponse));
 }
 
 }  // namespace
@@ -175,7 +188,9 @@ void CollModCoordinator::_saveShardingInfoOnCoordinatorIfNecessary(OperationCont
             Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfoWithPlacementRefresh(
                 opCtx, _collInfo->nsForTargeting));
 
-        info.primaryShard = chunkManager.dbPrimary();
+        // Coordinator is guaranteed to be running on primary shard
+        info.primaryShard = ShardingState::get(opCtx)->shardId();
+
         std::set<ShardId> shardIdsSet;
         chunkManager.getAllShardIds(&shardIdsSet);
         std::vector<ShardId> participantsNotOwningChunks;
@@ -261,8 +276,12 @@ ExecutorFuture<void> CollModCoordinator::_runImpl(
             }
 
             {
+                // Implicitly check for collection UUID mismatch - use the 'originalNss()' provided
+                // in the DDL command. Timeseries collections will always throw
+                // CollectionUUIDMismatch, as the collection name is on a view, which doesn't have a
+                // UUID.
                 AutoGetCollection coll{opCtx,
-                                       nss(),
+                                       originalNss(),
                                        MODE_IS,
                                        AutoGetCollection::Options{}
                                            .viewMode(auto_get_collection::ViewMode::kViewsPermitted)
@@ -434,11 +453,23 @@ ExecutorFuture<void> CollModCoordinator::_runImpl(
 
                         BSONObjBuilder builder;
                         std::string errmsg;
-                        auto ok =
-                            appendRawResponses(opCtx, &errmsg, &builder, responses).responseOK;
+                        bool ok = [&]() {
+                            BSONObjBuilder rawBuilder;
+                            bool ok = appendRawResponses(opCtx, &errmsg, &rawBuilder, responses)
+                                          .responseOK;
+                            BSONObj extractedObjFromRaw = rawBuilder.obj();
+                            if (ok) {
+                                extractedObjFromRaw = extractedObjFromRaw.removeField("raw");
+                                _appendResponseCollModIndexChanges(responses, builder);
+                            }
+                            builder.appendElements(extractedObjFromRaw);
+                            return ok;
+                        }();
+
                         if (!errmsg.empty()) {
                             CommandHelpers::appendSimpleCommandStatus(builder, ok, errmsg);
                         }
+
                         _result = builder.obj();
 
                         const auto collUUID = _doc.getCollUUID();
@@ -460,15 +491,10 @@ ExecutorFuture<void> CollModCoordinator::_runImpl(
                         opCtx, originalNss(), cmd, true, &collModResBuilder));
                     auto collModRes = collModResBuilder.obj();
 
-                    const auto dbInfo = uassertStatusOK(
-                        Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, nss().dbName()));
-                    const auto shard = uassertStatusOK(
-                        Grid::get(opCtx)->shardRegistry()->getShard(opCtx, dbInfo->getPrimary()));
+                    const auto shard = uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(
+                        opCtx, ShardingState::get(opCtx)->shardId()));
                     BSONObjBuilder builder;
                     builder.appendElements(collModRes);
-                    BSONObjBuilder subBuilder(builder.subobjStart("raw"));
-                    subBuilder.append(shard->getConnString().toString(), collModRes);
-                    subBuilder.doneFast();
                     _result = builder.obj();
                 }
             }));

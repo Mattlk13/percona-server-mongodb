@@ -46,6 +46,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/bson/util/simple8b_builder.h"
+#include "mongo/bson/util/simple8b_type_util.h"
 #include "mongo/platform/int128.h"
 #include "mongo/stdx/type_traits.h"
 #include "mongo/unittest/assert.h"
@@ -53,6 +54,16 @@
 #include "mongo/util/shared_buffer.h"
 
 using namespace mongo;
+
+// Performs addition as unsigned and cast back to signed to get overflow defined to wrapped around
+// instead of undefined behavior.
+static constexpr int64_t add(int64_t lhs, int64_t rhs) {
+    return static_cast<int64_t>(static_cast<uint64_t>(lhs) + static_cast<uint64_t>(rhs));
+}
+
+static constexpr int128_t add(int128_t lhs, int128_t rhs) {
+    return static_cast<int128_t>(static_cast<uint128_t>(lhs) + static_cast<uint128_t>(rhs));
+}
 
 template <typename T>
 void assertValuesEqual(const Simple8b<T>& actual, const std::vector<boost::optional<T>>& expected) {
@@ -75,18 +86,19 @@ void assertValuesEqual(const Simple8b<T>& actual, const std::vector<boost::optio
 template <typename T>
 std::pair<SharedBuffer, int> buildSimple8b(const std::vector<boost::optional<T>>& expectedValues) {
     BufBuilder _buffer;
-    Simple8bBuilder<T> builder([&_buffer](uint64_t simple8bBlock) {
+    auto writeFn = [&_buffer](uint64_t simple8bBlock) {
         _buffer.appendNum(simple8bBlock);
         return true;
-    });
+    };
+    Simple8bBuilder<T> builder;
     for (const auto& elem : expectedValues) {
         if (elem) {
-            ASSERT_TRUE(builder.append(*elem));
+            ASSERT_TRUE(builder.append(*elem, writeFn));
         } else {
-            builder.skip();
+            builder.skip(writeFn);
         }
     }
-    builder.flush();
+    builder.flush(writeFn);
 
     auto size = _buffer.len();
     return {_buffer.release(), size};
@@ -102,8 +114,67 @@ void testSimple8b(const std::vector<boost::optional<T>>& expectedValues,
         ASSERT_EQ(memcmp(buffer.get(), expectedBinary.data(), size), 0);
     }
 
+
     Simple8b<T> s8b(buffer.get(), size);
     assertValuesEqual(s8b, expectedValues);
+
+    make_signed_t<T> sum = 0;
+    for (auto&& val : expectedValues) {
+        if (val) {
+            sum = add(sum, Simple8bTypeUtil::decodeInt(*val));
+        }
+    }
+
+    uint64_t prev = 0xE;  // Tests in this file assume that the previous value was '0'. This is
+                          // different semantics from BSONColumn.
+    auto s = simple8b::sum<make_signed_t<T>>(
+        reinterpret_cast<const char*>(expectedBinary.data()), expectedBinary.size(), prev);
+    ASSERT_EQ(s, sum);
+
+    auto testPrefixSum = [&](auto prefix) {
+        make_signed_t<T> sum = prefix;
+        make_signed_t<T> prefixSum = 0;
+
+        for (auto&& val : expectedValues) {
+            if (val) {
+                sum = add(sum, Simple8bTypeUtil::decodeInt(*val));
+                prefixSum = add(prefixSum, sum);
+            }
+        }
+
+        uint64_t prev = 0xE;  // Tests in this file assume that the previous value was '0'. This is
+                              // different semantics from BSONColumn.
+        auto ps = simple8b::prefixSum<make_signed_t<T>>(
+            reinterpret_cast<const char*>(expectedBinary.data()),
+            expectedBinary.size(),
+            prefix,
+            prev);
+
+        ASSERT_EQ(ps, prefixSum);
+    };
+
+    // Test prefix sum with different initial prefixes
+    testPrefixSum(make_signed_t<T>(0));
+    testPrefixSum(make_signed_t<T>(1));
+
+    // Test visitAll
+    std::vector<boost::optional<make_signed_t<T>>> decodedValues;
+
+    prev = 0xE;
+    size_t visitCount = simple8b::visitAll<make_signed_t<T>>(
+        reinterpret_cast<const char*>(expectedBinary.data()),
+        expectedBinary.size(),
+        prev,
+        [&decodedValues](const make_signed_t<T> v) { decodedValues.push_back(v); },
+        [&decodedValues]() { decodedValues.push_back(boost::none); });
+    ASSERT_EQ(expectedValues.size(), visitCount);
+    ASSERT_EQ(expectedValues.size(), decodedValues.size());
+    for (size_t i = 0; i < expectedValues.size(); ++i) {
+        if (expectedValues[i])
+            ASSERT_EQ(Simple8bTypeUtil::decodeInt(*(expectedValues[i])), *(decodedValues[i]));
+        else
+            ASSERT_EQ(boost::none, decodedValues[i]);
+    }
 }
 
 template <typename T>
@@ -553,21 +624,22 @@ TEST(Simple8b, RleZeroThenRleAnotherValue) {
 
 TEST(Simple8b, MultipleFlushes) {
     BufBuilder buffer;
-    Simple8bBuilder<uint64_t> s8b([&buffer](uint64_t simple8bBlock) {
+    auto writeFn = [&buffer](uint64_t simple8bBlock) {
         buffer.appendNum(simple8bBlock);
         return true;
-    });
+    };
+    Simple8bBuilder<uint64_t> s8b;
 
     std::vector<uint64_t> values = {1};
     for (size_t i = 0; i < values.size(); ++i) {
-        ASSERT_TRUE(s8b.append(values[i]));
+        ASSERT_TRUE(s8b.append(values[i], writeFn));
     }
 
-    s8b.flush();
+    s8b.flush(writeFn);
 
     values[0] = 2;
     for (size_t i = 0; i < values.size(); ++i) {
-        ASSERT_TRUE(s8b.append(values[i]));
+        ASSERT_TRUE(s8b.append(values[i], writeFn));
     }
 
     std::vector<uint8_t> expectedBinary{
@@ -591,7 +663,7 @@ TEST(Simple8b, MultipleFlushes) {
         0x0  // 2nd word.
     };
 
-    s8b.flush();
+    s8b.flush(writeFn);
 
     char* hex = buffer.buf();
     size_t len = buffer.len();
@@ -601,6 +673,35 @@ TEST(Simple8b, MultipleFlushes) {
         ASSERT_EQ(static_cast<uint8_t>(*hex), expectedBinary[i]) << i;
         ++hex;
     }
+}
+
+TEST(Simple8b, BitShiftLargerThan64) {
+    // Construct a simple8b block directly that forces a bit shift larger than 64. The following
+    // example will have a bit shift of 68. We do not expect this to happen with sensible encoders,
+    // so we have to construct the simple8b block with a hex value.
+    //
+    // The binary is 10101011110011011100101110101001110100111110010101 10001 1101 1000
+    // Extended selector = 8 (1000), extension value = 13 (1101), shift = 68 (10001), and the value
+    // was chosen randomly to fit the remaining 51 bits.
+    // This produces the hex string: 55E6E5D4E9F2B1D8
+
+    // The expected value is the original value << (68 % 64 = 4) in decimal.
+    uint64_t expectedVal = 12089623907203408;
+    BufBuilder buffer;
+    const int64_t inputVal = 0x55E6E5D4E9F2B1D8;
+    buffer.appendNum(inputVal);
+
+    auto size = buffer.len();
+    auto sharedBuffer = buffer.release();
+
+    Simple8b<uint64_t> s8b(sharedBuffer.get(), size);
+    auto it = s8b.begin();
+
+    // This is validating an undefined encoding, and is subject to change in future versions of the
+    // decoder. This test is to validate the modulo behavior.
+    ASSERT_EQ(*it, expectedVal);
+    ++it;
+    ASSERT_FALSE(it.more());
 }
 
 TEST(Simple8b, Selector7BaseTest) {
@@ -1164,19 +1265,20 @@ TEST(Simple8b, RleEightSelectorLarge) {
 
 TEST(Simple8b, RleFlushResetsRle) {
     BufBuilder buffer;
-    Simple8bBuilder<uint64_t> builder([&buffer](uint64_t simple8bBlock) {
+    auto writeFn = [&buffer](uint64_t simple8bBlock) {
         buffer.appendNum(simple8bBlock);
         return true;
-    });
+    };
+    Simple8bBuilder<uint64_t> builder;
 
     // Write a single 1 and flush. Then we add 120 more 1s and check that this does not start RLE.
-    ASSERT_TRUE(builder.append(1));
-    builder.flush();
+    ASSERT_TRUE(builder.append(1, writeFn));
+    builder.flush(writeFn);
 
     for (int i = 0; i < 120; ++i) {
-        ASSERT_TRUE(builder.append(1));
+        ASSERT_TRUE(builder.append(1, writeFn));
     }
-    builder.flush();
+    builder.flush(writeFn);
 
     auto size = buffer.len();
     auto sharedBuffer = buffer.release();
@@ -1200,20 +1302,21 @@ TEST(Simple8b, RleFlushResetsRle) {
 
 TEST(Simple8b, RleFlushResetsPossibleSelectors) {
     BufBuilder buffer;
-    Simple8bBuilder<uint64_t> builder([&buffer](uint64_t simple8bBlock) {
+    auto writeFn = [&buffer](uint64_t simple8bBlock) {
         buffer.appendNum(simple8bBlock);
         return true;
-    });
+    };
+    Simple8bBuilder<uint64_t> builder;
 
     // Write a large value with many trailing zeros that does not fit in the base selector, we then
     // flush and make sure that we can write a value that only fits in the base selector. We should
     // have reset possible selectors as part of the flush.
     std::vector<boost::optional<uint64_t>> expectedInts = {0x8000000000000000, 0x0FFFFFFFFFFFFFFE};
 
-    ASSERT_TRUE(builder.append(*expectedInts[0]));
-    builder.flush();
-    ASSERT_TRUE(builder.append(*expectedInts[1]));
-    builder.flush();
+    ASSERT_TRUE(builder.append(*expectedInts[0], writeFn));
+    builder.flush(writeFn);
+    ASSERT_TRUE(builder.append(*expectedInts[1], writeFn));
+    builder.flush(writeFn);
 
     auto size = buffer.len();
     auto sharedBuffer = buffer.release();
@@ -1224,24 +1327,25 @@ TEST(Simple8b, RleFlushResetsPossibleSelectors) {
 
 TEST(Simple8b, FlushResetsLastInPreviousWhenFlushingRle) {
     BufBuilder buffer;
-    Simple8bBuilder<uint64_t> builder([&buffer](uint64_t simple8bBlock) {
+    auto writeFn = [&buffer](uint64_t simple8bBlock) {
         buffer.appendNum(simple8bBlock);
         return true;
-    });
+    };
+    Simple8bBuilder<uint64_t> builder;
 
     // Write 150 1s and flush. This should result in a word with 30 1s followed by RLE. We make sure
     // that last value written is reset when RLE is the last thing we flush.
     for (int i = 0; i < 150; ++i) {
-        ASSERT_TRUE(builder.append(1));
+        ASSERT_TRUE(builder.append(1, writeFn));
     }
-    builder.flush();
+    builder.flush(writeFn);
 
     // Last value written is only used for RLE so append 120 values of the same value and make sure
     // this does _NOT_ start RLE as flush occured in between.
     for (int i = 0; i < 120; ++i) {
-        ASSERT_TRUE(builder.append(1));
+        ASSERT_TRUE(builder.append(1, writeFn));
     }
-    builder.flush();
+    builder.flush(writeFn);
 
     auto size = buffer.len();
     auto sharedBuffer = buffer.release();
@@ -1265,24 +1369,25 @@ TEST(Simple8b, FlushResetsLastInPreviousWhenFlushingRle) {
 
 TEST(Simple8b, FlushResetsLastInPreviousWhenFlushingRleZeroRleAfter) {
     BufBuilder buffer;
-    Simple8bBuilder<uint64_t> builder([&buffer](uint64_t simple8bBlock) {
+    auto writeFn = [&buffer](uint64_t simple8bBlock) {
         buffer.appendNum(simple8bBlock);
         return true;
-    });
+    };
+    Simple8bBuilder<uint64_t> builder;
 
     // Write 150 1s and flush. This should result in a word with 30 1s followed by RLE. We make sure
     // that last value written is reset when RLE is the last thing we flush.
     for (int i = 0; i < 150; ++i) {
-        ASSERT_TRUE(builder.append(1));
+        ASSERT_TRUE(builder.append(1, writeFn));
     }
-    builder.flush();
+    builder.flush(writeFn);
     auto sizeAfterFlush = buffer.len();
 
     // Write 120 0s. They should be encoded as a single RLE block.
     for (int i = 0; i < 120; ++i) {
-        ASSERT_TRUE(builder.append(0));
+        ASSERT_TRUE(builder.append(0, writeFn));
     }
-    builder.flush();
+    builder.flush(writeFn);
 
     auto size = buffer.len();
     auto sharedBuffer = buffer.release();
@@ -1348,55 +1453,40 @@ TEST(Simple8b, RLELargeCount) {
 TEST(Simple8b, ValueTooLarge) {
     // This value needs 61 bits which it too large for Simple8b
     uint64_t value = 0x1FFFFFFFFFFFFFFF;
-    Simple8bBuilder<uint64_t> builder([](uint64_t) {
-        ASSERT(false);
-        return true;
-    });
-    ASSERT_FALSE(builder.append(value));
+    Simple8bBuilder<uint64_t> builder;
+    ASSERT_FALSE(builder.append(value, [](uint64_t) { ASSERT(false); }));
 }
 
 TEST(Simple8b, ValueTooLargeMaxUInt64) {
     // Make sure we handle uint64_t max correctly.
     uint64_t value = std::numeric_limits<uint64_t>::max();
 
-    Simple8bBuilder<uint64_t> builder([](uint64_t) {
-        ASSERT(false);
-        return true;
-    });
-    ASSERT_FALSE(builder.append(value));
+    Simple8bBuilder<uint64_t> builder;
+    ASSERT_FALSE(builder.append(value, [](uint64_t) { ASSERT(false); }));
 }
 
 TEST(Simple8b, ValueTooLargeMaxUInt128) {
     // Make sure we handle uint128_t max correctly.
     uint128_t value = std::numeric_limits<uint128_t>::max();
 
-    Simple8bBuilder<uint128_t> builder([](uint64_t) {
-        ASSERT(false);
-        return true;
-    });
-    ASSERT_FALSE(builder.append(value));
+    Simple8bBuilder<uint128_t> builder;
+    ASSERT_FALSE(builder.append(value, [](uint64_t) { ASSERT(false); }));
 }
 
 TEST(Simple8b, ValueTooLargeMaxUInt64AsUInt128) {
     // Make sure we handle uint128_t max correctly.
     uint128_t value = std::numeric_limits<uint64_t>::max();
 
-    Simple8bBuilder<uint128_t> builder([](uint64_t) {
-        ASSERT(false);
-        return true;
-    });
-    ASSERT_FALSE(builder.append(value));
+    Simple8bBuilder<uint128_t> builder;
+    ASSERT_FALSE(builder.append(value, [](uint64_t) { ASSERT(false); }));
 }
 
 TEST(Simple8b, ValueTooManyTrailingFor8SmallTooManyMeaningfulFor8Large) {
     // This value has 52 meaningful bits and 61 trailing zeros. This is too many trailing zeros for
     // Selector 8 Small and too many meaningful bits for Selector 8 Large.
     uint128_t value = absl::MakeUint128(0x1FFFFF0FFFFFF, 0xE000000000000000);
-    Simple8bBuilder<uint128_t> builder([](uint64_t) {
-        ASSERT(false);
-        return true;
-    });
-    ASSERT_FALSE(builder.append(value));
+    Simple8bBuilder<uint128_t> builder;
+    ASSERT_FALSE(builder.append(value, [](uint64_t) { ASSERT(false); }));
 }
 
 TEST(Simple8b, ValueTooLargeMax8SmallAddForSkipPattern) {
@@ -1405,11 +1495,8 @@ TEST(Simple8b, ValueTooLargeMax8SmallAddForSkipPattern) {
     // Extended 8 Small which brings it to 53 bits which is too many. Extended 8 Large can't be used
     // either as it can only store 51 meaningful bits.
     uint128_t value = absl::MakeUint128(0xFFFFFFFFFFFF, 0xF000000000000000);
-    Simple8bBuilder<uint128_t> builder([](uint64_t) {
-        ASSERT(false);
-        return true;
-    });
-    ASSERT_FALSE(builder.append(value));
+    Simple8bBuilder<uint128_t> builder;
+    ASSERT_FALSE(builder.append(value, [](uint64_t) { ASSERT(false); }));
 }
 
 TEST(Simple8b, ValueTooLargeTrailingZerosNotDivisibleBy4) {
@@ -1417,11 +1504,8 @@ TEST(Simple8b, ValueTooLargeTrailingZerosNotDivisibleBy4) {
     // be stored in the data bits as it's not divisible by 4. This brings the data bits to 55 which
     // it too large.
     uint128_t value = absl::MakeUint128(0x7FFFFFFFFFFF, 0xF800000000000000);
-    Simple8bBuilder<uint128_t> builder([](uint64_t) {
-        ASSERT(false);
-        return true;
-    });
-    ASSERT_FALSE(builder.append(value));
+    Simple8bBuilder<uint128_t> builder;
+    ASSERT_FALSE(builder.append(value, [](uint64_t) { ASSERT(false); }));
 }
 
 TEST(Simple8b, ValueTooLargeBitCountUsedForExtendedSelectors) {
@@ -1430,9 +1514,35 @@ TEST(Simple8b, ValueTooLargeBitCountUsedForExtendedSelectors) {
     // of bits required will still be too large. Make sure append takes into the account the number
     // of bits used for the count when checking if the value can be stored.
     uint64_t value = 0x646075fffc000200;
-    Simple8bBuilder<uint64_t> builder([](uint64_t) {
-        ASSERT(false);
-        return true;
-    });
-    ASSERT_FALSE(builder.append(value));
+    Simple8bBuilder<uint64_t> builder;
+    ASSERT_FALSE(builder.append(value, [](uint64_t) { ASSERT(false); }));
+}
+
+TEST(Simple8b, ResetRLEAfterLargeValue) {
+    // Large value that can be only be stored in the extended selectors that encodes a bit shift
+    uint64_t large = 0xC000000000000000;
+
+    std::vector<uint64_t> blocks;
+    auto writer = [&blocks](uint64_t block) {
+        blocks.push_back(block);
+    };
+    Simple8bBuilder<uint64_t> b;
+
+    // Write as many of these large values we need to ensure a non-RLE block is written followed by
+    // an RLE block.
+    for (int i = 0; i < simple8b_internal::kRleMultiplier + 7; ++i) {
+        ASSERT_TRUE(b.append(large, writer));
+    }
+
+    // Add a large value that can only fit in the base selector which can encode up to 60 meaningful
+    // bits. When terminating RLE we should completely reset to allow this value to be appended.
+    ASSERT_TRUE(b.append(0x07FFFFFFFFFFFFFF, writer));
+
+    b.flush(writer);
+
+    // In total 3 simple8b blocks should have been written
+    ASSERT_EQ(blocks.size(), 3);
+    // The second block should be an RLE block
+    ASSERT_TRUE((blocks[1] & simple8b_internal::kBaseSelectorMask) ==
+                simple8b_internal::kRleSelector);
 }

@@ -65,6 +65,7 @@
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
@@ -99,7 +100,7 @@ void openCallback(OperationContext* opCtx, const CollectionPtr& collection) {
     // the cursor. Also call abandonSnapshot to make sure that we are using a fresh
     // storage engine snapshot while waiting. Otherwise, we will end up reading from the
     // snapshot where the oplog entries are not yet visible even after the wait.
-    opCtx->recoveryUnit()->abandonSnapshot();
+    shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
     collection->getRecordStore()->waitForAllEarlierOplogWritesToBeVisible(opCtx);
 }
 
@@ -159,8 +160,10 @@ std::unique_ptr<sbe::PlanStage> buildResumeFromRecordIdSubtree(
     // Project out the RecordId we want to resume from as 'seekSlot'.
     auto seekSlot = state.slotId();
     auto projStage = sbe::makeProjectStage(
-        sbe::makeS<sbe::LimitSkipStage>(
-            sbe::makeS<sbe::CoScanStage>(csn->nodeId()), 1, boost::none, csn->nodeId()),
+        sbe::makeS<sbe::LimitSkipStage>(sbe::makeS<sbe::CoScanStage>(csn->nodeId()),
+                                        makeInt64Constant(1),
+                                        nullptr,
+                                        csn->nodeId()),
         csn->nodeId(),
         seekSlot,
         std::move(seekRecordIdExpression));
@@ -228,9 +231,11 @@ std::unique_ptr<sbe::PlanStage> buildResumeFromRecordIdSubtree(
     // 'limit 1' stage on top of the outer branch, as it should produce just a single seek recordId.
     auto innerStage = isResumingTailableScan || !resumeAfterRecordId
         ? std::move(inputStage)
-        : sbe::makeS<sbe::LimitSkipStage>(std::move(inputStage), boost::none, 1, csn->nodeId());
+        : sbe::makeS<sbe::LimitSkipStage>(
+              std::move(inputStage), nullptr, makeInt64Constant(1), csn->nodeId());
     return sbe::makeS<sbe::LoopJoinStage>(
-        sbe::makeS<sbe::LimitSkipStage>(std::move(unionStage), 1, boost::none, csn->nodeId()),
+        sbe::makeS<sbe::LimitSkipStage>(
+            std::move(unionStage), makeInt64Constant(1), nullptr, csn->nodeId()),
         std::move(innerStage),
         sbe::makeSV(),
         sbe::makeSV(seekRecordIdSlot),
@@ -269,7 +274,7 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateClusteredColl
     const bool forward = csn->direction == CollectionScanParams::FORWARD;
     sbe::RuntimeEnvironment* env = state.env.runtimeEnv;
 
-    invariant(csn->doSbeClusteredCollectionScan());
+    invariant(csn->doClusteredCollectionScanSbe());
     invariant(!csn->resumeAfterRecordId || forward);
     invariant(!csn->resumeAfterRecordId || !csn->tailable);
     // The minRecord and maxRecord optimizations are not compatible with resumeAfterRecordId.
@@ -316,10 +321,14 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateClusteredColl
         ParameterizedClusteredScanSlots{minRecordSlot, maxRecordSlot});
 
     // Create the ScanStage.
-    bool excludeScanEndRecordId =
+    bool includeScanStartRecordId =
         (csn->boundInclusion ==
-             CollectionScanParams::ScanBoundInclusion::kExcludeBothStartAndEndRecords ||
+             CollectionScanParams::ScanBoundInclusion::kIncludeBothStartAndEndRecords ||
          csn->boundInclusion == CollectionScanParams::ScanBoundInclusion::kIncludeStartRecordOnly);
+    bool includeScanEndRecordId =
+        (csn->boundInclusion ==
+             CollectionScanParams::ScanBoundInclusion::kIncludeBothStartAndEndRecords ||
+         csn->boundInclusion == CollectionScanParams::ScanBoundInclusion::kIncludeEndRecordOnly);
     auto stage = sbe::makeS<sbe::ScanStage>(collection->uuid(),
                                             resultSlot,
                                             recordIdSlot,
@@ -340,7 +349,8 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateClusteredColl
                                             false /* lowPriority default */,
                                             false /* useRandomCursor default */,
                                             true /* participateInTrialRunTracking default */,
-                                            excludeScanEndRecordId);
+                                            includeScanStartRecordId,
+                                            includeScanEndRecordId);
 
     // Iff this is a resume or fetch, build the subtree to start the scan from the seekRecordId.
     if (seekRecordIdSlot) {
@@ -355,24 +365,24 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateClusteredColl
                                                csn->resumeAfterRecordId.has_value());
     }
 
+    PlanStageSlots outputs;
+    outputs.setResultObj(resultSlot);
+    outputs.set(PlanStageSlots::kRecordId, recordIdSlot);
+    for (size_t i = 0; i < scanFieldNames.size(); ++i) {
+        outputs.set(std::make_pair(PlanStageSlots::kField, scanFieldNames[i]), scanFieldSlots[i]);
+    }
+
     // When the start and/or end scan bounds are from an expression, ScanStage::getNext() treats
     // them both as inclusive, and 'csn->filter' will enforce any exclusions. If the bound(s) came
     // from the "min" (always inclusive) and/or "max" (always exclusive) keywords, there may be no
     // filter, so ScanStage->getNext() must directly enforce the bounds. min's inclusivity matches
     // getNext()'s default behavior, but max's exclusivity does not and thus is enforced by the
-    // excludeScanEndRecordId argument to the ScanStage constructor above.
+    // includeScanEndRecordId argument to the ScanStage constructor above.
     SbExpr filterExpr = generateFilter(
-        state, csn->filter.get(), TypedSlot{resultSlot, TypeSignature::kAnyScalarType}, nullptr);
+        state, csn->filter.get(), SbSlot{resultSlot, TypeSignature::kAnyScalarType}, outputs);
     if (!filterExpr.isNull()) {
         stage = sbe::makeS<sbe::FilterStage<false>>(
-            std::move(stage), filterExpr.extractExpr(state).expr, csn->nodeId());
-    }
-
-    PlanStageSlots outputs;
-    outputs.set(PlanStageSlots::kResult, resultSlot);
-    outputs.set(PlanStageSlots::kRecordId, recordIdSlot);
-    for (size_t i = 0; i < scanFieldNames.size(); ++i) {
-        outputs.set(std::make_pair(PlanStageSlots::kField, scanFieldNames[i]), scanFieldSlots[i]);
+            std::move(stage), filterExpr.extractExpr(state), csn->nodeId());
     }
 
     return {std::move(stage), std::move(outputs)};
@@ -466,7 +476,7 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateGenericCollSc
     }
 
     PlanStageSlots outputs;
-    outputs.set(PlanStageSlots::kResult, resultSlot);
+    outputs.setResultObj(resultSlot);
     outputs.set(PlanStageSlots::kRecordId, recordIdSlot);
     for (size_t i = 0; i < fields.size(); ++i) {
         outputs.set(std::make_pair(PlanStageSlots::kField, fields[i]), fieldSlots[i]);
@@ -476,13 +486,11 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateGenericCollSc
         // 'stopApplyingFilterAfterFirstMatch' is only for oplog scans; this method doesn't do them.
         invariant(!csn->stopApplyingFilterAfterFirstMatch);
 
-        auto filterExpr = generateFilter(state,
-                                         csn->filter.get(),
-                                         TypedSlot{resultSlot, TypeSignature::kAnyScalarType},
-                                         &outputs);
+        auto filterExpr = generateFilter(
+            state, csn->filter.get(), SbSlot{resultSlot, TypeSignature::kAnyScalarType}, outputs);
         if (!filterExpr.isNull()) {
             stage = sbe::makeS<sbe::FilterStage<false>>(
-                std::move(stage), filterExpr.extractExpr(state).expr, csn->nodeId());
+                std::move(stage), filterExpr.extractExpr(state), csn->nodeId());
         }
     }
 
@@ -499,7 +507,7 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateCollScan(
     PlanYieldPolicy* yieldPolicy,
     bool isResumingTailableScan) {
 
-    if (csn->doSbeClusteredCollectionScan()) {
+    if (csn->doClusteredCollectionScanSbe()) {
         return generateClusteredCollScan(
             state, collection, csn, std::move(fields), yieldPolicy, isResumingTailableScan);
     } else {

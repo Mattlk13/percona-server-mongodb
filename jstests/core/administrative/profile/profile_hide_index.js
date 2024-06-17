@@ -3,7 +3,7 @@
  *
  * @tags: [
  *   # The test runs commands that are not allowed with security token: setProfilingLevel.
- *   not_allowed_with_security_token,
+ *   not_allowed_with_signed_security_token,
  *   assumes_read_concern_unchanged,
  *   assumes_read_preference_unchanged,
  *   requires_non_retryable_writes,
@@ -74,7 +74,7 @@ testHiddenFlagInCurrentOp({
                 "index": {"name": "b_1", "hidden": true}}));`,
     isCommandExpected: function(inprogs) {
         return inprogs.find(function(inprog) {
-            return inprog.command.collMod === "profile_hide_index" &&
+            return inprog.command.collMod === "profile_hide_index" && inprog.command.index &&
                 inprog.command.index.hidden === true && inprog.command.index.name === "b_1";
         }) !== undefined;
     },

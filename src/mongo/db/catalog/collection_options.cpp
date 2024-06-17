@@ -56,7 +56,6 @@
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/overloaded_visitor.h"  // IWYU pragma: keep
 #include "mongo/util/str.h"
@@ -318,6 +317,11 @@ StatusWith<CollectionOptions> CollectionOptions::parse(const BSONObj& options, P
             } catch (const DBException& ex) {
                 return ex.toStatus();
             }
+        } else if (fieldName == "recordIdsReplicated") {
+            if (e.type() != mongo::Bool) {
+                return {ErrorCodes::TypeMismatch, "'recordIdsReplicated' must be a boolean."};
+            }
+            collectionOptions.recordIdsReplicated = e.Bool();
         } else if (!createdOn24OrEarlier && !mongo::isGenericArgument(fieldName)) {
             return Status(ErrorCodes::InvalidOptions,
                           str::stream()
@@ -380,20 +384,20 @@ CollectionOptions CollectionOptions::fromCreateCommand(const CreateCommand& cmd)
         options.timeseries = std::move(*timeseries);
     }
     if (auto clusteredIndex = cmd.getClusteredIndex()) {
-        stdx::visit(OverloadedVisitor{
-                        [&](bool isClustered) {
-                            if (isClustered) {
-                                options.clusteredIndex =
-                                    clustered_util::makeCanonicalClusteredInfoForLegacyFormat();
-                            } else {
-                                options.clusteredIndex = boost::none;
-                            }
-                        },
-                        [&](const ClusteredIndexSpec& clusteredIndexSpec) {
-                            options.clusteredIndex =
-                                clustered_util::makeCanonicalClusteredInfo(clusteredIndexSpec);
-                        }},
-                    *clusteredIndex);
+        visit(OverloadedVisitor{
+                  [&](bool isClustered) {
+                      if (isClustered) {
+                          options.clusteredIndex =
+                              clustered_util::makeCanonicalClusteredInfoForLegacyFormat();
+                      } else {
+                          options.clusteredIndex = boost::none;
+                      }
+                  },
+                  [&](const ClusteredIndexSpec& clusteredIndexSpec) {
+                      options.clusteredIndex =
+                          clustered_util::makeCanonicalClusteredInfo(clusteredIndexSpec);
+                  }},
+              *clusteredIndex);
     }
     if (auto expireAfterSeconds = cmd.getExpireAfterSeconds()) {
         options.expireAfterSeconds = expireAfterSeconds;
@@ -405,6 +409,10 @@ CollectionOptions CollectionOptions::fromCreateCommand(const CreateCommand& cmd)
         options.encryptedFieldConfig = std::move(*encryptedFieldConfig);
         setEncryptedDefaultEncryptedCollectionNames(cmd.getNamespace(),
                                                     options.encryptedFieldConfig.get_ptr());
+    }
+
+    if (auto recordIdsReplicated = cmd.getRecordIdsReplicated()) {
+        options.recordIdsReplicated = *recordIdsReplicated;
     }
 
     return options;
@@ -506,6 +514,10 @@ void CollectionOptions::appendBSON(BSONObjBuilder* builder,
 
     if (encryptedFieldConfig && shouldAppend(CreateCommand::kEncryptedFieldsFieldName)) {
         builder->append(CreateCommand::kEncryptedFieldsFieldName, encryptedFieldConfig->toBSON());
+    }
+
+    if (recordIdsReplicated && shouldAppend(CreateCommand::kRecordIdsReplicatedFieldName)) {
+        builder->appendBool(CreateCommand::kRecordIdsReplicatedFieldName, true);
     }
 }
 

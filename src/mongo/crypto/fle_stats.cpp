@@ -39,13 +39,14 @@
 namespace mongo {
 
 namespace {
-FLEStatusSection fleStatusSection{};
+// We only track fle stats on the shard.
+auto& fleStatusSection =
+    *ServerStatusSectionBuilder<FLEStatusSection>("fle").bind(globalSystemTickSource()).forShard();
+
 }  // namespace
 
-FLEStatusSection::FLEStatusSection() : FLEStatusSection(globalSystemTickSource()) {}
-
-FLEStatusSection::FLEStatusSection(TickSource* tickSource)
-    : ServerStatusSection("fle"), _tickSource(tickSource) {
+FLEStatusSection::FLEStatusSection(std::string name, ClusterRole role, TickSource* tickSource)
+    : ServerStatusSection(std::move(name), std::move(role)), _tickSource(tickSource) {
     ECStats zeroStats;
     ECOCStats zeroECOC;
 

@@ -50,14 +50,16 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/client/dbclient_cursor.h"
+#include "mongo/db/admission/execution_admission_context.h"
+#include "mongo/db/catalog/clustered_collection_util.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/index_builds_manager.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/create_indexes_gen.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/dbdirectclient.h"
@@ -72,6 +74,7 @@
 #include "mongo/db/query/find_command.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session/internal_transactions_reap_service.h"
 #include "mongo/db/session/kill_sessions.h"
@@ -81,6 +84,7 @@
 #include "mongo/db/session/sessions_collection.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/transaction/transaction_participant.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
@@ -379,6 +383,12 @@ int removeExpiredTransactionSessionsFromDisk(
 
 void createTransactionTable(OperationContext* opCtx) {
     CollectionOptions options;
+    // We cluster by _id for improved performance at the cost of increased index maintenance.
+    // Because we only have one partial index on this collection, the performance benefit outweighs
+    // that cost.
+    if (feature_flags::gFeatureFlagClusteredConfigTransactions.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot()))
+        options.clusteredIndex = clustered_util::makeDefaultClusteredIdIndex();
     auto storageInterface = repl::StorageInterface::get(opCtx);
     auto createCollectionStatus = storageInterface->createCollection(
         opCtx, NamespaceString::kSessionTransactionsTableNamespace, options);
@@ -582,7 +592,8 @@ void MongoDSessionCatalog::onStepUp(OperationContext* opCtx) {
             auto newOpCtx = cc().makeOperationContext();
 
             // Avoid ticket acquisition during step up.
-            newOpCtx->lockState()->setAdmissionPriority(AdmissionContext::Priority::kImmediate);
+            ScopedAdmissionPriority<ExecutionAdmissionContext> admissionPriority(
+                newOpCtx.get(), AdmissionContext::Priority::kExempt);
 
             // Synchronize with killOps to make this unkillable.
             {
@@ -657,22 +668,54 @@ void MongoDSessionCatalog::observeDirectWriteToConfigTransactions(OperationConte
 
     const auto lsid =
         LogicalSessionId::parse(IDLParserContext("lsid"), singleSessionDoc["_id"].Obj());
+    // For inserts and updates, the in-storage txnNum will be available, though it is
+    // not available for deletes.
+    TxnNumber txnNum = kUninitializedTxnNumber;
+    auto txnNumElem = singleSessionDoc[SessionTxnRecord::kTxnNumFieldName];
+    // We can't use safeNumberLong here because 0 is a valid transaction number.
+    if (txnNumElem.type() == NumberLong) {
+        txnNum = txnNumElem.numberLong();
+    }
+
     catalog->scanSession(lsid, [&, ti = _ti.get()](const ObservableSession& session) {
         uassert(ErrorCodes::PreparedTransactionInProgress,
                 str::stream() << "Cannot modify the entry for session " << lsid.getId()
                               << " because it is in the prepared state",
                 !ti->isTransactionPrepared(session));
 
+        // For updates of external sessions, we can know if we already started a newer transaction
+        // or retryable write than the one in storage, and in that case there is no need to
+        // invalidate the session.
+        //
+        // TODO(SERVER-84271): This case is specifically for the update introduced for
+        // downgrading featureFlagReplicateVectoredInsertsTransactionally and can be removed with
+        // that flag.
+        bool startedNewerTxn = txnNum != kUninitializedTxnNumber &&
+            !isInternalSessionForRetryableWrite(lsid) &&
+            txnNum < session.getLastClientTxnNumberStarted();
+        if (startedNewerTxn) {
+            LOGV2_DEBUG(
+                8674101,
+                1,
+                "Skipping a session kill on direct update because a newer transaction has started",
+                "lsid"_attr = lsid,
+                "storedTxnNum"_attr = txnNum,
+                "sessionCacheTxnNum"_attr = session.getLastClientTxnNumberStarted());
+        }
+
         // Internal sessions for an old retryable write are marked as reapable as soon as a
         // retryable write or transaction with a newer txnNumber starts. Therefore, when deleting
         // the config.transactions doc for such internal sessions, the corresponding transaction
         // sessions should not be interrupted since they are guaranteed to be performing a
         // transaction or retryable write for newer txnNumber.
-        bool shouldRegisterKill = !isInternalSessionForRetryableWrite(lsid) ||
-            *lsid.getTxnNumber() >= session.getLastClientTxnNumberStarted();
+        bool shouldRegisterKill =
+            (!isInternalSessionForRetryableWrite(lsid) ||
+             *lsid.getTxnNumber() >= session.getLastClientTxnNumberStarted()) &&
+            !startedNewerTxn;
         if (shouldRegisterKill) {
-            opCtx->recoveryUnit()->registerChange(std::make_unique<KillSessionTokenOnCommit>(
-                ti, session.kill(ErrorCodes::Interrupted)));
+            shard_role_details::getRecoveryUnit(opCtx)->registerChange(
+                std::make_unique<KillSessionTokenOnCommit>(ti,
+                                                           session.kill(ErrorCodes::Interrupted)));
         }
     });
 }

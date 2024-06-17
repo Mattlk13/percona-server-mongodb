@@ -74,11 +74,11 @@ class OpObserverRegistry final : public OpObserver {
 
 public:
     OpObserverRegistry();
-    virtual ~OpObserverRegistry();
+    ~OpObserverRegistry() override;
 
     // This implementaton is unused, but needs to be implemented to conform to the OpObserver
     // interface.
-    NamespaceFilters getNamespaceFilters() const {
+    NamespaceFilters getNamespaceFilters() const override {
         return {NamespaceFilter::kAll, NamespaceFilter::kAll};
     }
 
@@ -223,6 +223,7 @@ public:
                    const CollectionPtr& coll,
                    std::vector<InsertStatement>::const_iterator begin,
                    std::vector<InsertStatement>::const_iterator end,
+                   const std::vector<RecordId>& recordIds,
                    std::vector<bool> fromMigrate,
                    bool defaultFromMigrate,
                    OpStateAccumulator* opAccumulator = nullptr) override {
@@ -240,8 +241,14 @@ public:
         }
 
         for (auto& o : *observerQueue)
-            o->onInserts(
-                opCtx, coll, begin, end, fromMigrate, defaultFromMigrate, &opStateAccumulator);
+            o->onInserts(opCtx,
+                         coll,
+                         begin,
+                         end,
+                         recordIds,
+                         fromMigrate,
+                         defaultFromMigrate,
+                         &opStateAccumulator);
     }
 
     void onInsertGlobalIndexKey(OperationContext* opCtx,
@@ -484,7 +491,7 @@ public:
 
     void onEmptyCapped(OperationContext* const opCtx,
                        const NamespaceString& collectionName,
-                       const UUID& uuid) {
+                       const UUID& uuid) override {
         ReservedTimes times{opCtx};
         for (auto& o : _observers)
             o->onEmptyCapped(opCtx, collectionName, uuid);
@@ -589,10 +596,13 @@ public:
         }
     }
 
-    void onBatchedWriteCommit(OperationContext* opCtx) override {
+    void onBatchedWriteCommit(OperationContext* opCtx,
+                              WriteUnitOfWork::OplogEntryGroupType oplogGroupingFormat,
+                              OpStateAccumulator* opAccumulator = nullptr) override {
         ReservedTimes times{opCtx};
+        OpStateAccumulator opStateAccumulator;
         for (auto& o : _observers) {
-            o->onBatchedWriteCommit(opCtx);
+            o->onBatchedWriteCommit(opCtx, oplogGroupingFormat, &opStateAccumulator);
         }
     }
 

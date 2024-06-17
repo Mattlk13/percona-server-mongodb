@@ -32,86 +32,82 @@
 #include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/pipeline/window_function/window_function_statement.h"
+#include "mongo/db/query/sbe_stage_builder_accumulator.h"
 #include "mongo/db/query/sbe_stage_builder_helpers.h"
 
 namespace mongo::stage_builder {
+struct WindowOpInfo;
 
-/**
- * Build a list of window function init functions.
- */
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowInit(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> arg,
-    boost::optional<sbe::value::SlotId> collatorSlot);
+class WindowOp {
+public:
+    WindowOp(std::string opName);
 
-/**
- * Similar to above but takes multiple arguments.
- */
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowInit(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    StringDataMap<std::unique_ptr<sbe::EExpression>> args,
-    boost::optional<sbe::value::SlotId> collatorSlot);
+    WindowOp(StringData opName) : WindowOp(opName.toString()) {}
 
-/**
- * Build a list of window function add functions.
- */
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowAdd(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> arg,
-    boost::optional<sbe::value::SlotId> collatorSlot);
+    WindowOp(const WindowFunctionStatement& wf);
 
-/**
- * Similar to above but takes multiple arguments.
- */
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowAdd(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    StringDataMap<std::unique_ptr<sbe::EExpression>> args,
-    boost::optional<sbe::value::SlotId> collatorSlot);
+    StringData getOpName() const {
+        return _opName;
+    }
 
-/**
- * Build a list of window function remove functions.
- */
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowRemove(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> arg,
-    boost::optional<sbe::value::SlotId> collatorSlot);
+    /**
+     * This method returns the number of agg expressions that need to be generated for this
+     * WindowOp.
+     */
+    size_t getNumAggs() const;
 
-/**
- * Similar to above but takes multiple arguments.
- */
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowRemove(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    StringDataMap<std::unique_ptr<sbe::EExpression>> args);
+    /**
+     * Given one or more input expressions ('input' / 'inputs'), these methods generate the
+     * arg expressions needed for this WindowOp.
+     */
+    AccumInputsPtr buildAddRemoveExprs(StageBuilderState& state, AccumInputsPtr inputs) const;
 
-/**
- * Build a window function finalize functions from the list of intermediate values.
- */
-std::unique_ptr<sbe::EExpression> buildWindowFinalize(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    sbe::value::SlotVector values,
-    boost::optional<sbe::value::SlotId> collatorSlot);
+    /**
+     * Given a vector of named arg expressions ('args' / 'argNames'), this method generates the
+     * accumulate expressions for this WindowOp.
+     */
+    SbExpr::Vector buildAddAggs(StageBuilderState& state, AccumInputsPtr inputs) const;
 
-/**
- * Similar to above but takes multiple arguments.
- */
-std::unique_ptr<sbe::EExpression> buildWindowFinalize(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    sbe::value::SlotVector values,
-    StringDataMap<std::unique_ptr<sbe::EExpression>> arg,
-    boost::optional<sbe::value::SlotId> collatorSlots);
+    /**
+     * Given a vector of named arg expressions ('args' / 'argNames'), this method generates the
+     * accumulate expressions for this WindowOp.
+     */
+    SbExpr::Vector buildRemoveAggs(StageBuilderState& state, AccumInputsPtr inputs) const;
 
-/**
- * Create a fake AccumulationStatement from the WindowFunctionStatement in order to invoke
- * accumulator stage builder.
- */
-AccumulationStatement createFakeAccumulationStatement(StageBuilderState& state,
-                                                      const WindowFunctionStatement& stmt);
+    /**
+     * Given a map of input expressions ('argExprs'), these methods generate the initialize
+     * expressions for this WindowOp.
+     */
+    SbExpr::Vector buildInitialize(StageBuilderState& state, AccumInputsPtr inputs) const;
+
+    /**
+     * Given a map of input expressions ('argExprs'), this method generates the finalize
+     * expression for this WindowOp.
+     */
+    SbExpr buildFinalize(StageBuilderState& state,
+                         AccumInputsPtr inputs,
+                         const SbSlotVector& aggSlots) const;
+
+private:
+    // Static helper method for looking up the info for this WindowOp in the global map.
+    // This method should only be used by WindowOp's constructors.
+    static const WindowOpInfo* lookupOpInfo(const std::string& opName);
+
+    // Non-static checked helper method for retrieving the value of '_opInfo'. This method will
+    // raise a tassert if '_opInfo' is null.
+    const WindowOpInfo* getOpInfo() const {
+        uassert(8859901,
+                str::stream() << "Unrecognized WindowOp name: " << _opName,
+                _opInfo != nullptr);
+
+        return _opInfo;
+    }
+
+    // Name of the specific accumulation op. This name is used to retrieve info about the op
+    // from the global map.
+    std::string _opName;
+
+    // Info about the specific accumulation op named by '_opName'.
+    const WindowOpInfo* _opInfo = nullptr;
+};
 }  // namespace mongo::stage_builder

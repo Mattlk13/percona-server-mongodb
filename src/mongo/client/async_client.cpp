@@ -89,8 +89,8 @@ MONGO_FAIL_POINT_DEFINE(pauseBeforeMarkKeepOpen);
 MONGO_FAIL_POINT_DEFINE(alwaysLogConnAcquisitionToWireTime)
 
 namespace {
-CounterMetric totalTimeForEgressConnectionAcquiredToWireMicros(
-    "network.totalTimeForEgressConnectionAcquiredToWireMicros");
+auto& totalTimeForEgressConnectionAcquiredToWireMicros =
+    *MetricBuilder<Counter64>{"network.totalTimeForEgressConnectionAcquiredToWireMicros"};
 }  // namespace
 
 Future<AsyncDBClient::Handle> AsyncDBClient::connect(
@@ -267,7 +267,10 @@ Future<bool> AsyncDBClient::completeSpeculativeAuth(std::shared_ptr<SaslClientSe
 Future<void> AsyncDBClient::initWireVersion(const std::string& appName,
                                             executor::NetworkConnectionHook* const hook) {
     auto requestObj = _buildHelloRequest(appName, hook);
-    auto opMsgRequest = OpMsgRequest::fromDBAndBody(DatabaseName::kAdmin, requestObj);
+    auto opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired /* admin is not per-tenant. */,
+        DatabaseName::kAdmin,
+        requestObj);
 
     auto msgId = nextMessageId();
     return _call(opMsgRequest.serialize(), msgId)
@@ -317,24 +320,24 @@ Future<Message> AsyncDBClient::_waitForResponse(boost::optional<int32_t> msgId,
         });
 }
 
-Future<rpc::UniqueReply> AsyncDBClient::runCommand(
-    OpMsgRequest request,
-    const BatonHandle& baton,
-    bool fireAndForget,
-    boost::optional<std::shared_ptr<Timer>> fromConnAcquiredTimer) {
+Future<rpc::UniqueReply> AsyncDBClient::runCommand(OpMsgRequest request,
+                                                   const BatonHandle& baton,
+                                                   bool fireAndForget,
+                                                   std::shared_ptr<Timer> fromConnAcquiredTimer) {
     auto requestMsg = request.serialize();
     if (fireAndForget) {
         OpMsg::setFlag(&requestMsg, OpMsg::kMoreToCome);
     }
     auto msgId = nextMessageId();
     auto future = _call(std::move(requestMsg), msgId, baton);
-    auto logMetrics = [this, fromConnAcquiredTimer] {
-        if (fromConnAcquiredTimer) {
+    auto logMetrics = [this, fromConnAcquiredTimerInner = std::move(fromConnAcquiredTimer)] {
+        if (fromConnAcquiredTimerInner) {
             const auto timeElapsedMicros =
-                durationCount<Microseconds>(fromConnAcquiredTimer.get()->elapsed());
+                durationCount<Microseconds>(fromConnAcquiredTimerInner->elapsed());
             totalTimeForEgressConnectionAcquiredToWireMicros.increment(timeElapsedMicros);
 
-            if ((!gEnableDetailedConnectionHealthMetricLogLines || timeElapsedMicros < 1000) &&
+            if ((!gEnableDetailedConnectionHealthMetricLogLines.load() ||
+                 timeElapsedMicros < 1000) &&
                 !MONGO_unlikely(alwaysLogConnAcquisitionToWireTime.shouldFail())) {
                 return;
             }
@@ -376,13 +379,13 @@ Future<rpc::UniqueReply> AsyncDBClient::runCommand(
 Future<executor::RemoteCommandResponse> AsyncDBClient::runCommandRequest(
     executor::RemoteCommandRequest request,
     const BatonHandle& baton,
-    boost::optional<std::shared_ptr<Timer>> fromConnAcquiredTimer) {
+    std::shared_ptr<Timer> fromConnAcquiredTimer) {
     auto startTimer = Timer();
-    auto opMsgRequest =
-        OpMsgRequest::fromDBAndBody(request.dbname, std::move(request.cmdObj), request.metadata);
-    opMsgRequest.validatedTenancyScope = request.validatedTenancyScope;
-    return runCommand(
-               std::move(opMsgRequest), baton, request.options.fireAndForget, fromConnAcquiredTimer)
+    auto opMsgRequest = static_cast<OpMsgRequest>(request);
+    return runCommand(std::move(opMsgRequest),
+                      baton,
+                      request.options.fireAndForget,
+                      std::move(fromConnAcquiredTimer))
         .then([this, startTimer = std::move(startTimer)](rpc::UniqueReply response) {
             return executor::RemoteCommandResponse(*response, startTimer.elapsed());
         });
@@ -418,9 +421,7 @@ Future<executor::RemoteCommandResponse> AsyncDBClient::runExhaustCommand(OpMsgRe
 
 Future<executor::RemoteCommandResponse> AsyncDBClient::beginExhaustCommandRequest(
     executor::RemoteCommandRequest request, const BatonHandle& baton) {
-    auto opMsgRequest =
-        OpMsgRequest::fromDBAndBody(request.dbname, std::move(request.cmdObj), request.metadata);
-    opMsgRequest.validatedTenancyScope = request.validatedTenancyScope;
+    auto opMsgRequest = static_cast<OpMsgRequest>(request);
 
     return runExhaustCommand(std::move(opMsgRequest), baton);
 }

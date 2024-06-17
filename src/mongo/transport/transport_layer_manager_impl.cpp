@@ -34,10 +34,19 @@
 #include <fstream>
 #endif
 
+#include "mongo/config.h"
 #include "mongo/logv2/log.h"
 #include "mongo/transport/asio/asio_session_manager.h"
 #include "mongo/transport/asio/asio_transport_layer.h"
 #include "mongo/util/assert_util.h"
+
+#ifdef MONGO_CONFIG_GRPC
+#include "mongo/transport/grpc/grpc_transport_layer_impl.h"
+#endif
+
+#ifdef MONGO_CONFIG_SSL
+#include "mongo/util/net/ssl_options.h"
+#endif
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
@@ -72,6 +81,12 @@ Status TransportLayerManagerImpl::start() {
     return Status::OK();
 }
 
+void TransportLayerManagerImpl::stopAcceptingSessions() {
+    for (auto&& tl : _tls) {
+        tl->stopAcceptingSessions();
+    }
+}
+
 void TransportLayerManagerImpl::shutdown() {
     invariant(_state.swap(State::kShutdown) != State::kShutdown);
     for (auto&& tl : _tls) {
@@ -89,6 +104,12 @@ Status TransportLayerManagerImpl::setup() {
     }
 
     return Status::OK();
+}
+
+void TransportLayerManagerImpl::forEach(std::function<void(TransportLayer*)> fn) {
+    for (auto&& tl : _tls) {
+        fn(tl.get());
+    }
 }
 
 void TransportLayerManagerImpl::appendStatsForServerStatus(BSONObjBuilder* bob) const {
@@ -121,23 +142,37 @@ std::unique_ptr<TransportLayerManager> TransportLayerManagerImpl::createWithConf
     ServiceContext* svcCtx,
     boost::optional<int> loadBalancerPort,
     boost::optional<int> routerPort,
-    std::unique_ptr<ClientTransportObserver> asioObserver) {
+    std::shared_ptr<ClientTransportObserver> observer) {
 
     std::vector<std::unique_ptr<TransportLayer>> retVector;
+    std::vector<std::shared_ptr<ClientTransportObserver>> observers;
+    if (observer) {
+        observers.push_back(std::move(observer));
+    }
 
     {
         AsioTransportLayer::Options opts(config);
         opts.loadBalancerPort = std::move(loadBalancerPort);
         opts.routerPort = std::move(routerPort);
 
-        std::vector<std::unique_ptr<ClientTransportObserver>> observers;
-        if (asioObserver) {
-            observers.push_back(std::move(asioObserver));
-        }
-        auto sm = std::make_unique<AsioSessionManager>(svcCtx, std::move(observers));
+        auto sm = std::make_unique<AsioSessionManager>(svcCtx, observers);
         auto tl = std::make_unique<AsioTransportLayer>(opts, std::move(sm));
         retVector.push_back(std::move(tl));
     }
+
+#ifdef MONGO_CONFIG_GRPC
+#ifdef MONGO_CONFIG_SSL
+    if (!sslGlobalParams.sslPEMKeyFile.empty()) {
+        using GRPCTL = grpc::GRPCTransportLayerImpl;
+        retVector.push_back(
+            GRPCTL::createWithConfig(svcCtx, GRPCTL::Options(*config), std::move(observers)));
+    } else {
+        LOGV2(8076800, "Unable to start gRPC transport without tlsCertificateKeyFile");
+    }
+#else
+    LOGV2(8076801, "Unable to start gRPC transport in a build without SSL enabled");
+#endif
+#endif
 
     auto egress = retVector[0].get();
     return std::make_unique<TransportLayerManagerImpl>(std::move(retVector), egress);
@@ -177,12 +212,6 @@ Status TransportLayerManagerImpl::rotateCertificates(std::shared_ptr<SSLManagerI
     return Status::OK();
 }
 #endif
-
-void TransportLayerManagerImpl::appendSessionManagerStats(BSONObjBuilder* builder) const {
-    std::for_each(_tls.cbegin(), _tls.cend(), [&](const auto& tl) {
-        tl->getSessionManager()->appendStats(builder);
-    });
-}
 
 bool TransportLayerManagerImpl::hasActiveSessions() const {
     return std::any_of(_tls.cbegin(), _tls.cend(), [](const auto& tl) {

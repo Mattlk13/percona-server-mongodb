@@ -145,7 +145,7 @@ def _validate_cpp_type(ctxt, idl_type, syntax_type):
         return
 
     # Support variant for writeConcernW.
-    if idl_type.cpp_type == "stdx::variant<std::string, std::int64_t>":
+    if idl_type.cpp_type == "std::variant<std::string, std::int64_t>":
         return
 
     # Check for std fixed integer types which are not allowed. These are not allowed even if they
@@ -255,6 +255,126 @@ def _get_struct_qualified_cpp_name(struct):
                                    common.title_case(struct.cpp_name or struct.name))
 
 
+def _compute_field_is_view(resolved_field, ctxt, symbols):
+    # type: (Union[syntax.Type, syntax.Enum, syntax.Struct], errors.ParserContext, syntax.SymbolTable) -> bool
+    """Compute is_view for a symbol referenced by a field."""
+    # Resolved field is an array.
+    if (isinstance(resolved_field, syntax.ArrayType)):
+        # Inner type needs to be resolved.
+        return _compute_field_is_view(resolved_field.element_type, ctxt, symbols)
+
+    # Resolved field is a variant.
+    elif (isinstance(resolved_field, syntax.VariantType)):
+        for variant_type in resolved_field.variant_types:
+            # Inner type needs to be resolved.
+            if (_compute_field_is_view(variant_type, ctxt, symbols)):
+                return True
+        for variant_struct_type in resolved_field.variant_struct_types:
+            if (_compute_is_view(variant_struct_type, ctxt, symbols)):
+                return True
+        return False
+
+    # Resolved field is a single type.
+    else:
+        return _compute_is_view(resolved_field, ctxt, symbols)
+
+
+def _compute_chained_item_is_view(struct, ctxt, symbols, chained_item):
+    # type: (syntax.Struct, errors.ParserContext, syntax.SymbolTable, Union[syntax.ChainedType, syntax.ChainedStruct]) -> bool
+    """Helper to compute is_view of chained types or structs."""
+    resolved_chained_item = symbols.resolve_type_from_name(ctxt, struct, chained_item.name,
+                                                           chained_item.name)
+    # If symbols.resolve_field_type returns None, we can assume an error occured during the function.
+    # We can rely on symbols.resolve_field_type to add errors.
+    if (resolved_chained_item is None):
+        assert (ctxt.errors.has_errors())
+        return True
+    return _compute_is_view(resolved_chained_item, ctxt, symbols)
+
+
+def _compute_command_type_is_view(struct, ctxt, symbols, field_type):
+    # type: (syntax.Struct, errors.ParserContext, syntax.SymbolTable, syntax.FieldType) -> bool
+    """
+    Compute is_view for the command parameter type.
+    
+    This function is similar to _compute_field_is_view, but because command parameter types are
+    syntax.FieldType instead of syntax.Type, separate logic must exist to resolve the command
+    parameter types.
+    """
+    if (isinstance(field_type, syntax.FieldTypeVariant)):
+        for variant_type in field_type.variant:
+            if (_compute_command_type_is_view(struct, ctxt, symbols, variant_type)):
+                return True
+    elif (isinstance(field_type, syntax.FieldTypeArray)):
+        return _compute_command_type_is_view(struct, ctxt, symbols, field_type.element_type)
+    elif (isinstance(field_type, syntax.FieldTypeSingle)):
+        resolved_type = symbols.resolve_field_type(ctxt, struct, field_type.type_name, field_type)
+        # If symbols.resolve_field_type returns None, we can assume an error occured during the function.
+        # We can rely on symbols.resolve_field_type to add errors.
+        if (resolved_type is None):
+            assert (ctxt.errors.has_errors())
+            return True
+        if (_compute_field_is_view(resolved_type, ctxt, symbols)):
+            return True
+    else:
+        ctxt.add_unknown_command_type_error(struct, struct.name)
+    return False
+
+
+def _compute_struct_is_view(struct, ctxt, symbols):
+    # type: (syntax.Struct, errors.ParserContext, syntax.SymbolTable) -> bool
+    """Compute is_view for structs. A struct is a view if any of its fields are views."""
+    # Empty structs are non view types.
+    if (not struct.fields):
+        return False
+
+    for field in struct.fields:
+        if (field.ignore):
+            continue
+        # Get the resolved field from the global symbol table.
+        resolved_field = symbols.resolve_field_type(ctxt, field, field.name, field.type)
+        # If symbols.resolve_field_type returns None, we can assume an error occured during the function.
+        # We can rely on symbols.resolve_field_type to add errors.
+        if (resolved_field is None):
+            assert (ctxt.errors.has_errors())
+            return True
+        # If any field is a view type, then the struct is also a view type.
+        if (_compute_field_is_view(resolved_field, ctxt, symbols)):
+            return True
+
+    if (struct.chained_types):
+        for chained_type in struct.chained_types:
+            if (_compute_chained_item_is_view(struct, ctxt, symbols, chained_type)):
+                return True
+
+    if (struct.chained_structs):
+        for chained_struct in struct.chained_structs:
+            if (_compute_chained_item_is_view(struct, ctxt, symbols, chained_struct)):
+                return True
+
+    # Check command parameter.
+    if (isinstance(struct, syntax.Command)):
+        if (struct.type is not None
+                and _compute_command_type_is_view(struct, ctxt, symbols, struct.type)):
+            return True
+
+    return False
+
+
+def _compute_is_view(symbol, ctxt, symbols):
+    # type: (Union[syntax.Type, syntax.Enum, syntax.Struct], errors.ParserContext, syntax.SymbolTable) -> bool
+    """Compute is_view for any symbol."""
+    if (isinstance(symbol, syntax.Type)):
+        return symbol.is_view
+    elif (isinstance(symbol, syntax.Enum)):
+        return False
+    elif (isinstance(symbol, syntax.Struct)):
+        return _compute_struct_is_view(symbol, ctxt, symbols)
+    else:
+        ctxt.add_unknown_symbol_error(symbol, symbol.name)
+        return True
+
+
 def _bind_struct_common(ctxt, parsed_spec, struct, ast_struct):
     # type: (errors.ParserContext, syntax.IDLSpec, syntax.Struct, ast.Struct) -> None
 
@@ -275,6 +395,7 @@ def _bind_struct_common(ctxt, parsed_spec, struct, ast_struct):
     ast_struct.is_catalog_ctxt = struct.is_catalog_ctxt
     ast_struct.query_shape_component = struct.query_shape_component
     ast_struct.unsafe_dangerous_disable_extra_field_duplicate_checks = struct.unsafe_dangerous_disable_extra_field_duplicate_checks
+    ast_struct.is_view = _compute_is_view(struct, ctxt, parsed_spec.symbols)
 
     # Check that unsafe_dangerous_disable_extra_field_duplicate_checks is used correctly
     if ast_struct.unsafe_dangerous_disable_extra_field_duplicate_checks and ast_struct.strict is True:
@@ -424,30 +545,6 @@ def _inject_hidden_command_fields(command):
 
     command.fields.append(db_field)
 
-    # Inject "$tenant" for use by cluster administrators overriding tenant in multitenancy.
-    tenant_field = syntax.Field(command.file_name, command.line, command.column)
-    tenant_field.name = "$tenant"
-    tenant_field.type = syntax.FieldTypeSingle(command.file_name, command.line, command.column)
-    tenant_field.type.type_name = "tenant_id"  # This comes from basic_types.idl
-    tenant_field.cpp_name = "dollarTenant"
-    tenant_field.optional = True
-    # The $tenant field should be injected when serializing to OpMsgRequest and to
-    # BSONObjBuilder if it exists.
-    tenant_field.serialize_op_msg_request_only = False
-
-    command.fields.append(tenant_field)
-
-    # Inject "expectPrefix" used to detect whether request contains a prefixed tenantId.
-    expect_prefix_field = syntax.Field(command.file_name, command.line, command.column)
-    expect_prefix_field.name = "expectPrefix"
-    expect_prefix_field.type = syntax.FieldTypeSingle(command.file_name, command.line,
-                                                      command.column)
-    expect_prefix_field.type.type_name = "bool"
-    expect_prefix_field.cpp_name = "expectPrefix"
-    expect_prefix_field.optional = True
-
-    command.fields.append(expect_prefix_field)
-
 
 def _bind_struct_type(struct):
     # type: (syntax.Struct) -> ast.Type
@@ -517,7 +614,7 @@ def _bind_variant_field(ctxt, ast_field, idl_type):
             for variant_type in ast_field.type.variant_struct_types:
                 yield variant_type.cpp_type
 
-    ast_field.type.cpp_type = f'stdx::variant<{", ".join(gen_cpp_types())}>'
+    ast_field.type.cpp_type = f'std::variant<{", ".join(gen_cpp_types())}>'
 
     # Validation doc_sequence types
     _validate_doc_sequence_field(ctxt, ast_field)
@@ -1433,6 +1530,17 @@ def _bind_server_parameter(ctxt, param):
     ast_param.redact = param.redact
     ast_param.test_only = param.test_only
     ast_param.deprecated_name = param.deprecated_name
+
+    # The omit_in_ftdc flag can only be enabled for cluster parameters.
+    if param.omit_in_ftdc is not None and param.set_at != ['cluster']:
+        ctxt.add_server_parameter_invalid_attr(param, 'omit_in_ftdc=True', ''.join(param.set_at))
+        return None
+
+    # If omit_in_ftdc is None (it has not been set) for a cluster parameter, then emit an error.
+    if param.omit_in_ftdc is None and param.set_at == ['cluster']:
+        ctxt.add_server_parameter_required_attr(param, 'omit_in_ftdc', 'cluster')
+
+    ast_param.omit_in_ftdc = param.omit_in_ftdc
 
     ast_param.set_at = _bind_server_parameter_set_at(ctxt, param)
     if ast_param.set_at is None:

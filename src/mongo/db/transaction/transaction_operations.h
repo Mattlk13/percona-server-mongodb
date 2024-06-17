@@ -29,7 +29,6 @@
 
 #pragma once
 
-#include <absl/container/node_hash_map.h>
 #include <boost/none.hpp>
 #include <boost/optional.hpp>
 #include <boost/optional/optional.hpp>
@@ -45,6 +44,7 @@
 #include "mongo/db/repl/oplog_entry.h"  // for ReplOperation
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/transaction/integer_interval_set.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/time_support.h"
@@ -82,14 +82,21 @@ public:
      * the last entry ('lastOp' == true). It may also be empty if there are no statement ids
      * contained in any of the replicated operations.
      *
+     * The 'oplogGroupingFormat' indicates whether these applyOps make up a multi-document
+     * transaction (kDontGroup), a potentially multi-oplog-entry transactional batched wrote
+     * (kGroupForTransaction), or a multi-oplog-entry potentially retryable write
+     * (kGroupForPossiblyRetryableOperations)
+     *
      * This is based on the signature of the logApplyOps() function within the OpObserverImpl
      * implementation, which takes a few more arguments that can be derived from the caller's
      * context.
      */
-    using LogApplyOpsFn = std::function<repl::OpTime(repl::MutableOplogEntry* oplogEntry,
-                                                     bool firstOp,
-                                                     bool lastOp,
-                                                     std::vector<StmtId> stmtIdsWritten)>;
+    using LogApplyOpsFn =
+        std::function<repl::OpTime(repl::MutableOplogEntry* oplogEntry,
+                                   bool firstOp,
+                                   bool lastOp,
+                                   std::vector<StmtId> stmtIdsWritten,
+                                   WriteUnitOfWork::OplogEntryGroupType oplogGroupingFormat)>;
 
     /**
      * Contains "applyOps" oplog entries for a transaction. "applyOps" entries are not actual
@@ -237,6 +244,12 @@ public:
      * The 'applyOpsOperationAssignment' contains BSON serialized transaction statements, their
      * assignment to "applyOps" oplog entries for a transaction.
      *
+     * The 'oplogGroupingFormat' indicates whether these applyOps make up a multi-document
+     * transaction (kDontGroup), a potentially multi-oplog-entry transactional batched wrote
+     * (kGroupForTransaction), or a multi-oplog-entry potentially retryable write
+     * (kGroupForPossiblyRetryableOperations)
+     *
+     *
      * In the case of writing entries for a prepared transaction, the last oplog entry
      * (i.e. the implicit prepare) will always be written using the last oplog slot given,
      * even if this means skipping over some reserved slots.
@@ -250,6 +263,7 @@ public:
     std::size_t logOplogEntries(const std::vector<OplogSlot>& oplogSlots,
                                 const ApplyOpsInfo& applyOpsOperationAssignment,
                                 Date_t wallClockTime,
+                                WriteUnitOfWork::OplogEntryGroupType oplogGroupingFormat,
                                 LogApplyOpsFn logApplyOpsFn,
                                 boost::optional<TransactionOperation::ImageBundle>*
                                     prePostImageToWriteToImageCollection) const;
@@ -274,7 +288,7 @@ private:
 
     // Holds stmtIds for operations which have been applied in the current multi-document
     // transaction.
-    stdx::unordered_set<StmtId> _transactionStmtIds;
+    IntegerIntervalSet<StmtId> _transactionStmtIds;
 
     // Size of operations in _transactionOperations as calculated by
     // DurableOplogEntry::getDurableReplOperationSize().

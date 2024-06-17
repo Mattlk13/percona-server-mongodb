@@ -18,12 +18,24 @@ env.Library(
     target='bson_column',
     source=[
         'bsoncolumn.cpp',
+        'bsoncolumn_interleaved.cpp',
         'bsoncolumnbuilder.cpp',
-        'simple8b_builder.cpp',
         'simple8b_type_util.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.Program(
+    target="bson_column_encoder",
+    source=[
+        "bson_column_encoder.cpp",
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        'bson_column',
+        'bson_extract',
     ],
 )
 
@@ -38,11 +50,23 @@ env.Benchmark(
     ],
 )
 
+env.Library(
+    target='bson_column_fuzzer_impl',
+    source=[
+        'bsoncolumn_fuzzer_impl.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        'bson_column',
+    ],
+)
+
 env.CppUnitTest(
     target='bson_util_test',
     source=[
         'bson_check_test.cpp',
         'bson_extract_test.cpp',
+        'bsoncolumn_blockbased_test.cpp',
         'bsoncolumn_test.cpp',
         'builder_test.cpp',
         'simple8b_test.cpp',
@@ -50,7 +74,10 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/sbe_values',
+        '$BUILD_DIR/mongo/util/safe_num',
         'bson_column',
+        'bson_column_fuzzer_impl',
         'bson_extract',
     ],
 )
@@ -62,6 +89,52 @@ env.Benchmark(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/sbe_values',
         'bson_column',
+    ],
+)
+
+env.CppLibfuzzerTest(
+    target='simple8b_fuzzer',
+    source=[
+        'simple8b_fuzzer.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        'bson_column',
+    ],
+)
+
+env.CppLibfuzzerTest(
+    target='bsoncolumn_decompress_fuzzer',
+    source=[
+        'bsoncolumn_decompress_fuzzer.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/bson/bson_validate',
+        'bson_column',
+    ],
+)
+
+env.Benchmark(
+    target='bufbuilder_bm',
+    source=[
+        'bufbuilder_bm.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.CppLibfuzzerTest(
+    target='bsoncolumnbuilder_reopen_fuzzer',
+    source=[
+        'bsoncolumnbuilder_reopen_fuzzer.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/bson/bson_validate',
+        'bson_column_fuzzer_impl',
     ],
 )

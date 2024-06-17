@@ -106,7 +106,7 @@ boost::optional<repl::OpTime> ReshardingOplogSessionApplication::_logPrePostImag
         "ReshardingOplogSessionApplication::_logPrePostImage",
         NamespaceString::kRsOplogNamespace,
         [&] {
-            AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
+            AutoGetOplogFastPath oplogWrite(opCtx, OplogAccessMode::kWrite);
 
             WriteUnitOfWork wuow(opCtx);
             const auto& opTime = repl::logOp(opCtx, &noopEntry);
@@ -122,6 +122,25 @@ boost::optional<repl::OpTime> ReshardingOplogSessionApplication::_logPrePostImag
             return opTime;
         });
 }
+
+namespace {
+std::vector<StmtId> gatherApplyOpsStatementIds(const mongo::repl::OplogEntry& op) {
+    std::vector<StmtId> stmtIds;
+    for (const auto& innerOp :
+         op.getObject()[repl::ApplyOpsCommandInfoBase::kOperationsFieldName].Array()) {
+        auto innerStmtIds =
+            repl::parseZeroOneManyStmtId(innerOp[repl::OplogEntry::kStatementIdFieldName]);
+        stmtIds.insert(stmtIds.end(), innerStmtIds.begin(), innerStmtIds.end());
+
+        // We have no way of handling migration of multiple pre or post images right now.  There
+        // are multiple options for handling it, but right now this format is only used for inserts
+        // (which have neither) so it should never come up.
+        invariant(innerOp[repl::OplogEntry::kPreImageOpTimeFieldName].eoo());
+        invariant(innerOp[repl::OplogEntry::kPostImageOpTimeFieldName].eoo());
+    }
+    return stmtIds;
+}
+}  // namespace
 
 boost::optional<SharedSemiFuture<void>> ReshardingOplogSessionApplication::tryApplyOperation(
     OperationContext* opCtx, const mongo::repl::OplogEntry& op) const {
@@ -150,13 +169,21 @@ boost::optional<SharedSemiFuture<void>> ReshardingOplogSessionApplication::tryAp
     }
 
     auto txnNumber = *op.getTxnNumber();
-    bool isRetryableWrite = op.isCrudOpType();
+    bool isRetryableApplyOps = op.getCommandType() == repl::OplogEntry::CommandType::kApplyOps &&
+        op.getMultiOpType() == repl::MultiOplogEntryType::kApplyOpsAppliedSeparately;
+    bool isRetryableWrite = op.isCrudOpType() || isRetryableApplyOps;
 
     auto o2Field =
         isRetryableWrite ? op.getEntry().getRaw() : TransactionParticipant::kDeadEndSentinel;
 
-    auto stmtIds =
-        isRetryableWrite ? op.getStatementIds() : std::vector<StmtId>{kIncompleteHistoryStmtId};
+    auto stmtIds = [&] {
+        if (!isRetryableWrite)
+            return std::vector<StmtId>{kIncompleteHistoryStmtId};
+        else if (!isRetryableApplyOps)
+            return op.getStatementIds();
+        else
+            return gatherApplyOpsStatementIds(op);
+    }();
     invariant(!stmtIds.empty());
 
     auto opId = ReshardingDonorOplogId::parse(IDLParserContext{"ReshardingOplogSessionApplication"},

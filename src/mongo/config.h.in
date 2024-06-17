@@ -107,6 +107,15 @@
 // Defined if grpc support is enabled
 @mongo_config_grpc@
 
+// Defined if the glibc rseq header is present
+@mongo_config_glibc_rseq@
+
+// Defined if using the tcmalloc-google memory allocator
+@mongo_config_tcmalloc_google@
+
+// Defined if using the tcmalloc-gperf memory allocator
+@mongo_config_tcmalloc_gperf@
+
 
 // Percona specific section
 

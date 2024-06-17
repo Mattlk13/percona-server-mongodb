@@ -45,7 +45,6 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/query/collation/collator_interface.h"
@@ -61,6 +60,7 @@
 #include "mongo/db/s/resharding/resharding_server_parameters_gen.h"
 #include "mongo/db/s/resharding/resharding_txn_cloner.h"
 #include "mongo/db/s/resharding/resharding_util.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/idl/idl_parser.h"
@@ -270,7 +270,7 @@ std::unique_ptr<ReshardingDataReplicationInterface> ReshardingDataReplication::m
     std::shared_ptr<executor::TaskExecutor> collectionClonerExecutor;
     if (!cloningDone) {
         if (resharding::gFeatureFlagReshardingImprovements.isEnabled(
-                serverGlobalParams.featureCompatibility)) {
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
             resharding::data_copy::ensureCollectionExists(
                 opCtx,
                 NamespaceString::kRecipientReshardingResumeDataNamespace,
@@ -518,7 +518,7 @@ ReshardingDonorOplogId ReshardingDataReplication::getOplogFetcherResumeId(
     const UUID& reshardingUUID,
     const NamespaceString& oplogBufferNss,
     Timestamp minFetchTimestamp) {
-    invariant(!opCtx->lockState()->isLocked());
+    invariant(!shard_role_details::getLocker(opCtx)->isLocked());
 
     AutoGetCollection coll(opCtx, oplogBufferNss, MODE_IS);
     if (coll) {

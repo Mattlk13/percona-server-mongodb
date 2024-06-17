@@ -30,7 +30,6 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/matcher/in_list_data.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/string_listset.h"
 
 #include <algorithm>
@@ -62,8 +61,6 @@ InListData::InListData(const InListData& other)
 
 void InListData::appendElements(BSONArrayBuilder& bab, bool getSortedAndDeduped) {
     if (getSortedAndDeduped) {
-        sortAndDedupElements();
-
         for (size_t i = 0; i < _elements.size(); ++i) {
             bab.append(_elements[i]);
         }
@@ -302,6 +299,9 @@ Status InListData::setElementsImpl(boost::optional<BSONObj> arr,
     // Update '_sbeTagMask' and '_hashSetSbeTagMask'.
     updateSbeTagMasks();
 
+    // Sort and de-dup the elements.
+    sortAndDedupElements();
+
     return Status::OK();
 }
 
@@ -331,10 +331,10 @@ void InListData::updateSbeTagMasks() {
     }
 }
 
-void InListData::sortAndDedupElementsImpl() {
-    tassert(7690406,
-            "Cannot call sortAndDedupElementsImpl() after InListData has been prepared",
-            !_prepared);
+void InListData::sortAndDedupElements() {
+    if (_sortedAndDeduped) {
+        return;
+    }
 
     auto elemLt = InListElemLessThan(_collator);
 
@@ -439,8 +439,8 @@ void InListData::makeBSONOwned() {
 void InListData::prepare() {
     tassert(7690409, "Cannot call prepare() when InListData has already been prepared", !_prepared);
 
-    sortAndDedupElements();
     buildHashSet();
+
     _prepared = true;
 }
 

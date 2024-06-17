@@ -4,6 +4,7 @@
 # pylint: disable=redefined-outer-name,invalid-name,subprocess-run-check
 
 import grp
+import json
 import logging
 import os
 import pathlib
@@ -71,8 +72,9 @@ def download_extract_package(package: str) -> List[str]:
 def download_extract_all_packages(package_urls: List[str]) -> List[str]:
     all_packages = []  # type: List[str]
     for package_url in package_urls:
-        package_names = download_extract_package(package_url)
-        all_packages.extend(["./" + package_name for package_name in package_names])
+        if package_url:
+            package_names = download_extract_package(package_url)
+            all_packages.extend(["./" + package_name for package_name in package_names])
     return all_packages
 
 
@@ -414,6 +416,13 @@ def test_stop():
 
 
 def test_install_compass(test_args: TestArgs):
+
+    if test_args['arch'] != "x86_64" or test_args['os_name'] not in ["ubuntu", "almalinux"]:
+        logging.info(
+            "Not installing compass on unsupported platform, see the docs: https://www.mongodb.com/docs/compass/current/install/"
+        )
+        return
+
     logging.info("Installing Compass.")
 
     cmd = []  # type: List[str]
@@ -421,13 +430,7 @@ def test_install_compass(test_args: TestArgs):
         cmd += ["DEBIAN_FRONTEND=noninteractive"]
     cmd += ["install_compass"]
 
-    exec_result = run_and_log(" ".join(cmd), end_on_error=False)
-
-    if exec_result.returncode != 0:
-        if test_args['arch'] == 'x86_64' and test_args['package_manager'] != 'zypper':
-            # install-compass does not work on platforms other than x86_64 and
-            # currently cannot use zypper to install packages.
-            raise RuntimeError("Failed to install compass")
+    run_and_log(" ".join(cmd))
 
 
 def test_uninstall(test_args: TestArgs):
@@ -487,6 +490,7 @@ else:
     sys.exit(1)
 
 test_args = get_test_args(package_manager, package_files)
+logging.info("Test Args:\n%s", json.dumps(test_args, sort_keys=True, indent=4))
 setup(test_args)
 install_fake_systemd(test_args)
 

@@ -22,6 +22,7 @@ selector:
   - jstests/core/timeseries/timeseries_index_use.js
   - jstests/core/timeseries/timeseries_lastpoint.js
   - jstests/core/query/find/finda.js
+  - jstests/core/query/regex/regex_collations.js
   # The following tests check $indexStats and are not expecting to see implicitly created indexes.
   - jstests/core/timeseries/timeseries_index_stats.js
   # The following tests already create some of the indexes we would create implicitly, and may
@@ -35,11 +36,12 @@ selector:
   - jstests/core/query/or_use_clustered_collection.js
   # Latency histogram statistics are affected by the creation of an implicit index.
   - jstests/core/top.js
-  # Creating an implicit index results in the following failure: "add index fails, too many indexes
-  # for test.transaction_too_large_for_cache key"
-  - jstests/core/transaction_too_large_for_cache.js
   # Creating an implicit index causes the plan cache entry we're expecting to be invalidated.
   - jstests/core/query/sbe_plan_cache_autoparameterize_ixscan.js
+  # Multiplanner does not always choose the same plan when the wildcard indexes are considered.
+  - jstests/core/query/or/or_to_in.js
+  # The following test fires a large query that takes too long with wildcard indexes.
+  - jstests/core/query/query_settings/query_settings_size_limits.js
 
   exclude_with_any_tags:
   # This suite implicitly creates compound wildcard indexes.

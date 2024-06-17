@@ -23,6 +23,7 @@ export var DiscoverTopology = (function() {
         res.passives = res.passives || [];
         return {
             type: Topology.kReplicaSet,
+            configsvr: res.configsvr == 2,
             primary: res.primary,
             nodes: [...res.hosts, ...res.passives]
         };
@@ -52,6 +53,7 @@ export var DiscoverTopology = (function() {
 
         const configsvrConn = connectFn(getConfigServerConnectionString());
         const configsvrHosts = getDataMemberConnectionStrings(configsvrConn);
+        configsvrConn.close();
 
         const shards = assert.commandWorked(conn.adminCommand({listShards: 1})).shards;
         const shardHosts = {};
@@ -59,6 +61,7 @@ export var DiscoverTopology = (function() {
         for (let shardInfo of shards) {
             const shardConn = connectFn(shardInfo.host);
             shardHosts[shardInfo._id] = getDataMemberConnectionStrings(shardConn);
+            shardConn.close();
         }
 
         // Discover mongos URIs from the connection string. If a mongos is not passed in explicitly,

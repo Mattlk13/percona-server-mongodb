@@ -263,6 +263,12 @@ AggregateCommandRequest ResolvedView::asExpandedViewAggregation(
         expandedRequest.setHint(request.getHint());
     }
 
+    // If query settings were present in the original request, they should be present in the
+    // 'expandedRequest'.
+    if (request.getQuerySettings()) {
+        expandedRequest.setQuerySettings(request.getQuerySettings());
+    }
+
     expandedRequest.setMaxTimeMS(request.getMaxTimeMS());
     expandedRequest.setReadConcern(request.getReadConcern());
     expandedRequest.setUnwrappedReadPref(request.getUnwrappedReadPref());
@@ -270,6 +276,7 @@ AggregateCommandRequest ResolvedView::asExpandedViewAggregation(
     expandedRequest.setAllowDiskUse(request.getAllowDiskUse());
     expandedRequest.setIsMapReduceCommand(request.getIsMapReduceCommand());
     expandedRequest.setLet(request.getLet());
+    expandedRequest.setIncludeQueryStatsMetrics(request.getIncludeQueryStatsMetrics());
 
     // Operations on a view must always use the default collation of the view. We must have already
     // checked that if the user's request specifies a collation, it matches the collation of the

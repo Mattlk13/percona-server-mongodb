@@ -58,6 +58,7 @@
 #include "mongo/bson/json.h"
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/exec/sbe/expression_test_base.h"
+#include "mongo/db/exec/sbe/sbe_unittest.h"
 #include "mongo/db/exec/sbe/sort_spec.h"
 #include "mongo/db/exec/sbe/values/bson.h"
 #include "mongo/db/exec/sbe/values/value.h"
@@ -206,7 +207,8 @@ protected:
             ASSERT(false) << "Expected error: " << expectedError << " for " << groupSpec
                           << " but succeeded";
         } catch (const DBException& e) {
-            ASSERT_TRUE(e.code() == expectedError) << "group spec: " << groupSpec;
+            ASSERT_TRUE(e.code() == expectedError)
+                << "group spec: " << groupSpec << " received error " << e.code();
         }
     }
 
@@ -274,7 +276,7 @@ protected:
 
     void runSbeIncompatibleGroupSpecTest(const BSONObj& groupSpec,
                                          boost::intrusive_ptr<ExpressionContext>& expCtx) {
-        expCtx->sbeCompatibility = SbeCompatibility::fullyCompatible;
+        expCtx->sbeCompatibility = SbeCompatibility::noRequirements;
         // When we parse and optimize the 'groupSpec' to build a DocumentSourceGroup, those
         // accumulation expressions or '_id' expression that are not supported by SBE will flip the
         // 'sbeCompatible()' flag in the 'groupStage' to false.
@@ -288,7 +290,7 @@ protected:
 
     void runSbeGroupCompatibleFlagTest(const std::vector<BSONObj>& groupSpecs,
                                        boost::intrusive_ptr<ExpressionContext>& expCtx) {
-        expCtx->sbeCompatibility = SbeCompatibility::fullyCompatible;
+        expCtx->sbeCompatibility = SbeCompatibility::noRequirements;
         for (const auto& groupSpec : groupSpecs) {
             // When we parse and optimize the groupSpec to build the DocumentSourceGroup, those
             // AccumulationExpressions or _id expression that are not supported by SBE will flip the
@@ -308,7 +310,7 @@ protected:
             } catch (const DBException& e) {
                 // The accumulator or the _id expression is unsupported in SBE, so we expect that
                 // the sbeCompatible flag should be false.
-                ASSERT(e.code() == 5754701 || e.code() == 5851602) << "group spec: " << groupSpec;
+                ASSERT(e.code() == 5754701 || e.code() == 8679702) << "group spec: " << groupSpec;
                 sbeGroupCompatible = false;
                 break;
             }
@@ -2136,6 +2138,17 @@ TEST_F(SbeStageBuilderGroupTest, SbeIncompatibleExpressionInGroup) {
     }
 }
 
+namespace {
+sbe::value::SlotId registerCollator(stage_builder::StageBuilderState& state,
+                                    const CollatorInterface* collator) {
+    return state.env->registerSlot("collator"_sd,
+                                   sbe::value::TypeTags::collator,
+                                   sbe::value::bitcastFrom<const CollatorInterface*>(collator),
+                                   false,
+                                   state.slotIdGenerator);
+}
+}  // namespace
+
 /**
  * A test fixture designed to test that the expressions generated to combine partial aggregates
  * that have been spilled to disk work correctly. We use 'EExpressionTestFixture' rather than
@@ -2147,7 +2160,20 @@ public:
     explicit SbeStageBuilderGroupAggCombinerTest()
         : _expCtx{make_intrusive<ExpressionContextForTest>()},
           _inputSlotId{bindAccessor(&_inputAccessor)},
-          _collatorSlotId{bindAccessor(&_collatorAccessor)} {}
+          _state{nullptr /* opCtx */,
+                 _env,
+                 nullptr /* planStageData */,
+                 _variables,
+                 nullptr /* yieldPolicy */,
+                 &_slotIdGenerator,
+                 &_frameIdGenerator,
+                 nullptr /* spoolIdGenerator */,
+                 nullptr /* inListsSet */,
+                 nullptr /* collatorsMap */,
+                 nullptr /* sortSpecMap */,
+                 _expCtx,
+                 false /* needsMerge */,
+                 false /* allowDiskUse */} {}
 
     AccumulationStatement makeAccumulationStatement(StringData accumName) {
         return makeAccumulationStatement(BSON("unused" << BSON(accumName << "unused")));
@@ -2169,10 +2195,10 @@ public:
      */
     std::unique_ptr<sbe::vm::CodeFragment> compileSingleInputNoCollator(
         const AccumulationStatement& accStatement) {
-        auto exprs = stage_builder::buildCombinePartialAggregates(
-            accStatement, {_inputSlotId}, boost::none, _frameIdGenerator);
+        auto exprs =
+            stage_builder::AccumOp{accStatement}.buildCombineAggs(_state, {}, {_inputSlotId});
         ASSERT_EQ(exprs.size(), 1u);
-        _expr = std::move(exprs[0]);
+        _expr = exprs[0].extractExpr(_state);
 
         return compileAggExpression(*_expr, &_aggAccessor);
     }
@@ -2193,8 +2219,8 @@ public:
     void aggregateAndAssertResults(BSONArray inputs,
                                    BSONArray expected,
                                    const sbe::vm::CodeFragment* code) {
-        auto [inputTag, inputVal] = makeArray(inputs);
-        auto [expectedTag, expectedVal] = makeArray(expected);
+        auto [inputTag, inputVal] = sbe::makeArray(inputs);
+        auto [expectedTag, expectedVal] = sbe::makeArray(expected);
         return aggregateAndAssertResults(inputTag, inputVal, expectedTag, expectedVal, code);
     }
 
@@ -2311,8 +2337,8 @@ public:
             auto partialAggArr = sbe::value::getArrayView(partialAggVal);
 
             auto [pushedValsTag, pushedValsVal] = accumType == Accumulator::kPush
-                ? makeArray(partialBsonArr)
-                : makeArraySet(partialBsonArr);
+                ? sbe::makeArray(partialBsonArr)
+                : sbe::makeArraySet(partialBsonArr);
             partialAggArr->push_back(pushedValsTag, pushedValsVal);
 
             partialAggArr->push_back(sbe::value::TypeTags::NumberInt64,
@@ -2424,19 +2450,17 @@ public:
         auto [expr, finalizeExpr] = [&]()
             -> std::pair<std::unique_ptr<sbe::EExpression>, std::unique_ptr<sbe::EExpression>> {
             if constexpr (Collation) {
+                auto collatorSlotId = registerCollator(_state, &collator);
+
                 auto expr =
                     stage_builder::makeFunction(aggExpr + "Merge",
                                                 stage_builder::makeVariable(_inputSlotId),
-                                                stage_builder::makeVariable(_collatorSlotId));
+                                                stage_builder::makeVariable(collatorSlotId));
                 auto finalizeExpr =
                     stage_builder::makeFunction(aggExpr + "Finalize",
                                                 stage_builder::makeVariable(aggSlot),
-                                                stage_builder::makeVariable(_collatorSlotId));
+                                                stage_builder::makeVariable(collatorSlotId));
 
-                _collatorAccessor.reset(
-                    false,
-                    sbe::value::TypeTags::collator,
-                    sbe::value::bitcastFrom<const CollatorInterface*>(&collator));
                 return {std::move(expr), std::move(finalizeExpr)};
             } else {
                 auto expr = stage_builder::makeFunction(aggExpr + "Merge",
@@ -2528,8 +2552,8 @@ protected:
     // check that the intermediate value is as expected after every turn of the crank.
     sbe::value::OwnedValueAccessor _aggAccessor;
 
-    sbe::value::OwnedValueAccessor _collatorAccessor;
-    sbe::value::SlotId _collatorSlotId;
+    Variables _variables;
+    stage_builder::StageBuilderState _state;
 
 private:
     BSONObj _accumulationStmtBson;
@@ -2553,15 +2577,13 @@ TEST_F(SbeStageBuilderGroupAggCombinerTest, CombinePartialAggsMin) {
 TEST_F(SbeStageBuilderGroupAggCombinerTest, CombinePartialAggsMinWithCollation) {
     auto accStatement = makeAccumulationStatement("$min"_sd);
 
-    auto exprs = stage_builder::buildCombinePartialAggregates(
-        accStatement, {_inputSlotId}, {_collatorSlotId}, _frameIdGenerator);
-    ASSERT_EQ(exprs.size(), 1u);
-    auto expr = std::move(exprs[0]);
-
     CollatorInterfaceMock collator{CollatorInterfaceMock::MockType::kReverseString};
-    _collatorAccessor.reset(false,
-                            sbe::value::TypeTags::collator,
-                            sbe::value::bitcastFrom<const CollatorInterface*>(&collator));
+
+    registerCollator(_state, &collator);
+
+    auto exprs = stage_builder::AccumOp{accStatement}.buildCombineAggs(_state, {}, {_inputSlotId});
+    ASSERT_EQ(exprs.size(), 1u);
+    auto expr = exprs[0].extractExpr(_state);
 
     auto compiledExpr = compileAggExpression(*expr, &_aggAccessor);
 
@@ -2592,15 +2614,13 @@ TEST_F(SbeStageBuilderGroupAggCombinerTest, CombinePartialAggsMax) {
 TEST_F(SbeStageBuilderGroupAggCombinerTest, CombinePartialAggsMaxWithCollation) {
     auto accStatement = makeAccumulationStatement("$max"_sd);
 
-    auto exprs = stage_builder::buildCombinePartialAggregates(
-        accStatement, {_inputSlotId}, {_collatorSlotId}, _frameIdGenerator);
-    ASSERT_EQ(exprs.size(), 1u);
-    auto expr = std::move(exprs[0]);
-
     CollatorInterfaceMock collator{CollatorInterfaceMock::MockType::kReverseString};
-    _collatorAccessor.reset(false,
-                            sbe::value::TypeTags::collator,
-                            sbe::value::bitcastFrom<const CollatorInterface*>(&collator));
+
+    registerCollator(_state, &collator);
+
+    auto exprs = stage_builder::AccumOp{accStatement}.buildCombineAggs(_state, {}, {_inputSlotId});
+    ASSERT_EQ(exprs.size(), 1u);
+    auto expr = exprs[0].extractExpr(_state);
 
     auto compiledExpr = compileAggExpression(*expr, &_aggAccessor);
 
@@ -2700,15 +2720,13 @@ TEST_F(SbeStageBuilderGroupAggCombinerTest, CombinePartialAggsAddToSet) {
 TEST_F(SbeStageBuilderGroupAggCombinerTest, CombinePartialAggsAddToSetWithCollation) {
     auto accStatement = makeAccumulationStatement("$addToSet"_sd);
 
-    auto exprs = stage_builder::buildCombinePartialAggregates(
-        accStatement, {_inputSlotId}, {_collatorSlotId}, _frameIdGenerator);
-    ASSERT_EQ(exprs.size(), 1u);
-    auto expr = std::move(exprs[0]);
-
     CollatorInterfaceMock collator{CollatorInterfaceMock::MockType::kToLowerString};
-    _collatorAccessor.reset(false,
-                            sbe::value::TypeTags::collator,
-                            sbe::value::bitcastFrom<const CollatorInterface*>(&collator));
+
+    registerCollator(_state, &collator);
+
+    auto exprs = stage_builder::AccumOp{accStatement}.buildCombineAggs(_state, {}, {_inputSlotId});
+    ASSERT_EQ(exprs.size(), 1u);
+    auto expr = exprs[0].extractExpr(_state);
 
     auto compiledExpr = compileAggExpression(*expr, &_aggAccessor);
 
@@ -2727,11 +2745,11 @@ TEST_F(SbeStageBuilderGroupAggCombinerTest, CombinePartialAggsAddToSetWithCollat
     auto [expectedTag, expectedVal] =
         makeArrayAccumVal(BSON_ARRAY(BSON_ARRAY(BSON_ARRAY("bar"
                                                            << "foo")
-                                                << 34)
+                                                << 18)
                                      << BSON_ARRAY(BSON_ARRAY("bar"
                                                               << "baz"
                                                               << "foo")
-                                                   << 51)),
+                                                   << 27)),
                           Accumulator::kAddToSet);
     aggregateAndAssertResults(
         inputValuesTag, inputValuesVal, expectedTag, expectedVal, compiledExpr.get());
@@ -2772,18 +2790,6 @@ TEST_F(SbeStageBuilderGroupAggCombinerTest, CombinePartialAggsMergeObjects) {
         BSON_ARRAY(BSONObj{} << BSONObj{} << BSON("a" << 1) << BSON("a" << 1) << BSON("a" << 1)
                              << BSON("a" << 2 << "b" << 3 << "c" << 4)
                              << BSON("a" << 2 << "b" << 3 << "c" << 4));
-    aggregateAndAssertResults(inputValues, expectedAggStates, compiledExpr.get());
-}
-
-TEST_F(SbeStageBuilderGroupAggCombinerTest, CombinePartialAggsSimpleCount) {
-    auto accStatement = makeAccumulationStatement(BSON("unused" << BSON("$sum" << 1)));
-    auto compiledExpr = compileSingleInputNoCollator(accStatement);
-
-    // $sum:1 is a simple count of the incoming documents, and therefore does not require the
-    // DoubleDouble summation algorithm. In order to combine partial counts, we use a simple
-    // summation.
-    auto inputValues = BSON_ARRAY(5 << 8 << "MISSING" << 4);
-    auto expectedAggStates = BSON_ARRAY(5 << 13 << 13 << 17);
     aggregateAndAssertResults(inputValues, expectedAggStates, compiledExpr.get());
 }
 
@@ -2887,8 +2893,8 @@ TEST_F(SbeStageBuilderGroupAggCombinerTest, CombinePartialAggsAvg) {
 
     // We expect $avg to result in two separate agg expressions: one for computing the sum and the
     // other for computing the count. Both agg expressions read from the same input slot.
-    auto exprs = stage_builder::buildCombinePartialAggregates(
-        accStatement, {_inputSlotId, _inputSlotId}, boost::none, _frameIdGenerator);
+    auto exprs = stage_builder::AccumOp{accStatement}.buildCombineAggs(
+        _state, {}, {_inputSlotId, _inputSlotId});
     ASSERT_EQ(exprs.size(), 2u);
 
     // Compile the first expression and make sure it can combine DoubleDouble summations as
@@ -2903,12 +2909,12 @@ TEST_F(SbeStageBuilderGroupAggCombinerTest, CombinePartialAggsAvg) {
                                       << BSON_ARRAY(1 << 2 << 3ll << 4ll << 5.5 << 6.6)
                                       << BSON_ARRAY(1 << 2 << 3ll << 4ll << 5.5 << 6.6
                                                       << Decimal128(7) << Decimal128(8))));
-    auto doubleDoubleSumExpr = compileAggExpression(*exprs[0], &_aggAccessor);
+    auto doubleDoubleSumExpr = compileAggExpression(*exprs[0].getExpr(_state), &_aggAccessor);
     aggregateAndAssertResults(
         inputTag, inputVal, expectedTag, expectedVal, doubleDoubleSumExpr.get());
 
     // Now compile the second expression and make sure it computes a simple sum.
-    auto simpleSumExpr = compileAggExpression(*exprs[1], &_aggAccessor);
+    auto simpleSumExpr = compileAggExpression(*exprs[1].getExpr(_state), &_aggAccessor);
 
     auto inputValues = BSON_ARRAY(5 << 8 << 0 << 4);
     auto expectedAggStates = BSON_ARRAY(5 << 13 << 13 << 17);

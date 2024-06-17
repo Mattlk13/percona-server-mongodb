@@ -99,7 +99,7 @@ public:
     MockMongoInterface(std::deque<DocumentSource::GetNextResult> mockResults)
         : _mockResults(std::move(mockResults)) {}
 
-    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+    std::unique_ptr<Pipeline, PipelineDeleter> preparePipelineForExecution(
         Pipeline* ownedPipeline,
         ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
         boost::optional<BSONObj> readConcern = boost::none) final {
@@ -111,14 +111,14 @@ public:
         return pipeline;
     }
 
-    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+    std::unique_ptr<Pipeline, PipelineDeleter> preparePipelineForExecution(
         const AggregateCommandRequest& aggRequest,
         Pipeline* pipeline,
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         boost::optional<BSONObj> shardCursorsSortSpec = boost::none,
         ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
         boost::optional<BSONObj> readConcern = boost::none) final {
-        return attachCursorSourceToPipeline(pipeline, shardTargetingPolicy, std::move(readConcern));
+        return preparePipelineForExecution(pipeline, shardTargetingPolicy, std::move(readConcern));
     }
 
 private:
@@ -175,7 +175,7 @@ protected:
         uassertStatusOK(createCollection(
             operationContext(), tempNss.dbName(), BSON("create" << tempNss.coll())));
         if (resharding::gFeatureFlagReshardingImprovements.isEnabled(
-                serverGlobalParams.featureCompatibility)) {
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
             uassertStatusOK(createCollection(
                 operationContext(),
                 NamespaceString::kRecipientReshardingResumeDataNamespace.dbName(),
@@ -239,7 +239,7 @@ protected:
         initializePipelineTest(shardKey, recipientShard, collectionData, configData);
         auto opCtx = operationContext();
         if (resharding::gFeatureFlagReshardingImprovements.isEnabled(
-                serverGlobalParams.featureCompatibility))
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot()))
             opCtx->setLogicalSessionId(makeLogicalSessionId(opCtx));
         TxnNumber txnNum(0);
         while (_cloner->doOneBatch(operationContext(), *_pipeline, txnNum)) {
@@ -260,9 +260,9 @@ protected:
         NamespaceString::createNamespaceString_forTest("test"_sd, "collection_being_resharded"_sd);
     const UUID _sourceUUID = UUID::gen();
     const NamespaceString tempNss =
-        resharding::constructTemporaryReshardingNss(_sourceNss.db_forTest(), _sourceUUID);
+        resharding::constructTemporaryReshardingNss(_sourceNss, _sourceUUID);
     const UUID _reshardingUUID = UUID::gen();
-    const ReshardingSourceId _sourceId{UUID::gen(), _myShardName};
+    const ReshardingSourceId _sourceId{UUID::gen(), kMyShardName};
     const DatabaseVersion _sourceDbVersion{UUID::gen(), Timestamp(1, 1)};
 
     std::unique_ptr<ReshardingMetrics> _metrics;
@@ -298,7 +298,7 @@ TEST_F(ReshardingCollectionClonerTest, MinKeyChunk) {
     };
 
     runPipelineTest(std::move(sk),
-                    _myShardName,
+                    kMyShardName,
                     std::move(collectionData),
                     std::move(configData),
                     kExpectedCopiedCount,

@@ -185,7 +185,8 @@ class TestRunner(Subcommand):
     def generate_multiversion_exclude_tags(self):
         """Generate multiversion exclude tags file."""
         generate_multiversion_exclude_tags.generate_exclude_yaml(
-            config.MULTIVERSION_BIN_VERSION, config.EXCLUDE_TAGS_FILE_PATH, self._resmoke_logger)
+            config.MULTIVERSION_BIN_VERSION, config.EXCLUDE_TAGS_FILE_PATH, config.EXPANSIONS_FILE,
+            self._resmoke_logger)
 
     @staticmethod
     def _find_suites_by_test(suites: List[Suite]):
@@ -316,7 +317,8 @@ class TestRunner(Subcommand):
         if task is None:
             for current_task in evg_conf.tasks:
                 func = current_task.find_func_command("run tests") \
-                    or current_task.find_func_command("generate resmoke tasks")
+                    or current_task.find_func_command("generate resmoke tasks") \
+                    or current_task.find_func_command("run benchmark tests")
                 if func and get_dict_value(func, ["vars", "suite"]) == suite_name:
                     task = current_task
                     break
@@ -376,8 +378,9 @@ class TestRunner(Subcommand):
             with open('resmoke_env_options.txt') as fin:
                 resmoke_env_options = fin.read().strip()
 
-        self._resmoke_logger.info("resmoke.py invocation for local usage: %s %s",
-                                  resmoke_env_options, local_resmoke_invocation)
+        local_resmoke_invocation = f"{resmoke_env_options} {local_resmoke_invocation}"
+        self._resmoke_logger.info("resmoke.py invocation for local usage: %s",
+                                  local_resmoke_invocation)
 
         lines = []
 
@@ -947,6 +950,11 @@ class RunPlugin(PluginInterface):
                             help="Number of clients running tests per fixture.")
 
         parser.add_argument(
+            "--useTenantClient", default=False, dest="use_tenant_client", action="store_true", help=
+            "Use tenant client. If set, each client will be constructed with a generated tenant id."
+        )
+
+        parser.add_argument(
             "--shellConnString", dest="shell_conn_string", metavar="CONN_STRING",
             help="Overrides the default fixture and connects with a mongodb:// connection"
             " string to an existing MongoDB cluster instead. This is useful for"
@@ -958,6 +966,16 @@ class RunPlugin(PluginInterface):
             help="Convenience form of --shellConnString for connecting to an"
             " existing MongoDB cluster with the URL mongodb://localhost:[PORT]."
             " This is useful for connecting to a server running in a debugger.")
+
+        parser.add_argument("--shellGRPC", dest="shell_grpc", action="store_true",
+                            help="Whether to use gRPC by default when connecting via the shell.")
+
+        parser.add_argument("--shellTls", dest="shell_tls_enabled", action="store_true",
+                            help="Whether to use TLS when connecting.")
+
+        parser.add_argument("--shellTlsCertificateKeyFile", dest="shell_tls_certificate_key_file",
+                            metavar="SHELL_TLS_CERTIFICATE_KEY_FILE",
+                            help="The TLS certificate to use when connecting.")
 
         parser.add_argument("--repeat", "--repeatSuites", type=int, dest="repeat_suites",
                             metavar="N",
@@ -1106,6 +1124,11 @@ class RunPlugin(PluginInterface):
             metavar="ON|OFF", help=("Enable or disable majority read concern support."
                                     " Defaults to %(default)s."))
 
+        mongodb_server_options.add_argument(
+            "--enableEnterpriseTests", action="store", dest="enable_enterprise_tests", default="on",
+            choices=("on", "off"), metavar="ON|OFF",
+            help=("Enable or disable enterprise tests. Defaults to 'on'."))
+
         mongodb_server_options.add_argument("--flowControl", action="store", dest="flow_control",
                                             choices=("on", "off"), metavar="ON|OFF",
                                             help=("Enable or disable flow control."))
@@ -1122,6 +1145,25 @@ class RunPlugin(PluginInterface):
             "--storageEngineCacheSizeGB", dest="storage_engine_cache_size_gb", metavar="CONFIG",
             help="Sets the storage engine cache size configuration"
             " setting for all mongod's.")
+
+        mongodb_server_options.add_argument(
+            "--tlsMode", dest="tls_mode", metavar="TLS_MODE", help="Indicates what TLS mode mongod "
+            "and mongos servers should be started with. See also: https://www.mongodb.com"
+            "/docs/manual/reference/configuration-options/#mongodb-setting-net.tls.mode")
+
+        mongodb_server_options.add_argument(
+            "--tlsCAFile", dest="tls_ca_file", metavar="TLS_CA_FILE",
+            help="Path to the CA certificate file to be used by all clients and servers.")
+
+        mongodb_server_options.add_argument(
+            "--mongodTlsCertificateKeyFile", dest="mongod_tls_certificate_key_file",
+            metavar="MONGOD_TLS_CERTIFICATE_KEY_FILE",
+            help="Path to the TLS certificate to be used by all mongods.")
+
+        mongodb_server_options.add_argument(
+            "--mongosTlsCertificateKeyFile", dest="mongos_tls_certificate_key_file",
+            metavar="MONGOS_TLS_CERTIFICATE_KEY_FILE",
+            help="Path to the TLS certificate to be used by all mongoses.")
 
         mongodb_server_options.add_argument(
             "--numReplSetNodes", type=int, dest="num_replset_nodes", metavar="N",
@@ -1165,6 +1207,10 @@ class RunPlugin(PluginInterface):
             "--configShard", dest="config_shard", metavar="CONFIG",
             help="If set, specifies which node is the config shard. Can also be set to 'any'.")
 
+        mongodb_server_options.add_argument(
+            "--embeddedRouter", dest="embedded_router", metavar="CONFIG",
+            help="If set, uses embedded routers instead of dedicated mongos.")
+
         internal_options = parser.add_argument_group(
             title=_INTERNAL_OPTIONS_TITLE,
             description=("Internal options for advanced users and resmoke developers."
@@ -1193,10 +1239,6 @@ class RunPlugin(PluginInterface):
         #     actually running analysis, which can be time and resource intensive.
         internal_options.add_argument("--internalParam", action="append", dest="internal_params",
                                       help=argparse.SUPPRESS)
-
-        internal_options.add_argument("--perfReportFile", dest="perf_report_file",
-                                      metavar="PERF_REPORT",
-                                      help="Writes a JSON file with performance test results.")
 
         internal_options.add_argument("--cedarReportFile", dest="cedar_report_file",
                                       metavar="CEDAR_REPORT",
@@ -1295,6 +1337,9 @@ class RunPlugin(PluginInterface):
 
         evergreen_options.add_argument("--versionId", dest="version_id", metavar="VERSION_ID",
                                        help="Sets the version ID of the task.")
+
+        evergreen_options.add_argument("--taskWorkDir", dest="work_dir", metavar="TASK_WORK_DIR",
+                                       help="Sets the working directory of the task.")
 
         evergreen_options.add_argument(
             "--projectConfigPath", dest="evg_project_config_path",

@@ -74,7 +74,6 @@
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_tags.h"
-#include "mongo/s/client/shard_remote_gen.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/decorable.h"
@@ -144,7 +143,10 @@ public:
                     break;
                 }
                 default:
-                    MONGO_UNREACHABLE;
+                    uasserted(ErrorCodes::IllegalOperation,
+                              str::stream()
+                                  << Request::kCommandName
+                                  << " can only be run over a specific collection or database");
             }
 
             auto exec = metadata_consistency_util::makeQueuedPlanExecutor(
@@ -180,7 +182,7 @@ public:
             OperationContext* opCtx,
             const CollectionType& coll,
             std::vector<MetadataInconsistencyItem>& inconsistenciesMerged) {
-            auto chunksInconsistencies = metadata_consistency_util::checkChunksInconsistencies(
+            auto chunksInconsistencies = metadata_consistency_util::checkChunksConsistency(
                 opCtx, coll, _getCollectionChunks(opCtx, coll));
 
             inconsistenciesMerged.insert(inconsistenciesMerged.end(),
@@ -195,7 +197,7 @@ public:
                 std::make_move_iterator(collectionsInconsistencies.begin()),
                 std::make_move_iterator(collectionsInconsistencies.end()));
 
-            auto zonesInconsistencies = metadata_consistency_util::checkZonesInconsistencies(
+            auto zonesInconsistencies = metadata_consistency_util::checkZonesConsistency(
                 opCtx, coll, _getCollectionZones(opCtx, coll.getNss()));
 
             inconsistenciesMerged.insert(inconsistenciesMerged.end(),

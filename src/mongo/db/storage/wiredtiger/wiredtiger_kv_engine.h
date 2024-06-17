@@ -133,12 +133,65 @@ struct WiredTigerBackup {
     inline static const std::string kOngoingBackupFile = "ongoingBackup.lock";
 };
 
+class SectionActivityPermit {
+public:
+    /**
+     * The default constructor tries to get an Activity Permit. If the section reading acitivities
+     * are permited, _permitActive is set to true.
+     */
+    SectionActivityPermit(WiredTigerEventHandler* eventHandler) : _eventHandler(eventHandler) {
+        if (_eventHandler->getSectionActivityPermit()) {
+            _permitActive = true;
+        }
+    }
+
+    /**
+     * The copy constructor is deleted so that the returned value from tryGetSectionActivityPermit
+     * function is guranteed to use the move constructor.
+     */
+    SectionActivityPermit(const SectionActivityPermit&) = delete;
+
+    /**
+     * The move constructor resets _eventHandler to NULL and _permitActive to false to make the
+     * "other" object stale.
+     */
+    SectionActivityPermit(SectionActivityPermit&& other) noexcept {
+        _eventHandler = other._eventHandler;
+        _permitActive = other._permitActive;
+        other._eventHandler = nullptr;
+        other._permitActive = false;
+    }
+
+    /**
+     * Returns whether the permit is ready.
+     */
+    bool ready() {
+        return _permitActive;
+    }
+
+    /**
+     * When the section generation activity for a reader is done, this destructor is called (one of
+     * the permits is released). The destructor call releases the section generation activity
+     * permit. If it is a _eventHandler is NULL (the object is stale, the permit is tranferred) or
+     * _permitActive is false (no permit was issued), releaseSectionActivityPermit is not called. If
+     * all the permits are released WT connection is allowed to shut down cleanly.
+     */
+    ~SectionActivityPermit() {
+        if (_eventHandler && _permitActive) {
+            _eventHandler->releaseSectionActivityPermit();
+        }
+    }
+
+private:
+    WiredTigerEventHandler* _eventHandler;
+    bool _permitActive{false};
+};
+
 class WiredTigerKVEngine final : public KVEngine {
 public:
     static StringData kTableUriPrefix;
 
-    WiredTigerKVEngine(OperationContext* opCtx,
-                       const std::string& canonicalName,
+    WiredTigerKVEngine(const std::string& canonicalName,
                        const std::string& path,
                        ClockSource* cs,
                        const std::string& extraOpenOptions,
@@ -149,9 +202,10 @@ public:
                        const encryption::MasterKeyProviderFactory& keyProviderFactory =
                            encryption::MasterKeyProvider::create);
 
-    ~WiredTigerKVEngine();
+    ~WiredTigerKVEngine() override;
 
-    void notifyStartupComplete() override;
+    void notifyStorageStartupRecoveryComplete() override;
+    void notifyReplStartupRecoveryComplete(OperationContext* opCtx) override;
 
     void setRecordStoreExtraOptions(const std::string& options);
     void setSortedDataInterfaceExtraOptions(const std::string& options);
@@ -165,7 +219,7 @@ public:
         return !isEphemeral();
     }
 
-    void checkpoint(OperationContext* opCtx) override;
+    void checkpoint() override;
 
     // Force a WT checkpoint, this will not update internal timestamps.
     void forceCheckpoint(bool useStableTimestamp);
@@ -198,6 +252,10 @@ public:
                                                 const NamespaceString& nss,
                                                 StringData ident,
                                                 const CollectionOptions& options) override;
+
+    std::unique_ptr<RecordStore> getTemporaryRecordStore(OperationContext* opCtx,
+                                                         StringData ident,
+                                                         KeyFormat keyFormat) override;
 
     std::unique_ptr<RecordStore> makeTemporaryRecordStore(OperationContext* opCtx,
                                                           StringData ident,
@@ -258,7 +316,7 @@ public:
                             const IndexDescriptor* desc,
                             bool isForceUpdateMetadata) override;
 
-    Status alterMetadata(OperationContext* opCtx, StringData uri, StringData config);
+    Status alterMetadata(StringData uri, StringData config);
 
     void keydbDropDatabase(const DatabaseName& dbName) override;
 
@@ -271,14 +329,11 @@ public:
     Status disableIncrementalBackup(OperationContext* opCtx) override;
 
     StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>> beginNonBlockingBackup(
-        OperationContext* opCtx,
-        boost::optional<Timestamp> checkpointTimestamp,
-        const StorageEngine::BackupOptions& options) override;
+        OperationContext* opCtx, const StorageEngine::BackupOptions& options) override;
 
     void endNonBlockingBackup(OperationContext* opCtx) override;
 
-    virtual StatusWith<std::deque<std::string>> extendBackupCursor(
-        OperationContext* opCtx) override;
+    StatusWith<std::deque<std::string>> extendBackupCursor(OperationContext* opCtx) override;
 
     Status hotBackup(OperationContext* opCtx, const std::string& path) override;
     Status hotBackupTar(OperationContext* opCtx, const std::string& path) override;
@@ -344,9 +399,9 @@ public:
 
     Timestamp getAllDurableTimestamp() const override;
 
-    bool supportsReadConcernSnapshot() const final override;
+    bool supportsReadConcernSnapshot() const final;
 
-    bool supportsOplogTruncateMarkers() const final override;
+    bool supportsOplogTruncateMarkers() const final;
 
     bool supportsReadConcernMajority() const final;
 
@@ -393,8 +448,6 @@ public:
     WiredTigerOplogManager* getOplogManager() const {
         return _oplogManager.get();
     }
-
-    static void appendGlobalStats(OperationContext* opCtx, BSONObjBuilder& b);
 
     Timestamp getStableTimestamp() const override;
     Timestamp getOldestTimestamp() const override;
@@ -444,6 +497,8 @@ public:
                                              Timestamp requestedTimestamp,
                                              bool roundUpIfTooOld) override;
 
+    Status autoCompact(OperationContext* opCtx, const AutoCompactOptions& options) override;
+
 private:
     StatusWith<Timestamp> _pinOldestTimestamp(WithLock,
                                               const std::string& requestingServiceName,
@@ -468,7 +523,7 @@ public:
     size_t getCacheSizeMB() const override;
 
     // TODO SERVER-81069: Remove this since it's intrinsically tied to encryption options only.
-    StatusWith<BSONObj> getSanitizedStorageOptionsForSecondaryReplication(
+    BSONObj getSanitizedStorageOptionsForSecondaryReplication(
         const BSONObj& options) const override;
 
     /**
@@ -476,6 +531,61 @@ public:
      * dictated by the _sizeStorerSyncTracker.
      */
     void sizeStorerPeriodicFlush();
+
+    /**
+     * WT WiredTigerServerStatusSection::generateSection activity is permitted if WT connection is
+     * ready and it is not shutting down. In that case, a tryGetSectionActivityPermit call returns a
+     * SectionActivityPermit object indcating that the caller may safely collect metrics and the
+     * storage engine shutdown will be blocked until the caller is done with collection. When the
+     * metrics collection is not allowed, a tryGetSectionActivityPermit call returns boost::none.
+     * ~SectionActivityPermit releases the permit.
+     */
+    boost::optional<SectionActivityPermit> tryGetSectionActivityPermit() {
+        SectionActivityPermit permit(&_eventHandler);
+        if (permit.ready()) {
+            return permit;
+        }
+        return boost::none;
+    }
+
+    /**
+     * Returns the number of active sections.
+     */
+    int32_t getActiveSections() {
+        return _eventHandler.getActiveSections();
+    }
+
+    /**
+     * If WT connection is made and WT connection is not closing down, WT Connection Ready Status is
+     * true. This function is unsafe because the connection can close immediately after this check
+     * returns true. By calling tryGetSectionActivityPermit(), a permit for section activity can be
+     * acquired and it can be made sure that the connection is open and will not close until the
+     * permit goes out of scope and the destructor for the permit releases it.
+     */
+    bool getWtConnReadyStatus_UNSAFE() {
+        return _eventHandler.getWtConnReadyStatus();
+    }
+    /**
+     * WT WiredTigerServerStatusSection::generateSection activity is permitted if WT connection is
+     * ready and it is not closing down. Calling tryGetSectionActivityPermit() is the recommended
+     * way to get the permit for section metrics collection because it guarantees the release of the
+     * permit. If getSectionActivityPermit_UNSAFE is used to get a permit, the caller *must* make a
+     * subsequent call to `releaseSectionActivityPermit` to allow the storage engine to shut down.
+
+     */
+    bool getSectionActivityPermit_UNSAFE() {
+        return _eventHandler.getSectionActivityPermit();
+    }
+
+    /**
+     * The releaseSectionActivityPermit_UNSAFE() call releases section generation activity permits.
+     * When no permits are held by the readers, WT connection is allowed to shut down cleanly.
+     * releaseSectionActivityPermit_UNSAFE can only be safely called after a preceding
+     * getSectionActivityPermit_UNSAFE call.
+     */
+    void releaseSectionActivityPermit_UNSAFE() {
+        _eventHandler.releaseSectionActivityPermit();
+    }
 
 private:
     class WiredTigerSessionSweeper;
@@ -490,7 +600,7 @@ private:
     // srcPath, destPath, filename, size to copy
     typedef std::tuple<boost::filesystem::path, boost::filesystem::path, boost::uintmax_t, std::time_t> FileTuple;
 
-    void _checkpoint(OperationContext* opCtx, WT_SESSION* session);
+    void _checkpoint(WT_SESSION* session);
 
     void _checkpoint(WT_SESSION* session, bool useTimestamp);
 
@@ -512,7 +622,7 @@ private:
      */
     void _openWiredTiger(const std::string& path, const std::string& wtOpenConfig);
 
-    Status _salvageIfNeeded(OperationContext* opCtx, const char* uri);
+    Status _salvageIfNeeded(const char* uri);
     void _ensureIdentPath(StringData ident);
 
     /**
@@ -522,7 +632,7 @@ private:
      * Returns DataModifiedByRepair if the rebuild was successful, and any other error on failure.
      * This will never return Status::OK().
      */
-    Status _rebuildIdent(OperationContext* opCtx, WT_SESSION* session, const char* uri);
+    Status _rebuildIdent(WT_SESSION* session, const char* uri);
 
     bool _hasUri(WT_SESSION* session, const std::string& uri) const;
 

@@ -2,7 +2,7 @@
 //
 // @tags: [
 //   # The test runs commands that are not allowed with security token: setProfilingLevel.
-//   not_allowed_with_security_token,
+//   not_allowed_with_signed_security_token,
 //   # Asserts on the number of index keys modified.
 //   assumes_no_implicit_index_creation,
 //   requires_fcv_70,
@@ -101,7 +101,7 @@ for (var i = 0; i < 3; i++) {
 // A clustered collection doesn't actually have an index on _id, and queries involve an efficient
 // bounded collection scan.
 const expectedKeysInserted = collectionIsClustered ? 0 : 1;
-const expectedDocsExamined = collectionIsClustered ? 1 : 0;
+const expectedDocsExamined = 0;
 assert.eq({_id: 4, a: 1},
           coll.findAndModify({query: {_id: 4}, update: {$inc: {a: 1}}, upsert: true, new: true}));
 profileObj = getLatestProfilerEntry(testDB);

@@ -262,7 +262,7 @@ StatusWith<ClusterCursorManager::PinnedCursor> ClusterCursorManager::checkOutCur
     cursorGuard->reattachToOperationContext(opCtx);
 
     CurOp::get(opCtx)->debug().queryHash = cursorGuard->getQueryHash();
-    CurOp::get(opCtx)->debug().queryStatsKeyHash = cursorGuard->getQueryStatsKeyHash();
+    CurOp::get(opCtx)->debug().queryStatsInfo.keyHash = cursorGuard->getQueryStatsKeyHash();
 
     return PinnedCursor(this, std::move(cursorGuard), entry->getNamespace(), cursorId);
 }
@@ -320,7 +320,7 @@ void ClusterCursorManager::killOperationUsingCursor(WithLock, CursorEntry* entry
     invariant(entry->getOperationUsingCursor());
     // Interrupt any operation currently using the cursor.
     OperationContext* opUsingCursor = entry->getOperationUsingCursor();
-    stdx::lock_guard<Client> lk(*opUsingCursor->getClient());
+    ClientLock lk(opUsingCursor->getClient());
     opUsingCursor->getServiceContext()->killOperation(lk, opUsingCursor, ErrorCodes::CursorKilled);
 
     // Don't delete the cursor, as an operation is using it. It will be cleaned up when the
@@ -446,35 +446,26 @@ size_t ClusterCursorManager::cursorsTimedOut() const {
     return _cursorsTimedOut;
 }
 
-ClusterCursorManager::Stats ClusterCursorManager::stats() const {
-    stdx::lock_guard<Latch> lk(_mutex);
-
-    Stats stats;
-
+auto ClusterCursorManager::getOpenCursorStats() const -> OpenCursorStats {
+    OpenCursorStats stats{};
+    stdx::lock_guard lk(_mutex);
     for (auto&& [cursorId, entry] : _cursorEntryMap) {
-        if (entry.isKillPending()) {
-            // Killed cursors do not count towards the number of pinned cursors or the number of
-            // open cursors.
+        if (entry.isKillPending())
             continue;
-        }
-
-        if (entry.getOperationUsingCursor()) {
-            ++stats.cursorsPinned;
-        }
-
+        if (entry.getOperationUsingCursor())
+            ++stats.pinned;
         switch (entry.getCursorType()) {
             case CursorType::SingleTarget:
-                ++stats.cursorsSingleTarget;
+                ++stats.singleTarget;
                 break;
             case CursorType::MultiTarget:
-                ++stats.cursorsMultiTarget;
+                ++stats.multiTarget;
                 break;
             case CursorType::QueuedData:
-                ++stats.cursorsQueuedData;
+                ++stats.queuedData;
                 break;
         }
     }
-
     return stats;
 }
 
@@ -608,21 +599,25 @@ StatusWith<ClusterClientCursorGuard> ClusterCursorManager::_detachCursor(WithLoc
 void collectQueryStatsMongos(OperationContext* opCtx, std::unique_ptr<query_stats::Key> key) {
     // If we haven't registered a cursor to prepare for getMore requests, we record
     // queryStats directly.
-    auto&& opDebug = CurOp::get(opCtx)->debug();
-    int64_t execTime = opDebug.additiveMetrics.executionTime.value_or(Microseconds{0}).count();
-    query_stats::writeQueryStats(opCtx,
-                                 opDebug.queryStatsKeyHash,
-                                 std::move(key),
-                                 execTime,
-                                 execTime,
-                                 opDebug.additiveMetrics.nreturned.value_or(0));
+    auto& opDebug = CurOp::get(opCtx)->debug();
+
+    auto snapshot = query_stats::captureMetrics(
+        opCtx,
+        query_stats::microsecondsToUint64(opDebug.additiveMetrics.executionTime),
+        opDebug.additiveMetrics);
+
+    query_stats::writeQueryStats(opCtx, opDebug.queryStatsInfo.keyHash, std::move(key), snapshot);
 }
 
 void collectQueryStatsMongos(OperationContext* opCtx, ClusterClientCursorGuard& cursor) {
+    auto& opDebug = CurOp::get(opCtx)->debug();
+    opDebug.additiveMetrics.aggregateDataBearingNodeMetrics(cursor->takeRemoteMetrics());
     cursor->incrementCursorMetrics(CurOp::get(opCtx)->debug().additiveMetrics);
 }
 
 void collectQueryStatsMongos(OperationContext* opCtx, ClusterCursorManager::PinnedCursor& cursor) {
+    auto& opDebug = CurOp::get(opCtx)->debug();
+    opDebug.additiveMetrics.aggregateDataBearingNodeMetrics(cursor->takeRemoteMetrics());
     cursor->incrementCursorMetrics(CurOp::get(opCtx)->debug().additiveMetrics);
 }
 

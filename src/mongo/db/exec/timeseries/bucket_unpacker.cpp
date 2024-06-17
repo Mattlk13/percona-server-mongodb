@@ -389,6 +389,8 @@ std::size_t BucketUnpackerV2::numberOfFields() {
     // and possibly the meta field.
     return kFixedFieldNumber + _fieldColumns.size();
 }
+
+using BucketUnpackerV3 = BucketUnpackerV2;
 }  // namespace
 
 BucketUnpacker::BucketUnpacker() = default;
@@ -569,19 +571,35 @@ void BucketUnpacker::reset(BSONObj&& bucket, bool bucketMatchedQuery) {
     uassert(5857903,
             "The $_internalUnpackBucket stage requires 'control.version' field to be present",
             versionField && isNumericBSONType(versionField.type()));
-    auto version = versionField.Number();
+    auto version = versionField.safeNumberInt();
 
-    if (version == 1) {
-        _unpackingImpl = std::make_unique<BucketUnpackerV1>(timeFieldElem);
-    } else if (version == 2) {
-        auto countField = controlField.Obj()[kBucketControlCountFieldName];
-        _unpackingImpl =
-            std::make_unique<BucketUnpackerV2>(timeFieldElem,
-                                               countField && isNumericBSONType(countField.type())
-                                                   ? static_cast<int>(countField.Number())
-                                                   : -1);
-    } else {
-        uasserted(5857900, "Invalid bucket version");
+    switch (version) {
+        case kTimeseriesControlUncompressedVersion: {
+            _unpackingImpl = std::make_unique<BucketUnpackerV1>(timeFieldElem);
+            break;
+        }
+        case kTimeseriesControlCompressedSortedVersion: {
+            auto countField = controlField.Obj()[kBucketControlCountFieldName];
+            _unpackingImpl = std::make_unique<BucketUnpackerV2>(
+                timeFieldElem,
+                countField && isNumericBSONType(countField.type())
+                    ? static_cast<int>(countField.Number())
+                    : -1);
+            break;
+        }
+        case kTimeseriesControlCompressedUnsortedVersion: {
+            auto countField = controlField.Obj()[kBucketControlCountFieldName];
+            _unpackingImpl = std::make_unique<BucketUnpackerV3>(
+                timeFieldElem,
+                countField && isNumericBSONType(countField.type())
+                    ? static_cast<int>(countField.Number())
+                    : -1);
+            break;
+        }
+        default: {
+            uasserted(5857900, "Invalid bucket version");
+            break;
+        }
     }
 
     // Walk the data region of the bucket, and decide if an iterator should be set up based on the
@@ -639,12 +657,17 @@ void BucketUnpacker::eraseMetaFromFieldSetAndDetermineIncludeMeta() {
     }
 }
 
-void BucketUnpacker::eraseExcludedComputedMetaProjFields() {
-    if (_spec.behavior() == BucketSpec::Behavior::kExclude) {
-        for (const auto& field : _spec.fieldSet()) {
-            _spec.eraseFromComputedMetaProjFields(field);
-        }
-    }
+void BucketUnpacker::eraseUnneededComputedMetaProjFields() {
+    //  If this is an inclusion spec and the current computed field is not part of in the include
+    //  fields, it means the computed field should not be available after the current unpack stage.
+    //  Similarly, for exclusion spec, if the current computed field is part of the exclude fields,
+    //  the computed fields should not be available after the current unpack stage. This can happen
+    //  if there was a $project stage after a $addFields stage.
+    bool removeIfInFieldSet = _spec.behavior() == BucketSpec::Behavior::kExclude;
+    auto conditionToErase = [&](const std::string& computedField) {
+        return _spec.fieldSet().contains(computedField) == removeIfInFieldSet;
+    };
+    _spec.eraseIfPredTrueFromComputedMetaProjFields(conditionToErase);
 }
 
 void BucketUnpacker::setBucketSpec(BucketSpec&& bucketSpec) {
@@ -652,7 +675,7 @@ void BucketUnpacker::setBucketSpec(BucketSpec&& bucketSpec) {
 
     eraseMetaFromFieldSetAndDetermineIncludeMeta();
     determineIncludeTimeField();
-    eraseExcludedComputedMetaProjFields();
+    eraseUnneededComputedMetaProjFields();
 
     _includeMinTimeAsMetadata = _spec.includeMinTimeAsMetadata;
     _includeMaxTimeAsMetadata = _spec.includeMaxTimeAsMetadata;

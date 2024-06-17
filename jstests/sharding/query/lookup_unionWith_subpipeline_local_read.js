@@ -2,18 +2,28 @@
  * Tests $lookup, $graphLookup, and $unionWith in a sharded environment to verify the local read
  * behavior of subpipelines dispatched as part of these stages.
  *
- * Requiers 7.1 to avoid multiversion problems because we updated targeting logic.
- * @tags: [requires_majority_read_concern, requires_fcv_71]
+ * Requires 7.3 to avoid multiversion problems because we updated targeting logic.
+ * @tags: [
+ *   requires_majority_read_concern,
+ *   requires_fcv_73,
+ *   # TODO (SERVER-85629): Re-enable this test once redness is resolved in multiversion suites.
+ *   DISABLED_TEMPORARILY_DUE_TO_FCV_UPGRADE,
+ *   requires_fcv_80
+ * ]
  */
 
 import {arrayEq} from "jstests/aggregation/extras/utils.js";
 import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
 import {enableLocalReadLogs, getLocalReadCount} from "jstests/libs/local_reads.js";
 import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
 import {
     profilerHasAtLeastOneMatchingEntryOrThrow,
     profilerHasZeroMatchingEntriesOrThrow
 } from "jstests/libs/profiler.js";
+import {
+    moveDatabaseAndUnshardedColls
+} from "jstests/sharding/libs/move_database_and_unsharded_coll_helper.js";
 
 const st = new ShardingTest({
     name: jsTestName(),
@@ -121,20 +131,19 @@ function assertProfilerEntriesMatch(expected, comment, pipeline) {
                     {"command.aggregate": {$eq: foreignNs}},
                     {"command.aggregate": {$eq: foreign.getName()}}
                 ],
-                "command.comment": comment
+                "command.comment": comment,
+                "errName": {$ne: "StaleConfig"}
             };
-            const remoteSubpipelineCount = node.getDB(dbName).system.profile.find(filter).itcount();
             if (expected.subPipelineRemote[i]) {
-                assert.gt(remoteSubpipelineCount,
-                          0,
-                          `Expected non-zero count of profiler entries for ${node.name}`);
+                profilerHasAtLeastOneMatchingEntryOrThrow({
+                    profileDB: node.getDB(dbName),
+                    filter: filter,
+                });
             } else {
-                assert.eq(
-                    0,
-                    remoteSubpipelineCount,
-                    () => 'Expected zero profiler entries but found: ' + tojson({
-                              [node.name]: node.getDB(dbName).system.profile.find(filter).toArray()
-                          }));
+                profilerHasZeroMatchingEntriesOrThrow({
+                    profileDB: node.getDB(dbName),
+                    filter: filter,
+                });
             }
         }
 
@@ -193,10 +202,10 @@ function assertAggResultAndRouting(pipeline, expectedResults, opts, expected) {
 // $unionWith tests
 //
 
-// Ensure the $unionWith stage is executed on the primary to reduce flakiness.
+// Ensure the $unionWith stage is executed on the same shard to reduce flakiness.
 let pipeline = [
     {$unionWith: {coll: foreign.getName(), pipeline: [{$match: {b: {$gte: 0}}}]}},
-    {$_internalSplitPipeline: {mergeType: "primaryShard"}}
+    {$_internalSplitPipeline: {mergeType: {"specificShard": st.shard0.shardName}}}
 ];
 let expectedRes = [
     {_id: -2, a: -2},
@@ -311,8 +320,8 @@ st.shardColl(local, {_id: 1}, {_id: 0}, {_id: 0});
 
 assertAggResultAndRouting(pipeline, expectedRes, {comment: "graphLookup_to_unsharded"}, {
     toplevelExec: [true, true],
-    // The primary shard executing the $graphLookup can read locally from the foreign collection,
-    // since it is unsharded. The other node sends the subpipelines over the network.
+    // The shard executing the $graphLookup can read locally from the foreign collection,
+    // since it is unsharded.
     subPipelineLocal: [true, false],
     subPipelineRemote: [true, false]
 });
@@ -324,10 +333,9 @@ st.shardColl(foreign, {_id: 1}, {_id: 0}, {_id: 0});
 pipeline[0].$graphLookup.from = "viewOfSharded";
 assertAggResultAndRouting(pipeline, expectedRes, {comment: "graphLookup_to_view_of_sharded"}, {
     toplevelExec: [true, true],
-    // Each node executing the $graphLookup will perform a scatter-gather query and open a cursor on
-    // every shard that contains the foreign collection. The non-primary shard sends one additional
-    // query which helps it resolve the sharded view.
     subPipelineLocal: [false, false],
+    // The node executing the $graphLookup will perform a scatter-gather query and open a cursor on
+    // every shard that contains the foreign collection.
     subPipelineRemote: [true, true]
 });
 
@@ -337,8 +345,8 @@ st.shardColl(local, {_id: 1}, {_id: 0}, {_id: 0});
 pipeline[0].$graphLookup.from = "viewOfUnsharded";
 assertAggResultAndRouting(pipeline, expectedRes, {comment: "graphLookup_to_view_of_unsharded"}, {
     toplevelExec: [true, true],
-    // The primary shard executing the $graphLookup can read locally from the foreign collection,
-    // since it is unsharded. The other node sends the subpipelines over the network.
+    // The shard executing the $graphLookup can read locally from the foreign collection, since it
+    // is unsharded. The other node sends the subpipelines over the network.
     subPipelineLocal: [true, false],
     subPipelineRemote: [true, false]
 });
@@ -455,50 +463,62 @@ assertAggResultAndRouting(pipeline, expectedRes, {comment: "lookup_to_view_of_un
     subPipelineRemote: [false, false],
 });
 
-// Test $lookup when it is routed to a secondary which is not yet aware of the foreign collection.
-st.shardColl(local, {_id: 1}, {_id: 0}, {_id: 0});
+// TODO SERVER-77915 remove this test case since the unsharded collection are now tracked and cannot
+// be unknown by a the secondary node: The secondary node in the below test case has staleDbVersion.
+// This leads the pipeline targeter to run a remote request and refresh. Now that collections are
+// tracked, the aggregation is sent using ShardVersion, which is never stale due to an
+// AutoGetCollection in the pipeline execution path that causes always to refresh if not installed.
+const isTrackUnshardedUponCreationEnabled = FeatureFlagUtil.isPresentAndEnabled(
+    st.s.getDB('admin'), "TrackUnshardedCollectionsUponCreation");
+if (!isTrackUnshardedUponCreationEnabled) {
+    // Test $lookup when it is routed to a secondary which is not yet aware of the foreign
+    // collection.
+    st.shardColl(local, {_id: 1}, {_id: 0}, {_id: 0});
 
-pipeline[0].$lookup.from = foreign.getName();
-assertAggResultAndRouting(
-    pipeline,
-    expectedRes,
-    {
-        comment: "lookup_on_stale_secondary",
-        $readPreference: {mode: 'secondary'},
-        readConcern: {level: 'majority'}
-    },
-    {
-        executeOnSecondaries: true,
-        // The $lookup cannot be executed in parallel because the foreign collection is unsharded.
-        toplevelExec: [true, false],
-        subPipelineLocal: [true, false],
-        subPipelineRemote: [true, false],
-    });
+    pipeline[0].$lookup.from = foreign.getName();
+    assertAggResultAndRouting(pipeline,
+                              expectedRes,
+                              {
+                                  comment: "lookup_on_stale_secondary",
+                                  $readPreference: {mode: 'secondary'},
+                                  readConcern: {level: 'majority'}
+                              },
+                              {
+                                  executeOnSecondaries: true,
+                                  // The $lookup cannot be executed in parallel because the foreign
+                                  // collection is unsharded.
+                                  toplevelExec: [true, false],
+                                  subPipelineLocal: [true, false],
+                                  subPipelineRemote: [true, false],
+                              });
+}
 
 // Test $lookup when it is routed to a secondary which is aware of the foreign collection.
 st.shardColl(local, {_id: 1}, {_id: 0}, {_id: 0});
+pipeline[0].$lookup.from = foreign.getName();
 
 // Ensure the secondary knows about the foreign collection.
 assert.eq(foreign.aggregate([], {$readPreference: {mode: 'secondary'}}).itcount(), 0);
-assertAggResultAndRouting(
-    pipeline,
-    expectedRes,
-    {
-        comment: "lookup_on_secondary",
-        $readPreference: {mode: 'secondary'},
-        readConcern: {level: 'majority'}
-    },
-    {
-        executeOnSecondaries: true,
-        // The $lookup cannot be executed in parallel because the foreign collection is unsharded.
-        toplevelExec: [true, false],
-        subPipelineLocal: [true, false],
-        subPipelineRemote: [false, false],
-    });
+assertAggResultAndRouting(pipeline,
+                          expectedRes,
+                          {
+                              comment: "lookup_on_secondary",
+                              $readPreference: {mode: 'secondary'},
+                              readConcern: {level: 'majority'}
+                          },
+                          {
+                              executeOnSecondaries: true,
+                              // The $lookup cannot be executed in parallel because the foreign
+                              // collection is unsharded.
+                              toplevelExec: [true, false],
+                              subPipelineLocal: [true, false],
+                              subPipelineRemote: [false, false],
+                          });
 
 // Test $lookup when it is routed to a secondary which thinks the foreign collection is unsharded,
 // but it is stale.
 st.shardColl(local, {_id: 1}, {_id: 0}, {_id: 0});
+pipeline[0].$lookup.from = foreign.getName();
 
 // Ensure the secondaries know about the local collection.
 assert.eq(local.aggregate([], {$readPreference: {mode: 'secondary'}}).itcount(), 0);
@@ -653,7 +673,8 @@ awaitShell = startParallelShell(
 // When we hit this failpoint, the nested $lookup will have just completed its first subpipeline.
 // Move the primary to the other shard to verify that $lookup execution changes correctly mid-query.
 failPoint.wait();
-assert.commandWorked(st.s0.adminCommand({movePrimary: dbName, to: st.shard1.shardName}));
+moveDatabaseAndUnshardedColls(
+    st.s0.getDB(dbName), st.shard1.shardName, false /* moveShardedData */);
 
 // Let the aggregate complete.
 failPoint.off();

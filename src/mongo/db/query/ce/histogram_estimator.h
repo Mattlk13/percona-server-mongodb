@@ -65,12 +65,13 @@ class HistogramEstimator : public cascades::CardinalityEstimator {
 public:
     HistogramEstimator(std::shared_ptr<stats::CollectionStatistics> stats,
                        std::unique_ptr<cascades::CardinalityEstimator> fallbackCE);
-    ~HistogramEstimator();
+    ~HistogramEstimator() override;
 
-    CEType deriveCE(const Metadata& metadata,
-                    const cascades::Memo& memo,
-                    const properties::LogicalProps& logicalProps,
-                    ABT::reference_type logicalNodeRef) const final;
+    CERecord deriveCE(const Metadata& metadata,
+                      const cascades::Memo& memo,
+                      const properties::LogicalProps& logicalProps,
+                      const QueryParameterMap& queryParameters,
+                      ABT::reference_type logicalNodeRef) const final;
 
 private:
     std::unique_ptr<HistogramTransport> _transport;

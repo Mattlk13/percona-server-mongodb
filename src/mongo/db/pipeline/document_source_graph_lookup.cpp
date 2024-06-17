@@ -70,13 +70,13 @@
 #include "mongo/logv2/log_component.h"
 #include "mongo/s/database_version.h"
 #include "mongo/s/shard_version.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/namespace_string_util.h"
 #include "mongo/util/str.h"
 #include "mongo/util/uuid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
-
 
 namespace mongo {
 
@@ -106,9 +106,17 @@ NamespaceString parseGraphLookupFromAndResolveNamespace(const BSONElement& elem,
     }
 
     // Valdate the db and coll names.
-    auto spec = NamespaceSpec::parse(
-        IDLParserContext{elem.fieldNameStringData(), false /* apiStrict */, defaultDb.tenantId()},
-        elem.embeddedObject());
+    const auto tenantId = defaultDb.tenantId();
+    const auto vts = tenantId
+        ? boost::make_optional(auth::ValidatedTenancyScopeFactory::create(
+              *tenantId, auth::ValidatedTenancyScopeFactory::TrustedForInnerOpMsgRequestTag{}))
+        : boost::none;
+    auto spec = NamespaceSpec::parse(IDLParserContext{elem.fieldNameStringData(),
+                                                      false /* apiStrict */,
+                                                      vts,
+                                                      tenantId,
+                                                      SerializationContext::stateDefault()},
+                                     elem.embeddedObject());
 
     auto nss = NamespaceStringUtil::deserialize(spec.getDb().value_or(DatabaseName()),
                                                 spec.getColl().value_or(""));
@@ -242,8 +250,25 @@ void DocumentSourceGraphLookUp::doDispose() {
     _visited.clear();
 }
 
+boost::optional<ShardId> DocumentSourceGraphLookUp::computeMergeShardId() const {
+    // Note that we can only check sharding state when we're on mongos as we may be holding
+    // locks on mongod (which would inhibit looking up sharding state in the catalog cache).
+    if (pExpCtx->inMongos) {
+        // Only nominate a merging shard if the outer collection is unsharded.
+        if (!pExpCtx->mongoProcessInterface->isSharded(pExpCtx->opCtx, pExpCtx->ns)) {
+            return pExpCtx->mongoProcessInterface->determineSpecificMergeShard(pExpCtx->opCtx,
+                                                                               _from);
+        }
+    } else {
+        return ShardingState::get(pExpCtx->opCtx)->shardId();
+    }
+    return boost::none;
+}
+
 bool DocumentSourceGraphLookUp::foreignShardedGraphLookupAllowed() const {
-    return !pExpCtx->opCtx->inMultiDocumentTransaction();
+    const auto fcvSnapshot = serverGlobalParams.mutableFCV.acquireFCVSnapshot();
+    return !pExpCtx->opCtx->inMultiDocumentTransaction() ||
+        gFeatureFlagAllowAdditionalParticipants.isEnabled(fcvSnapshot);
 }
 
 boost::optional<DocumentSource::DistributedPlanLogic>
@@ -251,6 +276,9 @@ DocumentSourceGraphLookUp::distributedPlanLogic() {
     // If $graphLookup into a sharded foreign collection is allowed, top-level $graphLookup
     // stages can run in parallel on the shards.
     if (foreignShardedGraphLookupAllowed() && pExpCtx->subPipelineDepth == 0) {
+        if (getMergeShardId()) {
+            return DistributedPlanLogic{nullptr, this, boost::none};
+        }
         return boost::none;
     }
 
@@ -266,7 +294,7 @@ void DocumentSourceGraphLookUp::doBreadthFirstSearch() {
             expectUnshardedCollectionInScope;
 
         const auto allowForeignSharded = foreignShardedGraphLookupAllowed();
-        if (!allowForeignSharded) {
+        if (!allowForeignSharded && !_fromExpCtx->inMongos) {
             // Enforce that the foreign collection must be unsharded for $graphLookup.
             expectUnshardedCollectionInScope =
                 _fromExpCtx->mongoProcessInterface->expectUnshardedCollectionInScope(
@@ -441,10 +469,11 @@ boost::optional<BSONObj> DocumentSourceGraphLookUp::makeMatchStageFromFrontier(
     // We wrap the query in a $match so that it can be parsed into a DocumentSourceMatch when
     // constructing a pipeline to execute.
 
-    // $match stages will conflate null, and undefined values. Keep track of which ones are
-    // present and eliminate documents that would match the others later.
+    // $graphLookup and regular $match semantics differ in treatment of null/missing. Regular $match
+    // stages may conflate null/missing values. Here, null only matches null.
+
+    // Keep track of whether we see null or missing in the frontier.
     bool matchNull = false;
-    bool matchUndefined = false;
     bool seenMissing = false;
     BSONObjBuilder match;
     {
@@ -464,8 +493,6 @@ boost::optional<BSONObj> DocumentSourceGraphLookUp::makeMatchStageFromFrontier(
                         for (auto&& value : _frontier) {
                             if (value.getType() == BSONType::jstNULL) {
                                 matchNull = true;
-                            } else if (value.getType() == BSONType::Undefined) {
-                                matchUndefined = true;
                             } else if (value.missing()) {
                                 seenMissing = true;
                             }
@@ -476,24 +503,9 @@ boost::optional<BSONObj> DocumentSourceGraphLookUp::makeMatchStageFromFrontier(
             }
             // We never want to see documents where the 'connectToField' is missing. Only add a
             // check for it in situations where we might match it accidentally.
-            if (matchNull || matchUndefined || seenMissing) {
+            if (matchNull || seenMissing) {
                 auto existsMatch = BSON(_connectToField.fullPath() << BSON("$exists" << true));
                 andObj << existsMatch;
-            }
-            // If matching null or undefined, make sure we don't match the other one.
-            // If seenMissing is true, we've already filtered out missing values above.
-            if (matchNull || matchUndefined) {
-                if (!matchUndefined) {
-                    auto notUndefined =
-                        BSON(_connectToField.fullPath() << BSON("$not" << BSON("$type"
-                                                                               << "undefined")));
-                    andObj << notUndefined;
-                } else if (!matchNull) {
-                    auto notUndefined =
-                        BSON(_connectToField.fullPath() << BSON("$not" << BSON("$type"
-                                                                               << "null")));
-                    andObj << notUndefined;
-                }
             }
         }
     }
@@ -517,6 +529,11 @@ void DocumentSourceGraphLookUp::performSearch() {
         _frontier.insert(startingValue);
         _frontierUsageBytes += startingValue.getApproximateSize();
     }
+
+    // Query settings are looked up after parsing and therefore are not populated in the
+    // '_fromExpCtx' as part of DocumentSourceGraphLookUp constructor. Assign query settings to the
+    // '_fromExpCtx' by copying them from the parent query ExpressionContext.
+    setQuerySettingsIfNeeded(_fromExpCtx, pExpCtx->getQuerySettings());
 
     try {
         doBreadthFirstSearch();
@@ -546,18 +563,11 @@ DocumentSource::GetModPathsReturn DocumentSourceGraphLookUp::getModifiedPaths() 
 }
 
 StageConstraints DocumentSourceGraphLookUp::constraints(Pipeline::SplitState pipeState) const {
-    // If we are in a mongos, graphLookup on sharded foreign collections is allowed, and the foreign
-    // collection is sharded, then the host type requirement is mongos or a shard. Otherwise, it's
-    // the primary shard.
-    HostTypeRequirement hostRequirement =
-        (pExpCtx->inMongos && pExpCtx->mongoProcessInterface->isSharded(pExpCtx->opCtx, _from) &&
-         foreignShardedGraphLookupAllowed())
-        ? HostTypeRequirement::kNone
-        : HostTypeRequirement::kPrimaryShard;
-
+    // $graphLookup can execute on a mongos or a shard, so its host type requirement is 'kNone'. If
+    // it needs to execute on a specific merging shard, it can request this later.
     StageConstraints constraints(StreamType::kStreaming,
                                  PositionRequirement::kNone,
-                                 hostRequirement,
+                                 HostTypeRequirement::kNone,
                                  DiskUseRequirement::kNoDiskUse,
                                  FacetRequirement::kAllowed,
                                  TransactionRequirement::kAllowed,
@@ -566,6 +576,13 @@ StageConstraints DocumentSourceGraphLookUp::constraints(Pipeline::SplitState pip
 
     constraints.canSwapWithMatch = true;
     constraints.canSwapWithSkippingOrLimitingStage = !_unwind;
+
+    // If this $graphLookup is on the merging half of the pipeline and the inner collection isn't
+    // sharded (that is, it is either unsplittable or untracked), then we should merge on the shard
+    // which owns the inner collection.
+    if (pipeState == Pipeline::SplitState::kSplitForMerge) {
+        constraints.mergeShardId = getMergeShardId();
+    }
 
     return constraints;
 }
@@ -883,4 +900,16 @@ void DocumentSourceGraphLookUp::addInvolvedCollections(
         stage->addInvolvedCollections(collectionNames);
     }
 }
+
+void DocumentSourceGraphLookUp::setQuerySettingsIfNeeded(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const query_settings::QuerySettings& querySettings) {
+    if (_didSetQuerySettingsToPipeline) {
+        return;
+    }
+
+    expCtx->setQuerySettings(querySettings);
+    _didSetQuerySettingsToPipeline = true;
+}
+
 }  // namespace mongo

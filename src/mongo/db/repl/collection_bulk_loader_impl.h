@@ -71,13 +71,14 @@ public:
                              ServiceContext::UniqueOperationContext opCtx,
                              const NamespaceString& nss,
                              const BSONObj& idIndexSpec);
-    virtual ~CollectionBulkLoaderImpl();
+    ~CollectionBulkLoaderImpl() override;
 
-    virtual Status init(const std::vector<BSONObj>& secondaryIndexSpecs) override;
+    Status init(const std::vector<BSONObj>& secondaryIndexSpecs) override;
 
-    virtual Status insertDocuments(std::vector<BSONObj>::const_iterator begin,
-                                   std::vector<BSONObj>::const_iterator end) override;
-    virtual Status commit() override;
+    Status insertDocuments(std::vector<BSONObj>::const_iterator begin,
+                           std::vector<BSONObj>::const_iterator end,
+                           ParseRecordIdAndDocFunc fn) override;
+    Status commit() override;
 
     CollectionBulkLoaderImpl::Stats getStats() const;
 
@@ -91,7 +92,8 @@ private:
      * For capped collections, each document will be inserted in its own WriteUnitOfWork.
      */
     Status _insertDocumentsForCappedCollection(std::vector<BSONObj>::const_iterator begin,
-                                               std::vector<BSONObj>::const_iterator end);
+                                               std::vector<BSONObj>::const_iterator end,
+                                               ParseRecordIdAndDocFunc fn);
 
     /**
      * For uncapped collections, we will insert documents in batches of size
@@ -99,7 +101,8 @@ private:
      * given batch will be inserted in one WriteUnitOfWork.
      */
     Status _insertDocumentsForUncappedCollection(std::vector<BSONObj>::const_iterator begin,
-                                                 std::vector<BSONObj>::const_iterator end);
+                                                 std::vector<BSONObj>::const_iterator end,
+                                                 ParseRecordIdAndDocFunc fn);
 
     /**
      * Adds document and associated RecordId to index blocks after inserting into RecordStore.

@@ -113,6 +113,7 @@ ALLOW_ANY_TYPE_LIST: List[str] = [
     'aggregate-param-allowDiskUse',
     'aggregate-param-cursor',
     'aggregate-param-hint',
+    'aggregate-param-allowedIndexes',
     'aggregate-param-needsMerge',
     'aggregate-param-fromMongos',
     'aggregate-param-$_requestReshardingResumeToken',
@@ -127,6 +128,7 @@ ALLOW_ANY_TYPE_LIST: List[str] = [
     'find-param-projection',
     'find-param-sort',
     'find-param-hint',
+    'find-param-allowedIndexes',
     'find-param-collation',
     'find-param-singleBatch',
     'find-param-allowDiskUse',
@@ -244,7 +246,9 @@ ALLOWED_STABLE_FIELDS_LIST: List[str] = [
     'commandCppTypeNotEqualUnstable-param-cppTypeNotEqualStructUnstableField',
     'newlyAddedTypeFieldBsonAnyNotAllowed-param-newlyAddedBsonSerializationTypeAnyStructField',
     'typeWithIncompatibleChainedStruct-param-newBsonSerializationTypeAnyUnstableStructField',
+    'addedCommandParameterDefault-param-newStableParameter',
     'addedCommandParameterStable-param-newOptionalStableParam',
+    'addedCommandParameterStableRequired-param-newStableParam',
     'addedCommandParameterStableWithDefault-param-newStableParamWithDefault',
     'newCommandParameterTypeStructRecursiveOne-param-unstableToStableOptionalField',
     'oldUnstableParamTypeChanges-param-oldUnstableTypeChangesParam',
@@ -301,6 +305,43 @@ ALLOWED_STABLE_FIELDS_LIST: List[str] = [
     'hello-reply-serviceId',
     'hello-reply-isImplicitDefaultMajorityWC',
     'hello-reply-cwwc',
+
+    # BulkWrite fields
+    'bulkWrite-param-ops',
+    'bulkWrite-param-insert',
+    'bulkWrite-param-document',
+    'bulkWrite-param-update',
+    'bulkWrite-param-filter',
+    'bulkWrite-param-multi',
+    'bulkWrite-param-updateMods',
+    'bulkWrite-param-upsert',
+    'bulkWrite-param-arrayFilters',
+    'bulkWrite-param-hint',
+    'bulkWrite-param-collation',
+    'bulkWrite-param-delete',
+    'bulkWrite-param-collation',
+    'bulkWrite-param-nsInfo',
+    'bulkWrite-param-ns',
+    'bulkWrite-param-cursor',
+    'bulkWrite-param-bypassDocumentValidation',
+    'bulkWrite-param-constants',
+    'bulkWrite-param-ordered',
+    'bulkWrite-param-stmtId',
+    'bulkWrite-param-stmtIds',
+    'bulkWrite-param-let',
+    'bulkWrite-param-errorsOnly',
+    'bulkWrite-reply-cursor',
+    'bulkWrite-reply-id',
+    'bulkWrite-reply-firstBatch',
+    'bulkWrite-reply-ns',
+    'bulkWrite-reply-electionId',
+    'bulkWrite-reply-opTime',
+    'bulkWrite-reply-nErrors',
+    'bulkWrite-reply-nInserted',
+    'bulkWrite-reply-nMatched',
+    'bulkWrite-reply-nModified',
+    'bulkWrite-reply-nUpserted',
+    'bulkWrite-reply-nDeleted',
 ]
 
 SKIPPED_FILES = [
@@ -335,6 +376,39 @@ ALLOWED_NEW_COMPLEX_ACCESS_CHECKS = dict(
     # This list is only used in unit-tests.
     complexChecksSupersetAllowed={'checkTwo', 'checkThree'},
     complexChecksSupersetSomeAllowed={'checkTwo'})
+
+
+@dataclass
+class AllowedNewPrivilege:
+    """Represents a privilege check that should be ignored by the API compatibility checker."""
+
+    resource_pattern: str
+    action_type: List[str]
+    agg_stage: Optional[str] = None
+
+    @classmethod
+    def create_from(cls, privilege: syntax.Privilege):
+        return cls(privilege.resource_pattern, privilege.action_type, privilege.agg_stage)
+
+
+ALLOWED_NEW_ACCESS_CHECK_PRIVILEGES = dict(
+    # Do not add any command other than the aggregate command or any privilege that is not required
+    # only by an aggregation stage not present in previously released versions.
+    aggregate=[
+        # TODO SERVER-87193: Check if we can remove the line below after the next 7.0 patch release (7.0.7) is out.
+        # The feature using 'queryStatsReadTransformed' has been backported to v7.0 but is not present
+        # in the latest patch release. It is guarded by a feature flag so we are allowing this conflict here.
+        AllowedNewPrivilege("cluster", ["queryStatsReadTransformed"], "queryStats"),
+    ],
+
+    # This list is only used in unit-tests.
+    complexChecksSupersetAllowed=[
+        AllowedNewPrivilege("resourcePatternTwo", ["actionTypeTwo"]),
+        AllowedNewPrivilege("resourcePatternThree", ["actionTypeThree"]),
+    ],
+    complexCheckPrivilegesSupersetSomeAllowed=[
+        AllowedNewPrivilege("resourcePatternTwo", ["actionTypeTwo"])
+    ])
 
 
 class FieldCompatibility:
@@ -1164,10 +1238,15 @@ def check_command_params_or_type_struct_fields(
             new_field_type = get_field_type(new_field, new_idl_file, new_idl_file_path)
             new_field_optional = new_field.optional or (new_field_type
                                                         and new_field_type.name == 'optionalBool')
-            if not new_field_optional and not is_unstable(new_field.stability):
+            if not new_field_optional and new_field.default is None and not is_unstable(
+                    new_field.stability):
                 ctxt.add_new_param_or_command_type_field_added_required_error(
                     cmd_name, new_field.name, new_idl_file_path, new_struct.name,
                     is_command_parameter)
+
+            if is_unstable(new_field.stability) and not new_field_optional:
+                ctxt.add_new_param_or_type_field_added_as_unstable_required_error(
+                    cmd_name, new_field.name, new_idl_file_path, is_command_parameter)
 
             # Check that a new field does not have an unallowed use of 'any' as the bson_serialization_type.
             any_allow_name: str = (cmd_name + "-param-" + new_field.name
@@ -1203,7 +1282,7 @@ def check_command_param_or_type_struct_field(
             cmd_name, old_field.name, old_idl_file_path, is_command_parameter)
 
     # If old field is unstable and new field is stable, the new field should either be optional or
-    # have a default value.
+    # have a default value, unless the old field was a required field.
     old_field_type = get_field_type(old_field, old_idl_file, old_idl_file_path)
     new_field_type = get_field_type(new_field, new_idl_file, new_idl_file_path)
     old_field_optional = old_field.optional or (old_field_type
@@ -1212,8 +1291,10 @@ def check_command_param_or_type_struct_field(
                                                 and new_field_type.name == "optionalBool")
     if is_unstable(old_field.stability) and not is_unstable(
             new_field.stability) and not new_field_optional and new_field.default is None:
-        ctxt.add_new_param_or_command_type_field_stable_required_no_default_error(
-            cmd_name, old_field.name, old_idl_file_path, type_name, is_command_parameter)
+        # Only error if the old field was not a required field already.
+        if old_field_optional or old_field.default is not None:
+            ctxt.add_new_param_or_command_type_field_stable_required_no_default_error(
+                cmd_name, old_field.name, old_idl_file_path, type_name, is_command_parameter)
 
     if not is_unstable(
             old_field.stability
@@ -1354,6 +1435,12 @@ def check_complex_checks(ctxt: IDLCompatibilityContext,
         for check in ALLOWED_NEW_COMPLEX_ACCESS_CHECKS[cmd_name]:
             if check in new_checks_normalized:
                 new_checks_normalized.remove(check)
+
+    if cmd_name in ALLOWED_NEW_ACCESS_CHECK_PRIVILEGES:
+        new_privileges = [
+            privilege for privilege in new_privileges if AllowedNewPrivilege.create_from(privilege)
+            not in ALLOWED_NEW_ACCESS_CHECK_PRIVILEGES[cmd_name]
+        ]
 
     if (len(new_checks_normalized) + len(new_privileges)) > (
             len(old_checks_normalized) + len(old_privileges)):

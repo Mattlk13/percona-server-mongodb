@@ -3,10 +3,11 @@
 # This file is a python script that describes the WiredTiger API.
 
 class Method:
-    def __init__(self, config):
+    def __init__(self, config, compilable=False):
         # Deal with duplicates: with complex configurations (like WT_SESSION::create), it's simpler
         # to deal with duplicates once than manually as configurations are defined.
         self.config = []
+        self.compilable = compilable
         lastname = None
         for c in sorted(config):
             if '.' in c.name:
@@ -301,10 +302,9 @@ file_config = format_meta + file_runtime_config + tiered_config + [
         the file format''',
         choices=['btree']),
     Config('huffman_key', 'none', r'''
-        This option is no longer supported, retained for backward compatibility'''),
+        This option is no longer supported, retained for backward compatibility''', undoc=True),
     Config('huffman_value', 'none', r'''
-        configure Huffman encoding for values. Permitted values are \c "none", \c "english",
-        \c "utf8<file>" or \c "utf16<file>". See @ref huffman for more information'''),
+        This option is no longer supported, retained for backward compatibility''', undoc=True),
     Config('ignore_in_memory_cache_size', 'false', r'''
         allow update and insert operations to proceed even if the cache is already at
         capacity. Only valid in conjunction with in-memory databases. Should be used with caution -
@@ -561,7 +561,7 @@ connection_runtime_config = [
         type='category', subconfig=[
         Config('background_compact', 'false', r'''
                if true, background compact aggressively removes compact statistics for a file and
-               decreases the max amount of time a file can be skipped for.''', 
+               decreases the max amount of time a file can be skipped for.''',
                type='boolean'),
         Config('corruption_abort', 'true', r'''
             if true and built in diagnostic mode, dump core in the case of data corruption''',
@@ -689,17 +689,17 @@ connection_runtime_config = [
         setting only alters behavior if it is lower than \c eviction_trigger''',
         min=0, max='10TB'),
     Config('extra_diagnostics', '[]', r'''
-        enable additional diagnostics in WiredTiger. These additional diagnostics include 
-        diagnostic assertions that can cause WiredTiger to abort when an invalid state 
+        enable additional diagnostics in WiredTiger. These additional diagnostics include
+        diagnostic assertions that can cause WiredTiger to abort when an invalid state
         is detected.
-        Options are given as a list, such as 
+        Options are given as a list, such as
         <code>"extra_diagnostics=[out_of_order,visibility]"</code>.
-        Choosing \c all enables all assertions. When WiredTiger is compiled with 
+        Choosing \c all enables all assertions. When WiredTiger is compiled with
         \c HAVE_DIAGNOSTIC=1 all assertions are enabled and cannot be reconfigured
         ''',
         type='list', choices=[
-            "all", "checkpoint_validate", "cursor_check", "disk_validate", "eviction_check", 
-            "generation_check", "hs_validate", "key_out_of_order", "log_validate", "prepared", 
+            "all", "checkpoint_validate", "cursor_check", "disk_validate", "eviction_check",
+            "generation_check", "hs_validate", "key_out_of_order", "log_validate", "prepared",
             "slow_operation", "txn_visibility"]),
     Config('file_manager', '', r'''
         control how file handles are managed''',
@@ -738,6 +738,10 @@ connection_runtime_config = [
             number of bytes per second available to all subsystems in total. When set,
             decisions about what subsystems are throttled, and in what proportion, are made
             internally. The minimum non-zero setting is 1MB.''',
+            min='0', max='1TB'),
+        Config('chunk_cache', '0', r'''
+            number of bytes per second available to the chunk cache. The minimum non-zero setting
+            is 1MB.''',
             min='0', max='1TB'),
         ]),
     Config('json_output', '[]', r'''
@@ -817,8 +821,8 @@ connection_runtime_config = [
         type='list', undoc=True,
         choices=[
         'aggressive_stash_free', 'aggressive_sweep', 'backup_rename', 'checkpoint_evict_page',
-        'checkpoint_handle', 'checkpoint_slow', 'checkpoint_stop', 'compact_slow',
-        'evict_reposition', 'failpoint_eviction_split',
+        'checkpoint_handle', 'checkpoint_slow', 'checkpoint_stop', 'commit_transaction_slow',
+        'compact_slow', 'evict_reposition', 'failpoint_eviction_split',
         'failpoint_history_store_delete_key_from_ts', 'history_store_checkpoint_delay',
         'history_store_search', 'history_store_sweep_race', 'prefix_compare',
         'prepare_checkpoint_delay', 'prepare_resolution_1','prepare_resolution_2',
@@ -843,6 +847,7 @@ connection_runtime_config = [
             'chunkcache',
             'compact',
             'compact_progress',
+            'configuration',
             'error_returns',
             'evict',
             'evict_stuck',
@@ -1105,6 +1110,9 @@ session_config = [
         configure debug specific behavior on a session. Generally only used for internal testing
         purposes.''',
         type='category', subconfig=[
+        Config('checkpoint_fail_before_turtle_update', 'false', r'''
+            Fail before writing a turtle file at the end of a checkpoint.''',
+            type='boolean'),
         Config('release_evict_page', 'false', r'''
             Configure the session to evict the page when it is released and no longer needed.''',
             type='boolean'),
@@ -1164,6 +1172,10 @@ wiredtiger_open_common =\
     Config('checkpoint_sync', 'true', r'''
         flush files to stable storage when closing or writing checkpoints''',
         type='boolean'),
+    Config('compile_configuration_count', '1000', r'''
+        the number of configuration strings that can be precompiled. Some configuration strings
+        are compiled internally when the connection is opened.''',
+        min='500'),
     Config('direct_io', '', r'''
         Use \c O_DIRECT on POSIX systems, and \c FILE_FLAG_NO_BUFFERING on Windows to access files.
         Options are given as a list, such as <code>"direct_io=[data]"</code>. Configuring \c
@@ -1388,8 +1400,9 @@ methods = {
     Config('background', '', r'''
         enable/disabled the background compaction server.''',
         type='boolean'),
+    Config('dryrun', 'false', r'''run only the estimation phase of compact''', type='boolean'),
     Config('exclude', '', r'''
-        A list of table objects to be excluded from background compaction. The list is immutable and
+        list of table objects to be excluded from background compaction. The list is immutable and
         only applied when the background compaction gets enabled. The list is not saved between the
         calls and needs to be reapplied each time the service is enabled. The individual objects in
         the list can only be of the \c table: URI type''',
@@ -1397,6 +1410,10 @@ methods = {
     Config('free_space_target', '20MB', r'''
         minimum amount of space recoverable for compaction to proceed''',
         min='1MB'),
+    Config('run_once', 'false', r'''
+        configure background compaction server to run once. In this mode, compaction is always
+        attempted on each table unless explicitly excluded''',
+        type='boolean'),
     Config('timeout', '1200', r'''
         maximum amount of time to allow for compact in seconds. The actual amount of time spent
         in compact may exceed the configured value. A value of zero disables the timeout''',
@@ -1602,6 +1619,9 @@ methods = {
         next_random_sample_size attempts to divide the object into \c next_random_sample_size
         equal-sized pieces, and each retrieval returns a record from one of those pieces. See
         @ref cursor_random for details'''),
+    Config('next_random_seed', '0', r'''
+        configure the cursor to set an initial random seed when using \c next_random configuration.
+        This is used for testing purposes only. See @ref cursor_random for details'''),
     Config('raw', 'false', r'''
         ignore the encodings for the key and value, manage data as if the formats were \c "u".
         See @ref cursor_raw for details''',
@@ -1648,7 +1668,6 @@ methods = {
 ]),
 
 'WT_SESSION.reset_snapshot' : Method([]),
-'WT_SESSION.rename' : Method([]),
 'WT_SESSION.reset' : Method([]),
 'WT_SESSION.salvage' : Method([
     Config('force', 'false', r'''
@@ -1669,10 +1688,15 @@ methods = {
         Display page addresses, time windows, and page types as pages are verified, using the
         application's message handler, intended for debugging''',
         type='boolean'),
-    Config('dump_app_data', 'false', r'''
+    Config('dump_all_data', 'false', r'''
         Display application data as pages or blocks are verified, using the application's message
         handler, intended for debugging. Disabling this does not guarantee that no user data will
         be output''',
+        type='boolean'),
+    Config('dump_key_data', 'false', r'''
+        Display application data keys as pages or blocks are verified, using the application's
+        message handler, intended for debugging. Disabling this does not guarantee that no user
+        data will be output''',
         type='boolean'),
     Config('dump_blocks', 'false', r'''
         Display the contents of on-disk blocks as they are verified, using the application's
@@ -1758,7 +1782,7 @@ methods = {
         whether to sync log records when the transaction commits, inherited from ::wiredtiger_open
         \c transaction_sync''',
         type='boolean')
-]),
+], compilable=True),
 
 'WT_SESSION.commit_transaction' : Method([
     Config('commit_timestamp', '', r'''
@@ -1906,6 +1930,8 @@ methods = {
 ]),
 
 'WT_CONNECTION.debug_info' : Method([
+    Config('backup', 'false', r'''
+        print incremental backup information''', type='boolean'),
     Config('cache', 'false', r'''
         print cache information''', type='boolean'),
     Config('cursors', 'false', r'''
@@ -1992,6 +2018,10 @@ methods = {
     Config('dryrun', 'false', r'''
         perform the checks associated with RTS, but don't modify any data.''',
         type='boolean'),
+    Config('threads', '4', r'''
+        maximum number of threads WiredTiger will start to help RTS. Each
+        RTS worker thread uses a session from the configured session_max''',
+        min=0, max=10),
 ]),
 
 'WT_SESSION.reconfigure' : Method(session_config),

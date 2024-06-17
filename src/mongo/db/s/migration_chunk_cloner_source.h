@@ -104,9 +104,9 @@ public:
                                                const std::vector<repl::ReplOperation>& stmts,
                                                repl::OpTime prepareOrCommitOpTime);
 
-    void commit(OperationContext* opCtx, boost::optional<Timestamp>);
+    void commit(OperationContext* opCtx, boost::optional<Timestamp>) override;
 
-    void rollback(OperationContext* opCtx){};
+    void rollback(OperationContext* opCtx) override{};
 
 private:
     const LogicalSessionId _lsid;
@@ -167,6 +167,25 @@ private:
     const NamespaceString _nss;
     const DocumentKey _documentKey;
     const repl::OpTime _opTime;
+};
+
+/**
+ * Used to keep track of retryable applyOps that may include changes in documents that are
+ * part of a chunk being migrated.  Only takes care of retryability; the actual operations
+ * are broken out and added to the transfer mods  by the other handlers.
+ */
+class LogRetryableApplyOpsForShardingHandler final : public RecoveryUnit::Change {
+public:
+    LogRetryableApplyOpsForShardingHandler(std::vector<NamespaceString> namespaces,
+                                           std::vector<repl::OpTime> opTimes);
+
+    void commit(OperationContext* opCtx, boost::optional<Timestamp>) override;
+
+    void rollback(OperationContext* opCtx) override{};
+
+private:
+    std::vector<NamespaceString> _namespaces;
+    std::vector<repl::OpTime> _opTimes;
 };
 
 /**
@@ -391,6 +410,7 @@ public:
 private:
     friend class LogOpForShardingHandler;
     friend class LogTransactionOperationsForShardingHandler;
+    friend class LogRetryableApplyOpsForShardingHandler;
 
     using RecordIdSet = std::set<RecordId>;
 

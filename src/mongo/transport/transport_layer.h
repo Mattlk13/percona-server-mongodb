@@ -127,6 +127,11 @@ public:
     virtual void shutdown() = 0;
 
     /**
+     * Stop accepting new sessions.
+     */
+    virtual void stopAcceptingSessions() = 0;
+
+    /**
      * Optional method for subclasses to setup their state before being ready to accept
      * connections.
      */
@@ -151,6 +156,14 @@ public:
      * Return the session manager, if any, associated with this TransportLayer.
      */
     virtual SessionManager* getSessionManager() const = 0;
+
+    /**
+     * Returns a shared_ptr reference to the owned SessionManager.
+     * Callers are strongly discouraged from retaining a full shared_ptr
+     * reference which may cause the SessionManager to outlive its TransportLayer.
+     * Please convert to `std::weak_ptr` if a long term, non-owning reference is needed.
+     */
+    virtual std::shared_ptr<SessionManager> getSharedSessionManager() const = 0;
 
 #ifdef MONGO_CONFIG_SSL
     /** Rotate the in-use certificates for new connections. */
@@ -208,7 +221,7 @@ public:
     Reactor(const Reactor&) = delete;
     Reactor& operator=(const Reactor&) = delete;
 
-    virtual ~Reactor() = default;
+    ~Reactor() override = default;
 
     /*
      * Run the event loop of the reactor until stop() is called.
@@ -218,7 +231,7 @@ public:
     virtual void stop() = 0;
     virtual void drain() = 0;
 
-    virtual void schedule(Task task) = 0;
+    void schedule(Task task) override = 0;
     virtual void dispatch(Task task) = 0;
 
     virtual bool onReactorThread() const = 0;

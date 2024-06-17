@@ -50,11 +50,10 @@
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
-#include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/s/catalog/type_config_version.h"
 #include "mongo/s/cluster_identity_loader.h"
-#include "mongo/s/sharding_router_test_fixture.h"
+#include "mongo/s/sharding_mongos_test_fixture.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/unittest/bson_test_util.h"
 #include "mongo/unittest/framework.h"
@@ -80,9 +79,10 @@ BSONObj getReplSecondaryOkMetadata() {
 
 class ClusterIdentityTest : public ShardingTestFixture {
 public:
-    void setUp() {
+    void setUp() override {
         // TODO SERVER-78051: Remove once shards can access the loaded cluster id.
-        serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::ConfigServer};
+        serverGlobalParams.clusterRole = {
+            ClusterRole::ShardServer, ClusterRole::ConfigServer, ClusterRole::RouterServer};
 
         ShardingTestFixture::setUp();
         configTargeter()->setFindHostReturnValue(configHost);
@@ -91,10 +91,9 @@ public:
     void expectConfigVersionLoad(StatusWith<OID> result) {
         onFindCommand([&](const RemoteCommandRequest& request) {
             ASSERT_EQUALS(configHost, request.target);
-            ASSERT_BSONOBJ_EQ(getReplSecondaryOkMetadata(),
-                              rpc::TrackingMetadata::removeTrackingData(request.metadata));
+            ASSERT_BSONOBJ_EQ(getReplSecondaryOkMetadata(), request.metadata);
 
-            auto opMsg = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+            auto opMsg = static_cast<OpMsgRequest>(request);
             auto query = query_request_helper::makeFromFindCommandForTests(opMsg.body);
 
             ASSERT_EQ(query->getNamespaceOrUUID().nss(), NamespaceString::kConfigVersionNamespace);

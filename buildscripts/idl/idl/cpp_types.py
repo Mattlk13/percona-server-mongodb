@@ -511,14 +511,16 @@ class BsonCppTypeBase(object, metaclass=ABCMeta):
         pass
 
     @abstractmethod
-    def gen_serializer_expression(self, indented_writer, expression, should_shapify=False):
-        # type: (writer.IndentedTextWriter, str, bool) -> str
+    def gen_serializer_expression(self, indented_writer, expression, should_shapify=False,
+                                  is_catalog_ctxt=False):
+        # type: (writer.IndentedTextWriter, str, bool, bool) -> str
         """Generate code with the text writer and return an expression to serialize the type."""
         pass
 
 
-def _call_method_or_global_function(expression, ast_type, should_shapify=False):
-    # type: (str, ast.Type, bool) -> str
+def _call_method_or_global_function(expression, ast_type, should_shapify=False,
+                                    is_catalog_ctxt=False):
+    # type: (str, ast.Type, bool, bool) -> str
     """
     Given a fully-qualified method name, call it correctly.
 
@@ -535,7 +537,12 @@ def _call_method_or_global_function(expression, ast_type, should_shapify=False):
     short_method_name = writer.get_method_name(method_name)
     if writer.is_function(method_name):
         if ast_type.deserialize_with_tenant:
-            serialization_context = ', ' + serialization_context
+            if is_catalog_ctxt:
+                # serializeForCatalog doesn't need a serializationContext
+                serialization_context = ''
+                method_name = method_name.replace("serialize", "serializeForCatalog")
+            else:
+                serialization_context = ', ' + serialization_context
         if should_shapify:
             shape_options = ', ' + shape_options
 
@@ -574,9 +581,11 @@ class _CommonBsonCppTypeBase(BsonCppTypeBase):
         # type: () -> bool
         return self._ast_type.serializer is not None
 
-    def gen_serializer_expression(self, indented_writer, expression, should_shapify=False):
-        # type: (writer.IndentedTextWriter, str, bool) -> str
-        return _call_method_or_global_function(expression, self._ast_type, should_shapify)
+    def gen_serializer_expression(self, indented_writer, expression, should_shapify=False,
+                                  is_catalog_ctxt=False):
+        # type: (writer.IndentedTextWriter, str, bool, bool) -> str
+        return _call_method_or_global_function(expression, self._ast_type, should_shapify,
+                                               is_catalog_ctxt)
 
 
 class _ObjectBsonCppTypeBase(BsonCppTypeBase):
@@ -598,18 +607,23 @@ class _ObjectBsonCppTypeBase(BsonCppTypeBase):
         # type: () -> bool
         return self._ast_type.serializer is not None
 
-    def gen_serializer_expression(self, indented_writer, expression, should_shapify=False):
-        # type: (writer.IndentedTextWriter, str, bool) -> str
+    def gen_serializer_expression(self, indented_writer, expression, should_shapify=False,
+                                  is_catalog_ctxt=False):
+        # type: (writer.IndentedTextWriter, str, bool, bool) -> str
         method_name = writer.get_method_name(self._ast_type.serializer)
-        if self._ast_type.deserialize_with_tenant:  # SerializationContext is tied to tenant deserialization
-            indented_writer.write_line(
-                common.template_args(
-                    'const BSONObj localObject = ${expression}.${method_name}(getSerializationContext());',
-                    expression=expression, method_name=method_name))
-        else:
-            indented_writer.write_line(
-                common.template_args('const BSONObj localObject = ${expression}.${method_name}();',
-                                     expression=expression, method_name=method_name))
+        function_arguments = []
+        # SerializationContext is tied to tenant deserialization
+        if self._ast_type.deserialize_with_tenant:
+            function_arguments.append('getSerializationContext()')
+        # Provide options if custom shapification required.
+        if should_shapify:
+            function_arguments.append('options')
+
+        indented_writer.write_line(
+            common.template_args(
+                'const BSONObj localObject = ${expression}.${method_name}(${function_arguments});',
+                expression=expression, method_name=method_name,
+                function_arguments=', '.join(function_arguments)))
         return "localObject"
 
 
@@ -632,8 +646,9 @@ class _ArrayBsonCppTypeBase(BsonCppTypeBase):
         # type: () -> bool
         return self._ast_type.serializer is not None
 
-    def gen_serializer_expression(self, indented_writer, expression, should_shapify=False):
-        # type: (writer.IndentedTextWriter, str, bool) -> str
+    def gen_serializer_expression(self, indented_writer, expression, should_shapify=False,
+                                  is_catalog_ctxt=False):
+        # type: (writer.IndentedTextWriter, str, bool, bool) -> str
         method_name = writer.get_method_name(self._ast_type.serializer)
         indented_writer.write_line(
             common.template_args('BSONArray localArray(${expression}.${method_name}());',
@@ -656,8 +671,9 @@ class _BinDataBsonCppTypeBase(BsonCppTypeBase):
         # type: () -> bool
         return True
 
-    def gen_serializer_expression(self, indented_writer, expression, should_shapify=False):
-        # type: (writer.IndentedTextWriter, str, bool) -> str
+    def gen_serializer_expression(self, indented_writer, expression, should_shapify=False,
+                                  is_catalog_ctxt=False):
+        # type: (writer.IndentedTextWriter, str, bool, bool) -> str
         if self._ast_type.serializer:
             method_name = writer.get_method_name(self._ast_type.serializer)
             indented_writer.write_line(

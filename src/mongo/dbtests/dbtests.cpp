@@ -66,6 +66,7 @@
 #include "mongo/db/session_manager_mongod.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
 #include "mongo/dbtests/framework.h"
@@ -87,10 +88,9 @@
 namespace mongo {
 namespace dbtests {
 namespace {
-const auto kIndexVersion = IndexDescriptor::IndexVersion::kV2;
-}  // namespace
 
-namespace {
+const auto kIndexVersion = IndexDescriptor::IndexVersion::kV2;
+
 ServiceContext::ConstructorActionRegisterer registerWireSpec{
     "RegisterWireSpec", [](ServiceContext* service) {
         WireSpec::Specification spec;
@@ -110,7 +110,8 @@ ServiceContext::ConstructorActionRegisterer registerWireSpec{
 
         WireSpec::getWireSpec(service).initialize(std::move(spec));
     }};
-}
+
+}  // namespace
 
 Status createIndex(OperationContext* opCtx, StringData ns, const BSONObj& keys, bool unique) {
     BSONObjBuilder specBuilder;
@@ -156,8 +157,11 @@ Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj
                            collection,
                            spec,
                            [opCtx](const std::vector<BSONObj>& specs) -> Status {
-                               if (opCtx->recoveryUnit()->getCommitTimestamp().isNull()) {
-                                   return opCtx->recoveryUnit()->setTimestamp(Timestamp(1, 1));
+                               if (shard_role_details::getRecoveryUnit(opCtx)
+                                       ->getCommitTimestamp()
+                                       .isNull()) {
+                                   return shard_role_details::getRecoveryUnit(opCtx)->setTimestamp(
+                                       Timestamp(1, 1));
                                }
                                return Status::OK();
                            })
@@ -195,7 +199,7 @@ Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj
                                  collection.getWritableCollection(opCtx),
                                  MultiIndexBlock::kNoopOnCreateEachFn,
                                  MultiIndexBlock::kNoopOnCommitFn));
-        ASSERT_OK(opCtx->recoveryUnit()->setTimestamp(Timestamp(1, 1)));
+        ASSERT_OK(shard_role_details::getRecoveryUnit(opCtx)->setTimestamp(Timestamp(1, 1)));
         wunit.commit();
     }
     abortOnExit.dismiss();
@@ -216,10 +220,6 @@ WriteContextForTests::WriteContextForTests(OperationContext* opCtx, StringData n
     invariant(db == _clientContext->db());
 }
 
-}  // namespace dbtests
-}  // namespace mongo
-
-
 int dbtestsMain(int argc, char** argv) {
     ::mongo::setTestCommandsEnabled(true);
     ::mongo::TestingProctor::instance().setEnabled(true);
@@ -227,7 +227,7 @@ int dbtestsMain(int argc, char** argv) {
 
     mongo::runGlobalInitializersOrDie(std::vector<std::string>(argv, argv + argc));
     // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
-    serverGlobalParams.mutableFeatureCompatibility.setVersion(multiversion::GenericFCV::kLatest);
+    serverGlobalParams.mutableFCV.setVersion(multiversion::GenericFCV::kLatest);
     repl::ReplSettings replSettings;
     replSettings.setOplogSizeBytes(10 * 1024 * 1024);
     setGlobalServiceContext(ServiceContext::make());
@@ -265,10 +265,13 @@ int dbtestsMain(int argc, char** argv) {
     repl::DropPendingCollectionReaper::set(
         service, std::make_unique<repl::DropPendingCollectionReaper>(storageMock.get()));
 
-    AuthorizationManager::get(service)->setAuthEnabled(false);
-    ScriptEngine::setup();
+    AuthorizationManager::get(service->getService())->setAuthEnabled(false);
+    ScriptEngine::setup(ExecutionEnvironment::Server);
     return mongo::dbtests::runDbTests(argc, argv);
 }
+
+}  // namespace dbtests
+}  // namespace mongo
 
 #if defined(_WIN32)
 // In Windows, wmain() is an alternate entry point for main(), and receives the same parameters
@@ -277,10 +280,11 @@ int dbtestsMain(int argc, char** argv) {
 // and makes them available through the argv() and envp() members.  This enables dbtestsMain()
 // to process UTF-8 encoded arguments and environment variables without regard to platform.
 int wmain(int argc, wchar_t* argvW[]) {
-    quickExit(dbtestsMain(argc, WindowsCommandLine(argc, argvW).argv()));
+    mongo::quickExit(
+        mongo::dbtests::dbtestsMain(argc, mongo::WindowsCommandLine(argc, argvW).argv()));
 }
 #else
 int main(int argc, char* argv[]) {
-    quickExit(dbtestsMain(argc, argv));
+    mongo::quickExit(mongo::dbtests::dbtestsMain(argc, argv));
 }
 #endif

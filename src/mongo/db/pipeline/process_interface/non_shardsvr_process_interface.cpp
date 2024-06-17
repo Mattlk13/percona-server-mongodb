@@ -61,12 +61,13 @@
 #include "mongo/db/repl/speculative_majority_read_info.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
 
 std::unique_ptr<Pipeline, PipelineDeleter>
-NonShardServerProcessInterface::attachCursorSourceToPipeline(
+NonShardServerProcessInterface::preparePipelineForExecution(
     Pipeline* ownedPipeline,
     ShardTargetingPolicy shardTargetingPolicy,
     boost::optional<BSONObj> readConcern) {
@@ -74,7 +75,7 @@ NonShardServerProcessInterface::attachCursorSourceToPipeline(
 }
 
 std::unique_ptr<Pipeline, PipelineDeleter>
-NonShardServerProcessInterface::attachCursorSourceToPipeline(
+NonShardServerProcessInterface::preparePipelineForExecution(
     const AggregateCommandRequest& aggRequest,
     Pipeline* pipeline,
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -117,10 +118,10 @@ boost::optional<Document> NonShardServerProcessInterface::lookupSingleDocument(
         // Speculative majority reads are required to use the 'kNoOverlap' read source.
         // Storage engine operations require at least Global IS.
         Lock::GlobalLock lk(expCtx->opCtx, MODE_IS);
-        invariant(expCtx->opCtx->recoveryUnit()->getTimestampReadSource() ==
+        invariant(shard_role_details::getRecoveryUnit(expCtx->opCtx)->getTimestampReadSource() ==
                   RecoveryUnit::ReadSource::kNoOverlap);
-        boost::optional<Timestamp> readTs =
-            expCtx->opCtx->recoveryUnit()->getPointInTimeReadTimestamp(expCtx->opCtx);
+        boost::optional<Timestamp> readTs = shard_role_details::getRecoveryUnit(expCtx->opCtx)
+                                                ->getPointInTimeReadTimestamp(expCtx->opCtx);
         invariant(readTs);
         speculativeMajorityReadInfo.setSpeculativeReadTimestampForward(*readTs);
     }
@@ -236,9 +237,10 @@ void NonShardServerProcessInterface::renameIfOptionsAndIndexesHaveNotChanged(
     RenameCollectionOptions options;
     options.dropTarget = dropTarget;
     options.stayTemp = stayTemp;
+    options.originalCollectionOptions = originalCollectionOptions;
+    options.originalIndexes = originalIndexes;
     // skip sharding validation on non sharded servers
-    doLocalRenameIfOptionsAndIndexesHaveNotChanged(
-        opCtx, sourceNs, targetNs, options, originalIndexes, originalCollectionOptions);
+    doLocalRenameIfOptionsAndIndexesHaveNotChanged(opCtx, sourceNs, targetNs, options);
 }
 
 void NonShardServerProcessInterface::createTimeseriesView(OperationContext* opCtx,
@@ -246,7 +248,7 @@ void NonShardServerProcessInterface::createTimeseriesView(OperationContext* opCt
                                                           const BSONObj& cmdObj,
                                                           const TimeseriesOptions& userOpts) {
     try {
-        uassertStatusOK(mongo::createTimeseries(opCtx, ns, cmdObj));
+        uassertStatusOK(mongo::createCollection(opCtx, ns.dbName(), cmdObj));
     } catch (DBException& ex) {
         _handleTimeseriesCreateError(ex, opCtx, ns, userOpts);
     }
@@ -260,7 +262,10 @@ void NonShardServerProcessInterface::createCollection(OperationContext* opCtx,
 
 void NonShardServerProcessInterface::createTempCollection(OperationContext* opCtx,
                                                           const NamespaceString& nss,
-                                                          const BSONObj& collectionOptions) {
+                                                          const BSONObj& collectionOptions,
+                                                          boost::optional<ShardId> dataShard) {
+    tassert(
+        7971800, "Should not specify 'dataShard' in a non-sharded context", !dataShard.has_value());
     BSONObjBuilder cmd;
     cmd << "create" << nss.coll();
     cmd << "temp" << true;

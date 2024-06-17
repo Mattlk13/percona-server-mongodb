@@ -76,6 +76,7 @@
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
+// TODO: SERVER-88503 Remove Index Filters feature.
 
 namespace mongo {
 
@@ -90,6 +91,13 @@ bool IndexFilterCommand::run(OperationContext* opCtx,
                              const DatabaseName& dbName,
                              const BSONObj& cmdObj,
                              BSONObjBuilder& result) {
+
+    static Rarely sampler;
+    if (sampler.tick()) {
+        LOGV2_WARNING(7923201,
+                      "Index filters are deprecated, consider using query settings instead. See "
+                      "https://www.mongodb.com/docs/manual/reference/command/setQuerySettings");
+    }
     const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
     AutoGetCollectionForReadCommand ctx(opCtx, nss);
     uassertStatusOK(runIndexFilterCommand(opCtx, ctx.getCollection(), cmdObj, &result));
@@ -158,6 +166,12 @@ Status ListFilters::list(const QuerySettings& querySettings, BSONObjBuilder* bob
     //  }
     BSONArrayBuilder hintsBuilder(bob->subarrayStart("filters"));
     std::vector<AllowedIndexEntry> entries = querySettings.getAllAllowedIndices();
+    if (entries.empty()) {
+        LOGV2_DEBUG(8403502,
+                    2,
+                    "Found no filters when listing index filters.",
+                    "nentries"_attr = entries.size());
+    }
     for (vector<AllowedIndexEntry>::const_iterator i = entries.begin(); i != entries.end(); ++i) {
         AllowedIndexEntry entry = *i;
 
@@ -253,6 +267,13 @@ Status ClearFilters::clear(OperationContext* opCtx,
     // Get entries from query settings. We need to remove corresponding entries from the plan
     // cache shortly.
     std::vector<AllowedIndexEntry> entries = querySettings->getAllAllowedIndices();
+
+    if (entries.empty()) {
+        LOGV2_DEBUG(8403501,
+                    2,
+                    "Found no existing filters when clearing index filters.",
+                    "nentries"_attr = entries.size());
+    }
 
     // OK to proceed with clearing all the index filters stored in 'QuerySettings'.
     querySettings->clearAllowedIndices();

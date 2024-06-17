@@ -28,15 +28,16 @@
  */
 
 
-#include <sys/eventfd.h>
-
 #include "mongo/transport/asio/asio_networking_baton.h"
+
+#include <sys/eventfd.h>
 
 #include "mongo/base/checked_cast.h"
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/logv2/log.h"
+#include "mongo/platform/compiler_gcc.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/errno_util.h"
 #include "mongo/util/fail_point.h"
@@ -74,7 +75,14 @@ struct EventFDHolder {
         ::close(fd);
     }
 
+    void initIfNeeded() {
+        if (!isFdValid()) {
+            fd = _initFd();
+        }
+    }
+
     void notify() {
+        invariant(isFdValid());
         while (::eventfd_write(fd, 1) != 0) {
             const auto savedErrno = errno;
             if (savedErrno == EINTR)
@@ -85,6 +93,7 @@ struct EventFDHolder {
 
     void wait() {
         // If we have activity on the `eventfd`, pull the count out.
+        invariant(isFdValid());
         ::eventfd_t u;
         while (::eventfd_read(fd, &u) != 0) {
             const auto savedErrno = errno;
@@ -95,6 +104,10 @@ struct EventFDHolder {
     }
 
 private:
+    bool isFdValid() {
+        return fd >= 0;
+    }
+
     static int _initFd() {
         int fd = ::eventfd(0, EFD_CLOEXEC);
         // On error, -1 is returned and `errno` is set
@@ -114,7 +127,8 @@ private:
     }
 
 public:
-    const int fd = _initFd();
+    // fd is lazy-initialized.
+    int fd = -1;
 };
 
 const auto getEventFDForClient = Client::declareDecoration<EventFDHolder>();
@@ -160,7 +174,11 @@ void AsioNetworkingBaton::schedule(Task func) noexcept {
 }
 
 void AsioNetworkingBaton::notify() noexcept {
-    efd(_opCtx).notify();
+    NotificationState old = _notificationState.swap(kNotificationPending);
+    if (old == kInAtomicWait)
+        _notificationState.notifyAll();
+    else if (old == kInPoll)
+        efd(_opCtx).notify();
 }
 
 Waitable::TimeoutState AsioNetworkingBaton::run_until(ClockSource* clkSource,
@@ -184,10 +202,15 @@ Waitable::TimeoutState AsioNetworkingBaton::run_until(ClockSource* clkSource,
 
 void AsioNetworkingBaton::run(ClockSource* clkSource) noexcept {
     // On the way out, fulfill promises and run scheduled jobs without holding the lock.
-    std::list<Promise<void>> toFulfill;
+    std::list<Promise<void>> toFulfill, toCancel;
+
     const ScopeGuard guard([&] {
         for (auto& promise : toFulfill) {
             promise.emplaceValue();
+        }
+
+        for (auto& promise : toCancel) {
+            promise.setError(getCanceledError());
         }
 
         auto lk = stdx::unique_lock(_mutex);
@@ -207,13 +230,18 @@ void AsioNetworkingBaton::run(ClockSource* clkSource) noexcept {
     if (!_scheduled.empty())
         return;
 
-    toFulfill.splice(toFulfill.end(), _poll(lk, clkSource));
+    std::tie(toFulfill, toCancel) = _poll(lk, clkSource);
 
     // Fire expired timers
     const auto now = clkSource->now();
     for (auto it = _timers.begin(); it != _timers.end() && it->first <= now;
          it = _timers.erase(it)) {
-        toFulfill.push_back(std::move(it->second.promise));
+        Timer& timer = it->second;
+        if (timer.canceled) {
+            toCancel.push_back(std::move(timer.promise));
+        } else {
+            toFulfill.push_back(std::move(timer.promise));
+        }
         _timersById.erase(it->second.id);
     }
 }
@@ -237,12 +265,8 @@ Future<void> AsioNetworkingBaton::addSession(Session& session, Type type) noexce
 Future<void> AsioNetworkingBaton::waitUntil(const ReactorTimer& reactorTimer,
                                             Date_t expiration) noexcept try {
     auto pf = makePromiseFuture<void>();
-    _safeExecute(stdx::unique_lock(_mutex),
-                 [this, expiration, timer = Timer{reactorTimer.id(), std::move(pf.promise)}](
-                     stdx::unique_lock<Mutex>) mutable {
-                     auto iter = _timers.emplace(expiration, std::move(timer));
-                     _timersById[iter->second.id] = iter;
-                 });
+    _addTimer(expiration, Timer{reactorTimer.id(), std::move(pf.promise)});
+
     return std::move(pf.future);
 } catch (const DBException& ex) {
     return ex.toStatus();
@@ -252,34 +276,104 @@ Future<void> AsioNetworkingBaton::waitUntil(Date_t expiration, const Cancellatio
     auto pf = makePromiseFuture<void>();
     DummyTimer dummy;
     const size_t timerId = dummy.id();
-    _safeExecute(stdx::unique_lock(_mutex),
-                 [this, timerId, expiration, promise = std::move(pf.promise), &token](
-                     stdx::unique_lock<Mutex>) mutable {
-                     Timer timer{timerId, std::move(promise)};
-                     auto iter = _timers.emplace(expiration, std::move(timer));
-                     _timersById[iter->second.id] = iter;
-                 });
+
+    _addTimer(expiration, Timer{timerId, std::move(pf.promise)});
+
     token.onCancel().thenRunOn(shared_from_this()).getAsync([this, timerId](Status s) {
         if (s.isOK()) {
             _cancelTimer(timerId);
         }
     });
+
     return std::move(pf.future);
 } catch (const DBException& ex) {
     return ex.toStatus();
+}
+
+void AsioNetworkingBaton::_addTimer(Date_t expiration, Timer timer) {
+    const size_t timerId = timer.id;
+
+    stdx::unique_lock lk(_mutex);
+
+    // The timer could exist already, and we need to assert that it's canceled if so.
+    auto it = _timersById.find(timerId);
+    invariant(it == _timersById.end() || it->second->second.canceled);
+
+    // The timer must not already be in _pendingTimers - cancellations of pending timers
+    // are processed immediately, inline, so if the timer is there, this is a duplicate.
+    invariant(_pendingTimers.try_emplace(timerId, expiration, std::move(timer)).second,
+              "Tried to add an already-existing timer to the baton");
+
+    // _safeExecute moving the timer from _pendingTimers to _timers.
+    _safeExecute(std::move(lk), [this, id = timerId](stdx::unique_lock<Mutex> lk) {
+        auto pendingIt = _pendingTimers.find(id);
+        // The timer may have been canceled out of _pendingTimers
+        if (pendingIt == _pendingTimers.end()) {
+            return;
+        }
+
+        // The timer may exist in _timers in the canceled state. We need to process its
+        // cancellation right now so we can put the new copy in its place.
+        boost::optional<Promise<void>> promise;
+        if (auto it = _timersById.find(id); it != _timersById.end()) {
+            Timer timer = std::exchange(it->second->second, {});
+            invariant(timer.canceled, "Tried to overwrite an existing and active timer");
+            promise = std::move(timer.promise);
+            _timers.erase(it->second);
+            _timersById.erase(it);
+        }
+
+        // Expiration, Timer pair
+        auto pair = std::move(pendingIt->second);
+        _pendingTimers.erase(pendingIt);
+
+        // Make the timer active by putting it into _timers and _timersById
+        auto it = _timers.emplace(std::move(pair));
+        _timersById[it->second.id] = it;
+
+        lk.unlock();
+        if (promise)
+            promise->setError(getCanceledError());
+    });
 }
 
 bool AsioNetworkingBaton::cancelSession(Session& session) noexcept {
     const auto id = session.id();
 
     stdx::unique_lock lk(_mutex);
-    if (_sessions.find(id) == _sessions.end())
+
+    // If the session is still pending, cancel it immediately, inline.
+    if (auto it = _pendingSessions.find(id); it != _pendingSessions.end()) {
+        TransportSession ts = std::exchange(it->second, {});
+        invariant(!ts.canceled, "Canceling session in baton failed");
+        _pendingSessions.erase(it);
+        lk.unlock();
+        ts.promise.setError(getCanceledError());
+        return true;
+    }
+
+    auto it = _sessions.find(id);
+
+    // If the session isn't in _pendingSessions or _sessions, it's unknown to the baton.
+    if (it == _sessions.end())
         return false;
 
+    // If the session is in _sessions and has already had its cancellation requested, return
+    // false and take no further action. The cancellation will be processed by a scheduled job.
+    if (it->second.canceled)
+        return false;
+
+    // Mark the session canceled so we handle subsequent requests to cancel this session correctly.
+    it->second.canceled = true;
+
+    // The session is active. Remove it and fulfill the promise out-of-line.
     _safeExecute(std::move(lk), [this, id](stdx::unique_lock<Mutex> lk) {
         auto iter = _sessions.find(id);
-        if (iter == _sessions.end())
+        // The session may have been removed already elsewhere, and it may have even been added
+        // back to the baton. So we may find it's absent or no longer canceled.
+        if (iter == _sessions.end() || !iter->second.canceled) {
             return;
+        }
 
         TransportSession ts = std::exchange(iter->second, {});
         _sessions.erase(iter);
@@ -298,19 +392,40 @@ bool AsioNetworkingBaton::cancelTimer(const ReactorTimer& timer) noexcept {
 
 bool AsioNetworkingBaton::_cancelTimer(size_t id) noexcept {
     stdx::unique_lock lk(_mutex);
-    if (_timersById.find(id) == _timersById.end())
+
+    // If the timer is pending, cancel it immediately, inline.
+    if (auto it = _pendingTimers.find(id); it != _pendingTimers.end()) {
+        Timer timer = std::exchange(it->second.second, {});
+        _pendingTimers.erase(it);
+        lk.unlock();
+        timer.promise.setError(getCanceledError());
+        return true;
+    }
+
+    auto it = _timersById.find(id);
+    if (it == _timersById.end())
         return false;
 
+    // If a cancellation was already requested, rely on the existing scheduled job to remove it
+    // rather than scheduling a new one.
+    Timer& timer = it->second->second;
+    if (timer.canceled)
+        return false;
+
+    timer.canceled = true;
+
+    // The timer is active. Remove it and fulfill the promise out-of-line.
     _safeExecute(std::move(lk), [this, id](stdx::unique_lock<Mutex> lk) {
         auto iter = _timersById.find(id);
+        // The timer may have already been canceled and removed elsewhere.
         if (iter == _timersById.end())
             return;
 
         Timer batonTimer = std::exchange(iter->second->second, {});
         _timers.erase(iter->second);
         _timersById.erase(iter);
-        lk.unlock();
 
+        lk.unlock();
         batonTimer.promise.setError(getCanceledError());
     });
 
@@ -336,8 +451,8 @@ void AsioNetworkingBaton::_safeExecute(stdx::unique_lock<Mutex> lk, AsioNetworki
     }
 }
 
-std::list<Promise<void>> AsioNetworkingBaton::_poll(stdx::unique_lock<Mutex>& lk,
-                                                    ClockSource* clkSource) {
+std::pair<std::list<Promise<void>>, std::list<Promise<void>>> AsioNetworkingBaton::_poll(
+    stdx::unique_lock<Mutex>& lk, ClockSource* clkSource) {
     const auto now = clkSource->now();
 
     // If we have a timer, then use it to enforce a timeout for polling.
@@ -357,36 +472,87 @@ std::list<Promise<void>> AsioNetworkingBaton::_poll(stdx::unique_lock<Mutex>& lk
         deadline.reset();
     }
 
-    _pollSet.clear();
-    _pollSet.reserve(_sessions.size() + 1);
-    _pollSet.push_back({efd(_opCtx).fd, POLLIN, 0});
+    if (_sessions.empty()) {
+        // There's a pending notification and there are no sessions. We should just return
+        // rather than calling poll().
+        if (_notificationState.load() == kNotificationPending) {
+            // Stores of kNone can use relaxed memory order because the notifying thread only needs
+            // to see the write of kNone; unrelated writes can safely be reordered around it.
+            _notificationState.storeRelaxed(kNone);
+            return {};
+        }
+    } else {
+        // Lazily initialize the eventfd if needed. The notifying thread is guaranteed to see
+        // the eventfd when it reads _notificationState == kInPoll because the write of kInPoll
+        // below is at least release (it's seq_cst) and the read of _notificationState in notify()
+        // is at least acquire (it's also seq_cst).
+        auto& efdHolder = efd(_opCtx);
+        efdHolder.initIfNeeded();
 
-    _pollSessions.clear();
-    _pollSessions.reserve(_sessions.size());
+        _pollSet.clear();
+        _pollSet.reserve(_sessions.size() + 1);
+        _pollSet.push_back({efdHolder.fd, POLLIN, 0});
 
-    for (auto iter = _sessions.begin(); iter != _sessions.end(); ++iter) {
-        _pollSet.push_back({iter->second.fd, iter->second.events, 0});
-        _pollSessions.push_back(iter);
+        _pollSessions.clear();
+        _pollSessions.reserve(_sessions.size());
+
+        for (auto iter = _sessions.begin(); iter != _sessions.end(); ++iter) {
+            _pollSet.push_back({iter->second.fd, iter->second.events, 0});
+            _pollSessions.push_back(iter);
+        }
     }
 
     int events = [&] {
         _inPoll = true;
         lk.unlock();
 
+        // Because _inPoll is true, we have ownership over the baton's state and can safely
+        // check if _sessions is empty without holding the lock.
+        const NotificationState newState = _sessions.empty() ? kInAtomicWait : kInPoll;
+
+        // If the state was previously kNone, then we're going to wait (either in ::poll or
+        // using the WaitableAtomic). We need to set the state accordingly.
+        auto oldState = kNone;
+        // If the old state was kNone, then there was no notification pending.
+        bool wasNotificationPending = !_notificationState.compareAndSwap(&oldState, newState);
+        invariant(oldState != kInPoll);
+        invariant(oldState != kInAtomicWait);
+
         const ScopeGuard guard([&] {
+            // Both consumes a notification (if-any) and mark us as no-longer in poll.
+            _notificationState.storeRelaxed(kNone);
+
             lk.lock();
             _inPoll = false;
         });
 
         blockAsioNetworkingBatonBeforePoll.pauseWhileSet();
-        int timeout = deadline ? Milliseconds(*deadline - now).count() : -1;
-        int events = ::poll(_pollSet.data(), _pollSet.size(), timeout);
-        if (events < 0) {
-            auto ec = lastSystemError();
-            if (ec != systemError(EINTR))
-                LOGV2_FATAL(50834, "error in poll", "error"_attr = errorMessage(ec));
+
+        if (newState == kInPoll) {
+            int timeout = wasNotificationPending
+                ? 0  // Don't wait if there is a notification pending.
+                : deadline ? Milliseconds(*deadline - now).count()
+                           : -1;
+
+            int events = ::poll(_pollSet.data(), _pollSet.size(), timeout);
+            if (events < 0) {
+                auto ec = lastSystemError();
+                if (ec != systemError(EINTR))
+                    LOGV2_FATAL(50834, "error in poll", "error"_attr = errorMessage(ec));
+            }
+            return events;
+        } else {
+            invariant(newState == kInAtomicWait);
+            if (wasNotificationPending)
+                return 0;
+
+            // Passing Date_t::max() to waitUntil will cause a duration overflow.
+            if (deadline && deadline != Date_t::max())
+                _notificationState.waitUntil(kInAtomicWait, *deadline);
+            else
+                _notificationState.wait(kInAtomicWait);
+            return 0;
         }
-        return events;
     }();
 
     if (events <= 0)
@@ -400,17 +566,22 @@ std::list<Promise<void>> AsioNetworkingBaton::_poll(stdx::unique_lock<Mutex>& lk
     }
     ++psit;
 
-    std::list<Promise<void>> promises;
+    std::list<Promise<void>> toFulfill, toCancel;
     for (auto sit = _pollSessions.begin(); events && sit != _pollSessions.end(); ++sit, ++psit) {
         if (psit->revents) {
-            promises.push_back(std::move((*sit)->second.promise));
+            TransportSession& ts = (*sit)->second;
+            if (ts.canceled) {
+                toCancel.push_back(std::move(ts.promise));
+            } else {
+                toFulfill.push_back(std::move(ts.promise));
+            }
             _sessions.erase(*sit);
             --events;
         }
     }
 
     invariant(events == 0, "Failed to process all events after going through registered sessions");
-    return promises;
+    return std::make_pair(std::move(toFulfill), std::move(toCancel));
 }
 
 Future<void> AsioNetworkingBaton::_addSession(Session& session, short events) try {
@@ -418,34 +589,79 @@ Future<void> AsioNetworkingBaton::_addSession(Session& session, short events) tr
     TransportSession ts{checked_cast<AsioSession&>(session).getSocket().native_handle(),
                         events,
                         std::move(pf.promise)};
-    _safeExecute(stdx::unique_lock(_mutex),
-                 [this, id = session.id(), ts = std::move(ts)](stdx::unique_lock<Mutex>) mutable {
-                     invariant(_sessions.emplace(id, std::move(ts)).second,
-                               "Adding session to baton failed");
-                 });
+    SessionId id = session.id();
+
+    stdx::unique_lock lk(_mutex);
+
+    // The session could exist in _sessions, and we need to assert that it's canceled if so.
+    auto it = _sessions.find(id);
+    invariant(it == _sessions.end() || it->second.canceled,
+              "Attempted to add duplicate session to baton");
+
+    // The session must not already be in _pendingSessions - cancellations of pending sessions
+    // are processed immediately, inline, so if the session is there, this is a duplicate.
+    invariant(_pendingSessions.emplace(id, std::move(ts)).second,
+              "Tried to add an already existing session");
+
+    // _safeExecute moving the session from _pendingSessions to _sessions.
+    _safeExecute(std::move(lk), [this, id](stdx::unique_lock<Mutex> lk) {
+        auto it = _pendingSessions.find(id);
+        if (it == _pendingSessions.end()) {
+            // The session may have been canceled out of _pendingSessions
+            return;
+        }
+
+        // The session may exist in _sessions in the canceled state. We need to process its
+        // cancellation right now so we can put the new copy in its place.
+        boost::optional<Promise<void>> promise;
+        auto activeIt = _sessions.find(id);
+        if (activeIt != _sessions.end()) {
+            invariant(activeIt->second.canceled, "Adding session to baton failed");
+            promise = std::move(activeIt->second.promise);
+            _sessions.erase(activeIt);
+        }
+
+        // Pending sessions cannot remain in the baton in the canceled state
+        auto nh = _pendingSessions.extract(it);
+        invariant(!nh.mapped().canceled, "Pending session in baton found in the canceled state");
+        invariant(_sessions.insert(std::move(nh)).inserted, "Adding session to baton failed");
+
+        lk.unlock();
+        if (promise)
+            promise->setError(getCanceledError());
+    });
+
     return std::move(pf.future);
 } catch (const DBException& ex) {
     return ex.toStatus();
 }
 
 void AsioNetworkingBaton::detachImpl() noexcept {
+
+    stdx::unique_lock lk(_mutex);
+
+    invariant(_opCtx->getBaton().get() == this);
+    _opCtx->setBaton(nullptr);
+
+    _opCtx = nullptr;
+
+    if (MONGO_likely(_scheduled.empty() && _sessions.empty() && _pendingSessions.empty() &&
+                     _timers.empty() && _pendingTimers.empty()))
+        return;
+
+    using std::swap;
     decltype(_scheduled) scheduled;
+    swap(_scheduled, scheduled);
     decltype(_sessions) sessions;
+    swap(_sessions, sessions);
+    decltype(_pendingSessions) pendingSessions;
+    swap(_pendingSessions, pendingSessions);
     decltype(_timers) timers;
+    swap(_timers, timers);
+    decltype(_pendingTimers) pendingTimers;
+    swap(_pendingTimers, pendingTimers);
 
-    {
-        stdx::lock_guard lk(_mutex);
-
-        invariant(_opCtx->getBaton().get() == this);
-        _opCtx->setBaton(nullptr);
-
-        _opCtx = nullptr;
-
-        using std::swap;
-        swap(_scheduled, scheduled);
-        swap(_sessions, sessions);
-        swap(_timers, timers);
-    }
+    lk.unlock();
 
     for (auto& job : scheduled) {
         job(stdx::unique_lock(_mutex));
@@ -456,8 +672,17 @@ void AsioNetworkingBaton::detachImpl() noexcept {
         session.second.promise.setError(getDetachedError());
     }
 
+    for (auto& pair : pendingSessions) {
+        pair.second.promise.setError(getDetachedError());
+    }
+
     for (auto& pair : timers) {
         pair.second.promise.setError(getDetachedError());
+    }
+
+    for (auto& pair : pendingTimers) {
+        Timer& timer = pair.second.second;
+        timer.promise.setError(getDetachedError());
     }
 }
 

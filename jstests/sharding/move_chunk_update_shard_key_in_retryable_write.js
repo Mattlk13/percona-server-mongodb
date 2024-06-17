@@ -6,7 +6,11 @@
  * error saying that the write can't be retried since it was upgraded to a transaction as part of
  * the update. This should be true whether or not a migration occurs on the chunk containing the
  * original value of the document's shard key. This file tests that behavior.
- * @tags: [uses_transactions, uses_multi_shard_transaction,]
+ * @tags: [
+ *    uses_transactions,
+ *    uses_multi_shard_transaction,
+ *    temp_disabled_embedded_router_uncategorized,
+ * ]
  */
 import {
     moveChunkParallel,
@@ -40,8 +44,8 @@ let mongos1TestDB = st.s1.getDB(dbName);
 
 // Create a sharded collection with three chunks:
 //     [-inf, -10), [-10, 10), [10, inf)
-assert.commandWorked(st.s0.adminCommand({enableSharding: dbName}));
-assert.commandWorked(st.s0.adminCommand({movePrimary: dbName, to: st.shard0.shardName}));
+assert.commandWorked(
+    st.s0.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 assert.commandWorked(st.s0.adminCommand({shardCollection: ns, key: {x: 1}}));
 assert.commandWorked(st.s0.adminCommand({split: ns, middle: {x: -10}}));
 assert.commandWorked(st.s0.adminCommand({split: ns, middle: {x: 10}}));
@@ -217,8 +221,18 @@ function attachTxnFields(cmdObj) {
                                           ErrorCodes.IncompleteTransactionHistory);
              assert.commandFailedWithCode(mongos0TestDB.runCommand(findAndModifyUpdateCmdObj),
                                           ErrorCodes.IncompleteTransactionHistory);
-             assert.commandFailedWithCode(mongos0TestDB.runCommand(findAndModifyUpsertCmdObj),
-                                          ErrorCodes.IncompleteTransactionHistory);
+             // TODO SERVER-84796 revert back to IncompleteTransactionHistory only.
+             // In recent versions, this takes the single write shard commit path, so the original
+             // shard will not durably write an entry for the transaction so the migration will
+             // migrate no history. This lets the retried retryable write trigger the
+             // WouldChangeOwningShard protocol, so the router is the first to detect the
+             // transaction has already run and will throw ConflictingOperationInProgress. This
+             // feature isn't fully retryable by design, so we only require throwing some error on
+             // retry to prevent double applying.
+             assert.commandFailedWithCode(mongos0TestDB.runCommand(findAndModifyUpsertCmdObj), [
+                 ErrorCodes.IncompleteTransactionHistory,
+                 ErrorCodes.ConflictingOperationInProgress
+             ]);
          });
 
     test("Updating shard key in retryable write receives error on retry when the original chunk " +

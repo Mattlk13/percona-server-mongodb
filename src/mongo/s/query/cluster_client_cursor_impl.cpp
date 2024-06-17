@@ -54,9 +54,11 @@
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 namespace mongo {
-
-static CounterMetric mongosCursorStatsTotalOpened("mongos.cursor.totalOpened");
-static CounterMetric mongosCursorStatsMoreThanOneBatch("mongos.cursor.moreThanOneBatch");
+namespace {
+auto& mongosCursorStatsTotalOpened = *MetricBuilder<Counter64>("mongos.cursor.totalOpened");
+auto& mongosCursorStatsMoreThanOneBatch =
+    *MetricBuilder<Counter64>("mongos.cursor.moreThanOneBatch");
+}  // namespace
 
 ClusterClientCursorGuard ClusterClientCursorImpl::make(
     OperationContext* opCtx,
@@ -87,8 +89,8 @@ ClusterClientCursorImpl::ClusterClientCursorImpl(OperationContext* opCtx,
       _lastUseDate(_createdDate),
       _queryHash(CurOp::get(opCtx)->debug().queryHash),
       _shouldOmitDiagnosticInformation(CurOp::get(opCtx)->getShouldOmitDiagnosticInformation()),
-      _queryStatsKeyHash(CurOp::get(opCtx)->debug().queryStatsKeyHash),
-      _queryStatsKey(std::move(CurOp::get(opCtx)->debug().queryStatsKey)) {
+      _queryStatsKeyHash(CurOp::get(opCtx)->debug().queryStatsInfo.keyHash),
+      _queryStatsKey(std::move(CurOp::get(opCtx)->debug().queryStatsInfo.key)) {
     dassert(!_params.compareWholeSortKeyOnRouter ||
             SimpleBSONObjComparator::kInstance.evaluate(
                 _params.sortToApplyOnRouter == AsyncResultsMerger::kWholeSortKeySortPattern));
@@ -107,8 +109,8 @@ ClusterClientCursorImpl::ClusterClientCursorImpl(OperationContext* opCtx,
       _lastUseDate(_createdDate),
       _queryHash(CurOp::get(opCtx)->debug().queryHash),
       _shouldOmitDiagnosticInformation(CurOp::get(opCtx)->getShouldOmitDiagnosticInformation()),
-      _queryStatsKeyHash(CurOp::get(opCtx)->debug().queryStatsKeyHash),
-      _queryStatsKey(std::move(CurOp::get(opCtx)->debug().queryStatsKey)) {
+      _queryStatsKeyHash(CurOp::get(opCtx)->debug().queryStatsInfo.keyHash),
+      _queryStatsKey(std::move(CurOp::get(opCtx)->debug().queryStatsInfo.key)) {
     dassert(!_params.compareWholeSortKeyOnRouter ||
             SimpleBSONObjComparator::kInstance.evaluate(
                 _params.sortToApplyOnRouter == AsyncResultsMerger::kWholeSortKeySortPattern));
@@ -150,13 +152,12 @@ void ClusterClientCursorImpl::kill(OperationContext* opCtx) {
             "Cannot kill a cluster client cursor that has already been killed",
             !_hasBeenKilled);
 
-    if (_queryStatsKeyHash && opCtx) {
-        query_stats::writeQueryStats(opCtx,
-                                     _queryStatsKeyHash,
-                                     std::move(_queryStatsKey),
-                                     _metrics.executionTime.value_or(Microseconds{0}).count(),
-                                     _firstResponseExecutionTime.value_or(Microseconds{0}).count(),
-                                     _metrics.nreturned.value_or(0));
+    if (_queryStatsKey && opCtx) {
+        auto snapshot = query_stats::captureMetrics(
+            opCtx, query_stats::microsecondsToUint64(_firstResponseExecutionTime), _metrics);
+
+        query_stats::writeQueryStats(
+            opCtx, _queryStatsKeyHash, std::move(_queryStatsKey), snapshot);
     }
 
     _root->kill(opCtx);

@@ -286,18 +286,8 @@ void OrderedIntervalList::complement() {
     // We will build up a list of intervals that represents the inversion of those in the OIL.
     vector<Interval> newIntervals;
     for (const auto& curInt : intervals) {
-
-        // There is one special case worth optimizing for: we will generate two point queries for an
-        // equality-to-null predicate like {a: {$eq: null}}. The points are undefined and null, so
-        // when complementing (for {a: {$ne: null}} or similar), we know that there is nothing in
-        // between these two points, and can avoid adding that range.
-        const bool isProvablyEmptyRange =
-            (curBoundary.type() == BSONType::Undefined && curInclusive &&
-             curInt.start.type() == BSONType::jstNULL && curInt.startInclusive);
-
         if ((0 != curInt.start.woCompare(curBoundary) ||
-             (!curInclusive && !curInt.startInclusive)) &&
-            !isProvablyEmptyRange) {
+             (!curInclusive && !curInt.startInclusive))) {
             // Make a new interval from 'curBoundary' to the start of 'curInterval'.
             BSONObjBuilder intBob;
             intBob.append(curBoundary);
@@ -612,6 +602,36 @@ bool IndexBoundsChecker::isValidKey(const BSONObj& key) {
         ++curOil;
     }
     return true;
+}
+
+IndexBoundsChecker::KeyState IndexBoundsChecker::checkKeyWithEndPosition(
+    const BSONObj& currentKey,
+    IndexSeekPoint* query,
+    key_string::Builder& endKey,
+    Ordering ord,
+    bool forward) {
+    auto state = checkKey(currentKey, query);
+    endKey.resetToEmpty(ord);
+    if (state == VALID && !_bounds->fields.back().isPoint()) {
+        auto size = _keyValues.size();
+        std::vector<const BSONElement*> out(size);
+        key_string::Discriminator discriminator;
+        for (size_t i = 0; i < size - 1; ++i) {
+            if (_keyValues[i]) {
+                endKey.appendBSONElement(_keyValues[i]);
+            }
+        }
+        const OrderedIntervalList& oil = _bounds->fields.back();
+        endKey.appendBSONElement(oil.intervals[_curInterval.back()].end);
+        if (oil.intervals[_curInterval.back()].endInclusive) {
+            discriminator = key_string::Discriminator::kInclusive;
+        } else {
+            discriminator = forward ? key_string::Discriminator::kExclusiveBefore
+                                    : key_string::Discriminator::kExclusiveAfter;
+        }
+        endKey.appendDiscriminator(discriminator);
+    }
+    return state;
 }
 
 IndexBoundsChecker::KeyState IndexBoundsChecker::checkKey(const BSONObj& key, IndexSeekPoint* out) {

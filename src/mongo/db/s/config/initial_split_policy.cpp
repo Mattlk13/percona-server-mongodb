@@ -89,10 +89,29 @@ using ChunkDistributionMap = stdx::unordered_map<ShardId, size_t>;
 using ZoneShardMap = StringMap<std::vector<ShardId>>;
 using boost::intrusive_ptr;
 
-std::vector<ShardId> getAllShardIdsShuffled(OperationContext* opCtx) {
-    auto shardIds = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
+std::vector<ShardId> getAllNonDrainingShardIdsShuffled(OperationContext* opCtx) {
+    const auto shardsAndOpTime = uassertStatusOKWithContext(
+        Grid::get(opCtx)->catalogClient()->getAllShards(
+            opCtx, repl::ReadConcernLevel::kMajorityReadConcern, true /* excludeDraining */),
+        "Cannot retrieve updated shard list from config server");
+    const auto shards = std::move(shardsAndOpTime.value);
+    const auto lastVisibleOpTime = std::move(shardsAndOpTime.opTime);
+
+    LOGV2_DEBUG(6566600,
+                1,
+                "Successfully retrieved updated shard list from config server",
+                "nonDrainingShardsNumber"_attr = shards.size(),
+                "lastVisibleOpTime"_attr = lastVisibleOpTime);
+
+    std::vector<ShardId> shardIds;
+    std::transform(shards.begin(),
+                   shards.end(),
+                   std::back_inserter(shardIds),
+                   [](const ShardType& shard) { return ShardId(shard.getName()); });
+
     std::default_random_engine rng{};
     std::shuffle(shardIds.begin(), shardIds.end(), rng);
+
     return shardIds;
 }
 
@@ -120,7 +139,7 @@ ShardId selectBestShard(const ChunkDistributionMap& chunkMap,
                         const ZoneInfo& zoneInfo,
                         const ZoneShardMap& zoneToShards,
                         const ChunkRange& chunkRange) {
-    auto zone = zoneInfo.getZoneForChunk(chunkRange);
+    auto zone = zoneInfo.getZoneForRange(chunkRange);
     auto iter = zoneToShards.find(zone);
 
     uassert(4952605,
@@ -335,9 +354,15 @@ InitialSplitPolicy::ShardCollectionConfig InitialSplitPolicy::generateShardColle
     const ShardKeyPattern& shardKeyPattern,
     const Timestamp& validAfter,
     const std::vector<BSONObj>& splitPoints,
-    const std::vector<ShardId>& allShardIds,
-    const int numContiguousChunksPerShard) {
+    const std::vector<ShardId>& allShardIds) {
     invariant(!allShardIds.empty());
+
+    size_t numInitialChunksPerShard = 1;
+    // TODO SERVER-81884: update once 8.0 becomes last LTS.
+    if (!feature_flags::gOneChunkPerShardEmptyCollectionWithHashedShardKey.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+        numInitialChunksPerShard = 2;
+    }
 
     std::vector<BSONObj> finalSplitPoints;
 
@@ -361,7 +386,8 @@ InitialSplitPolicy::ShardCollectionConfig InitialSplitPolicy::generateShardColle
         const BSONObj min = (i == 0) ? keyPattern.globalMin() : finalSplitPoints[i - 1];
         const BSONObj max =
             (i < finalSplitPoints.size()) ? finalSplitPoints[i] : keyPattern.globalMax();
-        const ShardId shardId = allShardIds[(i / numContiguousChunksPerShard) % allShardIds.size()];
+        // TODO SERVER-81884: simplify once numInitialChunksPerShard is always 1
+        const ShardId shardId = allShardIds[(i / numInitialChunksPerShard) % allShardIds.size()];
 
         appendChunk(params, min, max, &version, shardId, &chunks);
     }
@@ -414,27 +440,18 @@ InitialSplitPolicy::ShardCollectionConfig SingleChunkOnShardSplitPolicy::createF
 SplitPointsBasedSplitPolicy::SplitPointsBasedSplitPolicy(
     const ShardKeyPattern& shardKeyPattern,
     size_t numShards,
-    boost::optional<std::vector<ShardId>> availableShardIds,
-    // TODO SERVER-82611: get rid of the `numInitialChunks` argument.
-    // The `numInitialChunks` parameter was deprecated in SERVER-74747 and should not be used.
-    boost::optional<size_t> numInitialChunks)
+    boost::optional<std::vector<ShardId>> availableShardIds)
     : _availableShardIds(std::move(availableShardIds)) {
-    // `numInitialChunks` is a test-only paramter
-    uassert(ErrorCodes::InvalidOptions,
-            "numInitialChunks is deprecated",
-            !numInitialChunks || getTestCommandsEnabled());
 
     size_t numInitialChunksPerShard = 1;
     // TODO SERVER-81884: update once 8.0 becomes last LTS.
     if (!feature_flags::gOneChunkPerShardEmptyCollectionWithHashedShardKey.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
         numInitialChunksPerShard = 2;
     }
 
-    size_t numInitialChunksVal = numInitialChunks.value_or(numShards * numInitialChunksPerShard);
-    _splitPoints = calculateHashedSplitPoints(shardKeyPattern, BSONObj(), numInitialChunksVal);
-    _numContiguousChunksPerShard =
-        std::max(numInitialChunksVal / numShards, static_cast<size_t>(1));
+    _splitPoints = calculateHashedSplitPoints(
+        shardKeyPattern, BSONObj(), numShards * numInitialChunksPerShard);
 }
 
 InitialSplitPolicy::ShardCollectionConfig SplitPointsBasedSplitPolicy::createFirstChunks(
@@ -443,13 +460,12 @@ InitialSplitPolicy::ShardCollectionConfig SplitPointsBasedSplitPolicy::createFir
     const SplitPolicyParams& params) {
     const auto currentTime = VectorClock::get(opCtx)->getTime();
     const auto validAfter = currentTime.clusterTime().asTimestamp();
-    return generateShardCollectionInitialChunks(params,
-                                                shardKeyPattern,
-                                                validAfter,
-                                                _splitPoints,
-                                                _availableShardIds ? *_availableShardIds
-                                                                   : getAllShardIdsShuffled(opCtx),
-                                                _numContiguousChunksPerShard);
+    return generateShardCollectionInitialChunks(
+        params,
+        shardKeyPattern,
+        validAfter,
+        _splitPoints,
+        _availableShardIds ? *_availableShardIds : getAllNonDrainingShardIdsShuffled(opCtx));
 }
 
 AbstractTagsBasedSplitPolicy::AbstractTagsBasedSplitPolicy(
@@ -477,7 +493,7 @@ InitialSplitPolicy::ShardCollectionConfig AbstractTagsBasedSplitPolicy::createFi
     const SplitPolicyParams& params) {
     invariant(!_tags.empty());
 
-    const auto shardIds = _availableShardIds.value_or(getAllShardIdsShuffled(opCtx));
+    const auto shardIds = _availableShardIds.value_or(getAllNonDrainingShardIdsShuffled(opCtx));
     const auto currentTime = VectorClock::get(opCtx)->getTime();
     const auto validAfter = currentTime.clusterTime().asTimestamp();
     const auto& keyPattern = shardKeyPattern.getKeyPattern();
@@ -544,19 +560,23 @@ InitialSplitPolicy::ShardCollectionConfig AbstractTagsBasedSplitPolicy::createFi
 
 AbstractTagsBasedSplitPolicy::SplitInfo PresplitHashedZonesSplitPolicy::buildSplitInfoForTag(
     TagsType tag, const ShardKeyPattern& shardKeyPattern) {
+
+    // This strategy presplits each tag such that at least 'minNumInitialChunksPerShard' chunks are
+    // placed on every shard to which the tag is assigned. We distribute the chunks in an
+    // best-effort attempt to ensure that an equal number of chunks are created on each shard
+    // regardless of how the zones are laid out.
+
+    size_t minNumInitialChunksPerShard = 1;
+    // TODO SERVER-81884: update once 8.0 becomes last LTS.
+    if (!feature_flags::gOneChunkPerShardEmptyCollectionWithHashedShardKey.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+        minNumInitialChunksPerShard = 2;
+    }
+
     // Returns the ceiling number for the decimal value of x/y.
     auto ceilOfXOverY = [](auto x, auto y) {
         return (x / y) + (x % y != 0);
     };
-
-    // This strategy presplits each tag such that at least 1 chunk is placed on every shard to which
-    // the tag is assigned. We distribute the chunks such that at least '_numInitialChunks' are
-    // created across the cluster, and we make a best-effort attempt to ensure that an equal number
-    // of chunks are created on each shard regardless of how the zones are laid out.
-
-    //  We take the ceiling when the number is not divisible so that the final number of chunks
-    //  we generate are at least '_numInitialChunks'.
-    auto numChunksPerShard = ceilOfXOverY(_numInitialChunks, _numTagsPerShard.size());
 
     const auto& tagsToShardsMap = getTagsToShardIds();
     invariant(tagsToShardsMap.find(tag.getTag()) != tagsToShardsMap.end());
@@ -568,10 +588,12 @@ AbstractTagsBasedSplitPolicy::SplitInfo PresplitHashedZonesSplitPolicy::buildSpl
     chunkDistribution.reserve((shardsForCurrentTag.size()));
     auto numChunksForCurrentTag = 0;
     for (auto&& shard : shardsForCurrentTag) {
+        // TODO SERVER-81884: update once 8.0 becomes last LTS.
+        // numChunksForCurrentTagOnShard will always be 1 when minNumInitialChunksPerShard == 1
         auto numChunksForCurrentTagOnShard =
-            ceilOfXOverY(numChunksPerShard, _numTagsPerShard[shard.toString()]);
+            ceilOfXOverY(minNumInitialChunksPerShard, _numTagsPerShard[shard.toString()]);
         chunkDistribution.push_back({shard, numChunksForCurrentTagOnShard});
-        numChunksForCurrentTag += (numChunksForCurrentTagOnShard);
+        numChunksForCurrentTag += numChunksForCurrentTagOnShard;
     }
 
     // Extract the fields preceding the hashed field. We use this object as a base for building
@@ -594,15 +616,8 @@ PresplitHashedZonesSplitPolicy::PresplitHashedZonesSplitPolicy(
     const ShardKeyPattern& shardKeyPattern,
     std::vector<TagsType> tags,
     bool isCollectionEmpty,
-    boost::optional<std::vector<ShardId>> availableShardIds,
-    // TODO SERVER-82611: get rid of the `numInitialChunks` argument.
-    // The `numInitialChunks` parameter was deprecated in SERVER-74747 and should not be used.
-    boost::optional<size_t> numInitialChunks)
+    boost::optional<std::vector<ShardId>> availableShardIds)
     : AbstractTagsBasedSplitPolicy(opCtx, tags, std::move(availableShardIds)) {
-    // `numInitialChunks` is a test-only parameter
-    uassert(ErrorCodes::InvalidOptions,
-            "numInitialChunks is deprecated",
-            !numInitialChunks || getTestCommandsEnabled());
     // Verify that tags have been set up correctly for this split policy.
     _validate(shardKeyPattern, isCollectionEmpty);
 
@@ -617,16 +632,6 @@ PresplitHashedZonesSplitPolicy::PresplitHashedZonesSplitPolicy(
     // If we are here, we have confirmed that at least one tag is already set up. A tag can only be
     // created if they are associated with a zone and the zone has to be assigned to a shard.
     invariant(!_numTagsPerShard.empty());
-
-    size_t numInitialChunksPerShard = 1;
-    // TODO SERVER-81884: update once 8.0 becomes last LTS.
-    if (!feature_flags::gOneChunkPerShardEmptyCollectionWithHashedShardKey.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
-        numInitialChunksPerShard = 2;
-    }
-    // If 'numInitialChunks' was not specified, use default value.
-    _numInitialChunks =
-        numInitialChunks.value_or(_numTagsPerShard.size() * numInitialChunksPerShard);
 }
 
 /**
@@ -733,7 +738,7 @@ std::vector<BSONObj> SamplingBasedSplitPolicy::createRawPipeline(const ShardKeyP
     for (auto&& fieldRef : shardKeyFields) {
         // If the shard key includes a hashed field and current fieldRef is the hashed field.
         if (shardKey.isHashedPattern() &&
-            fieldRef->dottedField().compare(shardKey.getHashedField().fieldNameStringData()) == 0) {
+            fieldRef->dottedField() == shardKey.getHashedField().fieldNameStringData()) {
             arrayToObjectBuilder.emplace_back(
                 Doc{{"k", V{fieldRef->dottedField()}},
                     {"v", Doc{{"$toHashedIndexKey", V{"$" + fieldRef->dottedField()}}}}});
@@ -837,12 +842,12 @@ InitialSplitPolicy::ShardCollectionConfig SamplingBasedSplitPolicy::createFirstC
         }
         zoneToShardMap.emplace("", *_availableShardIds);
     } else {
-        auto allShardIds = getAllShardIdsShuffled(opCtx);
-        for (const auto& shard : allShardIds) {
+        const auto shardIds = getAllNonDrainingShardIdsShuffled(opCtx);
+        for (const auto& shard : shardIds) {
             chunkDistribution.emplace(shard, 0);
         }
 
-        zoneToShardMap.emplace("", std::move(allShardIds));
+        zoneToShardMap.emplace("", std::move(shardIds));
     }
 
     std::vector<ChunkType> chunks;
@@ -1079,7 +1084,7 @@ void ShardDistributionSplitPolicy::_checkShardsMatchZones(
     }
 
     for (const auto& chunk : chunks) {
-        auto zoneFromCmdParameter = zoneInfo.getZoneForChunk({chunk.getMin(), chunk.getMax()});
+        auto zoneFromCmdParameter = zoneInfo.getZoneForRange({chunk.getMin(), chunk.getMax()});
         auto iter = shardIdToTags.find(chunk.getShard());
         uassert(ErrorCodes::InvalidOptions,
                 str::stream() << "Specified zones and shardDistribution are conflicting with the "

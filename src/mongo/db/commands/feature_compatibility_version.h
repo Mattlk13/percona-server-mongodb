@@ -63,9 +63,6 @@ public:
     static void fassertInitializedAfterStartup(OperationContext* opCtx);
 
     /**
-     * TODO (SERVER-74847): Remove this function once we remove testing around downgrading from
-     * latest to last continuous.
-     *
      * Adds a transition that allows users to downgrade from latest FCV to last continuous FCV.
      * This function should only be called if the 'disableTransitionFromLatestToLastContinuous'
      * server parameter is set to 'false'. That parameter is test-only and defaulted to 'true'.
@@ -73,10 +70,10 @@ public:
     static void addTransitionFromLatestToLastContinuous();
 
     /**
-     * Returns the on-disk feature compatibility version document if it exists.
+     * Returns the on-disk feature compatibility version document if it can be found.
+     * If there was an error finding the document, returns the error reason.
      */
-    static boost::optional<BSONObj> findFeatureCompatibilityVersionDocument(
-        OperationContext* opCtx);
+    static StatusWith<BSONObj> findFeatureCompatibilityVersionDocument(OperationContext* opCtx);
 
     /**
      * uassert that a transition from fromVersion to newVersion is permitted. Different rules apply
@@ -144,7 +141,13 @@ public:
 };
 
 /**
- * Utility class to prevent the FCV from changing while the FixedFCVRegion is in scope.
+ * Utility class to prevent the on-disk FCV from changing while the FixedFCVRegion is in scope.
+ *
+ * Note that this does not prevent the in-memory FCV from changing (which for example could be reset
+ * during initial sync). The operator* and operator-> functions return a MutableFCV, which could
+ * change at different points in time, so if you wanted to get a consistent snapshot of the
+ * in-memory FCV, you should still use the ServerGlobalParams::MutableFCV's acquireFCVSnapshot()
+ * function.
  */
 class FixedFCVRegion {
 public:
@@ -154,8 +157,8 @@ public:
     bool operator==(const multiversion::FeatureCompatibilityVersion& other) const;
     bool operator!=(const multiversion::FeatureCompatibilityVersion& other) const;
 
-    const ServerGlobalParams::FeatureCompatibility& operator*() const;
-    const ServerGlobalParams::FeatureCompatibility* operator->() const;
+    const ServerGlobalParams::MutableFCV& operator*() const;
+    const ServerGlobalParams::MutableFCV* operator->() const;
 
 private:
     Lock::SharedLock _lk;

@@ -36,12 +36,13 @@
 
 #include "mongo/base/error_codes.h"
 #include "mongo/base/string_data.h"
+#include "mongo/db/admission/execution_admission_context.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/control/journal_flusher.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -92,7 +93,7 @@ void JournalFlusher::set(ServiceContext* serviceCtx, std::unique_ptr<JournalFlus
 }
 
 void JournalFlusher::run() {
-    ThreadClient tc(name(), getGlobalServiceContext()->getService());
+    ThreadClient tc(name(), getGlobalServiceContext()->getService(ClusterRole::ShardServer));
     LOGV2_DEBUG(4584701, 1, "starting {name} thread", "name"_attr = name());
 
     // The thread must not run and access the service context to create an opCtx while unit test
@@ -104,41 +105,46 @@ void JournalFlusher::run() {
                                 [&] { return _flushJournalNow || _needToPause || _shuttingDown; });
     }
 
-    auto setUpOpCtx = [&] {
+    boost::optional<ScopedAdmissionPriority<ExecutionAdmissionContext>> admissionPriority;
+    auto setUpOpCtx = [&](WithLock lk) {
         // Initialize the thread's opCtx.
         _uniqueCtx.emplace(tc->makeOperationContext());
 
         // Updates to a non-replicated collection, oplogTruncateAfterPoint, are made by this thread.
         // As this operation is critical for data durability we mark it as having Immediate priority
         // to skip ticket and flow control.
-        _uniqueCtx.get()->lockState()->setAdmissionPriority(AdmissionContext::Priority::kImmediate);
-
-        // The journal flusher should not conflict with the setFCV command.
-        _uniqueCtx->get()->lockState()->setShouldConflictWithSetFeatureCompatibilityVersion(false);
+        admissionPriority.emplace(_uniqueCtx->get(), AdmissionContext::Priority::kExempt);
     };
 
-    setUpOpCtx();
+    auto tearDownOpCtx = [&](WithLock lk) {
+        admissionPriority.reset();
+        _uniqueCtx.reset();
+    };
+
+    {
+        stdx::lock_guard<Latch> lk(_opCtxMutex);
+        setUpOpCtx(lk);
+    }
+
     while (true) {
         pauseJournalFlusherBeforeFlush.pauseWhileSet();
         try {
-            ON_BLOCK_EXIT([&] {
-                // We do not want to miss an interrupt for the next round. Therefore, the opCtx
-                // will be reset after a flushing round finishes.
-                //
-                // It is fine if the opCtx is signaled between finishing and resetting because
-                // state changes will be seen before the next round. We want to catch any
-                // interrupt signals that occur after state is checked at the start of a round:
-                // the time during or before the next flush.
-                stdx::lock_guard<Latch> lk(_opCtxMutex);
-                _uniqueCtx.reset();
-                setUpOpCtx();
-            });
-
-            _uniqueCtx->get()->recoveryUnit()->waitUntilDurable(_uniqueCtx->get());
+            shard_role_details::getRecoveryUnit(_uniqueCtx->get())
+                ->waitUntilDurable(_uniqueCtx->get());
 
             // Signal the waiters that a round completed.
             _currentSharedPromise->emplaceValue();
+
+            // Release snapshot before we start the next round.
+            shard_role_details::getRecoveryUnit(_uniqueCtx->get())->abandonSnapshot();
         } catch (const AssertionException& e) {
+            {
+                // Reset opCtx if we get an error.
+                stdx::lock_guard<Latch> lk(_opCtxMutex);
+                tearDownOpCtx(lk);
+                setUpOpCtx(lk);
+            }
+
             // Can be caused by killOp or stepdown.
             if (ErrorCodes::isInterruption(e.code())) {
                 // When this thread is interrupted it will immediately restart the journal flush
@@ -204,7 +210,7 @@ void JournalFlusher::run() {
             _stateChangeCV.notify_all();
 
             stdx::lock_guard<Latch> lk(_opCtxMutex);
-            _uniqueCtx.reset();
+            tearDownOpCtx(lk);
             return;
         }
 
@@ -248,7 +254,19 @@ void JournalFlusher::resume() {
 }
 
 void JournalFlusher::waitForJournalFlush(Interruptible* interruptible) {
-    _waitForJournalFlushNoRetry(interruptible);
+    auto myFuture = [&]() {
+        stdx::lock_guard<Latch> lk(_stateMutex);
+        _triggerJournalFlush(lk);
+        return _nextSharedPromise->getFuture();
+    }();
+
+    // Throws on error if the flusher thread is shutdown.
+    myFuture.get(interruptible);
+}
+
+void JournalFlusher::triggerJournalFlush() {
+    stdx::unique_lock<Latch> lk(_stateMutex);
+    _triggerJournalFlush(lk);
 }
 
 void JournalFlusher::interruptJournalFlusherForReplStateChange() {
@@ -259,17 +277,11 @@ void JournalFlusher::interruptJournalFlusherForReplStateChange() {
     }
 }
 
-void JournalFlusher::_waitForJournalFlushNoRetry(Interruptible* interruptible) {
-    auto myFuture = [&]() {
-        stdx::unique_lock<Latch> lk(_stateMutex);
-        if (!_flushJournalNow) {
-            _flushJournalNow = true;
-            _flushJournalNowCV.notify_one();
-        }
-        return _nextSharedPromise->getFuture();
-    }();
-    // Throws on error if the flusher thread is shutdown.
-    myFuture.get(interruptible);
+void JournalFlusher::_triggerJournalFlush(WithLock lk) {
+    if (!_flushJournalNow) {
+        _flushJournalNow = true;
+        _flushJournalNowCV.notify_one();
+    }
 }
 
 }  // namespace mongo

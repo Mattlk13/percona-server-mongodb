@@ -170,7 +170,7 @@ public:
 private:
     void _processValue(const Value& val) final;
 
-    using MultiSet = std::multiset<SimpleMemoryTokenWith<Value>, MemoryTokenValueComparator>;
+    using MultiSet = std::multiset<SimpleMemoryUsageTokenWith<Value>, MemoryTokenValueComparator>;
 
     MultiSet createMultiSet() const;
 
@@ -186,7 +186,7 @@ public:
 
     static const char* getName();
 
-    AccumulatorType getAccumulatorType() const {
+    AccumulatorType getAccumulatorType() const override {
         return AccumulatorType::kMinN;
     }
 
@@ -256,7 +256,7 @@ private:
     // firstN/lastN do NOT ignore null values.
     void _processValue(const Value& val) final;
 
-    std::deque<SimpleMemoryTokenWith<Value>> _deque;
+    std::deque<SimpleMemoryUsageTokenWith<Value>> _deque;
     Sense _variant;
 };
 
@@ -358,7 +358,7 @@ public:
      */
     void remove(const Value& val);
 
-    SortPattern getSortPattern() const {
+    const SortPattern& getSortPattern() const {
         return _sortPattern;
     }
 
@@ -381,7 +381,7 @@ public:
 private:
     // top/bottom/topN/bottomN do NOT ignore null values, but MISSING values will be promoted to
     // null so the users see them.
-    void _processValue(const Value& val);
+    void _processValue(const Value& val) override;
 
     std::pair<Value, Value> _genKeyOutPair(const Value& val);
 
@@ -394,7 +394,7 @@ private:
     boost::optional<SortKeyGenerator> _sortKeyGenerator;
     boost::optional<SortKeyComparator> _sortKeyComparator;
     boost::optional<
-        std::multimap<Value, SimpleMemoryTokenWith<Value>, std::function<bool(Value, Value)>>>
+        std::multimap<Value, SimpleMemoryUsageTokenWith<Value>, std::function<bool(Value, Value)>>>
         _map;
 };
 
@@ -402,5 +402,11 @@ extern template class AccumulatorTopBottomN<TopBottomSense::kBottom, false>;
 extern template class AccumulatorTopBottomN<TopBottomSense::kBottom, true>;
 extern template class AccumulatorTopBottomN<TopBottomSense::kTop, false>;
 extern template class AccumulatorTopBottomN<TopBottomSense::kTop, true>;
+
+using AccumulatorTop = AccumulatorTopBottomN<TopBottomSense::kTop, true>;
+using AccumulatorBottom = AccumulatorTopBottomN<TopBottomSense::kBottom, true>;
+
+using AccumulatorTopN = AccumulatorTopBottomN<TopBottomSense::kTop, false>;
+using AccumulatorBottomN = AccumulatorTopBottomN<TopBottomSense::kBottom, false>;
 
 }  // namespace mongo

@@ -40,8 +40,9 @@
 
 #include "mongo/base/data_type_endian.h"
 #include "mongo/base/data_view.h"
-#include "mongo/bson/util/simple8b_constants.h"
+#include "mongo/bson/util/simple8b_helpers.h"
 #include "mongo/platform/int128.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -195,6 +196,7 @@ void Simple8b<T>::Iterator::_loadBlock() {
     _current = ConstDataView(_pos).read<LittleEndian<uint64_t>>();
 
     _selector = _current & kBaseSelectorMask;
+    uassert(8787300, "invalid selector 0", _selector);
     uint8_t selectorExtension = ((_current >> kSelectorBits) & kBaseSelectorMask);
 
     // If RLE selector, just load remaining count. Keep value from previous.
@@ -212,6 +214,7 @@ void Simple8b<T>::Iterator::_loadBlock() {
     // If Selectors 7 or 8 check if we are using extended selectors
     if (_selector == 7 || _selector == 8) {
         _extensionType = kSelectorToExtension[_selector - 7][selectorExtension];
+        uassert(8787301, "invalid extended selector", _extensionType != kInvalidSelector);
         // Use the extended selector if extension is != 0
         if (_extensionType != kBaseSelector) {
             _selector = selectorExtension;
@@ -247,7 +250,15 @@ void Simple8b<T>::Iterator::_loadValue() {
 
     // Shift in any trailing zeros that are stored in the count for extended selectors 7 and 8.
     auto trailingZeros = (value & _countMask);
-    _value = static_cast<T>((value >> _countBits)) << (trailingZeros * _countMultiplier);
+
+    // It is undefined behavior to bit shift values by more than their bit length. While no sensible
+    // encoders will produce these values, we must still define this behavior for UBSAN.
+    auto numZeroes = trailingZeros * _countMultiplier;
+    if constexpr (std::is_same<T, uint64_t>::value) {
+        numZeroes %= 64;
+    }
+
+    _value = static_cast<T>((value >> _countBits)) << (numZeroes);
 }
 
 template <typename T>
@@ -334,4 +345,58 @@ typename Simple8b<T>::Iterator Simple8b<T>::end() const {
     return {_buffer + _size};
 }
 
+namespace simple8b {
+// Constant for a simple8b block containing a single 'missing' value.
+static constexpr uint64_t kSingleSkip = 0xFFFFFFFFFFFFFFFE;
+
+// Constant for a simple8b block containing a single zero value.
+static constexpr uint64_t kSingleZero = 0xE;
+
+/**
+ * Visits all values in sequence with provided callbacks
+ * visit - a callback for receiving all non-missing values (including 0)
+ * visitMissing - a callback for receiving missing
+ * visitZero - should have identical behavior to visit(0), may be used
+ *             to provide a more efficient implementation of this case
+ * Returns number of elements visited
+ */
+template <typename T, typename Visit, typename VisitZero, typename VisitMissing>
+inline size_t visitAll(const char* buffer,
+                       size_t size,
+                       uint64_t& prevNonRLE,
+                       const Visit& visit,
+                       const VisitZero& visitZero,
+                       const VisitMissing& visitMissing);
+
+template <typename T, typename Visit, typename VisitMissing>
+inline size_t visitAll(const char* buffer,
+                       size_t size,
+                       uint64_t& prevNonRLE,
+                       const Visit& visit,
+                       const VisitMissing& visitMissing) {
+    return visitAll<T>(
+        buffer, size, prevNonRLE, visit, [&visit]() { visit(0); }, visitMissing);
+}
+
+/**
+ * Calculates the sum for multiple simple8b blocks in a buffer. 'prevNonRLE' should be initialized
+ * to 'kSingleSkip' when calculating sum for the first buffer. If the caller needs sum from multiple
+ * buffers the value should be passed along between the calls.
+ */
+template <typename T>
+T sum(const char* buffer, size_t size, uint64_t& prevNonRLE);
+
+/**
+ * Calculates the prefix sum (or cumulative sum) for multiple simple8b blocks in a buffer. 'prefix'
+ * should contain the initial prefix and will be updated to the new prefix after calculating prefix
+ * sum for this block. 'prevNonRLE' should be initialized to 'kSingleSkip' when calculating prefix
+ * sum for the first buffer. If the caller needs prefix sum from multiple buffers the values of
+ * 'prefix' and 'prevNonRLE' should be passed along between the calls.
+ */
+template <typename T>
+T prefixSum(const char* buffer, size_t size, T& prefix, uint64_t& prevNonRLE);
+}  // namespace simple8b
+
 }  // namespace mongo
+
+#include "simple8b.inl"

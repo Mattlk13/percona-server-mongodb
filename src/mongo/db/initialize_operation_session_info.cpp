@@ -53,19 +53,27 @@
 
 namespace mongo {
 
-OperationSessionInfoFromClient initializeOperationSessionInfo(OperationContext* opCtx,
-                                                              const OpMsgRequest& opMsgRequest,
-                                                              bool requiresAuth,
-                                                              bool attachToOpCtx,
-                                                              bool isReplSetMemberOrMongos) {
-    auto osi = OperationSessionInfoFromClient::parse(IDLParserContext{"OperationSessionInfo"},
-                                                     opMsgRequest.body);
-    auto isAuthorizedForInternalClusterAction =
-        AuthorizationSession::get(opCtx->getClient())
-            ->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(opMsgRequest.getValidatedTenantId()),
-                ActionType::internal);
+namespace {
+bool isAuthorizedForInternalClusterAction(OperationContext* opCtx,
+                                          const boost::optional<TenantId>& validatedTenantId,
+                                          boost::optional<bool>& cachedResult) {
+    if (!cachedResult.has_value()) {
+        cachedResult =
+            AuthorizationSession::get(opCtx->getClient())
+                ->isAuthorizedForActionsOnResource(
+                    ResourcePattern::forClusterResource(validatedTenantId), ActionType::internal);
+    }
+    return *cachedResult;
+}
+}  // namespace
 
+OperationSessionInfoFromClient initializeOperationSessionInfo(
+    OperationContext* opCtx,
+    const boost::optional<TenantId>& validatedTenantId,
+    const OperationSessionInfoFromClientBase& osi,
+    bool requiresAuth,
+    bool attachToOpCtx,
+    bool isReplSetMemberOrMongos) {
     if (opCtx->getClient()->isInDirectClient()) {
         uassert(50891,
                 "Invalid to set operation session info in a direct client",
@@ -91,12 +99,13 @@ OperationSessionInfoFromClient initializeOperationSessionInfo(OperationContext* 
 
         // Do not initialize lsid when auth is enabled and no user is logged in since
         // there is no sensible uid that can be assigned to it.
-        if (AuthorizationManager::get(opCtx->getServiceContext())->isAuthEnabled() &&
+        if (AuthorizationManager::get(opCtx->getService())->isAuthEnabled() &&
             !authSession->isAuthenticated() && !requiresAuth) {
             return OperationSessionInfoFromClient();
         }
     }
 
+    boost::optional<bool> cachedIsAuthorizedForInternalClusterAction;
     if (osi.getSessionId()) {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
 
@@ -118,7 +127,8 @@ OperationSessionInfoFromClient initializeOperationSessionInfo(OperationContext* 
         if (isChildSession(lsid)) {
             uassert(ErrorCodes::InvalidOptions,
                     "Internal sessions are only allowed for internal clients",
-                    isAuthorizedForInternalClusterAction);
+                    isAuthorizedForInternalClusterAction(
+                        opCtx, validatedTenantId, cachedIsAuthorizedForInternalClusterAction));
             uassert(ErrorCodes::InvalidOptions,
                     "Internal sessions are not supported outside of transactions",
                     osi.getTxnNumber() && osi.getAutocommit() && !osi.getAutocommit().value());
@@ -148,7 +158,8 @@ OperationSessionInfoFromClient initializeOperationSessionInfo(OperationContext* 
         if (auto txnRetryCounter = osi.getTxnRetryCounter()) {
             uassert(ErrorCodes::InvalidOptions,
                     "txnRetryCounter is only allowed for internal clients",
-                    isAuthorizedForInternalClusterAction);
+                    isAuthorizedForInternalClusterAction(
+                        opCtx, validatedTenantId, cachedIsAuthorizedForInternalClusterAction));
             uassert(ErrorCodes::InvalidOptions,
                     str::stream() << "Cannot specify txnRetryCounter for a retryable write",
                     osi.getAutocommit().has_value());

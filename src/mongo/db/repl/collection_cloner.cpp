@@ -87,9 +87,32 @@ namespace repl {
 // collection 'namespace'.
 MONGO_FAIL_POINT_DEFINE(initialSyncHangDuringCollectionClone);
 
-// Failpoint which causes initial sync to hang after handling the next batch of results from the
-// DBClientConnection, optionally limited to a specific collection.
+// Failpoint which causes initial sync to hang before/after handling the next batch of results from
+// the DBClientConnection, optionally limited to a specific collection.
+MONGO_FAIL_POINT_DEFINE(initialSyncHangCollectionClonerBeforeHandlingBatchResponse);
 MONGO_FAIL_POINT_DEFINE(initialSyncHangCollectionClonerAfterHandlingBatchResponse);
+
+namespace {
+void waitWhileFailPointEnabled(FailPoint* failPoint,
+                               const NamespaceString& sourceNss,
+                               const std::function<bool()>& mustExit) {
+    failPoint->executeIf(
+        [&](const BSONObj&) {
+            while (MONGO_unlikely(failPoint->shouldFail()) && !mustExit()) {
+                LOGV2(8659100,
+                      "{FailPoint} is enabled. Blocking until fail point is disabled.",
+                      "FailPoint"_attr = failPoint->getName(),
+                      logAttrs(sourceNss));
+                mongo::sleepmillis(100);
+            }
+        },
+        [&](const BSONObj& data) {
+            const auto fpNss = NamespaceStringUtil::parseFailPointData(data, "nss"_sd);
+            // Only hang when cloning the specified collection, or if no collection was specified.
+            return fpNss.isEmpty() || fpNss == sourceNss;
+        });
+}
+}  // namespace
 
 CollectionCloner::CollectionCloner(const NamespaceString& sourceNss,
                                    const CollectionOptions& collectionOptions,
@@ -161,11 +184,6 @@ void CollectionCloner::preStage() {
     _stats.start = getSharedData()->getClock()->now();
 
     BSONObjBuilder b(BSON("collStats" << _sourceNss.coll().toString()));
-    if (gMultitenancySupport &&
-        gFeatureFlagRequireTenantID.isEnabled(serverGlobalParams.featureCompatibility) &&
-        _sourceNss.tenantId()) {
-        _sourceNss.tenantId()->serializeToBSON("$tenant", &b);
-    }
 
     BSONObj res;
     getClient()->runCommand(_sourceNss.dbName(), b.obj(), res);
@@ -255,16 +273,17 @@ BaseCloner::AfterStageBehavior CollectionCloner::listIndexesStage() {
             auto sanitizedStorageEngineOpts =
                 storageEngine->getSanitizedStorageOptionsForSecondaryReplication(
                     storageEngineElem.embeddedObject());
-            fassert(6812200, sanitizedStorageEngineOpts);
-            spec = spec.addFields(BSON(IndexDescriptor::kStorageEngineFieldName
-                                       << sanitizedStorageEngineOpts.getValue()));
+            spec = spec.addFields(
+                BSON(IndexDescriptor::kStorageEngineFieldName << sanitizedStorageEngineOpts));
         }
 
         if (spec.hasField("clustered")) {
             invariant(_collectionOptions.clusteredIndex);
             invariant(spec.getBoolField("clustered") == true);
             invariant(clustered_util::formatClusterKeyForListIndexes(
-                          _collectionOptions.clusteredIndex.value(), _collectionOptions.collation)
+                          _collectionOptions.clusteredIndex.value(),
+                          _collectionOptions.collation,
+                          _collectionOptions.expireAfterSeconds)
                           .woCompare(spec) == 0);
             // Skip if the spec is for the collection's clusteredIndex.
         } else if (spec.hasField("buildUUID")) {
@@ -387,6 +406,17 @@ void CollectionCloner::runQuery() {
 
     ExhaustMode exhaustMode = collectionClonerUsesExhaust ? ExhaustMode::kOn : ExhaustMode::kOff;
 
+    if (_collectionOptions.recordIdsReplicated) {
+        // The below projection returns a stream of documents in the format
+        // {r: <recordId>, d: <original document>}.
+        auto projection = BSON("_id" << 0 << "r"
+                                     << BSON("$meta"
+                                             << "recordId")
+                                     << "d"
+                                     << "$$ROOT");
+        findCmd.setProjection(std::move(projection));
+    }
+
     // We reset this every time we retry or resume a query.
     // We distinguish the first batch from the rest so that we only store the remote cursor id
     // the first time we get it.
@@ -401,7 +431,11 @@ void CollectionCloner::runQuery() {
     }
 }
 
+
 void CollectionCloner::handleNextBatch(DBClientCursor& cursor) {
+    waitWhileFailPointEnabled(&initialSyncHangCollectionClonerBeforeHandlingBatchResponse,
+                              _sourceNss,
+                              [&]() { return mustExit(); });
     {
         stdx::lock_guard<InitialSyncSharedData> lk(*getSharedData());
         if (!getSharedData()->getStatus(lk).isOK()) {
@@ -452,23 +486,12 @@ void CollectionCloner::handleNextBatch(DBClientCursor& cursor) {
     // Store the resume token for this batch.
     _resumeToken = cursor.getPostBatchResumeToken();
 
-    initialSyncHangCollectionClonerAfterHandlingBatchResponse.executeIf(
-        [&](const BSONObj&) {
-            while (MONGO_unlikely(
-                       initialSyncHangCollectionClonerAfterHandlingBatchResponse.shouldFail()) &&
-                   !mustExit()) {
-                LOGV2(21137,
-                      "initialSyncHangCollectionClonerAfterHandlingBatchResponse fail point "
-                      "enabled. Blocking until fail point is disabled",
-                      logAttrs(_sourceNss));
-                mongo::sleepsecs(1);
-            }
-        },
-        [&](const BSONObj& data) {
-            const auto fpNss = NamespaceStringUtil::parseFailPointData(data, "nss"_sd);
-            // Only hang when cloning the specified collection, or if no collection was specified.
-            return fpNss.isEmpty() || fpNss == _sourceNss;
-        });
+    // Clear retrying state after a successful batch.
+    clearRetryingState();
+
+    waitWhileFailPointEnabled(&initialSyncHangCollectionClonerAfterHandlingBatchResponse,
+                              _sourceNss,
+                              [&]() { return mustExit(); });
 }
 
 void CollectionCloner::insertDocumentsCallback(const executor::TaskExecutor::CallbackArgs& cbd) {
@@ -490,9 +513,14 @@ void CollectionCloner::insertDocumentsCallback(const executor::TaskExecutor::Cal
         _progressMeter.hit(int(docs.size()));
         invariant(_collLoader);
 
+        CollectionBulkLoader::ParseRecordIdAndDocFunc fn = (_collectionOptions.recordIdsReplicated)
+            ? ([](const BSONObj& doc) {
+                  return std::make_pair(RecordId(doc["r"].Long()), doc["d"].Obj());
+              })
+            : ([](const BSONObj& doc) { return std::make_pair(RecordId(0), doc); });
         // The insert must be done within the lock, because CollectionBulkLoader is not
         // thread safe.
-        uassertStatusOK(_collLoader->insertDocuments(docs.cbegin(), docs.cend()));
+        uassertStatusOK(_collLoader->insertDocuments(docs.cbegin(), docs.cend(), fn));
     }
 
     initialSyncHangDuringCollectionClone.executeIf(

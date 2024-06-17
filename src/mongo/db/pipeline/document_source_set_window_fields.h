@@ -57,7 +57,6 @@
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_dependencies.h"
 #include "mongo/db/pipeline/field_path.h"
-#include "mongo/db/pipeline/memory_usage_tracker.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/stage_constraints.h"
 #include "mongo/db/pipeline/variables.h"
@@ -68,6 +67,7 @@
 #include "mongo/db/query/query_shape/serialization_options.h"
 #include "mongo/db/query/sort_pattern.h"
 #include "mongo/util/intrusive_counter.h"
+#include "mongo/util/memory_usage_tracker.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -138,7 +138,7 @@ public:
                                 UnionRequirement::kAllowed);
     }
 
-    const char* getSourceName() const {
+    const char* getSourceName() const override {
         return kStageName.rawData();
     };
 
@@ -171,16 +171,16 @@ public:
     Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
                                                      Pipeline::SourceContainer* container) final;
 
-    boost::optional<DistributedPlanLogic> distributedPlanLogic() {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() override {
         // Force to run on the merging half for now.
         return DistributedPlanLogic{nullptr, this, boost::none};
     }
 
     boost::intrusive_ptr<DocumentSource> optimize() final;
 
-    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final override;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
-    DocumentSource::GetNextResult doGetNext();
+    DocumentSource::GetNextResult doGetNext() override;
 
     void setSource(DocumentSource* source) final {
         pSource = source;
@@ -224,7 +224,7 @@ private:
     bool _eof = false;
     // Used by the failpoint to determine when to spill to disk.
     int32_t _numDocsProcessed = 0;
-    SbeCompatibility _sbeCompatibility = SbeCompatibility::flagGuarded;
+    SbeCompatibility _sbeCompatibility = SbeCompatibility::noRequirements;
 };
 
 }  // namespace mongo

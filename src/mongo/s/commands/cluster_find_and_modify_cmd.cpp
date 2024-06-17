@@ -119,6 +119,8 @@
 namespace mongo {
 namespace {
 
+constexpr size_t kMaxDatabaseCreationAttempts = 3u;
+
 using QuerySamplingOptions = OperationContext::QuerySamplingOptions;
 
 const ReadPreferenceSetting kPrimaryOnlyReadPreference(ReadPreference::PrimaryOnly);
@@ -322,10 +324,11 @@ void handleWouldChangeOwningShardErrorTransaction(
             inlineExecutor);
 
         txn.run(opCtx,
-                [sharedBlock, fleCrudProcessed](const txn_api::TransactionClient& txnClient,
-                                                ExecutorPtr txnExec) -> SemiFuture<void> {
+                [opCtx, sharedBlock, fleCrudProcessed](const txn_api::TransactionClient& txnClient,
+                                                       ExecutorPtr txnExec) -> SemiFuture<void> {
                     return documentShardKeyUpdateUtil::updateShardKeyForDocument(
                                txnClient,
+                               opCtx,
                                txnExec,
                                sharedBlock->nss,
                                sharedBlock->changeInfo,
@@ -507,8 +510,9 @@ CollectionRoutingInfo getCollectionRoutingInfo(OperationContext* opCtx,
     // timeseries deletes or updates feature flag is enabled.
     const bool arbitraryTimeseriesWritesEnabled =
         feature_flags::gTimeseriesDeletesSupport.isEnabled(
-            serverGlobalParams.featureCompatibility) ||
-        feature_flags::gTimeseriesUpdatesSupport.isEnabled(serverGlobalParams.featureCompatibility);
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) ||
+        feature_flags::gTimeseriesUpdatesSupport.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
     if (!arbitraryTimeseriesWritesEnabled || cri.cm.hasRoutingTable() ||
         maybeTsNss.isTimeseriesBucketsCollection()) {
         return cri;
@@ -542,13 +546,6 @@ boost::optional<ShardId> targetPotentiallySingleShard(
     const BSONObj& query,
     const BSONObj& collation,
     bool isTimeseriesViewRequest) {
-    // Special case: there's only one shard owning all the chunks.
-    if (cm.getNShardsOwningChunks() == 1) {
-        std::set<ShardId> shardIds;
-        cm.getAllShardIds(&shardIds);
-        return *shardIds.begin();
-    }
-
     std::set<ShardId> shardIds;
     getShardIdsForQuery(expCtx,
                         getQueryForShardKey(expCtx, cm, query, isTimeseriesViewRequest),
@@ -604,7 +601,7 @@ Status FindAndModifyCmd::explain(OperationContext* opCtx,
                                  const OpMsgRequest& request,
                                  ExplainOptions::Verbosity verbosity,
                                  rpc::ReplyBuilderInterface* result) const {
-    const DatabaseName dbName = request.getDbName();
+    const DatabaseName dbName = request.parseDbName();
     auto bodyBuilder = result->getBodyBuilder();
     BSONObj cmdObj = [&]() {
         // Check whether the query portion needs to be rewritten for FLE.
@@ -704,7 +701,12 @@ Status FindAndModifyCmd::explain(OperationContext* opCtx,
         *shardId, response, shard->getConnString().getServers().front()};
 
     return ClusterExplain::buildExplainResult(
-        opCtx, {arsResponse}, ClusterExplain::kSingleShard, millisElapsed, cmdObj, &bodyBuilder);
+        ExpressionContext::makeBlankExpressionContext(opCtx, nss),
+        {arsResponse},
+        ClusterExplain::kSingleShard,
+        millisElapsed,
+        cmdObj,
+        &bodyBuilder);
 }
 
 bool FindAndModifyCmd::run(OperationContext* opCtx,
@@ -718,13 +720,35 @@ bool FindAndModifyCmd::run(OperationContext* opCtx,
     }
 
     // Collect metrics.
-    _updateMetrics.collectMetrics(cmdObj);
+    _updateMetrics->collectMetrics(cmdObj);
 
-    // Technically, findAndModify should only be creating database if upsert is true, but this
-    // would require that the parsing be pulled into this function.
-    cluster::createDatabase(opCtx, nss.dbName());
 
-    auto cri = getCollectionRoutingInfo(opCtx, cmdObj, nss);
+    auto cri = [&]() {
+        size_t attempts = 1u;
+        while (true) {
+            try {
+                // Technically, findAndModify should only be creating database if upsert is true,
+                // but this would require that the parsing be pulled into this function.
+                cluster::createDatabase(opCtx, nss.dbName());
+                return getCollectionRoutingInfo(opCtx, cmdObj, nss);
+            } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+                LOGV2_INFO(8584300,
+                           "Failed initialization of routing info because the database has been "
+                           "concurrently dropped",
+                           logAttrs(nss.dbName()),
+                           "attemptNumber"_attr = attempts,
+                           "maxAttempts"_attr = kMaxDatabaseCreationAttempts);
+
+                if (attempts++ >= kMaxDatabaseCreationAttempts) {
+                    // The maximum number of attempts has been reached, so the procedure fails as it
+                    // could be a logical error. At this point, it is unlikely that the error is
+                    // caused by concurrent drop database operations.
+                    throw;
+                }
+            }
+        }
+    }();
+
     const auto& cm = cri.cm;
     auto isTrackedTimeseries = cm.hasRoutingTable() && cm.getTimeseriesFields();
     auto isTimeseriesViewRequest = false;
@@ -743,14 +767,35 @@ bool FindAndModifyCmd::run(OperationContext* opCtx,
         if (isTimeseriesViewRequest) {
             cmdObjForShard = replaceNamespaceByBucketNss(cmdObjForShard, nss);
         }
-        BSONObj query = cmdObjForShard.getObjectField("query");
-        const bool isUpsert = cmdObjForShard.getBoolField("upsert");
-        const BSONObj collation = getCollation(cmdObjForShard);
-        const auto letParams = getLet(cmdObjForShard);
-        const auto runtimeConstants = getLegacyRuntimeConstants(cmdObjForShard);
+
+        auto letParams = getLet(cmdObjForShard);
+        auto runtimeConstants = getLegacyRuntimeConstants(cmdObjForShard);
+        BSONObj collation = getCollation(cmdObjForShard);
         auto expCtx = makeExpressionContextWithDefaultsForTargeter(
             opCtx, nss, cri, collation, boost::none /* verbosity */, letParams, runtimeConstants);
 
+        // If this command has 'let' parameters, then evaluate them once and stash them back on the
+        // original command object. Note that this isn't necessary outside of the case where we have
+        // a routing table because this is intended to prevent evaluating let parameters multiple
+        // times (which can only happen when executing against a sharded cluster).
+        if (letParams) {
+            // Serialize variables before moving 'cmdObjForShard' to avoid invalid access.
+            expCtx->variables.seedVariablesWithLetParameters(expCtx.get(), *letParams);
+            auto letVars = Value(expCtx->variables.toBSON(expCtx->variablesParseState, *letParams));
+
+            MutableDocument cmdDoc(Document(std::move(cmdObjForShard)));
+            cmdDoc[write_ops::FindAndModifyCommandRequest::kLetFieldName] = letVars;
+            cmdObjForShard = cmdDoc.freeze().toBson();
+
+            // Reset the objects set up above as they are now invalid given that 'cmdObjForShard'
+            // has been changed.
+            letParams = getLet(cmdObjForShard);
+            runtimeConstants = getLegacyRuntimeConstants(cmdObjForShard);
+            collation = getCollation(cmdObjForShard);
+        }
+
+        BSONObj query = cmdObjForShard.getObjectField("query");
+        const bool isUpsert = cmdObjForShard.getBoolField("upsert");
 
         if (write_without_shard_key::useTwoPhaseProtocol(opCtx,
                                                          nss,
@@ -863,7 +908,7 @@ void FindAndModifyCmd::_constructResult(OperationContext* opCtx,
 
     if (responseStatus.code() == ErrorCodes::WouldChangeOwningShard) {
         if (feature_flags::gFeatureFlagUpdateDocumentShardKeyUsingTransactionApi.isEnabled(
-                serverGlobalParams.featureCompatibility)) {
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
             handleWouldChangeOwningShardError(opCtx, shardId, nss, cmdObj, responseStatus, result);
         } else {
             // TODO SERVER-67429: Remove this branch.
@@ -981,8 +1026,9 @@ void FindAndModifyCmd::_runExplainWithoutShardKey(OperationContext* opCtx,
         ClusterQueryWithoutShardKey clusterQueryWithoutShardKeyCommand(cmdObjForPassthrough);
         const auto explainClusterQueryWithoutShardKeyCmd =
             ClusterExplain::wrapAsExplain(clusterQueryWithoutShardKeyCommand.toBSON({}), verbosity);
-        auto opMsg =
-            OpMsgRequest::fromDBAndBody(nss.dbName(), explainClusterQueryWithoutShardKeyCmd);
+        auto opMsg = OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::get(opCtx),
+                                                 nss.dbName(),
+                                                 explainClusterQueryWithoutShardKeyCmd);
         return CommandHelpers::runCommandDirectly(opCtx, opMsg).getOwned();
     }();
 
@@ -996,8 +1042,9 @@ void FindAndModifyCmd::_runExplainWithoutShardKey(OperationContext* opCtx,
             write_without_shard_key::targetDocForExplain);
         const auto explainClusterWriteWithoutShardKeyCmd =
             ClusterExplain::wrapAsExplain(clusterWriteWithoutShardKeyCommand.toBSON({}), verbosity);
-        auto opMsg =
-            OpMsgRequest::fromDBAndBody(nss.dbName(), explainClusterWriteWithoutShardKeyCmd);
+        auto opMsg = OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::get(opCtx),
+                                                 nss.dbName(),
+                                                 explainClusterWriteWithoutShardKeyCmd);
         return CommandHelpers::runCommandDirectly(opCtx, opMsg).getOwned();
     }();
 

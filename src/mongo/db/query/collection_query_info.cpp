@@ -45,6 +45,7 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/collection_index_usage_tracker.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/exec/index_path_projection.h"
 #include "mongo/db/exec/projection_executor.h"
 #include "mongo/db/feature_flag.h"
@@ -64,6 +65,7 @@
 #include "mongo/db/query/planner_ixselect.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_component.h"
 #include "mongo/platform/atomic_word.h"
@@ -92,6 +94,22 @@ CoreIndexInfo indexInfoFromIndexCatalogEntry(const IndexCatalogEntry& ice) {
             ice.getFilterExpression(),
             ice.getCollator(),
             projExec};
+}
+
+void recordCollectionIndexUsage(const CollectionPtr& coll,
+                                long long collectionScans,
+                                long long collectionScansNonTailable,
+                                const std::set<std::string>& indexesUsed) {
+    const auto& collectionIndexUsageTracker =
+        CollectionIndexUsageTrackerDecoration::get(coll.get());
+
+    collectionIndexUsageTracker.recordCollectionScans(collectionScans);
+    collectionIndexUsageTracker.recordCollectionScansNonTailable(collectionScansNonTailable);
+
+    // Record indexes used to fulfill query.
+    for (auto it = indexesUsed.begin(); it != indexesUsed.end(); ++it) {
+        collectionIndexUsageTracker.recordIndexAccess(*it);
+    }
 }
 
 }  // namespace
@@ -228,18 +246,15 @@ void CollectionQueryInfo::computeUpdateIndexData(OperationContext* opCtx, const 
 void CollectionQueryInfo::notifyOfQuery(OperationContext* opCtx,
                                         const CollectionPtr& coll,
                                         const PlanSummaryStats& summaryStats) const {
-    const auto& collectionIndexUsageTracker =
-        CollectionIndexUsageTrackerDecoration::get(coll.get());
+    recordCollectionIndexUsage(coll,
+                               summaryStats.collectionScans,
+                               summaryStats.collectionScansNonTailable,
+                               summaryStats.indexesUsed);
+}
 
-    collectionIndexUsageTracker.recordCollectionScans(summaryStats.collectionScans);
-    collectionIndexUsageTracker.recordCollectionScansNonTailable(
-        summaryStats.collectionScansNonTailable);
-
-    const auto& indexesUsed = summaryStats.indexesUsed;
-    // Record indexes used to fulfill query.
-    for (auto it = indexesUsed.begin(); it != indexesUsed.end(); ++it) {
-        collectionIndexUsageTracker.recordIndexAccess(*it);
-    }
+void CollectionQueryInfo::notifyOfQuery(const CollectionPtr& coll, const OpDebug& debug) const {
+    recordCollectionIndexUsage(
+        coll, debug.collectionScans, debug.collectionScansNonTailable, debug.indexesUsed);
 }
 
 void CollectionQueryInfo::clearQueryCache(OperationContext* opCtx, const CollectionPtr& coll) {

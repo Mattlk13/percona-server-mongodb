@@ -45,7 +45,7 @@
 #include "mongo/db/query/find_command.h"
 #include "mongo/db/query/plan_explainer.h"
 #include "mongo/db/query/plan_summary_stats.h"
-#include "mongo/db/query/query_stats/key_generator.h"
+#include "mongo/db/query/query_stats/key.h"
 #include "mongo/util/fail_point.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
@@ -108,7 +108,10 @@ void endQueryOp(OperationContext* opCtx,
     if (cursor) {
         collectQueryStatsMongod(opCtx, *cursor);
     } else {
-        collectQueryStatsMongod(opCtx, std::move(curOp->debug().queryStatsKey));
+        auto* cq = exec.getCanonicalQuery();
+        const auto& expCtx =
+            cq ? cq->getExpCtx() : ExpressionContext::makeBlankExpressionContext(opCtx, exec.nss());
+        collectQueryStatsMongod(opCtx, expCtx, std::move(curOp->debug().queryStatsInfo.key));
     }
 
     if (collection) {

@@ -89,12 +89,10 @@
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/client/shard_remote_gen.h"
 #include "mongo/s/database_version.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/intrusive_counter.h"
 #include "mongo/util/namespace_string_util.h"
@@ -560,7 +558,7 @@ HistoricalPlacement ShardingCatalogClientImpl::_fetchPlacementMetadata(
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         DatabaseName::kAdmin,
         request.toBSON(BSONObj()),
-        Shard::kDefaultConfigCommandTimeout,
+        Milliseconds(defaultConfigCommandTimeoutMS.load()),
         Shard::RetryPolicy::kIdempotentOrCursorInvalidated));
 
     uassertStatusOK(remoteResponse.commandStatus);
@@ -1144,38 +1142,35 @@ std::vector<NamespaceString> ShardingCatalogClientImpl::getAllNssThatHaveZonesFo
 }
 
 StatusWith<repl::OpTimeWith<std::vector<ShardType>>> ShardingCatalogClientImpl::getAllShards(
-    OperationContext* opCtx, repl::ReadConcernLevel readConcern) {
-    auto findStatus = _exhaustiveFindOnConfig(opCtx,
-                                              kConfigReadSelector,
-                                              readConcern,
-                                              NamespaceString::kConfigsvrShardsNamespace,
-                                              BSONObj(),     // no query filter
-                                              BSONObj(),     // no sort
-                                              boost::none);  // no limit
-    if (!findStatus.isOK()) {
-        return findStatus.getStatus();
-    }
+    OperationContext* opCtx, repl::ReadConcernLevel readConcern, bool excludeDraining) {
+    const auto& findRes = uassertStatusOK(
+        _exhaustiveFindOnConfig(opCtx,
+                                kConfigReadSelector,
+                                readConcern,
+                                NamespaceString::kConfigsvrShardsNamespace,
+                                excludeDraining ? BSON(ShardType::draining.ne(true)) : BSONObj(),
+                                BSONObj() /* No sorting */,
+                                boost::none /* No limit */));
 
     std::vector<ShardType> shards;
-    shards.reserve(findStatus.getValue().value.size());
-    for (const BSONObj& doc : findStatus.getValue().value) {
+    shards.reserve(findRes.value.size());
+    for (const BSONObj& doc : findRes.value) {
         auto shardRes = ShardType::fromBSON(doc);
         if (!shardRes.isOK()) {
             return shardRes.getStatus().withContext(str::stream()
                                                     << "Failed to parse shard document " << doc);
         }
 
-        Status validateStatus = shardRes.getValue().validate();
-        if (!validateStatus.isOK()) {
+        ShardType& shard = shardRes.getValue();
+        if (const Status validateStatus = shard.validate(); !validateStatus.isOK()) {
             return validateStatus.withContext(str::stream()
                                               << "Failed to validate shard document " << doc);
         }
 
-        shards.push_back(shardRes.getValue());
+        shards.push_back(std::move(shard));
     }
 
-    return repl::OpTimeWith<std::vector<ShardType>>{std::move(shards),
-                                                    findStatus.getValue().opTime};
+    return repl::OpTimeWith<std::vector<ShardType>>{std::move(shards), findRes.opTime};
 }
 
 Status ShardingCatalogClientImpl::runUserManagementWriteCommand(OperationContext* opCtx,
@@ -1198,7 +1193,7 @@ Status ShardingCatalogClientImpl::runUserManagementWriteCommand(OperationContext
             }
             writeConcern = sw.getValue();
 
-            auto isValidUserManagementWriteConcern = stdx::visit(
+            auto isValidUserManagementWriteConcern = visit(
                 [](auto&& arg) {
                     using T = std::decay_t<decltype(arg)>;
                     if constexpr (std::is_same_v<T, std::string>)
@@ -1241,7 +1236,7 @@ Status ShardingCatalogClientImpl::runUserManagementWriteCommand(OperationContext
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         dbname,
         cmdToRun,
-        Shard::kDefaultConfigCommandTimeout,
+        Milliseconds(defaultConfigCommandTimeoutMS.load()),
         Shard::RetryPolicy::kNotIdempotent);
 
     if (!swResponse.isOK()) {
@@ -1271,7 +1266,7 @@ bool ShardingCatalogClientImpl::runUserManagementReadCommand(OperationContext* o
         kConfigPrimaryPreferredSelector,
         dbname,
         cmdObj,
-        Shard::kDefaultConfigCommandTimeout,
+        Milliseconds(defaultConfigCommandTimeoutMS.load()),
         Shard::RetryPolicy::kIdempotent);
     if (resultStatus.isOK()) {
         CommandHelpers::filterCommandReplyForPassthrough(resultStatus.getValue().response, result);
@@ -1294,12 +1289,15 @@ Status ShardingCatalogClientImpl::insertConfigDocument(OperationContext* opCtx,
         insertOp.setDocuments({doc});
         return insertOp;
     }());
-    request.setWriteConcern(writeConcern.toBSON());
 
     const auto configShard = _getConfigShard(opCtx);
     for (int retry = 1; retry <= kMaxWriteRetry; retry++) {
-        auto response = configShard->runBatchWriteCommand(
-            opCtx, Shard::kDefaultConfigCommandTimeout, request, Shard::RetryPolicy::kNoRetry);
+        auto response =
+            configShard->runBatchWriteCommand(opCtx,
+                                              Milliseconds(defaultConfigCommandTimeoutMS.load()),
+                                              request,
+                                              writeConcern,
+                                              Shard::RetryPolicy::kNoRetry);
 
         Status status = response.toStatus();
 
@@ -1363,8 +1361,13 @@ StatusWith<bool> ShardingCatalogClientImpl::updateConfigDocument(
     const BSONObj& update,
     bool upsert,
     const WriteConcernOptions& writeConcern) {
-    return _updateConfigDocument(
-        opCtx, nss, query, update, upsert, writeConcern, Shard::kDefaultConfigCommandTimeout);
+    return _updateConfigDocument(opCtx,
+                                 nss,
+                                 query,
+                                 update,
+                                 upsert,
+                                 writeConcern,
+                                 Milliseconds(defaultConfigCommandTimeoutMS.load()));
 }
 
 StatusWith<bool> ShardingCatalogClientImpl::updateConfigDocument(
@@ -1400,10 +1403,9 @@ StatusWith<bool> ShardingCatalogClientImpl::_updateConfigDocument(
         }()});
         return updateOp;
     }());
-    request.setWriteConcern(writeConcern.toBSON());
 
     auto response = _getConfigShard(opCtx)->runBatchWriteCommand(
-        opCtx, maxTimeMs, request, Shard::RetryPolicy::kIdempotent);
+        opCtx, maxTimeMs, request, writeConcern, Shard::RetryPolicy::kIdempotent);
 
     Status status = response.toStatus();
     if (!status.isOK()) {
@@ -1435,10 +1437,13 @@ Status ShardingCatalogClientImpl::removeConfigDocuments(OperationContext* opCtx,
         }()});
         return deleteOp;
     }());
-    request.setWriteConcern(writeConcern.toBSON());
 
     auto response = _getConfigShard(opCtx)->runBatchWriteCommand(
-        opCtx, Shard::kDefaultConfigCommandTimeout, request, Shard::RetryPolicy::kIdempotent);
+        opCtx,
+        Milliseconds(defaultConfigCommandTimeoutMS.load()),
+        request,
+        writeConcern,
+        Shard::RetryPolicy::kIdempotent);
     return response.toStatus();
 }
 
@@ -1533,7 +1538,6 @@ HistoricalPlacement ShardingCatalogClientImpl::getHistoricalPlacement(
     const Timestamp& atClusterTime,
     const boost::optional<NamespaceString>& nss) {
 
-    // TODO (SERVER-73029): Remove the invariant
     invariant(serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
     auto configShard = _getConfigShard(opCtx);
     /*

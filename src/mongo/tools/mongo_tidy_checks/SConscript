@@ -38,6 +38,7 @@ env['LINK'] = [f'{base_toolchain_bin}/g++']
 env['SHLINK'] = [f'{base_toolchain_bin}/g++']
 env['CPPPATH'] = [str(tidy_include)]
 env['LIBPATH'] = []
+env['CPPFLAGS'] = []
 env['CCFLAGS'] = [
     '-DGTEST_HAS_RTTI=0',
     '-D_GNU_SOURCE',
@@ -141,6 +142,7 @@ mongo_custom_check = env.SharedLibrary(
         "MongoMacroDefinitionLeaksCheck.cpp",
         "MongoNoUniqueAddressCheck.cpp",
         "MongoRandCheck.cpp",
+        "MongoStringDataConstRefCheck.cpp",
     ],
     LIBDEPS_NO_INHERIT=[
         '$BUILD_DIR/third_party/shim_allocator',

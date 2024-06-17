@@ -37,13 +37,16 @@
 #include <utility>
 #include <vector>
 
+#include "mongo/db/query/opt_counter_info.h"
 #include "mongo/db/query/optimizer/algebra/operator.h"
 #include "mongo/db/query/optimizer/cascades/interfaces.h"
 #include "mongo/db/query/optimizer/cascades/logical_rewriter.h"
+#include "mongo/db/query/optimizer/cascades/logical_rewrites.h"
 #include "mongo/db/query/optimizer/cascades/memo.h"
 #include "mongo/db/query/optimizer/cascades/physical_rewriter.h"
 #include "mongo/db/query/optimizer/containers.h"
 #include "mongo/db/query/optimizer/defs.h"
+#include "mongo/db/query/optimizer/explain.h"
 #include "mongo/db/query/optimizer/metadata.h"
 #include "mongo/db/query/optimizer/node_defs.h"
 #include "mongo/db/query/optimizer/reference_tracker.h"
@@ -105,7 +108,21 @@ class OptPhaseManager {
 public:
     using PhaseSet = opt::unordered_set<OptPhase>;
 
-    OptPhaseManager(PhaseSet phaseSet,
+    /**
+     * Helper struct to configure which phases & rewrites the optimizer should run.
+     */
+    struct PhasesAndRewrites {
+        PhaseSet phaseSet;
+        LogicalRewriteSet explorationSet;
+        LogicalRewriteSet substitutionSet;
+
+        // Factories for common configurations.
+        static PhasesAndRewrites getDefaultForProd();
+        static PhasesAndRewrites getDefaultForSampling();
+        static PhasesAndRewrites getDefaultForUnindexed();
+    };
+
+    OptPhaseManager(PhasesAndRewrites phasesAndRewrites,
                     PrefixId& prefixId,
                     bool requireRID,
                     Metadata metadata,
@@ -115,7 +132,10 @@ public:
                     PathToIntervalFn pathToInterval,
                     ConstFoldFn constFold,
                     DebugInfo debugInfo,
-                    QueryHints queryHints = {});
+                    QueryHints queryHints,
+                    QueryParameterMap queryParameters,
+                    OptimizerCounterInfo& optCounterInfo,
+                    boost::optional<ExplainOptions::Verbosity> explain = {});
 
     // We only allow moving.
     OptPhaseManager(const OptPhaseManager& /*other*/) = delete;
@@ -159,9 +179,15 @@ public:
 
     const RIDProjectionsMap& getRIDProjections() const;
 
-private:
+    const QueryParameterMap& getQueryParameters() const;
+
+    QueryParameterMap& getQueryParameters();
+
+    QueryPlannerOptimizationStagesForDebugExplain& getQueryPlannerOptimizationStages();
+
     bool hasPhase(OptPhase phase) const;
 
+private:
     template <OptPhase phase, class C>
     void runStructuralPhase(C instance, VariableEnvironment& env, ABT& input);
 
@@ -174,7 +200,7 @@ private:
 
     void runMemoLogicalRewrite(OptPhase phase,
                                VariableEnvironment& env,
-                               const LogicalRewriter::RewriteSet& rewriteSet,
+                               const LogicalRewriteSet& rewriteSet,
                                GroupIdType& rootGroupId,
                                bool runStandalone,
                                std::unique_ptr<LogicalRewriter>& logicalRewriter,
@@ -192,14 +218,10 @@ private:
                                                            VariableEnvironment& env,
                                                            ABT& input);
 
-
     /**
-     * Set of rewrites intended for use in production; excludes rewrites that only make the plan
-     * easier to read or easier to compare.
+     * Stores the set of phases and logical rewrites that the optimizer will run.
      */
-    static PhaseSet _allProdRewrites;
-
-    const PhaseSet _phaseSet;
+    const PhasesAndRewrites _phasesAndRewrites;
 
     const DebugInfo _debugInfo;
 
@@ -252,8 +274,9 @@ private:
     MemoPhysicalNodeId _physicalNodeId;
 
     /**
-     * Best post-memo exploration phase plan (set if '_supportExplain' is set and if we have
-     * performed memo rewrites).
+     * Stores the best physical plan ABT (with corresponding properties) after performing memo
+     * logical substitution, memo logical exploration and physical rewrite phases.
+     * Populated for explain purposes.
      */
     boost::optional<PlanAndProps> _postMemoPlan;
 
@@ -268,8 +291,32 @@ private:
      */
     RIDProjectionsMap _ridProjections;
 
-    // We don't own this.
+    /**
+     * We don't own this.
+     */
     PrefixId& _prefixId;
+
+    /**
+     * Map from parameter ID to constant for the query we are optimizing. This is used by the CE
+     * module to estimate selectivities of query parameters.
+     */
+    QueryParameterMap _queryParameters;
+
+    /**
+     * This tracks notable events during optimization. It is used for explain purposes. We don't own
+     * this.
+     */
+    OptimizerCounterInfo& _optCounterInfo;
+
+    /**
+     * Query explain verbosity
+     */
+    boost::optional<ExplainOptions::Verbosity> _explain;
+
+    /**
+     * Track query planner optimization stages for explain using queryPlannerDebug verbosity.
+     */
+    QueryPlannerOptimizationStagesForDebugExplain _queryPlannerOptimizationStages;
 };
 
 }  // namespace mongo::optimizer

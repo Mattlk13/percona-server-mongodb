@@ -18,20 +18,12 @@
  *   #      return different values after a failover
  *   tenant_migration_incompatible,
  *   does_not_support_stepdowns,
- *   not_allowed_with_security_token,
+ *   not_allowed_with_signed_security_token,
  * ]
  */
 import {assertArrayEq} from "jstests/aggregation/extras/utils.js";
 import {getSingleNodeExplain} from "jstests/libs/analyze_plan.js";
 import {setUpServerForColumnStoreIndexTest} from "jstests/libs/columnstore_util.js";
-import {checkSBEEnabled} from "jstests/libs/sbe_util.js";
-
-const columnstoreEnabled =
-    checkSBEEnabled(db, ["featureFlagColumnstoreIndexes"], true /* checkAllNodes */);
-if (!columnstoreEnabled) {
-    jsTestLog("Skipping columnstore index test since the feature flag is not enabled.");
-    quit();
-}
 
 if (!setUpServerForColumnStoreIndexTest(db)) {
     quit();
@@ -70,7 +62,7 @@ function test({agg, requiresRowStoreExpr, requiredRowstoreReads}) {
     const nullRegex =
         /columnscan s.* ((s.*)|(none)) paths\[.*\] pathFilters\[.*\] rowStoreExpr\[\] @.* @.*/;
     const notNullRegex =
-        /columnscan s.* ((s.*)|(none)) paths\[.*\] pathFilters\[.*\] rowStoreExpr\[.*, \n/;
+        /columnscan s.* ((s.*)|(none)) paths\[.*\] pathFilters\[.*\] rowStoreExpr\[((.*, \n)|(.+makeBsonObj.*))/;
     if (requiresRowStoreExpr) {
         assert(!nullRegex.test(sbeStages), `Don't expect null rowstoreExpr in ${sbeStages}`);
         assert(notNullRegex.test(sbeStages), `Expected non-null rowstoreExpr in ${sbeStages}`);

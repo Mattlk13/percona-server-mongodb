@@ -46,6 +46,7 @@ types:
     cpp_type: Value
     serializer: Value::serializeForIDL
     deserializer: Value::deserializeForIDL
+    is_view: false
 
 enums:
     QueryType:
@@ -53,7 +54,9 @@ enums:
         type: string
         values:
             Equality: "equality"
-            RangePreview: "rangePreview"
+            # TODO SERVER-87670 Remove once 8.0 is lastLTS.
+            RangePreviewDeprecated: "rangePreview"
+            Range: "range"
 
 feature_flags:
     featureFlagFLE2CleanupCommand:
@@ -103,6 +106,14 @@ structs:
                 optional: true
                 stability: unstable
                 validator: { gte: 0 }
+            trimFactor:
+                description: >-
+                    Number of root tree levels to cut. Increasing this value will decrease write conflicts and speed up inserts,
+                    but large range queries will slow down."
+                type: safeInt
+                optional: true
+                stability: unstable
+                validator: {gte: 0}
 
     EncryptedField:
         description: "Information about encrypted fields"

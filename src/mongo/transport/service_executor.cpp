@@ -39,9 +39,9 @@
 #include "mongo/stdx/thread.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/transport/service_executor.h"
-#include "mongo/transport/service_executor_fixed.h"
 #include "mongo/transport/service_executor_reserved.h"
 #include "mongo/transport/service_executor_synchronous.h"
+#include "mongo/transport/session_manager.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/assert_util_core.h"
 #include "mongo/util/clock_source.h"
@@ -54,18 +54,29 @@
 
 namespace mongo::transport {
 
-bool gInitialUseDedicatedThread = true;
-
 namespace {
 static constexpr auto kDiagnosticLogLevel = 4;
 
-auto getServiceExecutorStats =
-    ServiceContext::declareDecoration<synchronized_value<ServiceExecutorStats>>();
 auto getServiceExecutorContext =
     Client::declareDecoration<std::unique_ptr<ServiceExecutorContext>>();
 
-void incrThreadingModelStats(ServiceExecutorStats& stats, bool usesDedicatedThread, int step) {
-    (usesDedicatedThread ? stats.usesDedicated : stats.usesBorrowed) += step;
+SessionManager* getSessionManager(Client* client) {
+    if (!client)
+        return nullptr;
+    auto session = client->session();
+    if (!session)
+        return nullptr;
+    auto tl = session->getTransportLayer();
+    if (!tl)
+        return nullptr;
+    return tl->getSessionManager();
+}
+
+ServiceExecutorStats* getServiceExecutorContextStats(Client* client) {
+    auto* sm = getSessionManager(client);
+    if (!sm)
+        return nullptr;
+    return &sm->serviceExecutorStats;
 }
 
 // This is at best a naive solution. There could be a world where numOpenSessions() changes
@@ -73,7 +84,8 @@ void incrThreadingModelStats(ServiceExecutorStats& stats, bool usesDedicatedThre
 // onto the ServiceExecutorReserved when it is no longer necessary. The upside is that we
 // will automatically shift to the ServiceExecutorSynchronous after the first command loop.
 bool shouldUseReserved(Client* client) {
-    auto sm = client->session()->getTransportLayer()->getSessionManager();
+    auto* sm = getSessionManager(client);
+    invariant(sm);
     return sm->numOpenSessions() > sm->maxOpenSessions();
 }
 
@@ -86,15 +98,10 @@ void forEachServiceExecutor(ServiceContext* svcCtx, const Func& func) {
 
     call(std::type_identity<ServiceExecutorSynchronous>{});
     call(std::type_identity<ServiceExecutorReserved>{});
-    call(std::type_identity<ServiceExecutorFixed>{});
     call(std::type_identity<ServiceExecutorInline>{});
 }
 
 }  // namespace
-
-ServiceExecutorStats ServiceExecutorStats::get(ServiceContext* ctx) noexcept {
-    return getServiceExecutorStats(ctx).get();
-}
 
 ServiceExecutorContext* ServiceExecutorContext::get(Client* client) noexcept {
     // Service worker Clients will never have a ServiceExecutorContext.
@@ -109,18 +116,15 @@ void ServiceExecutorContext::set(Client* client,
 
     seCtx._client = client;
 
-    {
-        auto&& syncStats = *getServiceExecutorStats(client->getServiceContext());
-        if (seCtx._canUseReserved)
-            ++syncStats->limitExempt;
-        incrThreadingModelStats(*syncStats, seCtx.usesDedicatedThread(), 1);
-    }
+    if (seCtx._canUseReserved)
+        if (auto* stats = getServiceExecutorContextStats(client))
+            stats->limitExempt.fetchAndAddRelaxed(1);
 
     LOGV2_DEBUG(4898000,
                 kDiagnosticLogLevel,
                 "Setting initial ServiceExecutor context for client",
                 "client"_attr = client->desc(),
-                "usesDedicatedThread"_attr = seCtx.usesDedicatedThread(),
+                "usesDedicatedThread"_attr = true,
                 "canUseReserved"_attr = seCtx._canUseReserved);
     serviceExecutorContext = std::move(seCtxPtr);
 }
@@ -133,12 +137,13 @@ void ServiceExecutorContext::reset(Client* client) noexcept {
                 kDiagnosticLogLevel,
                 "Resetting ServiceExecutor context for client",
                 "client"_attr = client->desc(),
-                "threadingModel"_attr = seCtx->usesDedicatedThread(),
+                "threadingModel"_attr = true,
                 "canUseReserved"_attr = seCtx->_canUseReserved);
-    auto stats = *getServiceExecutorStats(client->getServiceContext());
+
     if (seCtx->_canUseReserved)
-        --stats->limitExempt;
-    incrThreadingModelStats(*stats, seCtx->usesDedicatedThread(), -1);
+        if (auto* stats = getServiceExecutorContextStats(client))
+            stats->limitExempt.fetchAndAddRelaxed(-1);
+
     seCtx.reset();
 }
 
@@ -146,13 +151,7 @@ void ServiceExecutorContext::setThreadModel(ThreadModel model) {
     if (_threadModel == model)
         return;
 
-    auto prev = std::exchange(_threadModel, model);
-    if (!_client)
-        return;
-
-    auto stats = *getServiceExecutorStats(_client->getServiceContext());
-    incrThreadingModelStats(*stats, prev != ThreadModel::kFixed, -1);
-    incrThreadingModelStats(*stats, model != ThreadModel::kFixed, +1);
+    std::exchange(_threadModel, model);
 }
 
 void ServiceExecutorContext::setCanUseReserved(bool canUseReserved) {
@@ -162,14 +161,9 @@ void ServiceExecutorContext::setCanUseReserved(bool canUseReserved) {
     }
 
     _canUseReserved = canUseReserved;
-    if (_client) {
-        auto stats = getServiceExecutorStats(_client->getServiceContext()).synchronize();
-        if (canUseReserved) {
-            ++stats->limitExempt;
-        } else {
-            --stats->limitExempt;
-        }
-    }
+    if (_client)
+        if (auto* stats = getServiceExecutorContextStats(_client))
+            stats->limitExempt.fetchAndAddRelaxed(canUseReserved ? 1 : -1);
 }
 
 ServiceExecutor* ServiceExecutorContext::getServiceExecutor() {
@@ -181,8 +175,6 @@ ServiceExecutor* ServiceExecutorContext::getServiceExecutor() {
     switch (_threadModel) {
         case ThreadModel::kInline:
             return ServiceExecutorInline::get(_client->getServiceContext());
-        case ThreadModel::kFixed:
-            return ServiceExecutorFixed::get(_client->getServiceContext());
         case ThreadModel::kSynchronous: {
             if (_canUseReserved && !_hasUsedSynchronous && shouldUseReserved(_client)) {
                 if (auto exec = ServiceExecutorReserved::get(_client->getServiceContext())) {

@@ -29,24 +29,38 @@
 
 #include "mongo/db/query/boolean_simplification/bitset_algebra.h"
 
-#include <absl/container/node_hash_set.h>
-#include <boost/dynamic_bitset/dynamic_bitset.hpp>
 // IWYU pragma: no_include "ext/alloc_traits.h"
 #include <algorithm>
 #include <ostream>
 #include <utility>
 
-#include "mongo/stdx/unordered_set.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/stream_utils.h"
 
 namespace mongo::boolean_simplification {
-Maxterm::Maxterm(std::initializer_list<Minterm> init) : minterms(std::move(init)) {
+void BitsetTerm::flip() {
+    predicates.flip();
+    predicates &= mask;
+}
+
+Maxterm::Maxterm(size_t size) : _numberOfBits(size) {}
+
+Maxterm::Maxterm(std::initializer_list<Minterm> init)
+    : minterms(std::move(init)), _numberOfBits(0) {
     tassert(7507918, "Maxterm cannot be initilized with empty list of minterms", !minterms.empty());
+    for (auto& minterm : minterms) {
+        _numberOfBits = std::max(minterm.size(), _numberOfBits);
+    }
+
+    for (auto& minterm : minterms) {
+        if (_numberOfBits > minterm.size()) {
+            minterm.resize(_numberOfBits);
+        }
+    }
 }
 
 bool Maxterm::isAlwaysTrue() const {
-    return minterms.size() == 1 && minterms.front().isAlwaysTrue();
+    return minterms.size() == 1 && minterms.front().isConjunctionAlwaysTrue();
 }
 
 bool Maxterm::isAlwaysFalse() const {
@@ -57,24 +71,6 @@ std::string Maxterm::toString() const {
     std::ostringstream oss{};
     oss << *this;
     return oss.str();
-}
-
-Maxterm& Maxterm::operator|=(const Minterm& rhs) {
-    minterms.emplace_back(rhs);
-    return *this;
-}
-
-Maxterm Maxterm::operator~() const {
-    if (minterms.empty()) {
-        return {Minterm{}};
-    }
-
-    Maxterm result = ~minterms.front();
-    for (size_t i = 1; i < minterms.size(); ++i) {
-        result &= ~minterms[i];
-    }
-
-    return result;
 }
 
 void Maxterm::removeRedundancies() {
@@ -102,22 +98,22 @@ void Maxterm::removeRedundancies() {
 }
 
 void Maxterm::append(size_t bitIndex, bool val) {
-    minterms.emplace_back(bitIndex, val);
+    minterms.emplace_back(_numberOfBits, bitIndex, val);
 }
 
 void Maxterm::appendEmpty() {
-    minterms.emplace_back();
+    minterms.emplace_back(_numberOfBits);
 }
 
 std::pair<Minterm, Maxterm> extractCommonPredicates(Maxterm maxterm) {
     if (maxterm.minterms.empty()) {
-        return {Minterm{}, std::move(maxterm)};
+        return {Minterm{maxterm.numberOfBits()}, std::move(maxterm)};
     }
 
-    Bitset commonTruePredicates{};
+    Bitset commonTruePredicates{maxterm.numberOfBits()};
     commonTruePredicates.set();
 
-    Bitset commonFalsePredicates{};
+    Bitset commonFalsePredicates{maxterm.numberOfBits()};
     commonFalsePredicates.set();
 
     for (const auto& minterm : maxterm.minterms) {
@@ -155,22 +151,6 @@ std::pair<Minterm, Maxterm> extractCommonPredicates(Maxterm maxterm) {
     return {std::move(commonPredicates), std::move(maxterm)};
 }
 
-Maxterm Minterm::operator~() const {
-    Maxterm result{};
-    result.minterms.reserve(mask.count());
-    for (size_t i = 0; i < mask.size(); ++i) {
-        if (mask[i]) {
-            result.minterms.emplace_back(i, !predicates[i]);
-        }
-    }
-    return result;
-}
-
-void Minterm::flip() {
-    predicates.flip();
-    predicates &= mask;
-}
-
 bool operator==(const BitsetTerm& lhs, const BitsetTerm& rhs) {
     return lhs.predicates == rhs.predicates && lhs.mask == rhs.mask;
 }
@@ -178,28 +158,6 @@ bool operator==(const BitsetTerm& lhs, const BitsetTerm& rhs) {
 std::ostream& operator<<(std::ostream& os, const BitsetTerm& term) {
     os << '(' << term.predicates << ", " << term.mask << ")";
     return os;
-}
-
-bool operator==(const Minterm& lhs, const Minterm& rhs) {
-    return lhs.predicates == rhs.predicates && lhs.mask == rhs.mask;
-}
-
-std::ostream& operator<<(std::ostream& os, const Minterm& minterm) {
-    os << '(' << minterm.predicates << ", " << minterm.mask << ")";
-    return os;
-}
-
-Maxterm& Maxterm::operator|=(const Maxterm& rhs) {
-    for (auto& right : rhs.minterms) {
-        *this |= right;
-    }
-    return *this;
-}
-
-Maxterm& Maxterm::operator&=(const Maxterm& rhs) {
-    Maxterm result = *this & rhs;
-    minterms.swap(result.minterms);
-    return *this;
 }
 
 bool operator==(const Maxterm& lhs, const Maxterm& rhs) {

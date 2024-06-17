@@ -96,8 +96,8 @@ constexpr Milliseconds TopologyCoordinator::PingStats::UninitializedPingTime;
 
 // Tracks the number of times we decide to change sync sources in order to sync from a significantly
 // closer node.
-CounterMetric numSyncSourceChangesDueToSignificantlyCloserNode(
-    "repl.syncSource.numSyncSourceChangesDueToSignificantlyCloserNode");
+auto& numSyncSourceChangesDueToSignificantlyCloserNode =
+    *MetricBuilder<Counter64>("repl.syncSource.numSyncSourceChangesDueToSignificantlyCloserNode");
 
 using namespace fmt::literals;
 
@@ -425,7 +425,7 @@ OpTime TopologyCoordinator::_getOldestSyncOpTime() const {
     // Find primary's oplog time. We will reject sync candidates that are more than
     // _options.maxSyncSourceLagSecs seconds behind this optime.
     if (_currentPrimaryIndex != -1) {
-        OpTime primaryOpTime = _memberData.at(_currentPrimaryIndex).getHeartbeatAppliedOpTime();
+        OpTime primaryOpTime = _memberData.at(_currentPrimaryIndex).getHeartbeatWrittenOpTime();
 
         // Check if primaryOpTime is still close to 0 because we haven't received
         // our first heartbeat from a new primary yet.
@@ -500,12 +500,12 @@ bool TopologyCoordinator::_isEligibleSyncSource(int candidateIndex,
         // Candidates cannot be excessively behind, if we are checking for staleness.
         if (shouldCheckStaleness) {
             const auto oldestSyncOpTime = _getOldestSyncOpTime();
-            if (memberData.getHeartbeatAppliedOpTime() < oldestSyncOpTime) {
+            if (memberData.getHeartbeatWrittenOpTime() < oldestSyncOpTime) {
                 LOGV2_INFO(3873110,
                            "Cannot select sync source because it is too far behind",
                            "syncSourceCandidate"_attr = syncSourceCandidate,
-                           "syncSourceCandidateOpTime"_attr =
-                               memberData.getHeartbeatAppliedOpTime(),
+                           "syncSourceCandidateLastWrittenOpTime"_attr =
+                               memberData.getHeartbeatWrittenOpTime(),
                            "oldestAcceptableOpTime"_attr = oldestSyncOpTime);
                 return false;
             }
@@ -531,12 +531,12 @@ bool TopologyCoordinator::_isEligibleSyncSource(int candidateIndex,
         }
     }
     // Only select a candidate that is ahead of me, if we are checking for staleness.
-    if (shouldCheckStaleness && memberData.getHeartbeatAppliedOpTime() <= lastOpTimeFetched) {
+    if (shouldCheckStaleness && memberData.getHeartbeatWrittenOpTime() <= lastOpTimeFetched) {
         LOGV2_INFO(3873113,
                    "Cannot select sync source which is not ahead of me",
                    "syncSourceCandidate"_attr = syncSourceCandidate,
-                   "syncSourceCandidateLastAppliedOpTime"_attr =
-                       memberData.getHeartbeatAppliedOpTime().toBSON(),
+                   "syncSourceCandidateLastWrittenOpTime"_attr =
+                       memberData.getHeartbeatWrittenOpTime().toBSON(),
                    "lastOpTimeFetched"_attr = lastOpTimeFetched.toBSON());
         return false;
     }
@@ -811,14 +811,14 @@ void TopologyCoordinator::prepareSyncFromResponse(const HostAndPort& target,
                    str::stream() << "I cannot reach the requested member: " << target.toString());
         return;
     }
-    const OpTime lastOpApplied = getMyLastAppliedOpTime();
-    if (hbdata.getHeartbeatAppliedOpTime().getSecs() + 10 < lastOpApplied.getSecs()) {
+    const OpTime lastOpWritten = getMyLastWrittenOpTime();
+    if (hbdata.getHeartbeatWrittenOpTime().getSecs() + 10 < lastOpWritten.getSecs()) {
         LOGV2_WARNING(
             21837,
             "Attempting to sync from sync source, but it is more than 10 seconds behind us",
             "syncSource"_attr = target,
-            "syncSourceHeartbeatAppliedOpTime"_attr = hbdata.getHeartbeatAppliedOpTime().getSecs(),
-            "lastOpApplied"_attr = lastOpApplied.getSecs());
+            "syncSourceHeartbeatWrittenOpTime"_attr = hbdata.getHeartbeatWrittenOpTime().getSecs(),
+            "lastOpWritten"_attr = lastOpWritten.getSecs());
         response->append("warning",
                          str::stream() << "requested member \"" << target.toString()
                                        << "\" is more than 10 seconds behind us");
@@ -876,16 +876,20 @@ StatusWith<bool> TopologyCoordinator::prepareHeartbeatResponseV1(
     }
 
     OpTimeAndWallTime lastOpApplied;
+    OpTimeAndWallTime lastOpWritten;
     OpTimeAndWallTime lastOpDurable;
 
-    // We include null times for lastApplied and lastDurable if we are in STARTUP_2, as we do not
-    // want to report replication progress and be part of write majorities while in initial sync.
+    // We include null times for lastApplied, lastWritten and lastDurable if we are in STARTUP_2, as
+    // we do not want to report replication progress and be part of write majorities while in
+    // initial sync.
     if (!myState.startup2()) {
         lastOpApplied = getMyLastAppliedOpTimeAndWallTime();
+        lastOpWritten = getMyLastWrittenOpTimeAndWallTime();
         lastOpDurable = getMyLastDurableOpTimeAndWallTime();
     }
 
     response->setAppliedOpTimeAndWallTime(lastOpApplied);
+    response->setWrittenOpTimeAndWallTime(lastOpWritten);
     response->setDurableOpTimeAndWallTime(lastOpDurable);
 
     if (_currentPrimaryIndex != -1) {
@@ -1164,12 +1168,33 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
     return nextAction;
 }
 
+OpTime TopologyCoordinator::_getMemberOpTimeForRecencyCheck(const MemberData& memberData,
+                                                            bool durablyWritten) {
+    OpTime memberOpTime;
+
+    // For j: true case use min(lastDurable, lastApplied) because oplog entries being
+    // durable no longer implies being applied, but we'd like to have numbered and
+    // tagged write concerns support the read-your-write semantics.
+    if (feature_flags::gReduceMajorityWriteLatency.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+        memberOpTime = durablyWritten
+            ? std::min(memberData.getLastDurableOpTime(), memberData.getLastAppliedOpTime())
+            : memberData.getLastAppliedOpTime();
+    } else {
+        memberOpTime =
+            durablyWritten ? memberData.getLastDurableOpTime() : memberData.getLastAppliedOpTime();
+    }
+
+    return memberOpTime;
+}
+
 bool TopologyCoordinator::haveNumNodesReachedOpTime(const OpTime& targetOpTime,
                                                     int numNodes,
                                                     bool durablyWritten) {
     // Replication progress that is for some reason ahead of us should not allow us to
     // satisfy a write concern if we aren't caught up ourselves.
-    OpTime myOpTime = durablyWritten ? getMyLastDurableOpTime() : getMyLastAppliedOpTime();
+    OpTime myOpTime = _getMemberOpTimeForRecencyCheck(_selfMemberData(), durablyWritten);
+
     if (myOpTime < targetOpTime) {
         return false;
     }
@@ -1188,8 +1213,7 @@ bool TopologyCoordinator::haveNumNodesReachedOpTime(const OpTime& targetOpTime,
             continue;
         }
 
-        const OpTime& memberOpTime =
-            durablyWritten ? memberData.getLastDurableOpTime() : memberData.getLastAppliedOpTime();
+        OpTime memberOpTime = _getMemberOpTimeForRecencyCheck(memberData, durablyWritten);
 
         // In addition to checking if a member has a greater/equal timestamp field we also need to
         // make sure that the memberOpTime is in the same term as the OpTime we wait for. If a
@@ -1224,9 +1248,8 @@ TopologyCoordinator::MemberPredicate TopologyCoordinator::makeOpTimePredicate(co
     // OpTime has been replicated.
     invariant(opTime.getTerm() == getMyLastAppliedOpTime().getTerm());
 
-    return [=](const MemberData& memberData) {
-        auto memberOpTime =
-            durablyWritten ? memberData.getLastDurableOpTime() : memberData.getLastAppliedOpTime();
+    return [this, &opTime, durablyWritten](const MemberData& memberData) {
+        OpTime memberOpTime = _getMemberOpTimeForRecencyCheck(memberData, durablyWritten);
 
         // In addition to checking if a member has a greater/equal timestamp field we also need to
         // make sure that the memberOpTime is in the same term as the OpTime we wait for. If a
@@ -1353,6 +1376,23 @@ void TopologyCoordinator::resetMemberTimeouts(Date_t now,
     }
 }
 
+OpTime TopologyCoordinator::getMyLastWrittenOpTime() const {
+    return _selfMemberData().getLastWrittenOpTime();
+}
+
+OpTimeAndWallTime TopologyCoordinator::getMyLastWrittenOpTimeAndWallTime() const {
+    return {_selfMemberData().getLastWrittenOpTime(), _selfMemberData().getLastWrittenWallTime()};
+}
+
+void TopologyCoordinator::setMyLastWrittenOpTimeAndWallTime(OpTimeAndWallTime opTimeAndWallTime,
+                                                            Date_t now,
+                                                            bool isRollbackAllowed) {
+    auto opTime = opTimeAndWallTime.opTime;
+    auto& myMemberData = _selfMemberData();
+    invariant(isRollbackAllowed || opTime >= myMemberData.getLastWrittenOpTime());
+    myMemberData.setLastWrittenOpTimeAndWallTime(opTimeAndWallTime, now);
+}
+
 OpTime TopologyCoordinator::getMyLastAppliedOpTime() const {
     return _selfMemberData().getLastAppliedOpTime();
 }
@@ -1477,13 +1517,19 @@ StatusWith<bool> TopologyCoordinator::setLastOptimeForMember(
                 3,
                 "Updating member data due to replSetUpdatePosition",
                 "memberId"_attr = memberId,
+                "oldLastWrittenOpTime"_attr = memberData->getLastWrittenOpTime(),
                 "oldLastAppliedOpTime"_attr = memberData->getLastAppliedOpTime(),
                 "oldLastDurableOpTime"_attr = memberData->getLastDurableOpTime(),
+                "newWrittenOpTime"_attr = args.writtenOpTime,
                 "newAppliedOpTime"_attr = args.appliedOpTime,
                 "newDurableOpTime"_attr = durableOpTime);
 
-    bool advancedOpTime = memberData->advanceLastAppliedOpTimeAndWallTime(
-        {args.appliedOpTime, args.appliedWallTime}, now);
+
+    bool advancedOpTime = memberData->advanceLastWrittenOpTimeAndWallTime(
+        {args.writtenOpTime, args.writtenWallTime}, now);
+    advancedOpTime = memberData->advanceLastAppliedOpTimeAndWallTime(
+                         {args.appliedOpTime, args.appliedWallTime}, now) ||
+        advancedOpTime;
     advancedOpTime =
         memberData->advanceLastDurableOpTimeAndWallTime({durableOpTime, durableWallTime}, now) ||
         advancedOpTime;
@@ -1669,7 +1715,7 @@ int TopologyCoordinator::_findHealthyPrimaryOfEqualOrGreaterPriority(
 }
 
 bool TopologyCoordinator::_amIFreshEnoughForPriorityTakeover() const {
-    const OpTime ourLatestKnownOpTime = latestKnownOpTime();
+    const OpTime ourLatestKnownOpTime = latestKnownAppliedOpTime();
 
     // Rules are:
     // - If the terms don't match, we don't call for priority takeover.
@@ -1700,7 +1746,7 @@ bool TopologyCoordinator::_amIFreshEnoughForPriorityTakeover() const {
 
 bool TopologyCoordinator::_amIFreshEnoughForCatchupTakeover() const {
 
-    const OpTime ourLatestKnownOpTime = latestKnownOpTime();
+    const OpTime ourLatestKnownOpTime = latestKnownAppliedOpTime();
 
     // Rules are:
     // - We must have the freshest optime of all the up nodes.
@@ -1785,7 +1831,7 @@ void TopologyCoordinator::changeMemberState_forTest(const MemberState& newMember
     switch (newMemberState.s) {
         case MemberState::RS_PRIMARY:
             _role = Role::kCandidate;
-            processWinElection(OID(), electionTime);
+            processWinElection(electionTime);
             invariant(_role == Role::kLeader);
             break;
         case MemberState::RS_SECONDARY:
@@ -1832,6 +1878,8 @@ void TopologyCoordinator::setCurrentPrimary_forTest(int primaryIndex,
             hbResponse.setElectionTime(electionTime);
             hbResponse.setAppliedOpTimeAndWallTime(
                 {_memberData.at(primaryIndex).getHeartbeatAppliedOpTime(), Date_t() + Seconds(1)});
+            hbResponse.setWrittenOpTimeAndWallTime(
+                {_memberData.at(primaryIndex).getHeartbeatWrittenOpTime(), Date_t() + Seconds(1)});
             hbResponse.setSyncingTo(HostAndPort());
             _memberData.at(primaryIndex)
                 .setUpValues(_memberData.at(primaryIndex).getLastHeartbeat(),
@@ -1882,6 +1930,8 @@ std::string TopologyCoordinator::_getReplSetStatusString() {
 void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatusArgs,
                                                 BSONObjBuilder* response,
                                                 Status* result) {
+    auto featureFlagMajorityWriteLatency = feature_flags::gReduceMajorityWriteLatency.isEnabled(
+        serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
     // output for each member
     std::vector<BSONObj> membersOut;
     const MemberState myState = getMemberState();
@@ -1890,6 +1940,8 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
     const Date_t lastOpAppliedWall = getMyLastAppliedOpTimeAndWallTime().wallTime;
     const OpTime lastOpDurable = getMyLastDurableOpTime();
     const Date_t lastOpDurableWall = getMyLastDurableOpTimeAndWallTime().wallTime;
+    const OpTime lastOpWritten = getMyLastWrittenOpTime();
+    const Date_t lastOpWrittenWall = getMyLastWrittenOpTimeAndWallTime().wallTime;
     const BSONObj& initialSyncStatus = rsStatusArgs.initialSyncStatus;
     const BSONObj& electionCandidateMetrics = rsStatusArgs.electionCandidateMetrics;
     const BSONObj& electionParticipantMetrics = rsStatusArgs.electionParticipantMetrics;
@@ -1903,9 +1955,16 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
         response->append("uptime", static_cast<int>(rsStatusArgs.selfUptime));
 
         appendOpTime(response, "optime", lastOpApplied);
+        if (featureFlagMajorityWriteLatency) {
+            appendOpTime(response, "optimeWritten", lastOpWritten);
+        }
 
         response->appendDate("optimeDate",
                              Date_t::fromDurationSinceEpoch(Seconds(lastOpApplied.getSecs())));
+        if (featureFlagMajorityWriteLatency) {
+            response->appendDate("optimeWrittenDate",
+                                 Date_t::fromDurationSinceEpoch(Seconds(lastOpWritten.getSecs())));
+        }
         if (_maintenanceModeCalls) {
             response->append("maintenanceMode", _maintenanceModeCalls);
         }
@@ -1935,8 +1994,16 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
                 appendOpTime(&bb, "optime", lastOpApplied);
                 bb.appendDate("optimeDate",
                               Date_t::fromDurationSinceEpoch(Seconds(lastOpApplied.getSecs())));
+                if (featureFlagMajorityWriteLatency) {
+                    appendOpTime(&bb, "optimeWritten", lastOpWritten);
+                    bb.appendDate("optimeWrittenDate",
+                                  Date_t::fromDurationSinceEpoch(Seconds(lastOpWritten.getSecs())));
+                }
                 bb.appendDate("lastAppliedWallTime", it->getLastAppliedWallTime());
                 bb.appendDate("lastDurableWallTime", it->getLastDurableWallTime());
+                if (featureFlagMajorityWriteLatency) {
+                    bb.appendDate("lastWrittenWallTime", it->getLastWrittenWallTime());
+                }
             }
 
             if (!_syncSource.empty() && !_iAmPrimary()) {
@@ -1988,6 +2055,9 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
             if (!itConfig.isArbiter()) {
                 appendOpTime(&bb, "optime", it->getHeartbeatAppliedOpTime());
                 appendOpTime(&bb, "optimeDurable", it->getHeartbeatDurableOpTime());
+                if (featureFlagMajorityWriteLatency) {
+                    appendOpTime(&bb, "optimeWritten", it->getHeartbeatWrittenOpTime());
+                }
 
                 bb.appendDate("optimeDate",
                               Date_t::fromDurationSinceEpoch(
@@ -1995,9 +2065,17 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
                 bb.appendDate("optimeDurableDate",
                               Date_t::fromDurationSinceEpoch(
                                   Seconds(it->getHeartbeatDurableOpTime().getSecs())));
+                if (featureFlagMajorityWriteLatency) {
+                    bb.appendDate("optimeWrittenDate",
+                                  Date_t::fromDurationSinceEpoch(
+                                      Seconds(it->getHeartbeatWrittenOpTime().getSecs())));
+                }
 
                 bb.appendDate("lastAppliedWallTime", it->getLastAppliedWallTime());
                 bb.appendDate("lastDurableWallTime", it->getLastDurableWallTime());
+                if (featureFlagMajorityWriteLatency) {
+                    bb.appendDate("lastWrittenWallTime", it->getLastWrittenWallTime());
+                }
             }
             bb.appendDate("lastHeartbeat", it->getLastHeartbeat());
             bb.appendDate("lastHeartbeatRecv", it->getLastHeartbeatRecv());
@@ -2054,8 +2132,7 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
     }
 
     if (_rsConfig.getConfigServer_deprecated() ||
-        (gFeatureFlagAllMongodsAreSharded.isEnabledAndIgnoreFCVUnsafeAtStartup() &&
-         serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer))) {
+        serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
         response->append("configsvr", true);
     }
 
@@ -2079,9 +2156,15 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
 
     appendOpTime(&optimes, "appliedOpTime", lastOpApplied);
     appendOpTime(&optimes, "durableOpTime", lastOpDurable);
+    if (featureFlagMajorityWriteLatency) {
+        appendOpTime(&optimes, "writtenOpTime", lastOpWritten);
+    }
 
     optimes.appendDate("lastAppliedWallTime", lastOpAppliedWall);
     optimes.appendDate("lastDurableWallTime", lastOpDurableWall);
+    if (featureFlagMajorityWriteLatency) {
+        optimes.appendDate("lastWrittenWallTime", lastOpWrittenWall);
+    }
 
     response->append("optimes", optimes.obj());
     if (lastStableRecoveryTimestamp) {
@@ -2128,14 +2211,18 @@ StatusWith<BSONObj> TopologyCoordinator::prepareReplSetUpdatePositionCommand(
         }
 
         BSONObjBuilder entry(arrayBuilder.subobjStart());
-        memberData.getLastDurableOpTime().append(&entry,
-                                                 UpdatePositionArgs::kDurableOpTimeFieldName);
-        entry.appendDate(UpdatePositionArgs::kDurableWallTimeFieldName,
-                         memberData.getLastDurableWallTime());
+        memberData.getLastWrittenOpTime().append(&entry,
+                                                 UpdatePositionArgs::kWrittenOpTimeFieldName);
+        entry.appendDate(UpdatePositionArgs::kWrittenWallTimeFieldName,
+                         memberData.getLastWrittenWallTime());
         memberData.getLastAppliedOpTime().append(&entry,
                                                  UpdatePositionArgs::kAppliedOpTimeFieldName);
         entry.appendDate(UpdatePositionArgs::kAppliedWallTimeFieldName,
                          memberData.getLastAppliedWallTime());
+        memberData.getLastDurableOpTime().append(&entry,
+                                                 UpdatePositionArgs::kDurableOpTimeFieldName);
+        entry.appendDate(UpdatePositionArgs::kDurableWallTimeFieldName,
+                         memberData.getLastDurableWallTime());
         entry.append(UpdatePositionArgs::kMemberIdFieldName, memberData.getMemberId().getData());
         entry.append(UpdatePositionArgs::kConfigVersionFieldName, _rsConfig.getConfigVersion());
     }
@@ -2161,8 +2248,14 @@ void TopologyCoordinator::fillMemberData(BSONObjBuilder* result) {
             const auto lastAppliedOpTime = memberData.getLastAppliedOpTime();
             entry.append("lastAppliedOpTime", lastAppliedOpTime.toBSON());
 
+            const auto lastWrittenOpTime = memberData.getLastWrittenOpTime();
+            entry.append("lastWrittenOpTime", lastWrittenOpTime.toBSON());
+
             const auto heartbeatAppliedOpTime = memberData.getHeartbeatAppliedOpTime();
             entry.append("heartbeatAppliedOpTime", heartbeatAppliedOpTime.toBSON());
+
+            const auto heartbeatWrittenOpTime = memberData.getHeartbeatWrittenOpTime();
+            entry.append("heartbeatWrittenOpTime", heartbeatWrittenOpTime.toBSON());
 
             const auto heartbeatDurableOpTime = memberData.getHeartbeatDurableOpTime();
             entry.append("heartbeatDurableOpTime", heartbeatDurableOpTime.toBSON());
@@ -2175,7 +2268,7 @@ void TopologyCoordinator::fillMemberData(BSONObjBuilder* result) {
 }
 
 void TopologyCoordinator::fillHelloForReplSet(std::shared_ptr<HelloResponse> response,
-                                              const StringData& horizonString) const {
+                                              StringData horizonString) const {
     invariant(_rsConfig.isInitialized());
     response->setTopologyVersion(getTopologyVersion());
     const MemberState myState = getMemberState();
@@ -2246,7 +2339,7 @@ void TopologyCoordinator::fillHelloForReplSet(std::shared_ptr<HelloResponse> res
     }
     response->setMe(selfConfig.getHostAndPort(horizonString));
     if (_iAmPrimary()) {
-        response->setElectionId(_electionId);
+        response->setElectionId(OID::fromTerm(_electionIdTerm));
     }
 }
 
@@ -2280,8 +2373,8 @@ Timestamp TopologyCoordinator::getElectionTime() const {
     return _electionTime;
 }
 
-OID TopologyCoordinator::getElectionId() const {
-    return _electionId;
+long long TopologyCoordinator::getElectionIdTerm() const {
+    return _electionIdTerm;
 }
 
 int TopologyCoordinator::getCurrentPrimaryIndex() const {
@@ -2442,8 +2535,9 @@ TopologyCoordinator::UnelectableReasonMask TopologyCoordinator::_getUnelectableR
 TopologyCoordinator::UnelectableReasonMask TopologyCoordinator::_getMyUnelectableReason(
     const Date_t now, StartElectionReasonEnum reason) const {
     UnelectableReasonMask result = None;
+    const OpTime lastWritten = getMyLastWrittenOpTime();
     const OpTime lastApplied = getMyLastAppliedOpTime();
-    if (lastApplied.isNull()) {
+    if (lastWritten.isNull() || lastApplied.isNull()) {
         result |= NoData;
     }
     if (!_aMajoritySeemsToBeUp()) {
@@ -2655,18 +2749,13 @@ bool TopologyCoordinator::canAcceptWrites() const {
     return _leaderMode == LeaderMode::kWritablePrimary;
 }
 
-void TopologyCoordinator::setElectionInfo(OID electionId, Timestamp electionOpTime) {
-    invariant(_role == Role::kLeader);
-    _electionTime = electionOpTime;
-    _electionId = electionId;
-}
-
-void TopologyCoordinator::processWinElection(OID electionId, Timestamp electionOpTime) {
+void TopologyCoordinator::processWinElection(Timestamp electionOpTime) {
     invariant(_role == Role::kCandidate);
     invariant(_leaderMode == LeaderMode::kNotLeader);
     _role = Role::kLeader;
     _setLeaderMode(LeaderMode::kLeaderElect);
-    setElectionInfo(electionId, electionOpTime);
+    _electionIdTerm = _term;
+    _electionTime = electionOpTime;
     _currentPrimaryIndex = _selfIndex;
     _clearSyncSource();
     _forceSyncSourceIndex = -1;
@@ -2680,7 +2769,7 @@ void TopologyCoordinator::processLoseElection() {
     invariant(_leaderMode == LeaderMode::kNotLeader);
     const HostAndPort syncSourceAddress = getSyncSourceAddress();
     _electionTime = Timestamp(0, 0);
-    _electionId = OID();
+    _electionIdTerm = repl::OpTime::kUninitializedTerm;
     _role = Role::kFollower;
 }
 
@@ -2876,7 +2965,7 @@ bool TopologyCoordinator::updateLastCommittedOpTimeAndWallTime() {
         return false;
     }
 
-    // Whether we use the applied or durable OpTime for the commit point is decided here.
+    // Whether we use the written or durable OpTime for the commit point is decided here.
     const bool useDurableOpTime = _rsConfig.getWriteConcernMajorityShouldJournal();
 
     std::vector<OpTimeAndWallTime> votingNodesOpTimesAndWallTimes;
@@ -2887,9 +2976,9 @@ bool TopologyCoordinator::updateLastCommittedOpTimeAndWallTime() {
         if (memberConfig.isVoter()) {
             const OpTimeAndWallTime durableOpTime = {memberData.getLastDurableOpTime(),
                                                      memberData.getLastDurableWallTime()};
-            const OpTimeAndWallTime appliedOpTime = {memberData.getLastAppliedOpTime(),
-                                                     memberData.getLastAppliedWallTime()};
-            const OpTimeAndWallTime opTime = useDurableOpTime ? durableOpTime : appliedOpTime;
+            const OpTimeAndWallTime writtenOpTime = {memberData.getLastWrittenOpTime(),
+                                                     memberData.getLastWrittenWallTime()};
+            const OpTimeAndWallTime opTime = useDurableOpTime ? durableOpTime : writtenOpTime;
             votingNodesOpTimesAndWallTimes.push_back(opTime);
         }
     }
@@ -2940,17 +3029,17 @@ bool TopologyCoordinator::advanceLastCommittedOpTimeAndWallTime(OpTimeAndWallTim
 
     // Arbiters don't have data so they always advance their commit point via heartbeats.
     if (!_selfConfig().isArbiter() &&
-        getMyLastAppliedOpTime().getTerm() != committedOpTime.opTime.getTerm()) {
+        getMyLastWrittenOpTime().getTerm() != committedOpTime.opTime.getTerm()) {
         if (fromSyncSource) {
-            committedOpTime = std::min(committedOpTime, getMyLastAppliedOpTimeAndWallTime());
+            committedOpTime = std::min(committedOpTime, getMyLastWrittenOpTimeAndWallTime());
         } else {
             LOGV2_DEBUG(21824,
                         1,
-                        "Ignoring commit point with different term than my lastApplied, since it "
+                        "Ignoring commit point with different term than my lastWritten, since it "
                         "may not be on the same oplog branch as mine",
                         "committedOpTime"_attr = committedOpTime,
-                        "myLastAppliedOpTimeAndWallTime"_attr =
-                            getMyLastAppliedOpTimeAndWallTime());
+                        "myLastWrittenOpTimeAndWallTime"_attr =
+                            getMyLastWrittenOpTimeAndWallTime());
             return false;
         }
     }
@@ -3078,8 +3167,8 @@ bool TopologyCoordinator::shouldChangeSyncSource(const HostAndPort& currentSourc
     }
 
     OpTime currentSourceOpTime =
-        std::max(oqMetadata.getLastOpApplied(),
-                 _memberData.at(currentSourceIndex).getHeartbeatAppliedOpTime());
+        std::max(oqMetadata.getLastOpWritten(),
+                 _memberData.at(currentSourceIndex).getHeartbeatWrittenOpTime());
 
     fassert(4612000, !currentSourceOpTime.isNull());
 
@@ -3252,7 +3341,7 @@ bool TopologyCoordinator::_shouldChangeSyncSourceDueToLag(const HostAndPort& cur
 
         for (size_t i = 0; i < _memberData.size(); i++) {
             const auto& member = _memberData[i];
-            if (currentSourceLagThresholdSecs < member.getHeartbeatAppliedOpTime().getSecs() &&
+            if (currentSourceLagThresholdSecs < member.getHeartbeatWrittenOpTime().getSecs() &&
                 _isEligibleSyncSource(i,
                                       now,
                                       lastOpTimeFetched,
@@ -3269,8 +3358,8 @@ bool TopologyCoordinator::_shouldChangeSyncSourceDueToLag(const HostAndPort& cur
                       "syncSourceOpTime"_attr = currentSourceOpTime.toString(),
                       "maxSyncSourceLagSecs"_attr = _options.maxSyncSourceLagSecs,
                       "otherMember"_attr = member.getHostAndPort().toString(),
-                      "otherMemberHearbeatAppliedOpTime"_attr =
-                          member.getHeartbeatAppliedOpTime().toString());
+                      "otherMemberHearbeatWrittenOpTime"_attr =
+                          member.getHeartbeatWrittenOpTime().toString());
                 return true;
             }
         }
@@ -3439,6 +3528,7 @@ rpc::ReplSetMetadata TopologyCoordinator::prepareReplSetMetadata(
 rpc::OplogQueryMetadata TopologyCoordinator::prepareOplogQueryMetadata(int rbid) const {
     return rpc::OplogQueryMetadata(_lastCommittedOpTimeAndWallTime,
                                    getMyLastAppliedOpTime(),
+                                   getMyLastWrittenOpTime(),
                                    rbid,
                                    _currentPrimaryIndex,
                                    _rsConfig.findMemberIndexByHostAndPort(getSyncSourceAddress()),
@@ -3485,12 +3575,12 @@ void TopologyCoordinator::processReplSetRequestVotes(const ReplSetRequestVotesAr
         response->setVoteGranted(false);
         response->setReason("candidate's set name ({}) differs from mine ({})"_format(
             args.getSetName(), _rsConfig.getReplSetName()));
-    } else if (args.getLastAppliedOpTime() < getMyLastAppliedOpTime()) {
+    } else if (args.getLastWrittenOpTime() < getMyLastWrittenOpTime()) {
         response->setVoteGranted(false);
         response->setReason(
-            "candidate's data is staler than mine. candidate's last applied OpTime: {}, "
-            "my last applied OpTime: {}"_format(args.getLastAppliedOpTime().toString(),
-                                                getMyLastAppliedOpTime().toString()));
+            "candidate's data is staler than mine. candidate's last written OpTime: {}, "
+            "my last written OpTime: {}"_format(args.getLastWrittenOpTime().toString(),
+                                                getMyLastWrittenOpTime().toString()));
     } else if (!args.isADryRun() && _lastVote.getTerm() == args.getTerm()) {
         response->setVoteGranted(false);
         response->setReason("already voted for another candidate ({}) this term ({})"_format(
@@ -3584,7 +3674,34 @@ void TopologyCoordinator::incrementTopologyVersion() {
     _topologyVersion.setCounter(counter + 1);
 }
 
-OpTime TopologyCoordinator::latestKnownOpTime() const {
+OpTime TopologyCoordinator::latestKnownWrittenOpTime() const {
+    OpTime latest = getMyLastWrittenOpTime();
+    for (std::vector<MemberData>::const_iterator it = _memberData.begin(); it != _memberData.end();
+         ++it) {
+        // Ignore self
+        if (it->isSelf()) {
+            continue;
+        }
+        // Ignore down members
+        if (!it->up()) {
+            continue;
+        }
+        // Ignore removed nodes (not in config, so not valid).
+        if (it->getState().removed()) {
+            continue;
+        }
+
+        OpTime optime = it->getHeartbeatWrittenOpTime();
+
+        if (optime > latest) {
+            latest = optime;
+        }
+    }
+
+    return latest;
+}
+
+OpTime TopologyCoordinator::latestKnownAppliedOpTime() const {
     OpTime latest = getMyLastAppliedOpTime();
     for (std::vector<MemberData>::const_iterator it = _memberData.begin(); it != _memberData.end();
          ++it) {

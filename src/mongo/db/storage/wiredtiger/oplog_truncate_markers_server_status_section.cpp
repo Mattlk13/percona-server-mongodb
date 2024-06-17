@@ -48,7 +48,7 @@ namespace {
 
 class OplogTruncateMarkersServerStatusSection : public ServerStatusSection {
 public:
-    OplogTruncateMarkersServerStatusSection() : ServerStatusSection("oplogTruncation") {}
+    using ServerStatusSection::ServerStatusSection;
     /**
      * <ServerStatusSection>
      */
@@ -75,8 +75,10 @@ public:
         }
         return builder.obj();
     }
-
-} oplogTruncateMarkersStats;
+};
+auto oplogTruncateMarkersStats =
+    *ServerStatusSectionBuilder<OplogTruncateMarkersServerStatusSection>("oplogTruncation")
+         .forShard();
 
 }  // namespace
 }  // namespace mongo

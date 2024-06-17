@@ -42,13 +42,12 @@ env.Library(
 )
 
 env.Library(
-    target='timeseries_stats',
+    target='bucket_compression_failure',
     source=[
-        'timeseries_stats.cpp',
+        'bucket_compression_failure.cpp',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/pipeline/pipeline',
     ],
 )
 
@@ -76,6 +75,7 @@ env.Library(
         '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
         '$BUILD_DIR/mongo/bson/util/bson_column',
         '$BUILD_DIR/mongo/db/catalog/index_catalog',
+        '$BUILD_DIR/mongo/db/coll_mod_command_idl',
         '$BUILD_DIR/mongo/db/exec/bucket_unpacker',
         '$BUILD_DIR/mongo/db/index_commands_idl',
         '$BUILD_DIR/mongo/db/ops/write_ops_parsers',
@@ -97,7 +97,9 @@ env.Library(
         '$BUILD_DIR/mongo/db/catalog/catalog_helpers',
         '$BUILD_DIR/mongo/db/coll_mod_command_idl',
         '$BUILD_DIR/mongo/db/exec/bucket_unpacker',
+        '$BUILD_DIR/mongo/db/index_commands_idl',
         '$BUILD_DIR/mongo/db/server_base',
+        '$BUILD_DIR/mongo/db/shard_role',
         'catalog_helper',
         'timeseries_conversion_util',
         'timeseries_options',
@@ -114,14 +116,17 @@ env.Library(
         '$BUILD_DIR/mongo/db/catalog/collection_query_info',
         '$BUILD_DIR/mongo/db/catalog/document_validation',
         '$BUILD_DIR/mongo/db/dbdirectclient',
+        '$BUILD_DIR/mongo/db/ops/delete_request_idl',
         '$BUILD_DIR/mongo/db/ops/write_ops_exec_util',
         '$BUILD_DIR/mongo/db/query/query_stats/query_stats',
         '$BUILD_DIR/mongo/db/record_id_helpers',
         '$BUILD_DIR/mongo/db/repl/tenant_migration_decoration',
         '$BUILD_DIR/mongo/db/shard_role',
+        '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/mongo/db/timeseries/bucket_catalog/bucket_catalog',
         '$BUILD_DIR/mongo/db/update/update_common',
         'bucket_compression',
+        'bucket_compression_failure',
         'timeseries_conversion_util',
         'timeseries_options',
     ],
@@ -181,6 +186,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/catalog/collection_catalog',
+        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/op_observer/op_observer',
         '$BUILD_DIR/mongo/db/timeseries/bucket_catalog/bucket_catalog',
         'timeseries_extended_range',

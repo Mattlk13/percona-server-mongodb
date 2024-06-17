@@ -66,6 +66,7 @@
 
 namespace mongo {
 namespace {
+using namespace fmt::literals;
 
 class CommitShardSplitCmd : public TypedCommand<CommitShardSplitCmd> {
 public:
@@ -129,12 +130,12 @@ public:
             return true;
         }
 
-        NamespaceString ns() const {
+        NamespaceString ns() const override {
             return NamespaceString(request().getDbName());
         }
     };
 
-    std::string help() const {
+    std::string help() const override {
         return "Start an operation to split a shard into its own slice.";
     }
 
@@ -205,7 +206,7 @@ public:
             return true;
         }
 
-        NamespaceString ns() const {
+        NamespaceString ns() const override {
             return NamespaceString(request().getDbName());
         }
     };
@@ -280,7 +281,7 @@ public:
             return true;
         }
 
-        NamespaceString ns() const {
+        NamespaceString ns() const override {
             return NamespaceString(request().getDbName());
         }
     };

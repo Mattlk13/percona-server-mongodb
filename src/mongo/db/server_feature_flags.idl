@@ -48,14 +48,19 @@ feature_flags:
         cpp_varname: gFeatureFlagGlobalIndexes
         default: false
         shouldBeFCVGated: true
-    featureFlagAdditionalParticipants:
-        description: "Adding additional participants to existing transactions"
-        cpp_varname: gFeatureFlagAdditionalParticipants
+    featureFlagAllowAdditionalParticipants:
+        description: "Enable adding additional participants to active transaction"
+        cpp_varname: gFeatureFlagAllowAdditionalParticipants
         default: false
         shouldBeFCVGated: true
     featureFlagBulkWriteCommand:
         description: "Support for bulkWrite command and one-shot transactions"
         cpp_varname: gFeatureFlagBulkWriteCommand
+        default: true
+        shouldBeFCVGated: false
+    featureFlagRecordIdsReplicated:
+        description: "Enable creating collections with the RecordIdsReplicated option."
+        cpp_varname: gFeatureFlagRecordIdsReplicated
         default: false
         shouldBeFCVGated: true
     featureFlagAuditConfigClusterParameter:
@@ -67,7 +72,7 @@ feature_flags:
     featureFlagOCSF:
         description: "Provide an OCSF compatible output for audit logs"
         cpp_varname: gFeatureFlagOCSF
-        default: false
+        default: true
         shouldBeFCVGated: false
     featureFlagStreams:
         description: "Enable support for streams"
@@ -81,12 +86,6 @@ feature_flags:
         cpp_varname: feature_flags::gFeatureFlagUseUnreplicatedTruncatesForDeletions
         default: true
         shouldBeFCVGated: false
-    featureFlagTTLIndexesOnCappedCollections:
-        description: "Enables support for capped collections having a TTL index."
-        cpp_varname: feature_flags::gFeatureFlagTTLIndexesOnCappedCollections
-        default: true
-        version: 7.1
-        shouldBeFCVGated: true
     featureFlagEndOfTransactionChangeEvent:
         description: "Feature flag to enable endOfTransaction oplog entry and change stream event"
         cpp_varname: feature_flags::gFeatureFlagEndOfTransactionChangeEvent
@@ -118,5 +117,66 @@ feature_flags:
     featureFlagOIDCInternalAuthorization:
         description: "Feature flag gating OIDC authentication with internal authorization"
         cpp_varname: gFeatureFlagOIDCInternalAuthorization
+        default: true
+        shouldBeFCVGated: false
+    featureFlagUseSorterChecksumV2:
+        description: "Feature flag to enable v2 version of sorter file checksum"
+        cpp_varname: gFeatureFlagUseSorterChecksumV2
+        default: true
+        version: 7.3
+        shouldBeFCVGated: true
+    featureFlagValidateAndDefaultValuesForShardedTimeseries:
+        description: "Feature flag to enable new durable metadata for the timeseries collection
+        create coordinator"
+        cpp_varname: gFeatureFlagValidateAndDefaultValuesForShardedTimeseries
+        default: true
+        version: 7.1
+        shouldBeFCVGated: true
+    featureFlagAutoCompact:
+        description: "Feature flag to execute background compaction"
+        cpp_varname: gFeatureFlagAutoCompact
+        default: true
+        shouldBeFCVGated: false
+    featureFlagCompactOptions:
+        description: "Feature flag to execute compaction with more options"
+        cpp_varname: gFeatureFlagCompactOptions
+        default: true
+        shouldBeFCVGated: false
+    featureFlagLogSlowOpsBasedOnTimeWorking:
+        description: "Feature flag to enable slow operation logging based on time working rather
+        than total latency"
+        cpp_varname: gFeatureFlagLogSlowOpsBasedOnTimeWorking
+        default: true
+        shouldBeFCVGated: false
+    featureFlagQERangeV2:
+        description: "Queryable Encryption Range V2"
+        cpp_varname: gFeatureFlagQERangeV2
+        default: true
+        version: 8.0
+        shouldBeFCVGated: true
+    featureFlagOnlineTransitionToSharded:
+        description: "Feature flag to transition a replica set into a one shard cluster (config shard)."
+        cpp_varname: gFeatureFlagOnlineTransitionToSharded
+        default: false
+        shouldBeFCVGated: true
+    featureFlagIngressAdmissionControl:
+        description: "Feature flag to enable data node ingress admission control"
+        cpp_varname: gFeatureFlagIngressAdmissionControl
+        default: false
+        shouldBeFCVGated: false
+    featureFlagPrefetch:
+        description: "Feature flag to make pre-fetching available"
+        cpp_varname: gFeatureFlagPrefetch
+        default: true
+        shouldBeFCVGated: false
+    featureFlagDefaultReadMaxTimeMS:
+        description: "Feature flag to allow setting a server-wide default maxTimeMS used for all
+        read operations"
+        cpp_varname: gFeatureFlagDefaultReadMaxTimeMS
+        default: false
+        shouldBeFCVGated: true
+    featureFlagPeriodicServerParameterSampling:
+        description: "Feature flag to enable periodic FTDC sampling of server parameters"
+        cpp_varname: gFeatureFlagPeriodicServerParameterSampling
         default: false
         shouldBeFCVGated: false

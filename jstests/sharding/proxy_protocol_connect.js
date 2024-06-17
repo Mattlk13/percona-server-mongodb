@@ -1,6 +1,9 @@
 /**
  * Validate we can connect over the proxy protocol port with the protocol appended.
- * @tags: [requires_fcv_52]
+ * @tags: [
+ *   requires_fcv_52,
+ *   temp_disabled_embedded_router_uncategorized,
+ * ]
  */
 
 if (_isWindows()) {
@@ -42,8 +45,8 @@ function testProxyProtocolConnectFailure(lbPort, sendLoadBalanced) {
     st.stop();
 }
 
-const ingressPort = 21234;
-const egressPort = 21235;
+const ingressPort = allocatePort();
+const egressPort = allocatePort();
 
 testProxyProtocolConnect(ingressPort, egressPort, 1);
 testProxyProtocolConnect(ingressPort, egressPort, 2);

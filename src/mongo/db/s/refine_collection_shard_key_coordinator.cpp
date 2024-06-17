@@ -96,7 +96,7 @@ void notifyChangeStreamsOnRefineCollectionShardKeyComplete(OperationContext* opC
     auto const serviceContext = opCtx->getClient()->getServiceContext();
 
     writeConflictRetry(opCtx, "RefineCollectionShardKey", NamespaceString::kRsOplogNamespace, [&] {
-        AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
+        AutoGetOplogFastPath oplogWrite(opCtx, OplogAccessMode::kWrite);
         WriteUnitOfWork uow(opCtx);
         serviceContext->getOpObserver()->onInternalOpMessage(opCtx,
                                                              collNss,
@@ -249,13 +249,15 @@ ExecutorFuture<void> RefineCollectionShardKeyCoordinator::_runImpl(
                 sharding_ddl_util::stopMigrations(
                     opCtx, nss(), _request.getCollectionUUID(), getNewSession(opCtx));
 
+                const auto& ns = nss();
+                auto catalogCache = Grid::get(opCtx)->catalogCache();
+
                 // From this point on considering a steady state cluster, we do another refresh, in
                 // case a migration committed before the previous command in order to get a fresh
                 // routing data.
-                onCollectionPlacementVersionMismatch(opCtx, nss(), boost::none);
+                const auto _ = uassertStatusOK(
+                    catalogCache->getCollectionRoutingInfoWithPlacementRefresh(opCtx, ns));
 
-                const auto& ns = nss();
-                auto catalogCache = Grid::get(opCtx)->catalogCache();
                 shardVersionRetry(
                     opCtx,
                     catalogCache,

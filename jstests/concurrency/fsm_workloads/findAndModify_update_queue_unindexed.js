@@ -10,6 +10,11 @@
  * trying to update the same document from the queue.
  *
  * This workload was designed to reproduce SERVER-21434.
+ *
+ * @tags: [
+ *   # PM-1632 was delivered in 7.1.
+ *   requires_fcv_71,
+ * ]
  */
 import {extendWorkload} from "jstests/concurrency/fsm_libs/extend_workload.js";
 import {
@@ -19,7 +24,7 @@ import {
 export const $config = extendWorkload($baseConfig, function($config, $super) {
     // Use the workload name as the database name, since the workload
     // name is assumed to be unique.
-    $config.data.uniqueDBName = 'findAndModify_update_queue_unindexed';
+    $config.data.uniqueDBName = jsTestName();
 
     $config.data.getIndexSpecs = function getIndexSpecs() {
         return [];

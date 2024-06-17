@@ -170,7 +170,7 @@ public:
 
         void fetchSuccessful(OplogFetcher* fetcher) final;
 
-        ~OplogFetcherRestartDecisionDefault(){};
+        ~OplogFetcherRestartDecisionDefault() override{};
 
     private:
         // Restarts since the last successful oplog query response.
@@ -254,7 +254,7 @@ public:
                  OnShutdownCallbackFn onShutdownCallbackFn,
                  Config config);
 
-    virtual ~OplogFetcher();
+    ~OplogFetcher() override;
 
     /**
      * Validates documents in current batch of results returned from tailing the remote oplog.
@@ -449,14 +449,14 @@ private:
     /**
      * Checks the first batch of results from query.
      * 'documents' are the first batch of results returned from tailing the remote oplog.
-     * 'remoteLastOpApplied' is the last OpTime applied on the sync source.
+     * 'remoteLastOpWritten' is the last oplog entry OpTime written on the sync source.
      * 'remoteRBID' is a RollbackId for the sync source returned in this oplog query.
      *
      * Returns TooStaleToSyncFromSource if we are too stale to sync from our source.
      * Returns OplogStartMissing if we should go into rollback.
      */
     Status _checkRemoteOplogStart(const OplogFetcher::Documents& documents,
-                                  OpTime remoteLastOpApplied,
+                                  OpTime remoteLastOpWritten,
                                   int remoteRBID);
 
     /**

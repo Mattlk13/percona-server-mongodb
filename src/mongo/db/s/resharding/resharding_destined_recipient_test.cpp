@@ -75,7 +75,6 @@
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/sharding_mongod_test_fixture.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_write_router.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/session/logical_session_id.h"
@@ -131,8 +130,10 @@ void runInTransaction(OperationContext* opCtx, Callable&& func) {
 
     auto txnParticipant = TransactionParticipant::get(opCtx);
     ASSERT(txnParticipant);
-    txnParticipant.beginOrContinue(
-        opCtx, {txnNum}, false /* autocommit */, true /* startTransaction */);
+    txnParticipant.beginOrContinue(opCtx,
+                                   {txnNum},
+                                   false /* autocommit */,
+                                   TransactionParticipant::TransactionActions::kStart);
     txnParticipant.unstashTransactionResources(opCtx, "SetDestinedRecipient");
 
     func();
@@ -145,8 +146,7 @@ class DestinedRecipientTest : public ShardServerTestFixtureWithCatalogCacheLoade
 public:
     const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("test.foo");
     const std::string kShardKey = "x";
-    const HostAndPort kConfigHostAndPort{"DummyConfig", 12345};
-    const std::vector<ShardType> kShardList = {ShardType(_myShardName.toString(), "Host0:12345"),
+    const std::vector<ShardType> kShardList = {ShardType(kMyShardName.toString(), "Host0:12345"),
                                                ShardType("shard1", "Host1:12345")};
 
     void setUp() override {
@@ -175,7 +175,9 @@ public:
         StaticCatalogClient(std::vector<ShardType> shards) : _shards(std::move(shards)) {}
 
         StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
-            OperationContext* opCtx, repl::ReadConcernLevel readConcern) override {
+            OperationContext* opCtx,
+            repl::ReadConcernLevel readConcern,
+            bool excludeDraining) override {
             return repl::OpTimeWith<std::vector<ShardType>>(_shards);
         }
         std::vector<CollectionType> getShardedCollections(OperationContext* opCtx,
@@ -279,7 +281,7 @@ protected:
                             env.version.placementVersion().epoch(),
                             env.version.placementVersion().getTimestamp(),
                             Date_t::now(),
-                            UUID::gen(),
+                            env.sourceUuid,
                             BSON(kShardKey << 1));
         coll.setAllowMigrations(false);
 

@@ -43,6 +43,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/catalog_raii.h"
+#include "mongo/db/catalog_shard_feature_flag_gen.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
@@ -55,7 +56,6 @@
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharding_migration_critical_section.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/shard_id.h"
 #include "mongo/logv2/log.h"
@@ -68,6 +68,7 @@
 #include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/database_version.h"
 #include "mongo/s/request_types/flush_database_cache_updates_gen.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/database_name_util.h"
 #include "mongo/util/decorable.h"
@@ -138,7 +139,7 @@ public:
         /**
          * ns() is the database to flush, with no collection.
          */
-        NamespaceString ns() const {
+        NamespaceString ns() const override {
             return NamespaceString(_dbName());
         }
 
@@ -158,7 +159,7 @@ public:
 
         void typedRun(OperationContext* opCtx) {
             auto const shardingState = ShardingState::get(opCtx);
-            uassertStatusOK(shardingState->canAcceptShardedCommands());
+            shardingState->assertCanAcceptShardedCommands();
 
             uassert(ErrorCodes::IllegalOperation,
                     "Can't issue _flushDatabaseCacheUpdates from 'eval'",
@@ -210,6 +211,18 @@ public:
             if (Base::request().getSyncFromConfig()) {
                 LOGV2_DEBUG(21981, 1, "Forcing remote routing table refresh", "db"_attr = dbName);
                 uassertStatusOK(onDbVersionMismatchNoExcept(opCtx, dbName, boost::none));
+            }
+
+            // A config server could receive this command even if not in config shard mode if the CS
+            // secondary is on an older binary version running a ShardServerCatalogCacheLoader. In
+            // that case we don't want to hit the MONGO_UNREACHABLE in
+            // ConfigServerCatalogCacheLoader::waitForDatabaseFlush() but throw an error instead so
+            // that the secondaries know they don't have updated metadata yet.
+
+            // (Ignore FCV check): TODO(SERVER-75389): add why FCV is ignored here.
+            if (!gFeatureFlagTransitionToCatalogShard.isEnabledAndIgnoreFCVUnsafe() &&
+                serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
+                uasserted(8454801, "config server is not storing cached metadata");
             }
 
             CatalogCacheLoader::get(opCtx).waitForDatabaseFlush(opCtx, dbName);

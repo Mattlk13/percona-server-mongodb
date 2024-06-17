@@ -50,13 +50,13 @@
 #include "mongo/db/query/plan_explainer.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/query/query_stats/data_bearing_node_metrics.h"
 #include "mongo/db/query/restore_context.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/s/scoped_collection_metadata.h"
 #include "mongo/db/shard_role.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/assert_util_core.h"
 #include "mongo/util/decorable.h"
 #include "mongo/util/future.h"
@@ -71,28 +71,28 @@ public:
     VariantCollectionPtrOrAcquisition(CollectionAcquisition collection)
         : _collectionPtrOrAcquisition(collection) {}
 
-    const stdx::variant<const CollectionPtr*, CollectionAcquisition>& get() {
+    const std::variant<const CollectionPtr*, CollectionAcquisition>& get() {
         return _collectionPtrOrAcquisition;
     };
 
     const CollectionPtr& getCollectionPtr() const;
 
     bool isCollectionPtr() const {
-        return stdx::holds_alternative<const CollectionPtr*>(_collectionPtrOrAcquisition);
+        return holds_alternative<const CollectionPtr*>(_collectionPtrOrAcquisition);
     }
 
     bool isAcquisition() const {
-        return stdx::holds_alternative<CollectionAcquisition>(_collectionPtrOrAcquisition);
+        return holds_alternative<CollectionAcquisition>(_collectionPtrOrAcquisition);
     }
 
     const CollectionAcquisition& getAcquisition() const {
-        return stdx::get<CollectionAcquisition>(_collectionPtrOrAcquisition);
+        return std::get<CollectionAcquisition>(_collectionPtrOrAcquisition);
     }
 
     boost::optional<ScopedCollectionFilter> getShardingFilter(OperationContext* opCtx) const;
 
 private:
-    stdx::variant<const CollectionPtr*, CollectionAcquisition> _collectionPtrOrAcquisition;
+    std::variant<const CollectionPtr*, CollectionAcquisition> _collectionPtrOrAcquisition;
 };
 
 /**
@@ -224,6 +224,13 @@ public:
     virtual CanonicalQuery* getCanonicalQuery() const = 0;
 
     /**
+     * Get the pipeline that this executor is executing, without transferring ownership.
+     */
+    virtual Pipeline* getPipeline() const {
+        return nullptr;
+    }
+
+    /**
      * Return the namespace that the query is running over.
      *
      * WARNING: In general, a query execution plan can involve multiple collections, and therefore
@@ -284,6 +291,12 @@ public:
      * "saved" state, so callers must still call restoreState to use this object.
      */
     virtual void reattachToOperationContext(OperationContext* opCtx) = 0;
+
+    /**
+     * Releases all storage engine resources that the plan executor has acquired. The plan will be
+     * left in the "saved" state so a call to restoreState() will be necessary afterwards.
+     */
+    void releaseAllAcquiredResources();
 
     /**
      * Produces the next document from the query execution plan. The caller can request that the

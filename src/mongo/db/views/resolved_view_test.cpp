@@ -202,7 +202,6 @@ TEST(ResolvedViewTest, EnsureSerializationContextCopy) {
                 SerializationContext::stateCommandRequest());
 
     SerializationContext scCommand = SerializationContext::stateCommandRequest();
-    scCommand.setTenantIdSource(true);
     scCommand.setPrefixState(true);
     AggregateCommandRequest requestOnViewCommand{viewNss, emptyPipeline, scCommand};
 
@@ -211,9 +210,21 @@ TEST(ResolvedViewTest, EnsureSerializationContextCopy) {
               SerializationContext::Source::Command);
     ASSERT_EQ(resultCommand.getSerializationContext().getCallerType(),
               SerializationContext::CallerType::Request);
-    ASSERT_TRUE(resultCommand.getSerializationContext().receivedNonPrefixedTenantId());
     ASSERT_EQ(resultCommand.getSerializationContext().getPrefix(),
               SerializationContext::Prefix::IncludePrefix);
+}
+
+TEST(ResolvedViewTest, ExpandingAggRequestPreservesIncludeQueryStatsMetrics) {
+    const ResolvedView resolvedView{backingNss, emptyPipeline, kSimpleCollation};
+    AggregateCommandRequest aggRequest(viewNss, std::vector<mongo::BSONObj>());
+
+    aggRequest.setIncludeQueryStatsMetrics(false);
+    auto result = resolvedView.asExpandedViewAggregation(aggRequest);
+    ASSERT_FALSE(result.getIncludeQueryStatsMetrics());
+
+    aggRequest.setIncludeQueryStatsMetrics(true);
+    result = resolvedView.asExpandedViewAggregation(aggRequest);
+    ASSERT_TRUE(result.getIncludeQueryStatsMetrics());
 }
 
 TEST(ResolvedViewTest, FromBSONFailsIfMissingResolvedView) {

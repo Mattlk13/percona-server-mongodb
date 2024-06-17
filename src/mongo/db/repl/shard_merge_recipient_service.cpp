@@ -217,7 +217,7 @@ bool isRetriableOplogFetcherError(Status oplogFetcherStatus) {
 class OplogFetcherRestartDecisionTenantMigration
     : public OplogFetcher::OplogFetcherRestartDecision {
 public:
-    ~OplogFetcherRestartDecisionTenantMigration(){};
+    ~OplogFetcherRestartDecisionTenantMigration() override{};
     bool shouldContinue(OplogFetcher* fetcher, Status status) final {
         return false;
     }
@@ -277,7 +277,7 @@ public:
         MONGO_UNREACHABLE;
     };
 
-    virtual StatusWith<ReplSetConfig> getCurrentConfig() const final {
+    StatusWith<ReplSetConfig> getCurrentConfig() const final {
         MONGO_UNREACHABLE;
     }
 
@@ -1403,7 +1403,7 @@ void ShardMergeRecipientService::Instance::_processCommittedTransactionEntry(con
     // Use the same wallclock time as the noop entry.
     sessionTxnRecord.setLastWriteDate(noopEntry.getWallClockTime());
 
-    AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
+    AutoGetOplogFastPath oplogWrite(opCtx, OplogAccessMode::kWrite);
     writeConflictRetry(
         opCtx, "writeDonorCommittedTxnEntry", NamespaceString::kRsOplogNamespace, [&] {
             WriteUnitOfWork wuow(opCtx);
@@ -1752,10 +1752,8 @@ Status ShardMergeRecipientService::Instance::_enqueueDocuments(
 
     if (info.toApplyDocumentCount != 0) {
         auto opCtx = cc().makeOperationContext();
-        // Wait for enough space.
-        _donorOplogBuffer->waitForSpace(opCtx.get(), info.toApplyDocumentBytes);
         // Buffer docs for later application.
-        _donorOplogBuffer->push(opCtx.get(), begin, end);
+        _donorOplogBuffer->push(opCtx.get(), begin, end, info.toApplyDocumentBytes);
     }
 
     return Status::OK();
@@ -1865,7 +1863,7 @@ ShardMergeRecipientService::Instance::_advanceMajorityCommitTsToBkpCursorCheckpo
                        "mergeRecipientWriteNoopToAdvanceStableTimestamp",
                        NamespaceString::kRsOplogNamespace,
                        [&] {
-                           AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
+                           AutoGetOplogFastPath oplogWrite(opCtx, OplogAccessMode::kWrite);
                            WriteUnitOfWork wuow(opCtx);
                            const std::string msg = str::stream()
                                << "Merge recipient advancing stable timestamp";
@@ -2117,9 +2115,10 @@ void ShardMergeRecipientService::Instance::_updateStateDoc(
 }
 
 void ShardMergeRecipientService::Instance::_assertIfMigrationIsSafeToRunWithCurrentFcv() {
+    auto fcvSnapshot = serverGlobalParams.featureCompatibility.acquireFCVSnapshot();
     //(Generic FCV reference): This FCV check should exist across LTS binary versions.
-    auto recipientFCV = serverGlobalParams.featureCompatibility.getVersion();
-    if (serverGlobalParams.featureCompatibility.isUpgradingOrDowngrading(recipientFCV)) {
+    auto recipientFCV = fcvSnapshot.getVersion();
+    if (fcvSnapshot.isUpgradingOrDowngrading(recipientFCV)) {
         LOGV2(7339711, "Must abort shard merge as recipient is upgrading or downgrading");
         uasserted(ErrorCodes::TenantMigrationAborted,
                   "Can't run shard merge when FCV is downgrading or upgrading");

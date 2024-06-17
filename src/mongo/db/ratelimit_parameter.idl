@@ -40,3 +40,4 @@ server_parameters:
         cpp_class:
             name: RateLimitParameter
             override_set: true
+        redact: false

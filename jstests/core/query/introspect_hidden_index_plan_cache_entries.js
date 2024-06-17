@@ -8,8 +8,9 @@
  *   # routed to the primary.
  *   assumes_read_concern_unchanged,
  *   assumes_read_preference_unchanged,
- *   # Plan cache state is node-local and will not get migrated alongside tenant data.
+ *   # Plan cache state is node-local and will not get migrated alongside user data.
  *   tenant_migration_incompatible,
+ *   assumes_balancer_off,
  * ]
  */
 
@@ -61,7 +62,7 @@ function initCollection(collection) {
     // the indexes.
     assert.commandWorked(collection.createIndex({a: 1}));
     assert.commandWorked(collection.createIndex({b: 1}));
-    assert.commandWorked(collection.createIndex({a: 1, b: 1}));
+    assert.commandWorked(collection.createIndex({a: -1, b: 1}));
 
     // Create a cache entry and ensure it is cached.
     const cnt = collection.find({a: 1}, {_id: 0, a: 1}).sort({a: -1}).itcount();

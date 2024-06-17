@@ -53,9 +53,10 @@ HashJoinStage::HashJoinStage(std::unique_ptr<PlanStage> outer,
                              value::SlotVector innerCond,
                              value::SlotVector innerProjects,
                              boost::optional<value::SlotId> collatorSlot,
+                             PlanYieldPolicy* yieldPolicy,
                              PlanNodeId planNodeId,
                              bool participateInTrialRunTracking)
-    : PlanStage("hj"_sd, planNodeId, participateInTrialRunTracking),
+    : PlanStage("hj"_sd, yieldPolicy, planNodeId, participateInTrialRunTracking),
       _outerCond(std::move(outerCond)),
       _outerProjects(std::move(outerProjects)),
       _innerCond(std::move(innerCond)),
@@ -78,8 +79,9 @@ std::unique_ptr<PlanStage> HashJoinStage::clone() const {
                                            _innerCond,
                                            _innerProjects,
                                            _collatorSlot,
+                                           _yieldPolicy,
                                            _commonStats.nodeId,
-                                           _participateInTrialRunTracking);
+                                           participateInTrialRunTracking());
 }
 
 void HashJoinStage::prepare(CompileCtx& ctx) {
@@ -124,20 +126,13 @@ void HashJoinStage::prepare(CompileCtx& ctx) {
     }
 
     _probeKey.resize(_inInnerKeyAccessors.size());
-
-    _compiled = true;
 }
 
 value::SlotAccessor* HashJoinStage::getAccessor(CompileCtx& ctx, value::SlotId slot) {
-    if (_compiled) {
-        if (auto it = _outOuterAccessors.find(slot); it != _outOuterAccessors.end()) {
-            return it->second;
-        }
-
-        return _children[1]->getAccessor(ctx, slot);
+    if (auto it = _outOuterAccessors.find(slot); it != _outOuterAccessors.end()) {
+        return it->second;
     }
-
-    return ctx.getAccessor(slot);
+    return _children[1]->getAccessor(ctx, slot);
 }
 
 void HashJoinStage::open(bool reOpen) {
@@ -164,14 +159,14 @@ void HashJoinStage::open(bool reOpen) {
         size_t idx = 0;
         // Copy keys in order to do the lookup.
         for (auto& p : _inOuterKeyAccessors) {
-            auto [tag, val] = p->copyOrMoveValue();
+            auto [tag, val] = p->getCopyOfValue();
             key.reset(idx++, true, tag, val);
         }
 
         idx = 0;
         // Copy projects.
         for (auto& p : _inOuterProjectAccessors) {
-            auto [tag, val] = p->copyOrMoveValue();
+            auto [tag, val] = p->getCopyOfValue();
             project.reset(idx++, true, tag, val);
         }
 
@@ -188,6 +183,7 @@ void HashJoinStage::open(bool reOpen) {
 
 PlanState HashJoinStage::getNext() {
     auto optTimer(getOptTimer(_opCtx));
+    checkForInterruptAndYield(_opCtx);
 
     if (_htIt != _htItEnd) {
         ++_htIt;

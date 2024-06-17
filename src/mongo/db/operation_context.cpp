@@ -31,10 +31,6 @@
 #include <boost/move/utility_core.hpp>
 #include <boost/none.hpp>
 #include <boost/optional/optional.hpp>
-// IWYU pragma: no_include "cxxabi.h"
-#include <string>
-#include <thread>
-#include <type_traits>
 
 #include "mongo/base/error_extra_info.h"
 #include "mongo/base/string_data.h"
@@ -51,7 +47,6 @@
 #include "mongo/platform/random.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/transport/baton.h"
-#include "mongo/transport/session.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/fail_point.h"
@@ -59,7 +54,6 @@
 #include "mongo/util/waitable.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
-
 
 namespace mongo {
 
@@ -87,11 +81,8 @@ const auto kNoWaiterThread = stdx::thread::id();
 }  // namespace
 
 OperationContext::OperationContext(Client* client, OperationId opId)
-    : OperationContext(client, OperationIdSlot(opId)) {}
-
-OperationContext::OperationContext(Client* client, OperationIdSlot&& opIdSlot)
     : _client(client),
-      _opId(std::move(opIdSlot)),
+      _opId(opId),
       _elapsedTime(client ? client->getServiceContext()->getTickSource()
                           : globalSystemTickSource()) {}
 
@@ -384,13 +375,6 @@ void OperationContext::markKilled(ErrorCodes::Error killCode) {
         LOGV2(20883, "Interrupted operation as its client disconnected", "opId"_attr = getOpID());
     }
 
-    // Record that a kill was requested on this operationContext due to replication state change
-    // since it is possible to call markKilled() multiple times but only the first killCode will
-    // be preserved.
-    if (killCode == ErrorCodes::InterruptedDueToReplStateChange) {
-        _killRequestedForReplStateChange.store(true);
-    }
-
     if (auto status = ErrorCodes::OK; _killCode.compareAndSwap(&status, killCode)) {
         _cancelSource.cancel();
         if (_baton) {
@@ -448,7 +432,7 @@ void OperationContext::setOperationKey(OperationKey opKey) {
     invariant(!_opKey);
 
     _opKey.emplace(std::move(opKey));
-    OperationKeyManager::get(_client).add(*_opKey, _opId.getId());
+    OperationKeyManager::get(_client).add(*_opKey, _opId);
 }
 
 void OperationContext::releaseOperationKey() {
@@ -470,7 +454,7 @@ void OperationContext::setTxnRetryCounter(TxnRetryCounter txnRetryCounter) {
     _txnRetryCounter = txnRetryCounter;
 }
 
-std::unique_ptr<RecoveryUnit> OperationContext::releaseRecoveryUnit() {
+std::unique_ptr<RecoveryUnit> OperationContext::releaseRecoveryUnit_DO_NOT_USE() {
     if (_recoveryUnit) {
         _recoveryUnit->setOperationContext(nullptr);
     }
@@ -478,21 +462,21 @@ std::unique_ptr<RecoveryUnit> OperationContext::releaseRecoveryUnit() {
     return std::move(_recoveryUnit);
 }
 
-std::unique_ptr<RecoveryUnit> OperationContext::releaseAndReplaceRecoveryUnit() {
-    auto ru = releaseRecoveryUnit();
-    setRecoveryUnit(
+std::unique_ptr<RecoveryUnit> OperationContext::releaseAndReplaceRecoveryUnit_DO_NOT_USE() {
+    auto ru = releaseRecoveryUnit_DO_NOT_USE();
+    setRecoveryUnit_DO_NOT_USE(
         std::unique_ptr<RecoveryUnit>(getServiceContext()->getStorageEngine()->newRecoveryUnit()),
         WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
     return ru;
 }
 
-void OperationContext::replaceRecoveryUnit() {
-    setRecoveryUnit(
+void OperationContext::replaceRecoveryUnit_DO_NOT_USE() {
+    setRecoveryUnit_DO_NOT_USE(
         std::unique_ptr<RecoveryUnit>(getServiceContext()->getStorageEngine()->newRecoveryUnit()),
         WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
 }
 
-WriteUnitOfWork::RecoveryUnitState OperationContext::setRecoveryUnit(
+WriteUnitOfWork::RecoveryUnitState OperationContext::setRecoveryUnit_DO_NOT_USE(
     std::unique_ptr<RecoveryUnit> unit, WriteUnitOfWork::RecoveryUnitState state) {
     _recoveryUnit = std::move(unit);
     if (_recoveryUnit) {
@@ -504,13 +488,14 @@ WriteUnitOfWork::RecoveryUnitState OperationContext::setRecoveryUnit(
     return oldState;
 }
 
-void OperationContext::setLockState(std::unique_ptr<Locker> locker) {
+void OperationContext::setLockState_DO_NOT_USE(std::unique_ptr<Locker> locker) {
     invariant(!_locker);
     invariant(locker);
     _locker = std::move(locker);
 }
 
-std::unique_ptr<Locker> OperationContext::swapLockState(std::unique_ptr<Locker> locker, WithLock) {
+std::unique_ptr<Locker> OperationContext::swapLockState_DO_NOT_USE(std::unique_ptr<Locker> locker,
+                                                                   WithLock clientLock) {
     invariant(_locker);
     invariant(locker);
     _locker.swap(locker);

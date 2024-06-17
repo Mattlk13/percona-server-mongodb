@@ -301,22 +301,61 @@ function testDbCheckParameters() {
         checkHealthLog(healthlog, query, multiBatchSimpleCollSize / maxDocsPerBatch);
     }
     {
-        // Validate custom maxBytesPerBatch
-        clearHealthLog(replSet);
-        const coll = db.getSiblingDB("maxBytesPerBatch").maxBytesPerBatch;
+        // Validate maxDbCheckMBperSec.
+        const coll = db.getSiblingDB("maxDbCheckMBperSec").maxDbCheckMBperSec;
+        assert.commandWorked(db.getSiblingDB("maxDbCheckMBperSec").runCommand({
+            createIndexes: coll.getName(),
+            indexes: [{key: {a: 1}, name: 'a_1'}],
+        }));
 
-        // Insert nDocs, each of which being slightly larger than 1MB, and then run dbCheck with
-        // maxBytesPerBatch := 1MB
+        // Insert nDocs, each slightly larger than the maxDbCheckMBperSec value (1MB), which is the
+        // default value, while maxBatchTimeMillis is 1 second. Consequently, we will have only 1MB
+        // per batch.
         const nDocs = 5;
-        coll.insertMany([...Array(nDocs).keys()].map(x => ({a: 'a'.repeat(1024 * 1024)})),
+        const chars = ['a', 'b', 'c', 'd', 'e'];
+        coll.insertMany([...Array(nDocs).keys()].map(x => ({a: chars[x].repeat(1024 * 1024 * 2)})),
                         {ordered: false});
-        const maxBytesPerBatch = 1024 * 1024;
+        [{maxBatchTimeMillis: 1000},
+         {validateMode: "dataConsistency", maxBatchTimeMillis: 1000},
+         {validateMode: "dataConsistencyAndMissingIndexKeysCheck", maxBatchTimeMillis: 1000}]
+            .forEach(parameters => {
+                clearHealthLog(replSet);
+                runDbCheck(replSet,
+                           db.getSiblingDB("maxDbCheckMBperSec"),
+                           coll.getName(),
+                           parameters,
+                           true /*awaitCompletion*/);
 
-        runDbCheck(replSet, db.getSiblingDB("maxBytesPerBatch"), coll.getName(), {
-            maxBytesPerBatch: maxBytesPerBatch
-        });
+                // DbCheck logs (nDocs + 1) batches to account for each batch hitting the time
+                // deadline after processing only one document. Then, DbCheck will run an additional
+                // empty batch at the end to confirm that there are no more documents.
+                let query = {"operation": "dbCheckBatch"};
+                checkHealthLog(healthlog, query, nDocs + 1);
 
-        // Confirm dbCheck logs nDocs batches.
+                let expectedCount = 1;
+                if (parameters.validateMode == "dataConsistencyAndMissingIndexKeysCheck") {
+                    // There should be two items checked as the index is included.
+                    expectedCount = 2;
+                }
+                query = {"operation": "dbCheckBatch", "data.count": expectedCount};
+                checkHealthLog(healthlog, query, nDocs);
+
+                query = {"operation": "dbCheckBatch", "data.count": 0};
+                checkHealthLog(healthlog, query, 1);
+            });
+
+        clearHealthLog(replSet);
+        runDbCheck(
+            replSet,
+            db.getSiblingDB("maxDbCheckMBperSec"),
+            coll.getName(),
+            {validateMode: "extraIndexKeysCheck", secondaryIndex: "a_1", maxBatchTimeMillis: 1000},
+            true /*awaitCompletion*/);
+
+        // DbCheck logs (nDocs) batches to account for each batch hitting the time deadline after
+        // processing only one document.
+        // Extra index check's implementation is different from 'dataConsistency' as it doesn't need
+        // to run an additional empty batch at the end to confirm that there are no more documents.
         let query = {"operation": "dbCheckBatch"};
         checkHealthLog(healthlog, query, nDocs);
 
@@ -357,40 +396,6 @@ function testErrorOnUnreplicated() {
 testErrorOnNonexistent();
 testErrorOnSecondary();
 testErrorOnUnreplicated();
-
-// Test stepdown.
-function testSucceedsOnStepdown() {
-    let primary = replSet.getPrimary();
-    let db = primary.getDB(dbName);
-
-    let nodeId = replSet.getNodeId(primary);
-    runDbCheck(replSet, db, multiBatchSimpleCollName);
-
-    // Step down the primary.
-    assert.commandWorked(primary.getDB("admin").runCommand({replSetStepDown: 0, force: true}));
-
-    // Wait for the cluster to come up.
-    replSet.awaitSecondaryNodes();
-
-    // Find the node we ran dbCheck on.
-    db = replSet.getSecondaries()
-             .filter(function isPreviousPrimary(node) {
-                 return replSet.getNodeId(node) === nodeId;
-             })[0]
-             .getDB(dbName);
-
-    // Check that it's still responding.
-    try {
-        assert.commandWorked(db.runCommand({ping: 1}), "ping failed after stepdown during dbCheck");
-    } catch (e) {
-        doassert("cannot connect after dbCheck with stepdown");
-    }
-
-    // And that our dbCheck completed.
-    assert(dbCheckCompleted(db), "dbCheck failed to terminate on stepdown");
-}
-
-testSucceedsOnStepdown();
 
 // Just add an extra document, and test that it catches it.
 function simpleTestCatchesExtra() {

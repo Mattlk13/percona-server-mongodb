@@ -73,10 +73,12 @@ public:
      * Recovers data from the interim file as needed.
      * Rotates files if needed.
      */
-    static StatusWith<std::unique_ptr<FTDCFileManager>> create(const FTDCConfig* config,
-                                                               const boost::filesystem::path& path,
-                                                               FTDCCollectorCollection* collection,
-                                                               Client* client);
+    static StatusWith<std::unique_ptr<FTDCFileManager>> create(
+        const FTDCConfig* config,
+        const boost::filesystem::path& path,
+        FTDCCollectorCollection* collection,
+        Client* client,
+        UseMultiServiceSchema multiServiceSchema);
 
     /**
      * Rotates files
@@ -89,6 +91,10 @@ public:
      * Rotates files as needed.
      */
     Status writeSampleAndRotateIfNeeded(Client* client, const BSONObj& sample, Date_t date);
+
+    Status writePeriodicMetadataSampleAndRotateIfNeeded(Client* client,
+                                                        const BSONObj& sample,
+                                                        Date_t date);
 
     /**
      * Closes the current file manager down.
@@ -106,7 +112,8 @@ public:
 private:
     FTDCFileManager(const FTDCConfig* config,
                     const boost::filesystem::path& path,
-                    FTDCCollectorCollection* collection);
+                    FTDCCollectorCollection* collection,
+                    UseMultiServiceSchema multiServiceSchema);
 
     /**
      * Gets a list of metrics files in a directory.
@@ -159,6 +166,9 @@ private:
 
     // collection of collectors to add to new files on rotation, and server restart
     FTDCCollectorCollection* const _rotateCollectors;
+
+    // Whether or not to use the multiversion schema for FTDC file output
+    UseMultiServiceSchema _multiServiceSchema;
 };
 
 }  // namespace mongo

@@ -30,24 +30,44 @@
 #pragma once
 
 #include "mongo/db/s/sharding_ddl_coordinator_external_state.h"
+#include "mongo/db/s/sharding_test_helpers.h"
 
 namespace mongo {
 
+using Fault = sharding_test_helpers::Fault;
+using MockCommandResponse = sharding_test_helpers::FaultGenerator;
+
 class ShardingDDLCoordinatorExternalStateForTest : public ShardingDDLCoordinatorExternalState {
 public:
-    virtual void checkShardedDDLAllowedToStart(OperationContext* opCtx,
-                                               const NamespaceString& nss) const override;
-    virtual void waitForVectorClockDurable(OperationContext* opCtx) const override;
-    virtual void assertIsPrimaryShardForDb(OperationContext* opCtx,
-                                           const DatabaseName& dbName) const override;
-    virtual bool isShardedTimeseries(OperationContext* opCtx,
-                                     const NamespaceString& bucketNss) const override;
+    ShardingDDLCoordinatorExternalStateForTest();
+    void checkShardedDDLAllowedToStart(OperationContext* opCtx,
+                                       const NamespaceString& nss) const override;
+    void waitForVectorClockDurable(OperationContext* opCtx) const override;
+    void assertIsPrimaryShardForDb(OperationContext* opCtx,
+                                   const DatabaseName& dbName) const override;
+    bool isShardedTimeseries(OperationContext* opCtx,
+                             const NamespaceString& bucketNss) const override;
+    void allowMigrations(OperationContext* opCtx,
+                         const NamespaceString& nss,
+                         bool allowMigrations) override;
+    bool checkAllowMigrations(OperationContext* opCtx, const NamespaceString& nss) override;
+
+    MockCommandResponse allowMigrationsResponse;
+    MockCommandResponse migrationsAllowedResponse;
+    bool migrationsAllowed = true;
 };
 
 class ShardingDDLCoordinatorExternalStateFactoryForTest
     : public ShardingDDLCoordinatorExternalStateFactory {
 public:
-    virtual std::unique_ptr<ShardingDDLCoordinatorExternalState> create() const override;
+    ShardingDDLCoordinatorExternalStateFactoryForTest() {}
+    ShardingDDLCoordinatorExternalStateFactoryForTest(
+        std::shared_ptr<ShardingDDLCoordinatorExternalStateForTest> externalState);
+
+    std::shared_ptr<ShardingDDLCoordinatorExternalState> create() const override;
+
+private:
+    std::shared_ptr<ShardingDDLCoordinatorExternalStateForTest> _externalState;
 };
 
 }  // namespace mongo

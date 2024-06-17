@@ -121,10 +121,12 @@ public:
     const std::vector<BatchedUpsertDetail*>& getUpsertDetails() const;
     const BatchedUpsertDetail* getUpsertDetailsAt(std::size_t pos) const;
 
+    // TODO SERVER-87035: Remove lastOp.
     void setLastOp(repl::OpTime lastOp);
     bool isLastOpSet() const;
     repl::OpTime getLastOp() const;
 
+    // TODO SERVER-87035: Remove electionId.
     void setElectionId(const OID& electionId);
     bool isElectionIdSet() const;
     OID getElectionId() const;
@@ -207,7 +209,7 @@ public:
     MultipleErrorsOccurredInfo(BSONArray arr) : _arr(std::move(arr)) {}
 
     static std::shared_ptr<const ErrorExtraInfo> parse(const BSONObj& obj);
-    void serialize(BSONObjBuilder* bob) const;
+    void serialize(BSONObjBuilder* bob) const override;
 
 private:
     BSONArray _arr;

@@ -60,4 +60,14 @@ StatusWith<int> parseMaxTimeMS(BSONElement maxTimeMSElt, long long maxValue = IN
  */
 StatusWith<int> parseMaxTimeMSOpOnly(BSONElement maxTimeMSElt);
 
+/**
+ * Returns the provided, valid maxTimeMS or throws.
+ */
+int parseAndThrowMaxTimeMS(BSONElement maxTimeMSElt);
+
+/**
+ * Returns the provided, valid maxTimeMSOpOnly or throws.
+ */
+int parseAndThrowMaxTimeMSOpOnly(BSONElement maxTimeMSElt);
+
 }  // namespace mongo

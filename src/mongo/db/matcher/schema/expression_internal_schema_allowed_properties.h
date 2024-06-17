@@ -174,7 +174,7 @@ public:
         return _patternProperties[i - 1].second->getFilter();
     }
 
-    virtual void resetChild(size_t i, MatchExpression* other) {
+    void resetChild(size_t i, MatchExpression* other) override {
         tassert(6329408, "Out-of-bounds access to child of MatchExpression.", i < numChildren());
 
         if (i == 0) {
@@ -198,6 +198,14 @@ public:
 
     const std::vector<PatternSchema>& getPatternProperties() const {
         return _patternProperties;
+    }
+
+    StringData getNamePlaceholder() const {
+        return _namePlaceholder;
+    }
+
+    const ExpressionWithPlaceholder* getOtherwise() const {
+        return _otherwise.get();
     }
 
 private:

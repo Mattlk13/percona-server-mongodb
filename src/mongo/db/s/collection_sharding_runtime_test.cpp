@@ -48,12 +48,9 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog_raii.h"
-#include "mongo/db/cluster_role.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/global_settings.h"
 #include "mongo/db/op_observer/op_observer.h"
-#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/optime_with.h"
@@ -70,7 +67,6 @@
 #include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/sharding_index_catalog_ddl_util.h"
 #include "mongo/db/s/sharding_mongod_test_fixture.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/shard_id.h"
 #include "mongo/db/vector_clock.h"
@@ -250,57 +246,62 @@ TEST_F(CollectionShardingRuntimeTest,
         csr.getCollectionDescription(opCtx).uuidMatches(newMetadata.getChunkManager()->getUUID()));
 }
 
-TEST_F(CollectionShardingRuntimeTest, ReturnUnshardedMetadataInServerlessMode) {
-    const NamespaceString testNss =
-        NamespaceString::createNamespaceString_forTest("TestDBForServerless", "TestColl");
+TEST_F(CollectionShardingRuntimeTest, ShardVersionCheckDetectsClusterTimeConflicts) {
     OperationContext* opCtx = operationContext();
+    CollectionShardingRuntime csr(getServiceContext(), kTestNss);
+    const auto metadata = makeShardedMetadata(opCtx);
+    csr.setFilteringMetadata(opCtx, metadata);
 
-    // Enable serverless mode in global settings.
-    repl::ReplSettings severlessRs;
-    severlessRs.setServerlessMode();
-    repl::ReplSettings originalRs = getGlobalReplSettings();
-    setGlobalReplSettings(severlessRs);
-    ASSERT_TRUE(getGlobalReplSettings().isServerless());
+    const auto collectionTimestamp = metadata.getShardPlacementVersion().getTimestamp();
 
-    // Enable sharding state and set shard version on the OSS for testNss.
-    ScopedSetShardRole scopedSetShardRole1{
-        opCtx,
-        testNss,
-        ShardVersion::UNSHARDED(), /* shardVersion */
-        boost::none                /* databaseVersion */
-    };
+    auto receivedShardVersion =
+        ShardVersionFactory::make(metadata, boost::optional<CollectionIndexes>(boost::none));
 
-    CollectionShardingRuntime csr(getServiceContext(), testNss);
-    auto collectionFilter = csr.getOwnershipFilter(
-        opCtx, CollectionShardingRuntime::OrphanCleanupPolicy::kAllowOrphanCleanup, true);
-    ASSERT_FALSE(collectionFilter.isSharded());
-    ASSERT_FALSE(csr.getCurrentMetadataIfKnown()->isSharded());
-    ASSERT_FALSE(csr.getCollectionDescription(opCtx).isSharded());
+    // Test that conflict is thrown when transaction 'atClusterTime' is not valid the current shard
+    // version.
+    {
+        const auto previousReadConcern = repl::ReadConcernArgs::get(operationContext());
+        repl::ReadConcernArgs::get(operationContext()) =
+            repl::ReadConcernArgs(repl::ReadConcernLevel::kSnapshotReadConcern);
 
-    // Enable sharding state and set shard version on the OSS for logical session nss.
-    CollectionGeneration gen{OID::gen(), Timestamp(1, 1)};
-    ScopedSetShardRole scopedSetShardRole2{
-        opCtx,
-        NamespaceString::kLogicalSessionsNamespace,
-        ShardVersionFactory::make(
-            ChunkVersion(gen, {1, 0}),
-            boost::optional<CollectionIndexes>(boost::none)), /* shardVersion */
-        boost::none                                           /* databaseVersion */
-    };
+        // Valid atClusterTime (equal or later than collection timestamp).
+        {
+            repl::ReadConcernArgs::get(operationContext())
+                .setArgsAtClusterTimeForSnapshot(collectionTimestamp + 1);
+            ScopedSetShardRole scopedSetShardRole{
+                opCtx, kTestNss, receivedShardVersion, boost::none /* databaseVersion */};
+            ASSERT_DOES_NOT_THROW(csr.checkShardVersionOrThrow(opCtx));
+        }
 
-    CollectionShardingRuntime csrLogicalSession(getServiceContext(),
-                                                NamespaceString::kLogicalSessionsNamespace);
-    ASSERT(csrLogicalSession.getCurrentMetadataIfKnown() == boost::none);
-    ASSERT_THROWS_CODE(
-        csrLogicalSession.getCollectionDescription(opCtx), DBException, ErrorCodes::StaleConfig);
-    ASSERT_THROWS_CODE(
-        csrLogicalSession.getOwnershipFilter(
-            opCtx, CollectionShardingRuntime::OrphanCleanupPolicy::kAllowOrphanCleanup, true),
-        DBException,
-        ErrorCodes::StaleConfig);
+        // Conflicting atClusterTime (earlier than collection timestamp).
+        repl::ReadConcernArgs::get(operationContext())
+            .setArgsAtClusterTimeForSnapshot(collectionTimestamp - 1);
+        ScopedSetShardRole scopedSetShardRole{
+            opCtx, kTestNss, receivedShardVersion, boost::none /* databaseVersion */};
+        ASSERT_THROWS_CODE(
+            csr.checkShardVersionOrThrow(opCtx), DBException, ErrorCodes::SnapshotUnavailable);
 
-    // Reset the global settings.
-    setGlobalReplSettings(originalRs);
+        repl::ReadConcernArgs::get(operationContext()) = previousReadConcern;
+    }
+
+    // Test that conflict is thrown when transaction 'placementConflictTime' is not valid the
+    // current shard version.
+    {
+        // Valid placementConflictTime (equal or later than collection timestamp).
+        {
+            receivedShardVersion.setPlacementConflictTime(LogicalTime(collectionTimestamp + 1));
+            ScopedSetShardRole scopedSetShardRole{
+                opCtx, kTestNss, receivedShardVersion, boost::none /* databaseVersion */};
+            ASSERT_DOES_NOT_THROW(csr.checkShardVersionOrThrow(opCtx));
+        }
+
+        // Conflicting placementConflictTime (earlier than collection timestamp).
+        receivedShardVersion.setPlacementConflictTime(LogicalTime(collectionTimestamp - 1));
+        ScopedSetShardRole scopedSetShardRole{
+            opCtx, kTestNss, receivedShardVersion, boost::none /* databaseVersion */};
+        ASSERT_THROWS_CODE(
+            csr.checkShardVersionOrThrow(opCtx), DBException, ErrorCodes::SnapshotUnavailable);
+    }
 }
 
 class CollectionShardingRuntimeTestWithMockedLoader
@@ -309,8 +310,7 @@ public:
     const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("test.foo");
     const UUID kCollUUID = UUID::gen();
     const std::string kShardKey = "x";
-    const HostAndPort kConfigHostAndPort{"DummyConfig", 12345};
-    const std::vector<ShardType> kShardList = {ShardType(_myShardName.toString(), "Host0:12345")};
+    const std::vector<ShardType> kShardList = {ShardType(kMyShardName.toString(), "Host0:12345")};
 
     void setUp() override {
         ShardServerTestFixtureWithCatalogCacheLoaderMock::setUp();
@@ -338,7 +338,9 @@ public:
         StaticCatalogClient(std::vector<ShardType> shards) : _shards(std::move(shards)) {}
 
         StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
-            OperationContext* opCtx, repl::ReadConcernLevel readConcern) override {
+            OperationContext* opCtx,
+            repl::ReadConcernLevel readConcern,
+            bool excludeDraining) override {
             return repl::OpTimeWith<std::vector<ShardType>>(_shards);
         }
 

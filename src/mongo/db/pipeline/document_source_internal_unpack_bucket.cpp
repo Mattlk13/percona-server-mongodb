@@ -162,7 +162,7 @@ boost::intrusive_ptr<DocumentSourceSort> createNewSortWithMemoryUsage(
  */
 bool checkMetadataSortReorder(
     const SortPattern& sortPattern,
-    const StringData& metaFieldStr,
+    StringData metaFieldStr,
     const boost::optional<std::string&> lastpointTimeField = boost::none) {
     auto timeFound = false;
     for (const auto& sortKey : sortPattern) {
@@ -280,7 +280,7 @@ boost::intrusive_ptr<DocumentSourceGroup> createBucketGroupForReorder(
     auto newGroup = DocumentSourceGroup::create(expCtx, groupByExpr, std::move(accumulators));
 
     // The $first accumulator is compatible with SBE.
-    newGroup->setSbeCompatibility(SbeCompatibility::fullyCompatible);
+    newGroup->setSbeCompatibility(SbeCompatibility::noRequirements);
 
     return newGroup;
 }
@@ -289,6 +289,7 @@ boost::intrusive_ptr<DocumentSourceGroup> createBucketGroupForReorder(
 void optimizePrefix(Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     auto prefix = Pipeline::SourceContainer(container->begin(), itr);
     Pipeline::optimizeContainer(&prefix);
+    Pipeline::optimizeEachStage(&prefix);
     container->erase(container->begin(), itr);
     container->splice(itr, prefix);
 }
@@ -411,7 +412,7 @@ boost::intrusive_ptr<Expression> rewriteMetaFieldPaths(
     //
     // Clone by serializing and reparsing. There does not seem to be a more idiomatic way to do this
     // at the moment.
-    auto serialized = expr->serialize(SerializationOptions{});
+    auto serialized = expr->serialize();
     auto obj = BSON("f" << serialized);
     auto clonedExpr =
         Expression::parseOperand(pExpCtx.get(), obj.firstElement(), pExpCtx->variablesParseState);
@@ -488,7 +489,7 @@ std::unique_ptr<AccumulationExpression> rewriteCountGroupAccm(
                 timeseries::kBucketControlVersionFieldName.toString(),
             pExpCtx->variablesParseState),
         ExpressionConstant::create(pExpCtx,
-                                   Value(timeseries::kTimeseriesControlCompressedVersion)));
+                                   Value(timeseries::kTimeseriesControlCompressedSortedVersion)));
 
     auto thenExpr = ExpressionFieldPath::createPathFromString(
         pExpCtx, controlCountField, pExpCtx->variablesParseState);
@@ -1058,7 +1059,7 @@ void DocumentSourceInternalUnpackBucket::setEventFilter(BSONObj eventFilterBson,
     // compatible and check after parsing if the '_eventFilter' made the unpack stage
     // incompatible.
     auto originalSbeCompatibility = pExpCtx->sbeCompatibility;
-    pExpCtx->sbeCompatibility = SbeCompatibility::fullyCompatible;
+    pExpCtx->sbeCompatibility = SbeCompatibility::noRequirements;
 
     _eventFilter = uassertStatusOK(MatchExpressionParser::parse(
         _eventFilterBson, pExpCtx, ExtensionsCallbackNoop(), Pipeline::kAllowedMatcherFeatures));
@@ -1168,7 +1169,7 @@ DocumentSourceInternalUnpackBucket::rewriteGroupStage(Pipeline::SourceContainer:
     // the exprs created by the rewrite mark it as incompatible, so that we can transfer the flag
     // onto the group.
     const SbeCompatibility origSbeCompat = pExpCtx->sbeCompatibility;
-    pExpCtx->sbeCompatibility = SbeCompatibility::fullyCompatible;
+    pExpCtx->sbeCompatibility = SbeCompatibility::noRequirements;
 
     // We destruct 'this' object when we replace it with the new group, so the guard has to capture
     // the context's intrusive pointer by value.
@@ -1328,6 +1329,7 @@ bool DocumentSourceInternalUnpackBucket::enableStreamingGroupIfPossible(
     return true;
 }
 
+namespace {
 template <TopBottomSense sense, bool single>
 bool extractFromAcc(const AccumulatorN* acc,
                     const boost::intrusive_ptr<Expression>& init,
@@ -1375,30 +1377,37 @@ bool extractFromAccIfTopBottomN(const AccumulatorN* multiAcc,
                                 boost::optional<BSONObj>& outputSortPattern) {
     const auto accType = multiAcc->getAccumulatorType();
     if (accType == AccumulatorN::kTopN) {
-        return extractFromAcc<TopBottomSense::kTop, false>(
+        return extractFromAcc<TopBottomSense::kTop, false /* single */>(
             multiAcc, init, outputAccumulator, outputSortPattern);
     } else if (accType == AccumulatorN::kTop) {
-        return extractFromAcc<TopBottomSense::kTop, true>(
+        return extractFromAcc<TopBottomSense::kTop, true /* single */>(
             multiAcc, init, outputAccumulator, outputSortPattern);
     } else if (accType == AccumulatorN::kBottomN) {
-        return extractFromAcc<TopBottomSense::kBottom, false>(
+        return extractFromAcc<TopBottomSense::kBottom, false /* single */>(
             multiAcc, init, outputAccumulator, outputSortPattern);
     } else if (accType == AccumulatorN::kBottom) {
-        return extractFromAcc<TopBottomSense::kBottom, true>(
+        return extractFromAcc<TopBottomSense::kBottom, true /* single */>(
             multiAcc, init, outputAccumulator, outputSortPattern);
     }
     // This isn't a topN/bottomN/top/bottom accumulator.
     return false;
 }
 
+// The lastpoint optimization ultimately inserts bucket-level $sort + $group to limit the amount of
+// data to be unpacked. Here we use the original $group to create a matching $sort followed by a
+// $group with $first/$last accumulator over $$ROOT as if it ran _after_ unpacking. We'll modify
+// these stages to run at the bucket-level later.
 std::pair<boost::intrusive_ptr<DocumentSourceSort>, boost::intrusive_ptr<DocumentSourceGroup>>
-tryRewriteGroupAsSortGroup(boost::intrusive_ptr<ExpressionContext> expCtx,
-                           Pipeline::SourceContainer::iterator itr,
-                           Pipeline::SourceContainer* container,
-                           DocumentSourceGroup* groupStage) {
+tryCreateBucketLevelSortGroup(boost::intrusive_ptr<ExpressionContext> expCtx,
+                              Pipeline::SourceContainer::iterator itr,
+                              Pipeline::SourceContainer* container,
+                              DocumentSourceGroup* groupStage) {
     const auto accumulators = groupStage->getAccumulationStatements();
     if (accumulators.size() != 1) {
-        // If we have multiple accumulators, we fail to optimize for a lastpoint query.
+        // If we have multiple accumulators, we fail to optimize for a lastpoint query. Notice, that
+        // this is too strict. The optimization can still be done for the same type of acc with
+        // the same ordering. However, for this case the query can be re-written to combine the two
+        // accumulators into one $top/$bottom with a concatenated 'output' array.
         return {nullptr, nullptr};
     }
 
@@ -1425,12 +1434,12 @@ tryRewriteGroupAsSortGroup(boost::intrusive_ptr<ExpressionContext> expCtx,
         expCtx.get(), maybeAcc->firstElement(), expCtx->variablesParseState);
     auto newGroupStage =
         DocumentSourceGroup::create(expCtx, groupStage->getIdExpression(), {newAccState});
-    // We are running the same accumulators as were present in the original group but at the bucket
-    // level, so the group compatibility with SBE should be the same.
-    newGroupStage->setSbeCompatibility(groupStage->sbeCompatibility());
+
+    // The bucket-level group uses $first/$last accumulators that are supported by SBE.
+    newGroupStage->setSbeCompatibility(SbeCompatibility::noRequirements);
     return {newSortStage, newGroupStage};
 }
-
+}  // namespace
 
 bool DocumentSourceInternalUnpackBucket::optimizeLastpoint(Pipeline::SourceContainer::iterator itr,
                                                            Pipeline::SourceContainer* container) {
@@ -1458,7 +1467,7 @@ bool DocumentSourceInternalUnpackBucket::optimizeLastpoint(Pipeline::SourceConta
         // Try to rewrite the $group to a $sort+$group-style lastpoint query before proceeding with
         // the optimization.
         std::tie(sortStagePtr, groupStagePtr) =
-            tryRewriteGroupAsSortGroup(pExpCtx, itr, container, groupStage);
+            tryCreateBucketLevelSortGroup(pExpCtx, itr, container, groupStage);
 
         // Both these stages should be discarded once we exit this function; either because the
         // rewrite failed validation checks, or because we created updated versions of these stages
@@ -1591,6 +1600,34 @@ bool findSequentialDocumentCache(Pipeline::SourceContainer::iterator start,
     return start != end;
 }
 
+Pipeline::SourceContainer::iterator DocumentSourceInternalUnpackBucket::optimizeAtRestOfPipeline(
+    Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
+    if (itr == container->end()) {
+        return itr;
+    }
+
+    invariant(*itr == this);
+    Pipeline::SourceContainer::iterator unpackBucket = itr;
+
+    itr = std::next(itr);
+
+    try {
+        while (itr != container->end()) {
+            if (itr == unpackBucket) {
+                itr = std::next(itr);
+                if (itr == container->end())
+                    break;
+            }
+            itr = (*itr).get()->optimizeAt(itr, container);
+        }
+    } catch (DBException& ex) {
+        ex.addContext("Failed to optimize pipeline");
+        throw;
+    }
+
+    return itr;
+}
+
 DepsTracker DocumentSourceInternalUnpackBucket::getRestPipelineDependencies(
     Pipeline::SourceContainer::iterator itr,
     Pipeline::SourceContainer* container,
@@ -1601,6 +1638,50 @@ DepsTracker DocumentSourceInternalUnpackBucket::getRestPipelineDependencies(
         match_expression::addDependencies(_eventFilter.get(), &deps);
     }
     return deps;
+}
+
+void DocumentSourceInternalUnpackBucket::addVariableRefs(std::set<Variables::Id>* refs) const {
+    if (_eventFilter) {
+        match_expression::addVariableRefs(eventFilter(), refs);
+    }
+    if (_wholeBucketFilter) {
+        match_expression::addVariableRefs(wholeBucketFilter(), refs);
+    }
+}
+
+namespace {
+// For now, we only support adjacent $sort + $group for the top-k sort optimization.
+std::pair<DocumentSourceSort*, DocumentSourceGroup*> getSortAndGroup(
+    Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
+    if (std::next(itr) == container->end() || std::next(std::next(itr)) == container->end()) {
+        return {nullptr, nullptr};
+    }
+
+    auto prospectiveSortItr = std::next(itr);
+    auto prospectiveSort = dynamic_cast<DocumentSourceSort*>(prospectiveSortItr->get());
+    if (!prospectiveSort) {
+        return {nullptr, nullptr};
+    }
+
+    auto prospectiveGroupItr = std::next(prospectiveSortItr);
+    auto prospectiveGroup = dynamic_cast<DocumentSourceGroup*>(prospectiveGroupItr->get());
+    if (!prospectiveGroup) {
+        return {prospectiveSort, nullptr};
+    }
+
+    return {prospectiveSort, prospectiveGroup};
+}
+}  // namespace
+
+bool DocumentSourceInternalUnpackBucket::tryToAbsorbTopKSortIntoGroup(
+    Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
+    auto [prospectiveSort, prospectiveGroup] = getSortAndGroup(itr, container);
+    if (!prospectiveSort || !prospectiveGroup) {
+        return false;
+    }
+
+    return prospectiveGroup->tryToAbsorbTopKSort(
+        prospectiveSort, /*prospectiveSortItr=*/std::next(itr), container);
 }
 
 Pipeline::SourceContainer::iterator DocumentSourceInternalUnpackBucket::doOptimizeAt(
@@ -1650,6 +1731,10 @@ Pipeline::SourceContainer::iterator DocumentSourceInternalUnpackBucket::doOptimi
         }
     }
 
+    if (tryToAbsorbTopKSortIntoGroup(itr, container)) {
+        return itr;
+    }
+
     // Attempt to push geoNear on the metaField past $_internalUnpackBucket.
     if (auto nextNear = dynamic_cast<DocumentSourceGeoNear*>(std::next(itr)->get());
         nextNear && !_eventFilter) {
@@ -1686,31 +1771,33 @@ Pipeline::SourceContainer::iterator DocumentSourceInternalUnpackBucket::doOptimi
         }
     }
 
-    // Optimize the pipeline after this stage to merge $match stages and push them forward, and to
-    // take advantage of $expr rewrite optimizations.
+    // OptimizeAt the pipeline after this stage to merge $match stages and push them forward.
     if (!_optimizedEndOfPipeline) {
         _optimizedEndOfPipeline = true;
 
         if (std::next(itr) == container->end()) {
             return container->end();
         }
-        if (auto nextStage = dynamic_cast<DocumentSourceGeoNear*>(std::next(itr)->get())) {
-            // If the end of the pipeline starts with a $geoNear stage, make sure it gets optimized
-            // in a context where it knows there are other stages before it. It will split itself
-            // up into separate $match and $sort stages. But it doesn't split itself up when it's
-            // the first stage, because it expects to use a special DocumentSouceGeoNearCursor plan.
-            nextStage->optimizeAt(std::next(itr), container);
-        }
+
+        // TODO SERVER-84113: Remove specific caching logic and calls that result in optimize()
+        // being called.
         auto cacheFound = findSequentialDocumentCache(itr, container->end());
         if (cacheFound) {
-            // optimizeAt() is responsible for reordering stages, and optimize() is responsible for
-            // simplifying individual stages. $sequentialCache's optimizeAt() places the stage where
-            // it can cache as big a prefix of the pipeline as possible. To do so correctly, it
-            // needs to look at dependencies: a stage that depends on a let-variable cannot be
-            // cached. But optimize() can inline variables. Therefore, we want to avoid calling
-            // optimize() before $sequentialCache has a chance to run optimizeAt().
-            return Pipeline::optimizeAtEndOfPipeline(itr, container);
+            // We want to call optimizeAt() on the rest of the pipeline first, and exit this
+            // function since any calls to optimize() will interfere with the
+            // sequentialDocumentCache's ability to properly place itself or abandon.
+            return DocumentSourceInternalUnpackBucket::optimizeAtRestOfPipeline(itr, container);
         } else {
+            if (auto nextStage = dynamic_cast<DocumentSourceGeoNear*>(std::next(itr)->get())) {
+                // If the end of the pipeline starts with a $geoNear stage, make sure it gets
+                // optimized in a context where it knows there are other stages before it. It will
+                // split itself up into separate $match and $sort stages. But it doesn't split
+                // itself up when it's the first stage, because it expects to use a special
+                // DocumentSouceGeoNearCursor plan.
+                nextStage->optimizeAt(std::next(itr), container);
+            }
+            // We want to optimize the rest of the pipeline to ensure the stages are in their
+            // optimal position and expressions have been optimized to allow for certain rewrites.
             Pipeline::optimizeEndOfPipeline(itr, container);
         }
 
@@ -1795,6 +1882,7 @@ Pipeline::SourceContainer::iterator DocumentSourceInternalUnpackBucket::doOptimi
                                                              pExpCtx,
                                                              ExtensionsCallbackNoop(),
                                                              Pipeline::kAllowedMatcherFeatures));
+            // NAAMATODO comment to move this into optimize once that ticket is done
             _wholeBucketFilter = MatchExpression::optimize(std::move(_wholeBucketFilter),
                                                            /* enableSimplification */ false);
         }
@@ -1882,7 +1970,7 @@ bool DocumentSourceInternalUnpackBucket::isSbeCompatible() {
                         "If _eventFilter is set, we must have determined if it is compatible with "
                         "SBE or not.",
                         _isEventFilterSbeCompatible);
-                if (_isEventFilterSbeCompatible.get() < SbeCompatibility::fullyCompatible) {
+                if (_isEventFilterSbeCompatible.get() < SbeCompatibility::noRequirements) {
                     return false;
                 }
             }

@@ -44,7 +44,6 @@
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
-#include "mongo/client/connection_pool.h"
 #include "mongo/client/dbclient_base.h"
 #include "mongo/client/dbclient_connection.h"
 #include "mongo/db/auth/authorization_session.h"
@@ -52,7 +51,6 @@
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/namespace_string.h"
@@ -74,6 +72,7 @@
 #include "mongo/db/shutdown_in_progress_quiesce_info.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -105,19 +104,21 @@ const Milliseconds kRollbackOplogSocketTimeout(10 * 60 * 1000);
 // The number of times a node attempted to choose a node to sync from among the available sync
 // source options. This occurs if we re-evaluate our sync source, receive an error from the source,
 // or step down.
-CounterMetric numSyncSourceSelections("repl.syncSource.numSelections");
+auto& numSyncSourceSelections = *MetricBuilder<Counter64>{"repl.syncSource.numSelections"};
 
 // The number of times a node kept it's original sync source after re-evaluating if its current sync
 // source was optimal.
-CounterMetric numTimesChoseSameSyncSource("repl.syncSource.numTimesChoseSame");
+auto& numTimesChoseSameSyncSource = *MetricBuilder<Counter64>{"repl.syncSource.numTimesChoseSame"};
 
 // The number of times a node chose a new sync source after re-evaluating if its current sync source
 // was optimal.
-CounterMetric numTimesChoseDifferentSyncSource("repl.syncSource.numTimesChoseDifferent");
+auto& numTimesChoseDifferentSyncSource =
+    *MetricBuilder<Counter64>{"repl.syncSource.numTimesChoseDifferent"};
 
 // The number of times a node could not find a sync source when choosing a node to sync from among
 // the available options.
-CounterMetric numTimesCouldNotFindSyncSource("repl.syncSource.numTimesCouldNotFind");
+auto& numTimesCouldNotFindSyncSource =
+    *MetricBuilder<Counter64>{"repl.syncSource.numTimesCouldNotFind"};
 
 /**
  * Extends DataReplicatorExternalStateImpl to be member state aware.
@@ -199,8 +200,10 @@ BackgroundSync::BackgroundSync(
     ReplicationCoordinator* replicationCoordinator,
     ReplicationCoordinatorExternalState* replicationCoordinatorExternalState,
     ReplicationProcess* replicationProcess,
+    OplogWriter* oplogWriter,
     OplogApplier* oplogApplier)
-    : _oplogApplier(oplogApplier),
+    : _oplogWriter(oplogWriter),
+      _oplogApplier(oplogApplier),
       _replCoord(replicationCoordinator),
       _replicationCoordinatorExternalState(replicationCoordinatorExternalState),
       _replicationProcess(replicationProcess) {}
@@ -642,7 +645,12 @@ Status BackgroundSync::_enqueueDocuments(OplogFetcher::Documents::const_iterator
     auto opCtx = cc().makeOperationContext();
 
     // Wait for enough space.
-    _oplogApplier->waitForSpace(opCtx.get(), info.toApplyDocumentBytes);
+    // This should be called outside of the mutex to avoid deadlocks.
+    if (_oplogWriter) {
+        _oplogWriter->waitForSpace(opCtx.get(), info.toApplyDocumentBytes);
+    } else {
+        _oplogApplier->waitForSpace(opCtx.get(), info.toApplyDocumentBytes);
+    }
 
     {
         // Don't add more to the buffer if we are in shutdown. Continue holding the lock until we
@@ -653,7 +661,12 @@ Status BackgroundSync::_enqueueDocuments(OplogFetcher::Documents::const_iterator
         }
 
         // Buffer docs for later application.
-        _oplogApplier->enqueue(opCtx.get(), begin, end);
+        // When _oplogWriter is not null, featureFlagReduceMajorityWriteLatency is enabled.
+        if (_oplogWriter) {
+            _oplogWriter->enqueue(opCtx.get(), begin, end, info.toApplyDocumentBytes);
+        } else {
+            _oplogApplier->enqueue(opCtx.get(), begin, end, info.toApplyDocumentBytes);
+        }
 
         // Update last fetched info.
         _lastOpTimeFetched = info.lastDocument;
@@ -696,7 +709,7 @@ void BackgroundSync::_runRollback(OperationContext* opCtx,
 
     // Ensure future transactions read without a timestamp.
     invariant(RecoveryUnit::ReadSource::kNoTimestamp ==
-              opCtx->recoveryUnit()->getTimestampReadSource());
+              shard_role_details::getRecoveryUnit(opCtx)->getTimestampReadSource());
 
     // Rollback is a synchronous operation that uses the task executor and may not be
     // executed inside the fetcher callback.
@@ -743,14 +756,18 @@ void BackgroundSync::_runRollback(OperationContext* opCtx,
 
     OplogInterfaceLocal localOplog(opCtx);
 
-    ConnectionPool connectionPool;
-    std::unique_ptr<ConnectionPool::ConnectionPtr> connection;
-    auto getConnection = [&connection, &connectionPool, source]() -> DBClientBase* {
-        if (!connection.get()) {
-            connection.reset(new ConnectionPool::ConnectionPtr(
-                &connectionPool, source, Date_t::now(), kRollbackOplogSocketTimeout));
-        };
-        return connection->get();
+    std::unique_ptr<DBClientConnection> connection;
+    auto getConnection = [&connection, source]() -> DBClientBase* {
+        if (!connection) {
+            connection = std::make_unique<DBClientConnection>();
+            connection->setSoTimeout(durationCount<Milliseconds>(kRollbackOplogSocketTimeout) /
+                                     1000.0);
+            connection->connect(source, StringData(), boost::none);
+            if (auth::isInternalAuthSet()) {
+                connection->authenticateInternalUser();
+            }
+        }
+        return connection.get();
     };
 
     // Because oplog visibility is updated asynchronously, wait until all uncommitted oplog entries
@@ -795,10 +812,9 @@ void BackgroundSync::_runRollbackViaRecoverToCheckpoint(
         if (_state != ProducerState::Running) {
             return;
         }
+        _rollback = std::make_unique<RollbackImpl>(
+            localOplog, &remoteOplog, storageInterface, _replicationProcess, _replCoord);
     }
-
-    _rollback = std::make_unique<RollbackImpl>(
-        localOplog, &remoteOplog, storageInterface, _replicationProcess, _replCoord);
 
     LOGV2(21104, "Scheduling rollback", "syncSource"_attr = source);
     auto status = _rollback->runRollback(opCtx);
@@ -874,7 +890,12 @@ void BackgroundSync::_stop(WithLock lock, bool resetLastFetchedOptime) {
 
     _syncSourceHost = HostAndPort();
     if (resetLastFetchedOptime) {
-        invariant(_oplogApplier->getBuffer()->isEmpty());
+        // When _oplogWriter is not null, featureFlagReduceMajorityWriteLatency is enabled.
+        if (_oplogWriter) {
+            invariant(_oplogWriter->getBuffer()->isEmpty());
+        } else {
+            invariant(_oplogApplier->getBuffer()->isEmpty());
+        }
         _lastOpTimeFetched = OpTime();
         LOGV2(21108, "Resetting last fetched optimes in bgsync");
     }
@@ -898,7 +919,7 @@ void BackgroundSync::start(OperationContext* opCtx) {
 
     // Ensure future transactions read without a timestamp.
     invariant(RecoveryUnit::ReadSource::kNoTimestamp ==
-              opCtx->recoveryUnit()->getTimestampReadSource());
+              shard_role_details::getRecoveryUnit(opCtx)->getTimestampReadSource());
 
     do {
         lastAppliedOpTime = _readLastAppliedOpTime(opCtx);
@@ -907,9 +928,11 @@ void BackgroundSync::start(OperationContext* opCtx) {
         if (_state != ProducerState::Starting) {
             return;
         }
-        // If a node steps down during drain mode, then the buffer may not be empty at the beginning
-        // of secondary state.
-        if (!_oplogApplier->getBuffer()->isEmpty()) {
+        // If a node steps down during drain mode, then the buffer may not be empty at the
+        // beginning of secondary state.
+        // When _oplogWriter is not null, featureFlagReduceMajorityWriteLatency is enabled.
+        auto buffer = _oplogWriter ? _oplogWriter->getBuffer() : _oplogApplier->getBuffer();
+        if (!buffer->isEmpty()) {
             LOGV2(21109, "Going to start syncing, but buffer is not empty");
         }
         setState(lk, ProducerState::Running);

@@ -65,13 +65,6 @@
 
 namespace mongo {
 
-class BSONObj;
-class ChunkType;
-class KeysCollectionDocument;
-class NamespaceString;
-class Shard;
-
-
 /**
  * Takes two arrays of BSON objects and asserts that they contain the same documents
  */
@@ -96,12 +89,12 @@ inline void assertBSONObjsSame(const std::vector<BSONObj>& expectedBSON,
 
 /**
  * Provides config-specific functionality in addition to the mock storage engine and mock network
- * provided by ShardingMongodTestFixture.
+ * provided by ShardingMongoDTestFixture.
  */
-class ConfigServerTestFixture : public ShardingMongodTestFixture {
+class ConfigServerTestFixture : public ShardingMongoDTestFixture {
 protected:
     explicit ConfigServerTestFixture(Options options = {}, bool setUpMajorityReads = true);
-    ~ConfigServerTestFixture();
+    ~ConfigServerTestFixture() override;
 
     void setUp() override;
     void tearDown() override;
@@ -171,9 +164,12 @@ protected:
     /**
      * Setup the config.chunks collection to contain the given chunks.
      */
-    CollectionType setupCollection(const NamespaceString& nss,
-                                   const KeyPattern& shardKey,
-                                   const std::vector<ChunkType>& chunks);
+    CollectionType setupCollection(
+        const NamespaceString& nss,
+        const KeyPattern& shardKey,
+        const std::vector<ChunkType>& chunks,
+        std::function<void(CollectionType& coll)> collectionCustomizer = [](CollectionType& coll) {
+        });
 
     /**
      * Retrieves the chunk document <uuid, minKey> from the config server.
@@ -226,7 +222,7 @@ protected:
     executor::TaskExecutor* executorForAddShard() const;
 
     /**
-     * Same as ShardingMongodTestFixture::onCommand but run against _addShardNetworkTestEnv.
+     * Same as ShardingMongoDTestFixture::onCommand but run against _addShardNetworkTestEnv.
      */
     void onCommandForAddShard(executor::NetworkTestEnv::OnCommandFunction func);
 

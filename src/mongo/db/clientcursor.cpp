@@ -30,6 +30,7 @@
 #include "mongo/db/clientcursor.h"
 
 #include <boost/cstdint.hpp>
+#include <fmt/format.h>
 #include <iosfwd>
 #include <mutex>
 #include <ratio>
@@ -46,8 +47,13 @@
 #include "mongo/db/cursor_manager.h"
 #include "mongo/db/cursor_server_params.h"
 #include "mongo/db/query/plan_explainer.h"
+#include "mongo/db/query/query_knob_configuration.h"
+#include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/query/query_stats/optimizer_metrics_stats_entry.h"
 #include "mongo/db/query/query_stats/query_stats.h"
+#include "mongo/db/query/query_stats/supplemental_metrics_stats.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/util/background.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
@@ -56,43 +62,83 @@
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 namespace mongo {
+namespace {
 
-using std::string;
-using std::stringstream;
+using namespace fmt::literals;
 
-static CounterMetric cursorStatsOpen{"cursor.open.total"};
-static CounterMetric cursorStatsOpenPinned{"cursor.open.pinned"};
-static CounterMetric cursorStatsOpenNoTimeout{"cursor.open.noTimeout"};
-static CounterMetric cursorStatsTimedOut{"cursor.timedOut"};
-static CounterMetric cursorStatsTotalOpened{"cursor.totalOpened"};
-static CounterMetric cursorStatsMoreThanOneBatch{"cursor.moreThanOneBatch"};
+class CursorStats {
+public:
+    CursorStats() = default;
+    /** Doesn't move, copy or die. */
+    ~CursorStats() = delete;
+    CursorStats(const CursorStats&) = delete;
+    CursorStats& operator=(const CursorStats&) = delete;
+    CursorStats(CursorStats&&) = delete;
+    CursorStats& operator=(CursorStats&&) = delete;
 
-static CounterMetric cursorStatsLifespanLessThan1Second{"cursor.lifespan.lessThan1Second"};
-static CounterMetric cursorStatsLifespanLessThan5Seconds{"cursor.lifespan.lessThan5Seconds"};
-static CounterMetric cursorStatsLifespanLessThan15Seconds{"cursor.lifespan.lessThan15Seconds"};
-static CounterMetric cursorStatsLifespanLessThan30Seconds{"cursor.lifespan.lessThan30Seconds"};
-static CounterMetric cursorStatsLifespanLessThan1Minute{"cursor.lifespan.lessThan1Minute"};
-static CounterMetric cursorStatsLifespanLessThan10Minutes{"cursor.lifespan.lessThan10Minutes"};
-static CounterMetric cursorStatsLifespanGreaterThanOrEqual10Minutes{
-    "cursor.lifespan.greaterThanOrEqual10Minutes"};
+    /** Resets all data members that are commented as "resettable". */
+    void reset() {
+        auto zero = [](auto& m) {
+            m.decrement(m.get());
+        };
+        zero(open);
+        zero(openPinned);
+        zero(multiTarget);
+        zero(singleTarget);
+        zero(queuedData);
+        zero(timedOut);
+    }
+
+    Counter64& open{_makeStat("open.total")};         // resettable
+    Counter64& openPinned{_makeStat("open.pinned")};  // resettable
+    Counter64& openNoTimeout{_makeStat("open.noTimeout")};
+    Counter64& timedOut{_makeStat("timedOut")};  // resettable
+    Counter64& totalOpened{_makeStat("totalOpened")};
+    Counter64& moreThanOneBatch{_makeStat("moreThanOneBatch")};
+
+    Counter64& multiTarget{_makeStat("open.multiTarget")};    // resettable
+    Counter64& singleTarget{_makeStat("open.singleTarget")};  // resettable
+    Counter64& queuedData{_makeStat("open.queuedData")};      // resettable
+
+    Counter64& lifespanLessThan1Second{_makeStat("lifespan.lessThan1Second")};
+    Counter64& lifespanLessThan5Seconds{_makeStat("lifespan.lessThan5Seconds")};
+    Counter64& lifespanLessThan15Seconds{_makeStat("lifespan.lessThan15Seconds")};
+    Counter64& lifespanLessThan30Seconds{_makeStat("lifespan.lessThan30Seconds")};
+    Counter64& lifespanLessThan1Minute{_makeStat("lifespan.lessThan1Minute")};
+    Counter64& lifespanLessThan10Minutes{_makeStat("lifespan.lessThan10Minutes")};
+    Counter64& lifespanGreaterThanOrEqual10Minutes{
+        _makeStat("lifespan.greaterThanOrEqual10Minutes")};
+
+private:
+    static Counter64& _makeStat(StringData name) {
+        static constexpr auto prefix = "cursor"_sd;
+        return *MetricBuilder<Counter64>("{}.{}"_format(prefix, name))
+                    .setRole(ClusterRole::ShardServer);
+    }
+};
+auto& gCursorStats = *new CursorStats{};
+
+CursorStats& cursorStats() {
+    return gCursorStats;
+}
+}  // namespace
 
 void incrementCursorLifespanMetric(Date_t birth, Date_t death) {
     auto elapsed = death - birth;
-
     if (elapsed < Seconds(1)) {
-        cursorStatsLifespanLessThan1Second.increment();
+        cursorStats().lifespanLessThan1Second.increment();
     } else if (elapsed < Seconds(5)) {
-        cursorStatsLifespanLessThan5Seconds.increment();
+        cursorStats().lifespanLessThan5Seconds.increment();
     } else if (elapsed < Seconds(15)) {
-        cursorStatsLifespanLessThan15Seconds.increment();
+        cursorStats().lifespanLessThan15Seconds.increment();
     } else if (elapsed < Seconds(30)) {
-        cursorStatsLifespanLessThan30Seconds.increment();
+        cursorStats().lifespanLessThan30Seconds.increment();
     } else if (elapsed < Minutes(1)) {
-        cursorStatsLifespanLessThan1Minute.increment();
+        cursorStats().lifespanLessThan1Minute.increment();
     } else if (elapsed < Minutes(10)) {
-        cursorStatsLifespanLessThan10Minutes.increment();
+        cursorStats().lifespanLessThan10Minutes.increment();
     } else {
-        cursorStatsLifespanGreaterThanOrEqual10Minutes.increment();
+        cursorStats().lifespanGreaterThanOrEqual10Minutes.increment();
     }
 }
 
@@ -124,21 +170,21 @@ ClientCursor::ClientCursor(ClientCursorParams params,
       _planSummary(_exec->getPlanExplainer().getPlanSummary()),
       _planCacheKey(CurOp::get(operationUsingCursor)->debug().planCacheKey),
       _queryHash(CurOp::get(operationUsingCursor)->debug().queryHash),
-      _queryStatsKeyHash(CurOp::get(operationUsingCursor)->debug().queryStatsKeyHash),
-      _queryStatsKey(std::move(CurOp::get(operationUsingCursor)->debug().queryStatsKey)),
+      _queryStatsKeyHash(CurOp::get(operationUsingCursor)->debug().queryStatsInfo.keyHash),
+      _queryStatsKey(std::move(CurOp::get(operationUsingCursor)->debug().queryStatsInfo.key)),
       _shouldOmitDiagnosticInformation(
           CurOp::get(operationUsingCursor)->getShouldOmitDiagnosticInformation()),
       _opKey(operationUsingCursor->getOperationKey()) {
     invariant(_exec);
     invariant(_operationUsingCursor);
 
-    cursorStatsOpen.increment();
-    cursorStatsTotalOpened.increment();
+    cursorStats().open.increment();
+    cursorStats().totalOpened.increment();
 
     if (isNoTimeout()) {
         // cursors normally timeout after an inactivity period to prevent excess memory use
         // setting this prevents timeout of the cursor in question.
-        cursorStatsOpenNoTimeout.increment();
+        cursorStats().openNoTimeout.increment();
     }
 }
 
@@ -167,26 +213,17 @@ void ClientCursor::dispose(OperationContext* opCtx, boost::optional<Date_t> now)
         return;
     }
 
-    if (_queryStatsKeyHash && opCtx) {
-        query_stats::writeQueryStats(opCtx,
-                                     _queryStatsKeyHash,
-                                     std::move(_queryStatsKey),
-                                     _metrics.executionTime.value_or(Microseconds{0}).count(),
-                                     _firstResponseExecutionTime.value_or(Microseconds{0}).count(),
-                                     _metrics.nreturned.value_or(0));
-    }
-
     if (now) {
         incrementCursorLifespanMetric(_createdDate, *now);
     }
 
-    cursorStatsOpen.decrement();
+    cursorStats().open.decrement();
     if (isNoTimeout()) {
-        cursorStatsOpenNoTimeout.decrement();
+        cursorStats().openNoTimeout.decrement();
     }
 
     if (_metrics.nBatches && *_metrics.nBatches > 1) {
-        cursorStatsMoreThanOneBatch.increment();
+        cursorStats().moreThanOneBatch.increment();
     }
 
     _exec->dispose(opCtx);
@@ -194,6 +231,27 @@ void ClientCursor::dispose(OperationContext* opCtx, boost::optional<Date_t> now)
     // collections in the new 'opCtx'.
     ExternalDataSourceScopeGuard::updateOperationContext(this, opCtx);
     _disposed = true;
+
+    // It is discouraged but technically possible for a user to enable queryStats on the mongods of
+    // a replica set. In this case, a cursor will be created for each mongod. However, the
+    // queryStatsKey is behind a unique_ptr on CurOp. The ClientCursor constructor std::moves the
+    // queryStatsKey so it uniquely owns it (and also makes the queryStatsKey on CurOp now a
+    // nullptr) and copies over the queryStatsKeyHash as the latter is a cheap copy.
+
+    // In the case of sharded $search, two cursors will be created per mongod. In this way,
+    // two cursors are part of the same thread/operation, and therefore share a OpCtx/CurOp/OpDebug.
+    // The first cursor that is created will own the queryStatsKey and have a copy of the
+    // queryStatsKeyHash. On the other hand, the second one will only have a copy of the hash since
+    // the queryStatsKey will be null on CurOp from being std::move'd in the first cursor
+    // construction call. To not trip the tassert in writeQueryStats and because all cursors are
+    // guaranteed to have a copy of the hash, we check that the cursor has a key .
+    if (_queryStatsKey && opCtx) {
+        auto snapshot = query_stats::captureMetrics(
+            opCtx, query_stats::microsecondsToUint64(_firstResponseExecutionTime), _metrics);
+
+        query_stats::writeQueryStats(
+            opCtx, _queryStatsKeyHash, std::move(_queryStatsKey), snapshot);
+    }
 }
 
 GenericCursor ClientCursor::toGenericCursor() const {
@@ -227,7 +285,8 @@ ClientCursorPin::ClientCursorPin(OperationContext* opCtx,
     : _opCtx(opCtx),
       _cursor(cursor),
       _cursorManager(cursorManager),
-      _interruptibleLockGuard(std::make_unique<InterruptibleLockGuard>(opCtx->lockState())) {
+      _interruptibleLockGuard(
+          std::make_unique<InterruptibleLockGuard>(shard_role_details::getLocker(opCtx))) {
     invariant(_cursor);
     invariant(_cursor->_operationUsingCursor);
     invariant(!_cursor->_disposed);
@@ -237,7 +296,7 @@ ClientCursorPin::ClientCursorPin(OperationContext* opCtx,
     // either by being released back to the cursor manager or by being deleted. A cursor may be
     // transferred to another pin object via move construction or move assignment, but in this case
     // it is still considered pinned.
-    cursorStatsOpenPinned.increment();
+    cursorStats().openPinned.increment();
 }
 
 ClientCursorPin::ClientCursorPin(ClientCursorPin&& other)
@@ -310,7 +369,7 @@ void ClientCursorPin::release() {
     // Unpin the cursor. This must be done by calling into the cursor manager, since the cursor
     // manager must acquire the appropriate mutex in order to safely perform the unpin operation.
     _cursorManager->unpin(_opCtx, std::unique_ptr<ClientCursor, ClientCursor::Deleter>(_cursor));
-    cursorStatsOpenPinned.decrement();
+    cursorStats().openPinned.decrement();
 
     _cursor = nullptr;
 }
@@ -324,7 +383,7 @@ void ClientCursorPin::deleteUnderlying() {
     _cursor = nullptr;
     _cursorManager->deregisterAndDestroyCursor(_opCtx, std::move(ownedCursor));
 
-    cursorStatsOpenPinned.decrement();
+    cursorStats().openPinned.decrement();
     _shouldSaveRecoveryUnit = false;
 }
 
@@ -339,16 +398,16 @@ void ClientCursorPin::unstashResourcesOntoOperationContext() {
 
     if (auto& ru = _cursor->_stashedRecoveryUnit) {
         _shouldSaveRecoveryUnit = true;
-        invariant(!_opCtx->recoveryUnit()->isActive());
-        _opCtx->setRecoveryUnit(std::move(ru),
-                                WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+        invariant(!shard_role_details::getRecoveryUnit(_opCtx)->isActive());
+        shard_role_details::setRecoveryUnit(
+            _opCtx, std::move(ru), WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
     }
 }
 
 void ClientCursorPin::stashResourcesFromOperationContext() {
     // Move the recovery unit from the operation context onto the cursor and create a new RU for
     // the current OperationContext.
-    _cursor->stashRecoveryUnit(_opCtx->releaseAndReplaceRecoveryUnit());
+    _cursor->stashRecoveryUnit(shard_role_details::releaseAndReplaceRecoveryUnit(_opCtx));
 }
 
 namespace {
@@ -361,11 +420,11 @@ namespace {
  */
 class ClientCursorMonitor : public BackgroundJob {
 public:
-    std::string name() const {
+    std::string name() const override {
         return "ClientCursorMonitor";
     }
 
-    void run() {
+    void run() override {
         ThreadClient tc("clientcursormon",
                         getGlobalServiceContext()->getService(ClusterRole::ShardServer));
 
@@ -374,7 +433,7 @@ public:
                 const ServiceContext::UniqueOperationContext opCtx = cc().makeOperationContext();
                 auto now = opCtx->getServiceContext()->getPreciseClockSource()->now();
                 try {
-                    cursorStatsTimedOut.increment(
+                    cursorStats().timedOut.increment(
                         CursorManager::get(opCtx.get())->timeoutCursors(opCtx.get(), now));
                 } catch (const DBException& e) {
                     LOGV2_WARNING(
@@ -391,15 +450,6 @@ public:
 };
 
 auto getClientCursorMonitor = ServiceContext::declareDecoration<ClientCursorMonitor>();
-
-void _appendCursorStats(BSONObjBuilder& b) {
-    b.append("note", "deprecated, use server status metrics");
-    b.appendNumber("clientCursors_size", cursorStatsOpen.get());
-    b.appendNumber("totalOpen", cursorStatsOpen.get());
-    b.appendNumber("pinned", cursorStatsOpenPinned.get());
-    b.appendNumber("totalNoTimeout", cursorStatsOpenNoTimeout.get());
-    b.appendNumber("timedOut", cursorStatsTimedOut.get());
-}
 }  // namespace
 
 void startClientCursorMonitor() {
@@ -410,17 +460,69 @@ void collectQueryStatsMongod(OperationContext* opCtx, ClientCursorPin& pinnedCur
     pinnedCursor->incrementCursorMetrics(CurOp::get(opCtx)->debug().additiveMetrics);
 }
 
-void collectQueryStatsMongod(OperationContext* opCtx, std::unique_ptr<query_stats::Key> key) {
+void collectQueryStatsMongod(OperationContext* opCtx,
+                             const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                             std::unique_ptr<query_stats::Key> key) {
     // If we haven't registered a cursor to prepare for getMore requests, we record
     // query stats directly.
     auto& opDebug = CurOp::get(opCtx)->debug();
-    int64_t execTime = opDebug.additiveMetrics.executionTime.value_or(Microseconds{0}).count();
+
+    auto snapshot = query_stats::captureMetrics(
+        opCtx,
+        query_stats::microsecondsToUint64(opDebug.additiveMetrics.executionTime),
+        opDebug.additiveMetrics);
+
+    std::unique_ptr<query_stats::SupplementalStatsEntry> supplementalMetrics(nullptr);
+
+    if (internalQueryCollectOptimizerMetrics.load()) {
+        auto metricType(query_stats::SupplementalMetricType::Unknown);
+
+        const auto frameworkControlKnob =
+            expCtx->getQueryKnobConfiguration().getInternalQueryFrameworkControlForOp();
+        switch (opDebug.queryFramework) {
+            case PlanExecutor::QueryFramework::kClassicOnly:
+            case PlanExecutor::QueryFramework::kClassicHybrid:
+                metricType = query_stats::SupplementalMetricType::Classic;
+                break;
+            case PlanExecutor::QueryFramework::kSBEOnly:
+            case PlanExecutor::QueryFramework::kSBEHybrid:
+                metricType = query_stats::SupplementalMetricType::SBE;
+                break;
+            case PlanExecutor::QueryFramework::kCQF:
+                if (frameworkControlKnob == QueryFrameworkControlEnum::kTryBonsai) {
+                    metricType = query_stats::SupplementalMetricType::BonsaiM2;
+                } else if (frameworkControlKnob ==
+                           QueryFrameworkControlEnum::kTryBonsaiExperimental) {
+                    metricType = query_stats::SupplementalMetricType::BonsaiM4;
+                } else if (frameworkControlKnob == QueryFrameworkControlEnum::kForceBonsai) {
+                    metricType = query_stats::SupplementalMetricType::ForceBonsai;
+                }
+                break;
+            case PlanExecutor::QueryFramework::kUnknown:
+                break;
+        }
+
+        if (metricType != query_stats::SupplementalMetricType::Unknown) {
+            if (opDebug.estimatedCost && opDebug.estimatedCardinality) {
+                supplementalMetrics =
+                    std::make_unique<query_stats::OptimizerMetricsBonsaiStatsEntry>(
+                        opDebug.planningTime.count(),
+                        *opDebug.estimatedCost,
+                        *opDebug.estimatedCardinality,
+                        metricType);
+            } else {
+                supplementalMetrics =
+                    std::make_unique<query_stats::OptimizerMetricsClassicStatsEntry>(
+                        opDebug.planningTime.count(), metricType);
+            }
+        }
+    }
+
     query_stats::writeQueryStats(opCtx,
-                                 opDebug.queryStatsKeyHash,
+                                 opDebug.queryStatsInfo.keyHash,
                                  std::move(key),
-                                 execTime,
-                                 execTime,
-                                 opDebug.additiveMetrics.nreturned.value_or(0));
+                                 snapshot,
+                                 std::move(supplementalMetrics));
 }
 
 }  // namespace mongo

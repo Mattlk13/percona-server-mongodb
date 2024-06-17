@@ -95,7 +95,7 @@ ThreadPool* ReplicationCoordinatorExternalStateMock::getDbWorkThreadPool() const
     return nullptr;
 }
 
-void ReplicationCoordinatorExternalStateMock::forwardSecondaryProgress() {}
+void ReplicationCoordinatorExternalStateMock::forwardSecondaryProgress(bool prioritized) {}
 
 bool ReplicationCoordinatorExternalStateMock::isSelf(const HostAndPort& host,
                                                      ServiceContext* const service) {
@@ -304,10 +304,6 @@ double ReplicationCoordinatorExternalStateMock::getElectionTimeoutOffsetLimitFra
     return _electionTimeoutOffsetLimitFraction;
 }
 
-bool ReplicationCoordinatorExternalStateMock::isReadCommittedSupportedByStorageEngine(
-    OperationContext* opCtx) const {
-    return _isReadCommittedSupported;
-}
 
 bool ReplicationCoordinatorExternalStateMock::isReadConcernSnapshotSupportedByStorageEngine(
     OperationContext* opCtx) const {

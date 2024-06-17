@@ -62,7 +62,6 @@
 #include "mongo/db/catalog/uncommitted_catalog_updates.h"
 #include "mongo/db/collection_index_usage_tracker.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/feature_flag.h"
 #include "mongo/db/fts/fts_spec.h"
 #include "mongo/db/global_settings.h"
@@ -98,6 +97,7 @@
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/db/storage/storage_util.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/ttl_collection_cache.h"
 #include "mongo/db/update/document_diff_calculator.h"
 #include "mongo/db/update_index_data.h"
@@ -256,12 +256,12 @@ void IndexCatalogImpl::init(OperationContext* opCtx,
         if (spec.hasField(IndexDescriptor::kExpireAfterSecondsFieldName)) {
             // TTL indexes with an invalid 'expireAfterSeconds' field cause problems in multiversion
             // settings.
-            auto hasInvalidExpireAfterSeconds =
-                !index_key_validate::validateExpireAfterSeconds(
-                     spec[IndexDescriptor::kExpireAfterSecondsFieldName],
-                     index_key_validate::ValidateExpireAfterSecondsMode::kSecondaryTTLIndex)
-                     .isOK();
-            if (hasInvalidExpireAfterSeconds) {
+            auto swType = index_key_validate::validateExpireAfterSeconds(
+                spec[IndexDescriptor::kExpireAfterSecondsFieldName],
+                index_key_validate::ValidateExpireAfterSecondsMode::kSecondaryTTLIndex);
+            auto expireAfterSecondsType = index_key_validate::extractExpireAfterSecondsType(swType);
+            if (expireAfterSecondsType ==
+                TTLCollectionCache::Info::ExpireAfterSecondsType::kInvalid) {
                 LOGV2_OPTIONS(
                     6852200,
                     {logv2::LogTag::kStartupWarnings},
@@ -274,26 +274,19 @@ void IndexCatalogImpl::init(OperationContext* opCtx,
             }
             // Note that TTL deletion is supported on capped clustered collections via bounded
             // collection scan, which does not use an index.
-            if (feature_flags::gFeatureFlagTTLIndexesOnCappedCollections.isEnabled(
-                    serverGlobalParams.featureCompatibility) ||
-                !collection->isCapped()) {
-                if (opCtx->lockState()->inAWriteUnitOfWork()) {
-                    opCtx->recoveryUnit()->onCommit(
-                        [svcCtx = opCtx->getServiceContext(),
-                         uuid = collection->uuid(),
-                         indexName,
-                         hasInvalidExpireAfterSeconds](OperationContext*,
-                                                       boost::optional<Timestamp>) {
-                            TTLCollectionCache::get(svcCtx).registerTTLInfo(
-                                uuid,
-                                TTLCollectionCache::Info{indexName, hasInvalidExpireAfterSeconds});
-                        });
-                } else {
-                    TTLCollectionCache::get(opCtx->getServiceContext())
-                        .registerTTLInfo(
-                            collection->uuid(),
-                            TTLCollectionCache::Info{indexName, hasInvalidExpireAfterSeconds});
-                }
+            if (shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork()) {
+                shard_role_details::getRecoveryUnit(opCtx)->onCommit(
+                    [svcCtx = opCtx->getServiceContext(),
+                     uuid = collection->uuid(),
+                     indexName,
+                     expireAfterSecondsType](OperationContext*, boost::optional<Timestamp>) {
+                        TTLCollectionCache::get(svcCtx).registerTTLInfo(
+                            uuid, TTLCollectionCache::Info{indexName, expireAfterSecondsType});
+                    });
+            } else {
+                TTLCollectionCache::get(opCtx->getServiceContext())
+                    .registerTTLInfo(collection->uuid(),
+                                     TTLCollectionCache::Info{indexName, expireAfterSecondsType});
             }
         }
 
@@ -448,7 +441,8 @@ void IndexCatalogImpl::_logInternalState(OperationContext* opCtx,
                                          const CollectionPtr& collection,
                                          long long numIndexesInCollectionCatalogEntry,
                                          const std::vector<std::string>& indexNamesToDrop) {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_X));
+    invariant(
+        shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(collection->ns(), MODE_X));
 
     LOGV2_ERROR(20365,
                 "Internal Index Catalog state",
@@ -514,15 +508,6 @@ StatusWith<BSONObj> IndexCatalogImpl::prepareSpecForCreate(
 
     // Normalise the spec
     const auto normalSpec = IndexCatalog::normalizeIndexSpecs(opCtx, collection, validatedSpec);
-
-    // Check whether this is a TTL index being created on a capped collection.
-    if (collection && collection->isCapped() &&
-        validatedSpec.hasField(IndexDescriptor::kExpireAfterSecondsFieldName) &&
-        !feature_flags::gFeatureFlagTTLIndexesOnCappedCollections.isEnabled(
-            serverGlobalParams.featureCompatibility) &&
-        MONGO_likely(!ignoreTTLIndexCappedCollectionCheck.shouldFail())) {
-        return {ErrorCodes::CannotCreateIndex, "Cannot create TTL index on a capped collection"};
-    }
 
     // Check whether this is a non-_id index and there are any settings disallowing this server
     // from building non-_id indexes.
@@ -975,15 +960,15 @@ Status IndexCatalogImpl::_isSpecOk(OperationContext* opCtx,
             return wildcardSpecStatus;
         }
     } else if (pluginName == IndexNames::COLUMN) {
+        const auto fcvSnapshot = serverGlobalParams.featureCompatibility.acquireFCVSnapshot();
         uassert(ErrorCodes::NotImplemented,
                 str::stream() << pluginName
                               << " indexes are under development and cannot be used without "
                                  "enabling the feature flag",
                 // With our testing failpoint we may try to run this code before we've initialized
                 // the FCV.
-                !serverGlobalParams.featureCompatibility.isVersionInitialized() ||
-                    feature_flags::gFeatureFlagColumnstoreIndexes.isEnabled(
-                        serverGlobalParams.featureCompatibility));
+                !fcvSnapshot.isVersionInitialized() ||
+                    feature_flags::gFeatureFlagColumnstoreIndexes.isEnabled(fcvSnapshot));
         if (auto columnSpecStatus = validateColumnStoreSpec(collection, spec, indexVersion);
             !columnSpecStatus.isOK()) {
             return columnSpecStatus;
@@ -1331,8 +1316,9 @@ void IndexCatalogImpl::dropAllIndexes(OperationContext* opCtx,
 Status IndexCatalogImpl::resetUnfinishedIndexForRecovery(OperationContext* opCtx,
                                                          Collection* collection,
                                                          IndexCatalogEntry* entry) {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_X));
-    invariant(opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(
+        shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(collection->ns(), MODE_X));
+    invariant(shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
     const std::string indexName = entry->descriptor()->indexName();
 
@@ -1363,7 +1349,8 @@ Status IndexCatalogImpl::resetUnfinishedIndexForRecovery(OperationContext* opCtx
     // Drop the ident if it exists. The storage engine will return OK if the ident is not found.
     auto engine = opCtx->getServiceContext()->getStorageEngine();
     const std::string ident = released->getIdent();
-    Status status = engine->getEngine()->dropIdent(opCtx->recoveryUnit(), ident);
+    Status status =
+        engine->getEngine()->dropIdent(shard_role_details::getRecoveryUnit(opCtx), ident);
     if (!status.isOK()) {
         return status;
     }
@@ -1740,7 +1727,7 @@ Status IndexCatalogImpl::_updateRecord(OperationContext* const opCtx,
     // index has incorrect keys. Replace this failpoint with a test command instead.
     if (auto failpoint = skipUpdatingIndexDocument.scoped(); MONGO_unlikely(failpoint.isActive()) &&
         repl::feature_flags::gSecondaryIndexChecksInDbCheck.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
         auto indexName = failpoint.getData()["indexName"].valueStringDataSafe();
         if (indexName == index->descriptor()->indexName()) {
             LOGV2_DEBUG(
@@ -1878,7 +1865,8 @@ Status IndexCatalogImpl::indexRecords(OperationContext* opCtx,
         return Status::OK();
     }
 
-    if (Status status = opCtx->recoveryUnit()->setTimestamp(bsonRecords[0].ts); !status.isOK()) {
+    if (Status status = shard_role_details::getRecoveryUnit(opCtx)->setTimestamp(bsonRecords[0].ts);
+        !status.isOK()) {
         return status;
     }
 
@@ -1978,7 +1966,10 @@ void IndexCatalogImpl::unindexRecord(OperationContext* opCtx,
     }
 }
 
-Status IndexCatalogImpl::compactIndexes(OperationContext* opCtx) const {
+StatusWith<int64_t> IndexCatalogImpl::compactIndexes(OperationContext* opCtx,
+                                                     const CompactOptions& options) const {
+
+    int64_t estimatedBytes = 0;
     for (IndexCatalogEntryContainer::const_iterator it = _readyIndexes.begin();
          it != _readyIndexes.end();
          ++it) {
@@ -1988,16 +1979,17 @@ Status IndexCatalogImpl::compactIndexes(OperationContext* opCtx) const {
                     1,
                     "compacting index: {entry_descriptor}",
                     "entry_descriptor"_attr = *(entry->descriptor()));
-        Status status = entry->accessMethod()->compact(opCtx);
+        auto status = entry->accessMethod()->compact(opCtx, options);
         if (!status.isOK()) {
             LOGV2_ERROR(20377,
                         "Failed to compact index",
                         "index"_attr = *(entry->descriptor()),
-                        "error"_attr = redact(status));
+                        "error"_attr = redact(status.getStatus()));
             return status;
         }
+        estimatedBytes += status.getValue();
     }
-    return Status::OK();
+    return estimatedBytes;
 }
 
 std::string::size_type IndexCatalogImpl::getLongestIndexNameLength(OperationContext* opCtx) const {

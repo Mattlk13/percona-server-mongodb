@@ -202,7 +202,7 @@ void assertBsonObjEqualUnordered(const BSONObj& lhs, const BSONObj& rhs) {
 
 struct QueryAnalysisWriterTest : public ShardServerTestFixture {
 public:
-    void setUp() {
+    void setUp() override {
         ShardServerTestFixture::setUp();
         QueryAnalysisWriter::get(operationContext())->onStartup(operationContext());
 
@@ -218,7 +218,7 @@ public:
         tracker.refreshConfigurations({configuration0, configuration1});
     }
 
-    void tearDown() {
+    void tearDown() override {
         QueryAnalysisWriter::get(operationContext())->onShutdown();
         ShardServerTestFixture::tearDown();
     }
@@ -297,6 +297,7 @@ protected:
                 write_ops::UpdateModification(BSON("$set" << BSON("b.$[element]" << i))));
             updateOp.setC(BSON("x" << i));
             updateOp.setArrayFilters(std::vector<BSONObj>{BSON("element" << BSON("$gt" << i))});
+            updateOp.setSort(BSON("_id" << 1));
             updateOp.setMulti(_getRandomBool());
             updateOp.setUpsert(_getRandomBool());
             updateOp.setUpsertSupplied(_getRandomBool());

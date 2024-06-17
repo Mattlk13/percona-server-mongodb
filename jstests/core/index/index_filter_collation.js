@@ -4,7 +4,7 @@
  * @tags: [
  *   # The test runs commands that are not allowed with security token: planCacheListFilters,
  *   # planCacheSetFilter.
- *   not_allowed_with_security_token,
+ *   not_allowed_with_signed_security_token,
  *   # Needs to create a collection with a collation.
  *   assumes_no_implicit_collection_creation_after_drop,
  *   # This test attempts to perform queries with plan cache filters set up. The former operation
@@ -12,6 +12,8 @@
  *   # primary.
  *   assumes_read_preference_unchanged,
  *   does_not_support_stepdowns,
+ *   # Plan cache state is node-local and will not get migrated alongside user data
+ *   assumes_balancer_off,
  * ]
  */
 import {getPlanStages, getWinningPlan} from "jstests/libs/analyze_plan.js";
@@ -111,8 +113,10 @@ explain = coll.find({x: 3}).collation(caseInsensitive).explain();
 checkIndexFilterSet(explain, true);
 assertIsIxScanOnIndex(getWinningPlan(explain.queryPlanner), {x: 1});
 
-// TODO: SERVER-79230 Apply QuerySettings for distinct commands.
 if (isIndexFiltersToQuerySettings) {
+    // Query settings can't be used to substitute index filters for distinct commands. Configuring
+    // query settings requires providing full query shape. For 'find' one could build it from
+    // parameters passed into planCacheSetFilter. For 'distinct' query 'key' field is missing.
     quit();
 }
 

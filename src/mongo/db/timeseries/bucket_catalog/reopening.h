@@ -75,20 +75,25 @@ struct BucketToReopen {
  */
 struct ArchivedBucket {
     ArchivedBucket() = delete;
-    ArchivedBucket(const BucketId& bucketId, const std::string& timeField);
+    ArchivedBucket(const BucketId& bucketId, const tracked_string& timeField);
 
     BucketId bucketId;
-    std::string timeField;
+    tracked_string timeField;
 };
 
+
 /**
- * Calculates the marginal memory usage for an archived bucket. The 'IncludeMemoryOverheadFromMap'
- * parameter will be set to 'kInclude' if the bucket will be (if inserting) or was (if removing) the
- * only bucket associated with it's meta hash value. If so, then the returned value will attempt to
- * account for the overhead of the map data structure for the meta hash value.
+ * A light wrapper around a promise type to allow potentially conflicting operations to ensure
+ * orderly waiting and observability. Equivalent functionality exists in 'WriteBatch'.
  */
-long long marginalMemoryUsageForArchivedBucket(
-    const ArchivedBucket& bucket, IncludeMemoryOverheadFromMap includeMemoryOverheadFromMap);
+struct ReopeningRequest {
+    ReopeningRequest() = delete;
+    ReopeningRequest(ExecutionStatsController&& stats, boost::optional<OID> oid);
+
+    ExecutionStatsController stats;
+    boost::optional<OID> oid;
+    SharedPromise<void> promise;
+};
 
 /**
  * RAII type that tracks the state needed to coordinate the reopening of closed buckets between
@@ -102,7 +107,7 @@ class ReopeningContext {
 public:
     // A reopening candidate can be an OID for archive-based reopening, or an aggregation pipeline
     // for query-based reopening.
-    using CandidateType = stdx::variant<std::monostate, OID, std::vector<BSONObj>>;
+    using CandidateType = std::variant<std::monostate, OID, std::vector<BSONObj>>;
 
     ReopeningContext() = delete;
     ~ReopeningContext();
@@ -115,7 +120,7 @@ public:
     ReopeningContext(BucketCatalog& catalog,
                      Stripe& stripe,
                      WithLock stripeLock,
-                     const BucketKey& key,
+                     BucketKey key,
                      uint64_t era,
                      CandidateType&& candidate);
 
@@ -132,11 +137,11 @@ public:
     void clear(WithLock stripeLock);
 
     // Set by the bucket catalog to ensure proper synchronization of reopening attempt.
-    const uint64_t catalogEra;
+    uint64_t catalogEra;
 
     // Information needed for the caller to locate a candidate bucket to reopen from disk, populated
     // by the bucket catalog.
-    const CandidateType candidate;
+    CandidateType candidate;
 
     // Communicates to the BucketCatalog whether an attempt was made to fetch a query or bucket, and
     // the resulting bucket document that was found, if any. Populated by the caller.
@@ -147,21 +152,10 @@ public:
 private:
     Stripe* _stripe;
     BucketKey _key;
+    boost::optional<OID> _oid;
     bool _cleared;
 
     void clear();
-};
-
-/**
- * A light wrapper around a promise type to allow potentially conflicting operations to ensure
- * orderly waiting and observability. Equivalent functionality exists in 'WriteBatch'.
- */
-struct ReopeningRequest {
-    ReopeningRequest() = delete;
-    explicit ReopeningRequest(ExecutionStatsController&& stats);
-
-    ExecutionStatsController stats;
-    SharedPromise<void> promise;
 };
 
 /**

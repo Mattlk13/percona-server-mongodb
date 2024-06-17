@@ -203,6 +203,29 @@ public:
     virtual bool isSharded(OperationContext* opCtx, const NamespaceString& ns) = 0;
 
     /**
+     * TODO SERVER-79508 validate callers of this function remain correct.
+     *
+     * Returns false if the current request only handles parsing and validating queries. In other
+     * words, we are not executing queries. Examples include query analysis for queryable
+     * encryption, executing pipeline-style operations in the Update system, and creating a Query
+     * Shape. This function only returns false when the process interface is of type
+     * 'StubMongoProcessInterface'.
+     *
+     */
+    virtual bool isExpectedToExecuteQueries() {
+        return true;
+    }
+
+    /**
+     * Utility which determines which shard we should merge on. More precisely, if 'nss' is
+     * unsplittable or untracked, we should route to the shard which owns 'nss'. Note that this
+     * decision is inherently racy and subject to become stale. This is okay because either choice
+     * will work correctly, we are simply applying a heuristic optimization.
+     */
+    virtual boost::optional<ShardId> determineSpecificMergeShard(
+        OperationContext* opCtx, const NamespaceString& ns) const = 0;
+
+    /**
      * Advances the proxied write time associated with the client in ReplClientInfo to
      * be at least as high as the one tracked by the OperationTimeTracker associated with the
      * given operation context.
@@ -343,10 +366,14 @@ public:
      * they are annotated on the 'kAggTempCollections' collection on this shard. In both cases,
      * temporary collections are dropped (garbage-collected) on stepup (or startup in the case of
      * standalone nodes).
+     *
+     * This function accepts an optional 'dataShard' parameter that indicates the shard where the
+     * temporary collection should be created.
      */
     virtual void createTempCollection(OperationContext* opCtx,
                                       const NamespaceString& nss,
-                                      const BSONObj& collectionOptions) = 0;
+                                      const BSONObj& collectionOptions,
+                                      boost::optional<ShardId> dataShard = boost::none) = 0;
     /**
      * Creates the view backing a time-series collection.
      */
@@ -383,7 +410,7 @@ public:
      * If `shardTargetingPolicy` is kNotAllowed, the cursor will only be for local reads regardless
      * of whether or not this function is called in a sharded environment.
      */
-    virtual std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+    virtual std::unique_ptr<Pipeline, PipelineDeleter> preparePipelineForExecution(
         Pipeline* pipeline,
         ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
         boost::optional<BSONObj> readConcern = boost::none) = 0;
@@ -392,7 +419,7 @@ public:
      * Same as above but takes in an aggRequest and pipeline. This preserves any
      * aggregation options set on the AggregateCommandRequest.
      */
-    virtual std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+    virtual std::unique_ptr<Pipeline, PipelineDeleter> preparePipelineForExecution(
         const AggregateCommandRequest& aggRequest,
         Pipeline* pipeline,
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -444,6 +471,11 @@ public:
      * Returns the name of the local shard if sharding is enabled, or an empty string.
      */
     virtual std::string getShardName(OperationContext* opCtx) const = 0;
+
+    /**
+     * Returns the the local shard if this process is a shardsvr, else boost::none.
+     */
+    virtual boost::optional<ShardId> getShardId(OperationContext* opCtx) const = 0;
 
     /**
      * Returns whether or not this process is running as part of a sharded cluster.
@@ -566,8 +598,6 @@ public:
         OperationContext* opCtx,
         const NamespaceString& nss,
         const boost::optional<DatabaseVersion>& dbVersion) = 0;
-
-    virtual std::unique_ptr<ResourceYielder> getResourceYielder(StringData cmdName) const = 0;
 
     /**
      * If the user did not provide the 'fieldPaths' set, a default unique key will be picked,

@@ -162,14 +162,12 @@ public:
      */
     Document applyProjection(const Document& inputDoc) const final;
 
-    boost::optional<std::set<FieldRef>> extractExhaustivePaths() const {
+    boost::optional<std::set<FieldRef>> extractExhaustivePaths() const override {
         return boost::none;
     }
 
     std::pair<BSONObj, bool> extractComputedProjections(
-        const StringData& oldName,
-        const StringData& newName,
-        const std::set<StringData>& reservedNames) final {
+        StringData oldName, StringData newName, const std::set<StringData>& reservedNames) final {
         return _root->extractComputedProjectionsInAddFields(oldName, newName, reservedNames);
     }
 

@@ -41,8 +41,10 @@ namespace mongo::optimizer::ce {
 
 SBESamplingExecutor::~SBESamplingExecutor() {}
 
-boost::optional<optimizer::SelectivityType> SBESamplingExecutor::estimateSelectivity(
-    const Metadata& metadata, const int64_t sampleSize, const PlanAndProps& planAndProps) {
+std::pair<sbe::value::TypeTags, sbe::value::Value> SBESamplingExecutor::execute(
+    const Metadata& metadata,
+    const QueryParameterMap& queryParameters,
+    const PlanAndProps& planAndProps) const {
     auto env = VariableEnvironment::build(planAndProps._node);
     SlotVarMap slotMap;
     auto runtimeEnvironment = std::make_unique<sbe::RuntimeEnvironment>();  // TODO Use factory
@@ -50,21 +52,21 @@ boost::optional<optimizer::SelectivityType> SBESamplingExecutor::estimateSelecti
     sbe::value::SlotIdGenerator ids;
     sbe::InputParamToSlotMap inputParamToSlotMap;
 
-    SBENodeLowering g{env,
-                      *runtimeEnvironment,
-                      ids,
-                      inputParamToSlotMap,
-                      metadata,
-                      planAndProps._map,
-                      internalCascadesOptimizerSamplingCEScanStartOfColl.load()
-                          ? ScanOrder::Forward
-                          : ScanOrder::Random};
+    SBENodeLowering g{
+        env, *runtimeEnvironment, ids, inputParamToSlotMap, metadata, planAndProps._map};
     auto sbePlan = g.optimize(planAndProps._node, slotMap, ridSlot);
     tassert(6624261, "Unexpected rid slot", !ridSlot);
 
     // TODO: return errors instead of exceptions?
     uassert(6624244, "Lowering failed", sbePlan != nullptr);
     uassert(6624245, "Invalid slot map size", slotMap.size() == 1);
+
+    // Bind query parameters to runtime slots.
+    for (auto&& [paramId, slotId] : inputParamToSlotMap) {
+        auto [paramTag, paramVal] = queryParameters.at(paramId).get();
+        auto accessor = runtimeEnvironment->getAccessor(slotId);
+        accessor->reset(false, paramTag, paramVal);
+    }
 
     sbePlan->attachToOperationContext(_opCtx);
     sbe::CompileCtx ctx(std::move(runtimeEnvironment));
@@ -78,17 +80,15 @@ boost::optional<optimizer::SelectivityType> SBESamplingExecutor::estimateSelecti
     sbePlan->open(false);
     ON_BLOCK_EXIT([&] { sbePlan->close(); });
 
-    while (sbePlan->getNext() != sbe::PlanState::IS_EOF) {
-        const auto [tag, value] = accessors.at(0)->getViewOfValue();
-        if (tag == sbe::value::TypeTags::NumberInt64) {
-            // TODO: check if we get exactly one result from the groupby?
-            return {{static_cast<double>(value) / sampleSize}};
-        }
-        return boost::none;
-    };
+    if (sbePlan->getNext() == sbe::PlanState::IS_EOF) {
+        return {sbe::value::TypeTags::Nothing, 0};
+    }
 
-    // If nothing passes the filter, estimate 0.0 selectivity. HashGroup will return 0 results.
-    return {{0.0}};
+    auto result = accessors.at(0)->getCopyOfValue();
+    tassert(8375701,
+            "Sampling query returned more than one row",
+            sbePlan->getNext() == sbe::PlanState::IS_EOF);
+    return result;
 }
 
 }  // namespace mongo::optimizer::ce

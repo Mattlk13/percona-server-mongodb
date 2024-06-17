@@ -46,6 +46,7 @@
 // IWYU pragma: no_include "boost/system/detail/error_code.hpp"
 
 #include "mongo/base/error_codes.h"
+#include "mongo/db/admission/execution_admission_context.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_yield_restore.h"
 #include "mongo/db/catalog/commit_quorum_options.h"
@@ -58,7 +59,6 @@
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/dbhelpers.h"
@@ -89,6 +89,7 @@
 #include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/db/storage/two_phase_index_build_knobs_gen.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/attribute_storage.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
@@ -140,16 +141,49 @@ MONGO_FAIL_POINT_DEFINE(hangOnStepUpAsyncTaskBeforeCheckingCommitQuorum);
 
 extern FailPoint skipWriteConflictRetries;
 
-IndexBuildsCoordinator::IndexBuildsSSS::IndexBuildsSSS()
-    : ServerStatusSection("indexBuilds"),
-      registered(0),
-      scanCollection(0),
-      drainSideWritesTable(0),
-      drainSideWritesTablePreCommit(0),
-      waitForCommitQuorum(0),
-      drainSideWritesTableOnCommit(0),
-      processConstraintsViolatonTableOnCommit(0),
-      commit(0) {}
+class IndexBuildsSSS : public ServerStatusSection {
+public:
+    using ServerStatusSection::ServerStatusSection;
+
+    bool includeByDefault() const final {
+        return true;
+    }
+
+    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const final {
+        BSONObjBuilder indexBuilds;
+
+        indexBuilds.append("total", registered.loadRelaxed());
+        indexBuilds.append("killedDueToInsufficientDiskSpace",
+                           killedDueToInsufficientDiskSpace.loadRelaxed());
+        indexBuilds.append("failedDueToDataCorruption", failedDueToDataCorruption.loadRelaxed());
+
+        BSONObjBuilder phases{indexBuilds.subobjStart("phases")};
+        phases.append("scanCollection", scanCollection.loadRelaxed());
+        phases.append("drainSideWritesTable", drainSideWritesTable.loadRelaxed());
+        phases.append("drainSideWritesTablePreCommit", drainSideWritesTablePreCommit.loadRelaxed());
+        phases.append("waitForCommitQuorum", waitForCommitQuorum.loadRelaxed());
+        phases.append("drainSideWritesTableOnCommit", drainSideWritesTableOnCommit.loadRelaxed());
+        phases.append("processConstraintsViolatonTableOnCommit",
+                      processConstraintsViolatonTableOnCommit.loadRelaxed());
+        phases.append("commit", commit.loadRelaxed());
+        phases.done();
+
+        return indexBuilds.obj();
+    }
+
+    AtomicWord<int> registered{0};
+    AtomicWord<int> killedDueToInsufficientDiskSpace{0};
+    AtomicWord<int> failedDueToDataCorruption{0};
+    AtomicWord<int> scanCollection{0};
+    AtomicWord<int> drainSideWritesTable{0};
+    AtomicWord<int> drainSideWritesTablePreCommit{0};
+    AtomicWord<int> waitForCommitQuorum{0};
+    AtomicWord<int> drainSideWritesTableOnCommit{0};
+    AtomicWord<int> processConstraintsViolatonTableOnCommit{0};
+    AtomicWord<int> commit{0};
+};
+
+auto& indexBuildsSSS = *ServerStatusSectionBuilder<IndexBuildsSSS>("indexBuilds").forShard();
 
 namespace {
 
@@ -189,7 +223,7 @@ bool shouldBuildIndexesOnEmptyCollectionSinglePhased(OperationContext* opCtx,
                                                      const CollectionPtr& collection,
                                                      IndexBuildProtocol protocol) {
     const auto& nss = collection->ns();
-    invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X),
+    invariant(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(nss, MODE_X),
               str::stream() << nss.toStringForErrorMsg());
 
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
@@ -215,7 +249,10 @@ bool shouldBuildIndexesOnEmptyCollectionSinglePhased(OperationContext* opCtx,
     if (memberState.rollback()) {
         return false;
     }
-    if (inReplicationRecovery(opCtx->getServiceContext())) {
+
+    // This check happens before spawning the index build thread. So it does not race with the
+    // replication recovery flag being modified.
+    if (inReplicationRecovery(opCtx->getServiceContext()).load()) {
         return false;
     }
 
@@ -287,7 +324,7 @@ void onCommitIndexBuild(OperationContext* opCtx,
 
     invariant(IndexBuildProtocol::kTwoPhase == replState->protocol,
               str::stream() << "onCommitIndexBuild: " << buildUUID);
-    invariant(opCtx->lockState()->isWriteLocked(),
+    invariant(shard_role_details::getLocker(opCtx)->isWriteLocked(),
               str::stream() << "onCommitIndexBuild: " << buildUUID);
 
     auto opObserver = opCtx->getServiceContext()->getOpObserver();
@@ -299,7 +336,7 @@ void onCommitIndexBuild(OperationContext* opCtx,
     // check if the node is currently a primary before attempting to write to the oplog.
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     if (!replCoord->canAcceptWritesFor(opCtx, nss)) {
-        invariant(!opCtx->recoveryUnit()->getCommitTimestamp().isNull(),
+        invariant(!shard_role_details::getRecoveryUnit(opCtx)->getCommitTimestamp().isNull(),
                   str::stream() << "commitIndexBuild: " << buildUUID);
         return;
     }
@@ -318,7 +355,8 @@ void onAbortIndexBuild(OperationContext* opCtx,
         return;
     }
 
-    invariant(opCtx->lockState()->isWriteLocked(), replState.buildUUID.toString());
+    invariant(shard_role_details::getLocker(opCtx)->isWriteLocked(),
+              replState.buildUUID.toString());
 
     auto opObserver = opCtx->getServiceContext()->getOpObserver();
     auto collUUID = replState.collectionUUID;
@@ -408,7 +446,7 @@ void updateCurOpForCommitOrAbort(OperationContext* opCtx, StringData fieldName, 
  */
 repl::OpTime getLatestOplogOpTime(OperationContext* opCtx) {
     // Reset the snapshot so that it is ensured to see the latest oplog entries.
-    opCtx->recoveryUnit()->abandonSnapshot();
+    shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
 
     // Helpers::getLast will bypass the oplog visibility rules by doing a backwards collection
     // scan.
@@ -459,7 +497,7 @@ bool isIndexBuildResumable(OperationContext* opCtx,
     // startup recovery, the last optime here derived from the local oplog may not be a valid
     // optime to wait on for the majority commit point since the rest of the replica set may
     // be on a different branch of history.
-    if (inReplicationRecovery(opCtx->getServiceContext())) {
+    if (inReplicationRecovery(opCtx->getServiceContext()).load()) {
         LOGV2(5039100,
               "Index build: in replication recovery. Not waiting for last optime before "
               "interceptors to be majority committed",
@@ -496,18 +534,6 @@ bool isIndexBuildResumable(OperationContext* opCtx,
         if (CommitQuorumOptions::kVotingMembers != commitQuorum.mode) {
             return false;
         }
-    }
-
-    // Ensure that this node is a voting member in the replica set config.
-    auto hap = replCoord->getMyHostAndPort();
-    if (auto memberConfig = replCoord->findConfigMemberByHostAndPort(hap)) {
-        if (!memberConfig->isVoter()) {
-            return false;
-        }
-    } else {
-        // We cannot determine our member config, so skip the majority wait and leave this index
-        // build as non-resumable.
-        return false;
     }
 
     return true;
@@ -592,8 +618,9 @@ IndexBuildsCoordinator::makeKillIndexBuildOnLowDiskSpaceAction() {
         }
 
         void act(OperationContext* opCtx, int64_t availableBytes) noexcept final {
-            if (!feature_flags::gIndexBuildGracefulErrorHandling.isEnabled(
-                    serverGlobalParams.featureCompatibility)) {
+            if (!feature_flags::gIndexBuildGracefulErrorHandling
+                     .isEnabledUseLastLTSFCVWhenUninitialized(
+                         serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
                 LOGV2(6826200,
                       "Index build: disk space monitor detected we're low on storage space but "
                       "'featureFlagIndexBuildGracefulErrorHandling' is disabled. Ignoring it");
@@ -670,7 +697,7 @@ Status IndexBuildsCoordinator::_startIndexBuildForRecovery(OperationContext* opC
                                                            const std::vector<BSONObj>& specs,
                                                            const UUID& buildUUID,
                                                            IndexBuildProtocol protocol) {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X));
+    invariant(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(nss, MODE_X));
 
     std::vector<std::string> indexNames;
     for (auto& spec : specs) {
@@ -1105,6 +1132,14 @@ void IndexBuildsCoordinator::applyStartIndexBuild(OperationContext* opCtx,
 
     IndexBuildsCoordinator::IndexBuildOptions indexBuildOptions;
     indexBuildOptions.applicationMode = applicationMode;
+    if (repl::feature_flags::gReduceMajorityWriteLatency.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+        // When gReduceMajorityWriteLatency is enabled, the oplog can be written far ahead of oplog
+        // application. In this case, top of oplog will include this applyIndexBuild oplog itself so
+        // we will fall into deadlock if we wait the committedSnapshot to pass the top of oplog. So,
+        // we wait for the opTime of the applyIndexBuild oplog entry.
+        indexBuildOptions.startIndexBuildOpTime = oplogEntry.opTime;
+    }
 
     // If this is an initial syncing node, drop any conflicting ready index specs prior to
     // proceeding with building them.
@@ -1179,7 +1214,7 @@ void IndexBuildsCoordinator::applyCommitIndexBuild(OperationContext* opCtx,
             str::stream()
                 << "No commit timestamp set while applying commitIndexBuild operation. Build UUID: "
                 << buildUUID,
-            !opCtx->recoveryUnit()->getCommitTimestamp().isNull());
+            !shard_role_details::getRecoveryUnit(opCtx)->getCommitTimestamp().isNull());
 
     // There is a possibility that we cannot find an active index build with the given build UUID.
     // This can be the case when:
@@ -1294,7 +1329,7 @@ void IndexBuildsCoordinator::applyAbortIndexBuild(OperationContext* opCtx,
             str::stream()
                 << "No commit timestamp set while applying abortIndexBuild operation. Build UUID: "
                 << buildUUID,
-            !opCtx->recoveryUnit()->getCommitTimestamp().isNull());
+            !shard_role_details::getRecoveryUnit(opCtx)->getCommitTimestamp().isNull());
 
     std::string abortReason(str::stream()
                             << "abortIndexBuild oplog entry encountered: " << *oplogEntry.cause);
@@ -1493,7 +1528,7 @@ bool IndexBuildsCoordinator::abortIndexBuildByBuildUUID(OperationContext* opCtx,
         // to be able to abort two phase index builds during the oplog replay phase.
         if (IndexBuildProtocol::kTwoPhase == replState->protocol) {
             // The AutoGetCollection helper takes the RSTL implicitly.
-            invariant(opCtx->lockState()->isRSTLLocked());
+            invariant(shard_role_details::getLocker(opCtx)->isRSTLLocked());
 
             // Override the 'signalAction' as this is an initial syncing node.
             // Don't override it if it's a rollback abort which would be explictly requested
@@ -1568,7 +1603,7 @@ void IndexBuildsCoordinator::_completeAbort(OperationContext* opCtx,
     // OpObservers may introduce lock acquisitions (i.e. sharding state locks) and cause an
     // interruption during cleanup. For correctness, we must perform these final writes. Temporarily
     // disable interrupts.
-    UninterruptibleLockGuard noInterrupt(opCtx->lockState());  // NOLINT.
+    UninterruptibleLockGuard noInterrupt(shard_role_details::getLocker(opCtx));  // NOLINT.
 
     CollectionWriter coll(opCtx, replState->collectionUUID);
     const NamespaceStringOrUUID dbAndUUID(replState->dbName, replState->collectionUUID);
@@ -1840,7 +1875,7 @@ void IndexBuildsCoordinator::_onStepUpAsyncTaskFn(OperationContext* opCtx) {
 
                 // Some of the checks might have opened a snapshot. Abandon it before acquiring
                 // MODE_X lock during abort.
-                opCtx->recoveryUnit()->abandonSnapshot();
+                shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
 
                 // All other errors must be due to key generation. Abort the build now, instead of
                 // failing later during the commit phase retry.
@@ -2120,7 +2155,7 @@ void IndexBuildsCoordinator::createIndex(OperationContext* opCtx,
     invariant(collection,
               str::stream() << "IndexBuildsCoordinator::createIndexes: " << collectionUUID);
     auto nss = collection->ns();
-    invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X),
+    invariant(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(nss, MODE_X),
               str::stream() << "IndexBuildsCoordinator::createIndexes: " << collectionUUID);
 
     auto buildUUID = UUID::gen();
@@ -2251,11 +2286,11 @@ Status IndexBuildsCoordinator::_setUpIndexBuildForTwoPhaseRecovery(
     const UUID& buildUUID) {
     NamespaceStringOrUUID nssOrUuid{dbName, collectionUUID};
 
-    if (opCtx->recoveryUnit()->isActive()) {
+    if (shard_role_details::getRecoveryUnit(opCtx)->isActive()) {
         // This function is shared by multiple callers. Some of which have opened a transaction to
         // perform reads. This function may make mixed-mode writes. Mixed-mode assertions can only
         // be suppressed when beginning a fresh transaction.
-        opCtx->recoveryUnit()->abandonSnapshot();
+        shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
     }
     // Don't use the AutoGet helpers because they require an open database, which may not be the
     // case when an index build is restarted during recovery.
@@ -2562,7 +2597,9 @@ IndexBuildsCoordinator::PostSetupAction IndexBuildsCoordinator::_setUpIndexBuild
             // contained a write to this collection. We need to be holding the collection lock in X
             // mode so that we ensure that there are not any uncommitted transactions on this
             // collection.
-            replState->setLastOpTimeBeforeInterceptors(getLatestOplogOpTime(opCtx));
+            auto lastOpTimeBeforeInterceptors =
+                indexBuildOptions.startIndexBuildOpTime.value_or(getLatestOplogOpTime(opCtx));
+            replState->setLastOpTimeBeforeInterceptors(lastOpTimeBeforeInterceptors);
         }
     } catch (DBException& ex) {
         // It is fine to let the build continue even if we are interrupted, interrupt check before
@@ -2648,7 +2685,7 @@ void IndexBuildsCoordinator::_runIndexBuild(
     auto replState = invariant(swReplState);
 
     // Add build UUID to lock manager diagnostic output.
-    auto locker = opCtx->lockState();
+    auto locker = shard_role_details::getLocker(opCtx);
     auto oldLockerDebugInfo = locker->getDebugInfo();
     {
         str::stream ss;
@@ -2656,7 +2693,8 @@ void IndexBuildsCoordinator::_runIndexBuild(
         if (!oldLockerDebugInfo.empty()) {
             ss << "; " << oldLockerDebugInfo;
         }
-        locker->setDebugInfo(ss);
+        std::string debugStr = ss;
+        locker->setDebugInfo(std::move(debugStr));
     }
 
     auto status = [&]() {
@@ -2668,7 +2706,7 @@ void IndexBuildsCoordinator::_runIndexBuild(
         return Status::OK();
     }();
 
-    locker->setDebugInfo(oldLockerDebugInfo);
+    locker->setDebugInfo(std::move(oldLockerDebugInfo));
 
     // Ensure the index build is unregistered from the Coordinator and the Promise is set with
     // the build's result so that callers are notified of the outcome.
@@ -2804,7 +2842,7 @@ void IndexBuildsCoordinator::_cleanUpTwoPhaseAfterNonShutdownFailure(
 
             // (Ignore FCV check): This feature flag doesn't have any upgrade/downgrade concerns.
             if (feature_flags::gIndexBuildGracefulErrorHandling.isEnabled(
-                    serverGlobalParams.featureCompatibility) &&
+                    serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) &&
                 replState->canVoteForAbort()) {
                 // Always request an abort to the primary node, even if we are primary. If
                 // primary, the signal will loop back and cause an asynchronous external
@@ -2863,7 +2901,7 @@ void IndexBuildsCoordinator::_runIndexBuildInner(
 
         // Index builds can safely ignore prepare conflicts and perform writes. On secondaries,
         // prepare operations wait for index builds to complete.
-        opCtx->recoveryUnit()->setPrepareConflictBehavior(
+        shard_role_details::getRecoveryUnit(opCtx)->setPrepareConflictBehavior(
             PrepareConflictBehavior::kIgnoreConflictsAllowWrites);
 
         if (resumeInfo) {
@@ -2945,7 +2983,7 @@ void IndexBuildsCoordinator::_runIndexBuildInner(
     // to the primary node. Single-phase builds can also abort immediately, as the primary or
     // standalone is the only node aware of the build.
     if (!feature_flags::gIndexBuildGracefulErrorHandling.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
         // Index builds only check index constraints when committing. If an error occurs at that
         // point, then the build is cleaned up while still holding the appropriate locks. The only
         // errors that we cannot anticipate are user interrupts and shutdown errors.
@@ -3107,7 +3145,8 @@ void IndexBuildsCoordinator::_awaitLastOpTimeBeforeInterceptorsMajorityCommitted
     // Since we waited for all the writes before the interceptors were established to be majority
     // committed, if we read at the majority commit point for the collection scan, then none of the
     // documents put into the sorter can be rolled back.
-    opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kMajorityCommitted);
+    shard_role_details::getRecoveryUnit(opCtx)->setTimestampReadSource(
+        RecoveryUnit::ReadSource::kMajorityCommitted);
 }
 
 void IndexBuildsCoordinator::_buildIndex(OperationContext* opCtx,
@@ -3126,7 +3165,7 @@ void IndexBuildsCoordinator::_buildIndex(OperationContext* opCtx,
     // Read without a timestamp. When we commit, we block writes which guarantees all writes are
     // visible.
     invariant(RecoveryUnit::ReadSource::kNoTimestamp ==
-              opCtx->recoveryUnit()->getTimestampReadSource());
+              shard_role_details::getRecoveryUnit(opCtx)->getTimestampReadSource());
     // The collection scan might read with a kMajorityCommitted read source, but will restore
     // kNoTimestamp afterwards.
     _scanCollectionAndInsertSortedKeysIntoIndex(opCtx, replState);
@@ -3150,12 +3189,14 @@ void IndexBuildsCoordinator::_scanCollectionAndInsertSortedKeysIntoIndex(
     // impact on user operations. Other steps of the index builds such as the draining phase have
     // normal priority because index builds are required to eventually catch-up with concurrent
     // writers. Otherwise we risk never finishing the index build.
-    ScopedAdmissionPriorityForLock priority(opCtx->lockState(), AdmissionContext::Priority::kLow);
+    ScopedAdmissionPriority<ExecutionAdmissionContext> priority(opCtx,
+                                                                AdmissionContext::Priority::kLow);
     {
         indexBuildsSSS.scanCollection.addAndFetch(1);
 
         ScopeGuard scopeGuard([&] {
-            opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+            shard_role_details::getRecoveryUnit(opCtx)->setTimestampReadSource(
+                RecoveryUnit::ReadSource::kNoTimestamp);
         });
 
         // Wait for the last optime before the interceptors are established to be majority committed
@@ -3190,7 +3231,8 @@ void IndexBuildsCoordinator::_insertSortedKeysIntoIndexForResume(
     // impact on user operations. Other steps of the index builds such as the draining phase have
     // normal priority because index builds are required to eventually catch-up with concurrent
     // writers. Otherwise we risk never finishing the index build.
-    ScopedAdmissionPriorityForLock priority(opCtx->lockState(), AdmissionContext::Priority::kLow);
+    ScopedAdmissionPriority<ExecutionAdmissionContext> priority(opCtx,
+                                                                AdmissionContext::Priority::kLow);
     {
         const NamespaceStringOrUUID dbAndUUID(replState->dbName, replState->collectionUUID);
         AutoGetCollection collLock(opCtx, dbAndUUID, MODE_IX);
@@ -3453,6 +3495,10 @@ IndexBuildsCoordinator::CommitResult IndexBuildsCoordinator::_insertKeysFromSide
         throw;
     }
 
+    // At this point, the commitIndexBuild entry has already been written and replicated. For
+    // correctness, we must perform these final writes. Temporarily disable interrupts.
+    UninterruptibleLockGuard noInterrupt(shard_role_details::getLocker(opCtx));  // NOLINT.
+
     removeIndexBuildEntryAfterCommitOrAbort(opCtx, dbAndUUID, *indexBuildEntryColl, *replState);
     replState->stats.numIndexesAfter = getNumIndexesTotal(opCtx, collection.get());
     LOGV2(20663,
@@ -3471,7 +3517,8 @@ StatusWith<std::pair<long long, long long>> IndexBuildsCoordinator::_runIndexReb
     CollectionWriter& collection,
     const UUID& buildUUID,
     RepairData repair) noexcept {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_X));
+    invariant(
+        shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(collection->ns(), MODE_X));
 
     auto replState = invariant(_getIndexBuild(buildUUID));
 
@@ -3562,7 +3609,7 @@ int IndexBuildsCoordinator::getNumIndexesTotal(OperationContext* opCtx,
                                                const CollectionPtr& collection) {
     invariant(collection);
     const auto& nss = collection->ns();
-    invariant(opCtx->lockState()->isLocked(),
+    invariant(shard_role_details::getLocker(opCtx)->isLocked(),
               str::stream() << "Unable to get index count because collection was not locked"
                             << nss.toStringForErrorMsg());
 
@@ -3642,6 +3689,10 @@ std::vector<BSONObj> IndexBuildsCoordinator::prepareSpecListForCreate(
     }
 
     return resultSpecs;
+}
+
+void IndexBuildsCoordinator::_incWaitForCommitQuorum() {
+    indexBuildsSSS.waitForCommitQuorum.addAndFetch(1);
 }
 
 }  // namespace mongo

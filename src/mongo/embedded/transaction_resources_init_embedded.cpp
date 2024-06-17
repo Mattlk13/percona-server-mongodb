@@ -31,8 +31,6 @@
 #include <string>
 
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/locker.h"
-#include "mongo/db/concurrency/locker_impl.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/recovery_unit.h"
@@ -46,7 +44,7 @@ namespace {
 class TransactionResourcesEmbeddedClientObserver : public ServiceContext::ClientObserver {
 public:
     TransactionResourcesEmbeddedClientObserver() = default;
-    ~TransactionResourcesEmbeddedClientObserver() = default;
+    ~TransactionResourcesEmbeddedClientObserver() override = default;
 
     void onCreateClient(Client* client) final {}
 
@@ -57,7 +55,7 @@ public:
 
         shard_role_details::TransactionResources::attachToOpCtx(
             opCtx, std::make_unique<shard_role_details::TransactionResources>());
-        opCtx->setLockState(std::make_unique<LockerImpl>(service));
+        shard_role_details::makeLockerOnOperationContext(opCtx);
 
         // There are a few cases where we don't have a storage engine available yet when creating an
         // operation context.
@@ -69,8 +67,10 @@ public:
         //    testing purpose.
         auto storageEngine = service->getStorageEngine();
         if (storageEngine) {
-            opCtx->setRecoveryUnit(std::unique_ptr<RecoveryUnit>(storageEngine->newRecoveryUnit()),
-                                   WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+            shard_role_details::setRecoveryUnit(
+                opCtx,
+                std::unique_ptr<RecoveryUnit>(storageEngine->newRecoveryUnit()),
+                WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
         }
     }
 

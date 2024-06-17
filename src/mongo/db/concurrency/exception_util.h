@@ -37,11 +37,11 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/base/string_data.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
@@ -108,6 +108,7 @@ template <ErrorCodes::Error ec>
  * modify that document, this exception will get thrown by one of them.
  */
 [[noreturn]] inline void throwWriteConflictException(StringData context) {
+    using namespace fmt::literals;
     error_details::throwExceptionFor<ErrorCodes::WriteConflict>(
         "Caused by :: {} :: Please retry your operation or multi-document transaction."_format(
             context));
@@ -153,21 +154,24 @@ auto writeConflictRetry(OperationContext* opCtx,
                         F&& f,
                         boost::optional<size_t> retryLimit = boost::none) {
     invariant(opCtx);
-    invariant(opCtx->lockState());
-    invariant(opCtx->recoveryUnit());
+    invariant(shard_role_details::getLocker(opCtx));
+    invariant(shard_role_details::getRecoveryUnit(opCtx));
 
     // This failpoint disables exception handling for write conflicts. Only allow this exception to
     // escape user operations. Do not allow exceptions to escape internal threads, which may rely on
     // this exception handler to avoid crashing.
     bool userSkipWriteConflictRetry = MONGO_unlikely(skipWriteConflictRetries.shouldFail()) &&
         opCtx->getClient()->isFromUserConnection();
-    if (opCtx->lockState()->inAWriteUnitOfWork() || userSkipWriteConflictRetry) {
+    if (shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork() || userSkipWriteConflictRetry) {
         try {
             return f();
         } catch (ExceptionFor<ErrorCodes::TemporarilyUnavailable> const& e) {
             if (opCtx->inMultiDocumentTransaction()) {
                 convertToWCEAndRethrow(opCtx, opStr, e);
             }
+            throw;
+        } catch (ExceptionFor<ErrorCodes::WriteConflict>&) {
+            CurOp::get(opCtx)->debug().additiveMetrics.incrementWriteConflicts(1);
             throw;
         }
     }
@@ -181,7 +185,7 @@ auto writeConflictRetry(OperationContext* opCtx,
             CurOp::get(opCtx)->debug().additiveMetrics.incrementWriteConflicts(1);
             logWriteConflictAndBackoff(writeConflictAttempts, opStr, e.reason(), nssOrUUID);
             ++writeConflictAttempts;
-            opCtx->recoveryUnit()->abandonSnapshot();
+            shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
             if (MONGO_unlikely(retryLimit && writeConflictAttempts > *retryLimit)) {
                 LOGV2_ERROR(7677402,
                             "Got too many write conflicts, the server may run into problems.");

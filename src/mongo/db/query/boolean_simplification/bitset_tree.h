@@ -49,7 +49,12 @@ namespace mongo::boolean_simplification {
 struct BitsetTreeNode {
     enum Type { Or, And };
 
-    BitsetTreeNode(Type type, bool isNegated) : type(type), isNegated(isNegated), leafChildren() {}
+    BitsetTreeNode(Type type, bool isNegated) : type(type), isNegated(isNegated), leafChildren(0) {}
+
+    /**
+     * Resize leafChildren to be the same size.
+     */
+    void ensureBitsetSize(size_t size);
 
     /**
      * Represents whether the node is conjunction (AND) or disjunction(OR) of its children.
@@ -83,6 +88,16 @@ struct BitsetTreeNode {
         }
         return result;
     }
+
+    /**
+     * Apply De Morgan's Law: recursively push down the tree this node's negation.
+     */
+    void applyDeMorgan() {
+        applyDeMorganImpl(false);
+    }
+
+private:
+    void applyDeMorganImpl(bool isParentNegated);
 };
 
 std::ostream& operator<<(std::ostream& os, const BitsetTreeNode& tree);

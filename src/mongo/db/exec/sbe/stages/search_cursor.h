@@ -40,7 +40,7 @@
 #include "mongo/db/exec/sbe/stages/stages.h"
 #include "mongo/db/exec/sbe/util/debug_print.h"
 #include "mongo/db/exec/sbe/values/slot.h"
-#include "mongo/db/pipeline/search_helper.h"
+#include "mongo/db/pipeline/search/search_helper.h"
 #include "mongo/db/query/stage_types.h"
 #include "mongo/executor/task_executor_cursor.h"
 
@@ -52,13 +52,72 @@ namespace mongo::sbe {
  *
  * Debug string representation:
  *
- * search_cursor_stage resultSlot? [metaSlot1, ..., metadataSlotN] [fieldSlot1, ..., fieldSlotN]
- *     remoteCursorId isStoredSource sortSpecSlot? limitSlot? sortKeySlot? collatorSlot?
+ * search_cursor_stage idSlot? resultSlot? [metaSlot1, ..., metadataSlotN] [fieldSlot1, ...,
+ * fieldSlotN] remoteCursorId isStoredSource sortSpecSlot? limitSlot? sortKeySlot? collatorSlot?
  */
 class SearchCursorStage final : public PlanStage {
 public:
+    static std::unique_ptr<SearchCursorStage> createForStoredSource(
+        NamespaceString nss,
+        boost::optional<UUID> collUuid,
+        boost::optional<value::SlotId> resultSlot,
+        std::vector<std::string> metadataNames,
+        value::SlotVector metadataSlots,
+        std::vector<std::string> fieldNames,
+        value::SlotVector fieldSlots,
+        size_t remoteCursorId,
+        boost::optional<value::SlotId> sortSpecSlot,
+        boost::optional<value::SlotId> limitSlot,
+        boost::optional<value::SlotId> sortKeySlot,
+        boost::optional<value::SlotId> collatorSlot,
+        PlanYieldPolicy* yieldPolicy,
+        PlanNodeId planNodeId);
+
+    static std::unique_ptr<SearchCursorStage> createForNonStoredSource(
+        NamespaceString nss,
+        boost::optional<UUID> collUuid,
+        boost::optional<value::SlotId> idSlot,
+        std::vector<std::string> metadataNames,
+        value::SlotVector metadataSlots,
+        size_t remoteCursorId,
+        boost::optional<value::SlotId> sortSpecSlot,
+        boost::optional<value::SlotId> limitSlot,
+        boost::optional<value::SlotId> sortKeySlot,
+        boost::optional<value::SlotId> collatorSlot,
+        PlanYieldPolicy* yieldPolicy,
+        PlanNodeId planNodeId);
+
+    static std::unique_ptr<SearchCursorStage> createForMetadata(
+        NamespaceString nss,
+        boost::optional<UUID> collUuid,
+        boost::optional<value::SlotId> resultSlot,
+        size_t remoteCursorId,
+        PlanYieldPolicy* yieldPolicy,
+        PlanNodeId planNodeId);
+
+    std::unique_ptr<PlanStage> clone() const final;
+
+    void prepare(CompileCtx& ctx) final;
+    value::SlotAccessor* getAccessor(CompileCtx& ctx, value::SlotId slot) final;
+    void open(bool reOpen) final;
+    PlanState getNext() final;
+    void close() final;
+
+    std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const final;
+    const SpecificStats* getSpecificStats() const final;
+    std::vector<DebugPrinter::Block> debugPrint() const final;
+    size_t estimateCompileTimeSize() const final;
+
+    /**
+     * Calculate the number of documents needed to satisfy a user-defined limit. This information
+     * can be used in a getMore sent to mongot.
+     */
+    boost::optional<long long> calcDocsNeeded();
+
+private:
     SearchCursorStage(NamespaceString nss,
                       boost::optional<UUID> collUuid,
+                      boost::optional<value::SlotId> idSlot,
                       boost::optional<value::SlotId> resultSlot,
                       std::vector<std::string> metadataNames,
                       value::SlotVector metadataSlots,
@@ -73,36 +132,13 @@ public:
                       PlanYieldPolicy* yieldPolicy,
                       PlanNodeId planNodeId);
 
-    std::unique_ptr<PlanStage> clone() const final;
-
-    void prepare(CompileCtx& ctx) final;
-    value::SlotAccessor* getAccessor(CompileCtx& ctx, value::SlotId slot) final;
-    void open(bool reOpen) final;
-    PlanState getNext() final;
-    void close() final;
-
-    std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const final;
-    const SpecificStats* getSpecificStats() const final;
-    std::vector<DebugPrinter::Block> debugPrint() const final override;
-    size_t estimateCompileTimeSize() const final;
-
-    /**
-     * Calculate the number of documents needed to satisfy a user-defined limit. This information
-     * can be used in a getMore sent to mongot.
-     */
-    boost::optional<long long> calcDocsNeeded();
-
-    void setDocsReturnedStats(const CommonStats* docsReturnedStats) {
-        _docsReturnedStats = docsReturnedStats;
-    }
-
-private:
+    PlanState doGetNext();
     bool shouldReturnEOF();
 
-private:
     const NamespaceString _namespace;
     const boost::optional<UUID> _collUuid;
     // Output slots.
+    const boost::optional<value::SlotId> _idSlot;
     const boost::optional<value::SlotId> _resultSlot;
     const StringListSet _metadataNames;
     const value::SlotVector _metadataSlots;
@@ -120,6 +156,7 @@ private:
     const boost::optional<value::SlotId> _collatorSlot;
 
     // Output slot accessors.
+    value::OwnedValueAccessor _idAccessor;
     value::OwnedValueAccessor _resultAccessor;
     absl::InlinedVector<value::OwnedValueAccessor, 3> _metadataAccessors;
     value::SlotAccessorMap _metadataAccessorsMap;
@@ -141,11 +178,6 @@ private:
     boost::optional<SortKeyGenerator> _sortKeyGen;
     executor::TaskExecutorCursor* _cursor{nullptr};
     SearchStats _specificStats;
-    // A CommonStats that tracks how many documents is returned for $search, in the stored source
-    // case, _docsReturnedStats ptr points to current stage, otherwise it points to another stage to
-    // skip the docs that been filtered out.
-    // TODO: SERVER-80648 to have a better way to track count of idx scan stage.
-    const CommonStats* _docsReturnedStats;
     // Store the cursorId for logging purpose. We need to store it because the id on the
     // TaskExecutorCursor will be set to zero after the final getMore after the cursor is exhausted.
     boost::optional<CursorId> _cursorId;

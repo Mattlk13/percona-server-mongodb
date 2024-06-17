@@ -166,7 +166,6 @@ static std::pair<TypeTags, Value> deserializeValue(BufReader& buf,
             auto cnt = buf.read<LittleEndian<size_t>>();
             auto arr = getArrayMultiSetView(arrVal);
             if (cnt) {
-                arr->reserve(cnt);
                 for (size_t idx = 0; idx < cnt; ++idx) {
                     auto [tag, val] = deserializeValue(buf, collator);
                     arr->push_back(tag, val);
@@ -190,6 +189,20 @@ static std::pair<TypeTags, Value> deserializeValue(BufReader& buf,
             }
             tag = objTag;
             val = objVal;
+            break;
+        }
+        case TypeTags::MultiMap: {
+            auto collated = buf.read<char>();
+            auto [multiMapTag, multiMapVal] = makeNewMultiMap(collated ? collator : nullptr);
+            auto cnt = buf.read<LittleEndian<size_t>>();
+            auto multiMap = getMultiMapView(multiMapVal);
+            for (size_t idx = 0; idx < cnt; ++idx) {
+                auto key = deserializeValue(buf, collator);
+                auto value = deserializeValue(buf, collator);
+                multiMap->insert(key, value);
+            }
+            tag = multiMapTag;
+            val = multiMapVal;
             break;
         }
         case TypeTags::bsonObjectId:
@@ -351,6 +364,16 @@ static void serializeValue(BufBuilder& buf, TypeTags tag, Value val) {
             }
             break;
         }
+        case TypeTags::MultiMap: {
+            auto multiMap = getMultiMapView(val);
+            buf.appendChar(multiMap->getCollator() ? 1 : 0);
+            buf.appendNum(multiMap->size());
+            for (auto& [key, value] : multiMap->values()) {
+                serializeValue(buf, key.first, key.second);
+                serializeValue(buf, value.first, value.second);
+            }
+            break;
+        }
         case TypeTags::ObjectId: {
             auto objId = getObjectIdView(val);
             buf.appendStruct(*objId);
@@ -418,10 +441,22 @@ static void serializeValue(BufBuilder& buf, TypeTags tag, Value val) {
     }
 }
 
+/**
+ * If non-null 'collator' is provided during serialization, then the encoding guarantees that values
+ * which are equal up to the collation will encode to the same result, allowing for collation-aware
+ * equality comparisons. However, the collator-aware encoded values are not always decodable. Groups
+ * store an original copy of the group key alongside the encoded key string when there is a
+ * collation, so the key string does not need to be decodable.
+ */
 static void serializeValueIntoKeyString(key_string::Builder& buf,
                                         TypeTags tag,
                                         Value val,
                                         const CollatorInterface* collator) {
+
+    const auto stringTransformFn = [&](StringData stringData) {
+        return collator->getComparisonString(stringData);
+    };
+
     switch (tag) {
         case TypeTags::Nothing: {
             buf.appendBool(false);
@@ -484,27 +519,21 @@ static void serializeValueIntoKeyString(key_string::Builder& buf,
             buf.appendUndefined();
             break;
         }
-        case TypeTags::StringSmall: {
-            // Small strings cannot contain null bytes, so it is safe to serialize them as plain
-            // C-strings with a null terminator.
+        case TypeTags::StringSmall:
+        case TypeTags::StringBig:
+        case TypeTags::bsonString: {
             buf.appendBool(true);
             if (collator) {
-                buf.appendString(collator->getComparisonString(getStringView(tag, val)));
+                buf.appendString(getStringView(tag, val), stringTransformFn);
             } else {
                 buf.appendString(getStringView(tag, val));
             }
             break;
         }
-        case TypeTags::StringBig:
-        case TypeTags::bsonString: {
-            buf.appendBool(true);
-            if (collator) {
-                buf.appendString(collator->getComparisonString(getStringOrSymbolView(tag, val)));
-            } else {
-                buf.appendString(getStringOrSymbolView(tag, val));
-            }
-            break;
-        }
+        // Note that the collation would have to apply to bsonSymbol values to match the
+        // behavior of the Classic engine when spilling groups to disk. bsonSymbol is
+        // deprecated, however, and SBE no longer provides strict correctness guarantees about
+        // computations on bsonSymbol values.
         case TypeTags::bsonSymbol: {
             buf.appendBool(true);
             buf.appendSymbol(getStringOrSymbolView(tag, val));
@@ -518,7 +547,11 @@ static void serializeValueIntoKeyString(key_string::Builder& buf,
             BSONArrayBuilder builder;
             bson::convertToBsonArr(builder, value::ArrayEnumerator{tag, val});
             buf.appendBool(true);
-            buf.appendArray(BSONArray(builder.done()));
+            if (collator) {
+                buf.appendArray(builder.arr(), stringTransformFn);
+            } else {
+                buf.appendArray(builder.arr());
+            }
             break;
         }
         case TypeTags::Object: {
@@ -527,7 +560,11 @@ static void serializeValueIntoKeyString(key_string::Builder& buf,
             BSONObjBuilder builder;
             bson::convertToBsonObj(builder, getObjectView(val));
             buf.appendBool(true);
-            buf.appendObject(builder.done());
+            if (collator) {
+                buf.appendObject(builder.done(), stringTransformFn);
+            } else {
+                buf.appendObject(builder.done());
+            }
             break;
         }
         case TypeTags::ObjectId: {
@@ -536,13 +573,23 @@ static void serializeValueIntoKeyString(key_string::Builder& buf,
             break;
         }
         case TypeTags::bsonObject: {
+            BSONObj bson{getRawPointerView(val)};
             buf.appendBool(true);
-            buf.appendObject(BSONObj(getRawPointerView(val)));
+            if (collator) {
+                buf.appendObject(bson, stringTransformFn);
+            } else {
+                buf.appendObject(bson);
+            }
             break;
         }
         case TypeTags::bsonArray: {
+            BSONObj bson{getRawPointerView(val)};
             buf.appendBool(true);
-            buf.appendArray(BSONArray(BSONObj(getRawPointerView(val))));
+            if (collator) {
+                buf.appendArray(BSONArray(BSONObj(bson)), stringTransformFn);
+            } else {
+                buf.appendArray(BSONArray(BSONObj(bson)));
+            }
             break;
         }
         case TypeTags::bsonObjectId: {
@@ -739,6 +786,15 @@ int getApproximateSize(TypeTags tag, Value val) {
                 result += obj->field(idx).size();
                 auto [tag, val] = obj->getAt(idx);
                 result += getApproximateSize(tag, val);
+            }
+            break;
+        }
+        case TypeTags::MultiMap: {
+            auto multiMap = getMultiMapView(val);
+            result += sizeof(*multiMap);
+            for (auto& [key, value] : multiMap->values()) {
+                result += getApproximateSize(key.first, key.second);
+                result += getApproximateSize(value.first, value.second);
             }
             break;
         }

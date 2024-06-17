@@ -10,7 +10,6 @@ env.Library(
         'connection_pool_stats.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/util/net/network',
     ],
     LIBDEPS_PRIVATE=[
@@ -21,7 +20,9 @@ env.Library(
 
 env.Library(
     target='async_timer_mock',
-    source=['async_timer_mock.cpp'],
+    source=[
+        'async_timer_mock.cpp',
+    ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/base/system_error',
@@ -39,6 +40,10 @@ env.Library(
         '$BUILD_DIR/mongo/rpc/metadata',
         '$BUILD_DIR/mongo/s/mongos_server_parameters',
         '$BUILD_DIR/mongo/util/net/network',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/auth/security_token_auth',
+        '$BUILD_DIR/mongo/util/fail_point',
     ],
 )
 
@@ -85,6 +90,9 @@ env.Library(
     LIBDEPS=[
         'task_executor_interface',
     ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/util/fail_point',
+    ],
 )
 
 env.Library(
@@ -113,7 +121,6 @@ env.Library(
         'connection_pool.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/util/net/network',
         'connection_pool_stats',
         'remote_command',
@@ -121,6 +128,7 @@ env.Library(
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/server_base',
         '$BUILD_DIR/mongo/db/server_feature_flags',
+        '$BUILD_DIR/mongo/util/fail_point',
         'egress_connection_closer_manager',
     ],
 )
@@ -282,13 +290,17 @@ env.Library(
 )
 
 env.Library(
-    target='hedge_options_util', source=[
+    target='hedge_options_util',
+    source=[
         'hedge_options_util.cpp',
-    ], LIBDEPS=[
+    ],
+    LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/client/read_preference',
         '$BUILD_DIR/mongo/s/mongos_server_parameters',
-    ])
+        '$BUILD_DIR/mongo/util/fail_point',
+    ],
+)
 
 env.Library(
     target='async_rpc',
@@ -326,9 +338,11 @@ env.Library(
         'task_executor_pool_parameters.idl',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/db/server_base',
         '$BUILD_DIR/mongo/util/processinfo',
         'task_executor_interface',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/server_base',
     ],
 )
 
@@ -419,9 +433,10 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/repl/task_executor_mock',
         '$BUILD_DIR/mongo/db/service_context_non_d',
         '$BUILD_DIR/mongo/db/service_context_test_fixture',
+        '$BUILD_DIR/mongo/db/shard_role_api',
+        '$BUILD_DIR/mongo/db/vector_clock',
         '$BUILD_DIR/mongo/s/mongos_server_parameters',
-        '$BUILD_DIR/mongo/s/sharding_router_test_fixture',
-        '$BUILD_DIR/mongo/s/vector_clock_mongos',
+        '$BUILD_DIR/mongo/s/sharding_mongos_test_fixture',
         '$BUILD_DIR/mongo/transport/message_compressor',
         '$BUILD_DIR/mongo/util/clock_source_mock',
         'async_rpc',

@@ -56,7 +56,6 @@
 #include "mongo/db/change_streams_cluster_parameter_gen.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/drop_gen.h"
 #include "mongo/db/exec/batched_delete_stage.h"
@@ -85,6 +84,7 @@
 #include "mongo/db/storage/record_data.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -449,7 +449,7 @@ ChangeStreamChangeCollectionManager::ChangeCollectionsWriter::ChangeCollectionsW
     ConcurrentSharedValuesMap<UUID, ChangeCollectionTruncateMarkers, UUID::Hash>* tenantMarkerMap) {
     // This method must be called within a 'WriteUnitOfWork'. The caller must be responsible for
     // commiting the unit of work.
-    invariant(opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
     _writer = std::make_unique<ChangeCollectionsWriterInternal>(
         opCtx, opDebug, AutoGetChangeCollection::AccessMode::kWrite, tenantMarkerMap);
@@ -583,7 +583,7 @@ void ChangeStreamChangeCollectionManager::insertDocumentsToChangeCollection(
 
     // This method must be called within a 'WriteUnitOfWork'. The caller must be responsible for
     // commiting the unit of work.
-    invariant(opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
     ChangeCollectionsWriterInternal changeCollectionsWriter{
         opCtx,
@@ -731,7 +731,7 @@ std::shared_ptr<ChangeCollectionTruncateMarkers> initialiseTruncateMarkers(
     BSONObj doc;
     if (backScan->getNext(&doc, &rId) == PlanExecutor::ADVANCED) {
         auto wallTime = doc[repl::OplogEntry::kWallClockTimeFieldName].Date();
-        truncateMarkers->performPostInitialisation(opCtx, rId, wallTime);
+        truncateMarkers->performPostInitialisation(rId, wallTime);
     }
 
     return truncateMarkers;
@@ -815,7 +815,7 @@ void ChangeStreamChangeCollectionManager::_removeExpiredMarkers(
         }
 
         writeConflictRetry(opCtx, "truncate change collection", dbAndUUID, [&] {
-            opCtx->recoveryUnit()->allowOneUntimestampedWrite();
+            shard_role_details::getRecoveryUnit(opCtx)->allowOneUntimestampedWrite();
             auto changeCollection = acquireChangeCollectionForWrite(opCtx, dbAndUUID);
             WriteUnitOfWork wuow(opCtx);
 

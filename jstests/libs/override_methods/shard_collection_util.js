@@ -15,6 +15,8 @@ export const denylistedNamespaces = [
     /^admin\./,
     /^config\./,
     /\.system\./,
+    // TODO SERVER-84406 create a new list for the case unsplittable collection. The
+    // below nss should now be allowed in case of unsplittable.
     /enxcol_\..*\.esc/,
     /enxcol_\..*\.ecc/,
     /enxcol_\..*\.ecoc/,
@@ -61,8 +63,9 @@ export var ShardingOverrideCommon = (function() {
      * @returns nothing
      */
     function shardCollectionWithSpec({db, collName, shardKey, timeseriesSpec}) {
-        // Don't attempt to shard if this operation is running on mongoD.
-        if (!FixtureHelpers.isMongos(db)) {
+        // Only attempt to shard if this operation is running on a mongos or a mongod with replica
+        // set endpoint enabled.
+        if (!FixtureHelpers.isMongos(db) && !TestData.testingReplicaSetEndpoint) {
             return;
         }
 
@@ -133,8 +136,21 @@ export var ShardingOverrideCommon = (function() {
         }
     }
 
+    function createUnsplittableCollection({db, collName, opts}) {
+        // Expected to be called only on sharded clusters
+        assert(FixtureHelpers.isMongos(db));
+
+        const options = opts || {};
+
+        let createCmd = {createUnsplittableCollection: collName};
+        Object.extend(createCmd, options);
+
+        return db.runCommand(createCmd);
+    }
+
     return {
         shardCollection: shardCollection,
         shardCollectionWithSpec: shardCollectionWithSpec,
+        createUnsplittableCollection: createUnsplittableCollection,
     };
 })();

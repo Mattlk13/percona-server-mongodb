@@ -45,8 +45,8 @@
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/find_command.h"
 #include "mongo/db/query/projection.h"
-#include "mongo/db/query/query_decorations.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/query/query_knob_configuration.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/string_map.h"
 
@@ -65,20 +65,6 @@ bool sortPatternHasPartsWithCommonPrefix(const SortPattern& sortPattern) {
         }
     }
     return false;
-}
-
-bool isIdHackEligibleQuery(const CollectionPtr& collection,
-                           const FindCommandRequest& findCommand,
-                           const CollatorInterface* queryCollator) {
-    return isIdHackEligibleQueryWithoutCollator(findCommand) &&
-        CollatorInterface::collatorsMatch(queryCollator, collection->getDefaultCollator());
-}
-
-bool isIdHackEligibleQueryWithoutCollator(const FindCommandRequest& findCommand) {
-    return !findCommand.getShowRecordId() && findCommand.getHint().isEmpty() &&
-        findCommand.getMin().isEmpty() && findCommand.getMax().isEmpty() &&
-        !findCommand.getSkip() && CanonicalQuery::isSimpleIdQuery(findCommand.getFilter()) &&
-        !findCommand.getTailable();
 }
 
 bool isSortSbeCompatible(const SortPattern& sortPattern) {
@@ -110,9 +96,9 @@ bool isQuerySbeCompatible(const CollectionPtr* collection, const CanonicalQuery*
 
     const auto& nss = cq->nss();
 
-    auto& queryKnob = QueryKnobConfiguration::decoration(cq->getExpCtxRaw()->opCtx);
+    auto& queryKnob = cq->getExpCtx()->getQueryKnobConfiguration();
     if ((!feature_flags::gFeatureFlagTimeSeriesInSbe.isEnabled(
-             serverGlobalParams.featureCompatibility) ||
+             serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) ||
          queryKnob.getSbeDisableTimeSeriesForOp()) &&
         nss.isTimeseriesBucketsCollection()) {
         return false;

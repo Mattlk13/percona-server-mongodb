@@ -10,7 +10,7 @@ import pymongo.errors
 
 import buildscripts.resmokelib.utils.filesystem as fs
 from buildscripts.resmokelib import errors
-from buildscripts.resmokelib.testing.fixtures import interface as fixture_interface, talk_directly_to_shardsvrs
+from buildscripts.resmokelib.testing.fixtures import interface as fixture_interface
 from buildscripts.resmokelib.testing.fixtures import replicaset
 from buildscripts.resmokelib.testing.fixtures import shardedcluster
 from buildscripts.resmokelib.testing.fixtures import tenant_migration
@@ -136,7 +136,7 @@ class ContinuousStepdown(interface.Hook):
         elif isinstance(fixture, shardedcluster.ShardedClusterFixture):
             if self._shard_stepdown:
                 for shard_fixture in fixture.shards:
-                    if shard_fixture.config_shard is None or self._config_stepdown:
+                    if fixture.config_shard is None or self._config_stepdown:
                         self._add_fixture(shard_fixture)
             if self._config_stepdown and fixture.config_shard is None:
                 self._add_fixture(fixture.configsvr)
@@ -154,13 +154,6 @@ class ContinuousStepdown(interface.Hook):
             # Recursively call _add_fixture on all the independent clusters.
             for cluster_fixture in fixture.get_independent_clusters():
                 self._add_fixture(cluster_fixture)
-        elif isinstance(fixture, talk_directly_to_shardsvrs.TalkDirectlyToShardsvrsFixture):
-            if not fixture.all_nodes_electable:
-                raise ValueError(
-                    "The replica sets that are the target of the ContinuousStepdown hook must have"
-                    " the 'all_nodes_electable' option set.")
-            for rs_fixture in fixture.get_replsets():
-                self._rs_fixtures.append(rs_fixture)
 
 
 def is_shard_split(fixture):
@@ -321,6 +314,8 @@ class _StepdownThread(threading.Thread):
 
         secondaries = rs_fixture.get_secondaries()
 
+        self.logger.info("Stepping down primary on port %d of replica set '%s'", old_primary.port,
+                         rs_fixture.replset_name)
         if self._terminate:
             if not rs_fixture.stop_primary(old_primary, self._background_reconfig, self._kill):
                 return
@@ -333,7 +328,13 @@ class _StepdownThread(threading.Thread):
             def step_up_secondary():
                 while secondaries:
                     chosen = random.choice(secondaries)
+                    self.logger.info(
+                        "Chose secondary on port %d of replica set '%s' for step up attempt.",
+                        chosen.port, rs_fixture.replset_name)
                     if not rs_fixture.stepup_node(chosen, self._auth_options):
+                        self.logger.info(
+                            "Attempt to step up secondary on port %d of replica set '%s' failed.",
+                            chosen.port, rs_fixture.replset_name)
                         secondaries.remove(chosen)
                     else:
                         return chosen

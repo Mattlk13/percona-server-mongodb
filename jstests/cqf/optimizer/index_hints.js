@@ -2,6 +2,7 @@ import {
     assertValueOnPlanPath,
     checkCascadesOptimizerEnabled,
     removeUUIDsFromExplain,
+    runWithFastPathsDisabled,
     runWithParams,
 } from "jstests/libs/optimizer_utils.js";
 
@@ -19,14 +20,32 @@ assert.commandWorked(t.insert({_id: 2, b: 2, a: [2]}));
 assert.commandWorked(t.insert({_id: 3, b: 3, a: 2}));
 assert.commandWorked(t.insert({_id: 4, b: 4, a: [1, 3]}));
 
+runWithFastPathsDisabled(() => {
+    // Empty hint is ignored when there are no relevant indexes.
+    let res = t.explain("executionStats").find({a: 2}).hint({}).finish();
+    assertValueOnPlanPath("PhysicalScan", res, "child.child.nodeType");
+
+    res = t.explain("executionStats").aggregate([{$match: {a: 2}}], {hint: {}});
+    assertValueOnPlanPath("PhysicalScan", res, "child.child.nodeType");
+});
+
 assert.commandWorked(t.createIndex({a: 1}));
 assert.commandWorked(t.createIndex({b: 1}));
 
 // There are too few documents, and an index is not preferable.
-{
+runWithFastPathsDisabled(() => {
     let res = t.explain("executionStats").find({a: 2}).finish();
     assertValueOnPlanPath("PhysicalScan", res, "child.child.nodeType");
-}
+});
+
+runWithFastPathsDisabled(() => {
+    // Empty hint is ignored when there are relevant indexes that are not preferable.
+    let res = t.explain("executionStats").find({a: 2}).hint({}).finish();
+    assertValueOnPlanPath("PhysicalScan", res, "child.child.nodeType");
+
+    res = t.explain("executionStats").aggregate([{$match: {a: 2}}], {hint: {}});
+    assertValueOnPlanPath("PhysicalScan", res, "child.child.nodeType");
+});
 
 {
     let res = t.explain("executionStats").find({a: 2}).hint({a: 1}).finish();
@@ -59,10 +78,19 @@ for (let i = 0; i < 100; i++) {
     assert.commandWorked(t.insert({b: i + 5, a: i + 10}));
 }
 
-{
+runWithFastPathsDisabled(() => {
     let res = t.explain("executionStats").find({a: 2}).finish();
     assertValueOnPlanPath("IndexScan", res, "child.leftChild.nodeType");
-}
+});
+
+runWithFastPathsDisabled(() => {
+    // Empty hint is ignored when there are relevant indexes that are preferable.
+    let res = t.explain("executionStats").find({a: 2}).hint({}).finish();
+    assertValueOnPlanPath("IndexScan", res, "child.leftChild.nodeType");
+
+    res = t.explain("executionStats").aggregate([{$match: {a: 2}}], {hint: {}});
+    assertValueOnPlanPath("IndexScan", res, "child.leftChild.nodeType");
+});
 
 {
     let res = t.explain("executionStats").find({a: 2}).hint({a: 1}).finish();
@@ -105,8 +133,10 @@ Filter []
 |   |   Variable [evalTemp_0]
 |   PathTraverse [1]
 |   PathCompare [Eq]
-|   Const [2]
-PhysicalScan [{'<root>': scan_0, 'a': evalTemp_0}, cqf_index_hints_]
+|   FunctionCall [getParam]
+|   |   Const [3]
+|   Const [0]
+PhysicalScan [{'<root>': scan_0, 'a': evalTemp_0}, cqf_index_hints_, Reverse]
 `;
 
     const actualStr = removeUUIDsFromExplain(db, res);
@@ -129,8 +159,10 @@ Filter []
 |   EvalFilter []
 |   |   Variable [evalTemp_0]
 |   PathCompare [Eq]
-|   Const [2]
-PhysicalScan [{'<root>': scan_0, 'b': evalTemp_0}, cqf_index_hints_]
+|   FunctionCall [getParam]
+|   |   Const [3]
+|   Const [0]
+PhysicalScan [{'<root>': scan_0, 'b': evalTemp_0}, cqf_index_hints_, Reverse]
 `;
 
     const actualStr = removeUUIDsFromExplain(db, res);
@@ -153,11 +185,11 @@ NestedLoopJoin [joinType: Inner, {rid_1}]
 |   |   Const [true]
 |   Filter []
 |   |   EvalFilter []
-|   |   |   Variable [evalTemp_4]
+|   |   |   Variable [evalTemp_6]
 |   |   PathCompare [Eq]
 |   |   Const [2]
 |   LimitSkip [limit: 1, skip: 0]
-|   Seek [ridProjection: rid_1, {'<root>': scan_0, 'b': evalTemp_4}, cqf_index_hints_]
+|   Seek [ridProjection: rid_1, {'<root>': scan_0, 'b': evalTemp_6}, cqf_index_hints_]
 Unique [{rid_1}]
 IndexScan [{'<rid>': rid_1}, scanDefName: cqf_index_hints_, indexDefName: a_1, interval: {(Const [0], Const [""])}]
 `;
@@ -187,8 +219,10 @@ Filter []
 |   |   Variable [evalTemp_0]
 |   PathTraverse [1]
 |   PathCompare [Eq]
-|   Const [2]
-PhysicalScan [{'<root>': scan_0, 'b': evalTemp_0}, cqf_index_hints_]
+|   FunctionCall [getParam]
+|   |   Const [3]
+|   Const [0]
+PhysicalScan [{'<root>': scan_0, 'b': evalTemp_0}, cqf_index_hints_, Reverse]
 `;
 
     const actualStr = removeUUIDsFromExplain(db, res);

@@ -159,6 +159,7 @@ TEST_F(PlanSizeTest, HashAgg) {
                                      generateSlotId(),
                                      false,
                                      makeSlotExprPairVec(),
+                                     nullptr /* yieldPolicy */,
                                      kEmptyPlanNodeId);
     assertPlanSize(*stage);
 }
@@ -171,6 +172,7 @@ TEST_F(PlanSizeTest, HashJoin) {
                                       mockSV(),
                                       makeSV(),
                                       generateSlotId(),
+                                      nullptr /* yieldPolicy */,
                                       kEmptyPlanNodeId);
     assertPlanSize(*stage);
 }
@@ -215,7 +217,10 @@ TEST_F(PlanSizeTest, GenericIndexScanStage) {
 }
 
 TEST_F(PlanSizeTest, LimitSkip) {
-    auto stage = makeS<LimitSkipStage>(mockS(), 200, 300, kEmptyPlanNodeId);
+    auto stage = makeS<LimitSkipStage>(mockS(),
+                                       makeE<EConstant>(value::TypeTags::NumberInt64, 200),
+                                       makeE<EConstant>(value::TypeTags::NumberInt64, 300),
+                                       kEmptyPlanNodeId);
     assertPlanSize(*stage);
 }
 
@@ -286,9 +291,10 @@ TEST_F(PlanSizeTest, Sort) {
                          mockSV(),
                          std::vector<value::SortDirection>{value::SortDirection::Ascending},
                          mockSV(),
-                         std::numeric_limits<std::size_t>::max(),
+                         nullptr /*limit*/,
                          204857600,
                          false,
+                         nullptr /* yieldPolicy */,
                          kEmptyPlanNodeId);
     assertPlanSize(*stage);
 }
@@ -317,12 +323,14 @@ TEST_F(PlanSizeTest, SortedMerge) {
 }
 
 TEST_F(PlanSizeTest, SpoolLazyProducer) {
-    auto stage = makeS<SpoolLazyProducerStage>(mockS(), 1, mockSV(), nullptr, kEmptyPlanNodeId);
+    auto stage = makeS<SpoolLazyProducerStage>(
+        mockS(), 1, mockSV(), nullptr /* yieldPolicy */, kEmptyPlanNodeId);
     assertPlanSize(*stage);
 }
 
 TEST_F(PlanSizeTest, SpoolConsumer) {
-    auto stage = makeS<SpoolConsumerStage<true>>(1, mockSV(), kEmptyPlanNodeId);
+    auto stage =
+        makeS<SpoolConsumerStage<true>>(1, mockSV(), nullptr /* yieldPolicy */, kEmptyPlanNodeId);
     assertPlanSize(*stage);
 }
 

@@ -60,9 +60,6 @@ namespace mongo {
 
 using std::string;
 
-WiredTigerServerStatusSection::WiredTigerServerStatusSection(const std::string& sectionName)
-    : ServerStatusSection(sectionName) {}
-
 bool WiredTigerServerStatusSection::includeByDefault() const {
     return true;
 }
@@ -82,6 +79,15 @@ BSONObj WiredTigerServerStatusSection::generateSection(OperationContext* opCtx,
                         }());
     if (!lk.isLocked()) {
         LOGV2_DEBUG(3088800, 2, "Failed to retrieve wiredTiger statistics");
+        return BSONObj();
+    }
+
+    WiredTigerKVEngine* engine = checked_cast<WiredTigerKVEngine*>(
+        opCtx->getServiceContext()->getStorageEngine()->getEngine());
+
+    boost::optional<SectionActivityPermit> permit = engine->tryGetSectionActivityPermit();
+    if (!permit) {
+        LOGV2_DEBUG(7003148, 2, "WiredTiger is not Ready to collect statistics.");
         return BSONObj();
     }
 
@@ -107,10 +113,6 @@ BSONObj WiredTigerServerStatusSection::generateSection(OperationContext* opCtx,
         bob.append("reason", status.reason());
     }
 
-    WiredTigerKVEngine::appendGlobalStats(opCtx, bob);
-
-    WiredTigerKVEngine* engine = checked_cast<WiredTigerKVEngine*>(
-        opCtx->getServiceContext()->getStorageEngine()->getEngine());
     WiredTigerUtil::appendSnapshotWindowSettings(engine, session, &bob);
 
     {

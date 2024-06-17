@@ -36,6 +36,7 @@
 #include "mongo/transport/asio/asio_session.h"
 #include "mongo/transport/asio/asio_session_impl.h"
 #include "mongo/transport/asio/asio_transport_layer.h"
+#include "mongo/transport/grpc/client_cache.h"
 #include "mongo/transport/grpc/grpc_session.h"
 #include "mongo/transport/grpc/grpc_session_manager.h"
 #include "mongo/transport/grpc/grpc_transport_layer_impl.h"
@@ -91,11 +92,12 @@ public:
             std::make_unique<TransportLayerManagerImpl>(std::move(layers), _asioTL));
         uassertStatusOK(getServiceContext()->getTransportLayerManager()->setup());
         uassertStatusOK(getServiceContext()->getTransportLayerManager()->start());
+
+        _asioListenAddress = HostAndPort("127.0.0.1", _asioTL->listenerPort());
     }
 
     void tearDown() override {
         getServiceContext()->getTransportLayerManager()->shutdown();
-        sslGlobalParams.sslMode.store(SSLParams::SSLModes::SSLMode_disabled);
         _monitor.reset();
         ServiceContextTest::tearDown();
     }
@@ -111,6 +113,14 @@ public:
 
     AsioTransportLayer& getAsioTransportLayer() {
         return *_asioTL;
+    }
+
+    const HostAndPort& getGRPCListenAddress() const {
+        return _grpcTL->getListeningAddresses().at(0);
+    }
+
+    const HostAndPort& getAsioListenAddress() const {
+        return _asioListenAddress;
     }
 
     /**
@@ -138,30 +148,35 @@ private:
         return std::make_unique<test::MockSessionManager>(
             [this](test::SessionThread& sessionThread) {
                 if (_serverCb) {
-                    _serverCb(sessionThread.session());
+                    _serverCb(*sessionThread.session());
                 }
             });
     }
 
     std::unique_ptr<AsioTransportLayer> _makeAsioTransportLayer() {
-        return std::make_unique<AsioTransportLayer>(AsioTransportLayer::Options{},
-                                                    _makeSessionManager());
+        AsioTransportLayer::Options options{};
+        options.port = test::kLetKernelChoosePort;
+        return std::make_unique<AsioTransportLayer>(std::move(options), _makeSessionManager());
     }
 
     std::unique_ptr<grpc::GRPCTransportLayer> _makeGRPCTransportLayer() {
         grpc::GRPCTransportLayer::Options grpcOpts;
-        grpcOpts.bindPort = grpc::CommandServiceTestFixtures::kBindPort;
+        grpcOpts.bindPort = test::kLetKernelChoosePort;
         grpcOpts.maxServerThreads = grpc::CommandServiceTestFixtures::kMaxThreads;
         grpcOpts.enableEgress = true;
         grpcOpts.clientMetadata = grpc::makeClientMetadataDocument();
         auto* svcCtx = getServiceContext();
-        auto sm = std::make_unique<grpc::GRPCSessionManager>(svcCtx);
+        auto clientCache = std::make_shared<grpc::ClientCache>();
+        std::vector<std::shared_ptr<ClientTransportObserver>> observers;
+        auto sm =
+            std::make_unique<grpc::GRPCSessionManager>(svcCtx, clientCache, std::move(observers));
         auto grpcLayer = std::make_unique<grpc::GRPCTransportLayerImpl>(
             svcCtx, std::move(grpcOpts), std::move(sm));
         uassertStatusOK(grpcLayer->registerService(std::make_unique<grpc::CommandService>(
             grpcLayer.get(),
             [&](auto session) { _serverCb(*session); },
-            std::make_shared<grpc::WireVersionProvider>())));
+            std::make_shared<grpc::WireVersionProvider>(),
+            std::move(clientCache))));
         return grpcLayer;
     }
 
@@ -171,12 +186,21 @@ private:
     ServerCb _serverCb;
     std::string _sslCAFile = grpc::CommandServiceTestFixtures::kCAFile;
     std::string _sslPEMKeyFile = grpc::CommandServiceTestFixtures::kServerCertificateKeyFile;
+    test::SSLGlobalParamsGuard _sslGlobalParamsGuard;
+
+    HostAndPort _asioListenAddress;
 };
 
 TEST_F(AsioGRPCTransportLayerManagerTest, IngressAsioGRPC) {
     runTest([&](auto& monitor) {
         setServerCallback([](Session& session) {
-            ON_BLOCK_EXIT([&] { session.end(); });
+            ON_BLOCK_EXIT([&] {
+                if (auto grpcSession = dynamic_cast<grpc::IngressSession*>(&session)) {
+                    grpcSession->setTerminationStatus(Status::OK());
+                } else {
+                    session.end();
+                }
+            });
             auto swMsg = session.sourceMessage();
             ASSERT_OK(swMsg);
             ASSERT_OK(session.sinkMessage(swMsg.getValue()));
@@ -194,7 +218,7 @@ TEST_F(AsioGRPCTransportLayerManagerTest, IngressAsioGRPC) {
 
             for (auto i = 0; i < kNumSessions; i++) {
                 auto session =
-                    client->connect(grpc::CommandServiceTestFixtures::defaultServerAddress(),
+                    client->connect(getGRPCListenAddress(),
                                     grpc::CommandServiceTestFixtures::kDefaultConnectTimeout,
                                     {});
                 ON_BLOCK_EXIT([&] { ASSERT_OK(session->finish()); });
@@ -205,7 +229,7 @@ TEST_F(AsioGRPCTransportLayerManagerTest, IngressAsioGRPC) {
         auto asioThread = monitor.spawn([&] {
             for (auto i = 0; i < kNumSessions; i++) {
                 auto swSession = getAsioTransportLayer().connect(
-                    HostAndPort("localhost", 27017),
+                    getAsioListenAddress(),
                     ConnectSSLMode::kGlobalSSLMode,
                     grpc::CommandServiceTestFixtures::kDefaultConnectTimeout,
                     boost::none);
@@ -231,7 +255,7 @@ TEST_F(AsioGRPCTransportLayerManagerTest, EgressAsio) {
         });
 
         auto swSession = getTransportLayerManager().getEgressLayer()->connect(
-            HostAndPort("localhost", 27017),
+            getAsioListenAddress(),
             ConnectSSLMode::kGlobalSSLMode,
             grpc::CommandServiceTestFixtures::kDefaultConnectTimeout,
             boost::none);
@@ -293,7 +317,7 @@ TEST_F(AsioGRPCTransportLayerManagerTest, MarkKillOnGRPCClientDisconnect) {
                 grpc::CommandServiceTestFixtures::makeClientOptions());
             client->start(getServiceContext());
             ON_BLOCK_EXIT([&] { client->shutdown(); });
-            auto session = client->connect(grpc::CommandServiceTestFixtures::defaultServerAddress(),
+            auto session = client->connect(getGRPCListenAddress(),
                                            grpc::CommandServiceTestFixtures::kDefaultConnectTimeout,
                                            {});
             ON_BLOCK_EXIT([&] { session->end(); });
@@ -325,7 +349,13 @@ public:
         AsioGRPCTransportLayerManagerTest::setUp();
 
         setServerCallback([](Session& session) {
-            ON_BLOCK_EXIT([&] { session.end(); });
+            ON_BLOCK_EXIT([&] {
+                if (auto grpcSession = dynamic_cast<grpc::IngressSession*>(&session)) {
+                    grpcSession->setTerminationStatus(Status::OK());
+                } else {
+                    session.end();
+                }
+            });
             auto asioSession = dynamic_cast<AsioSession*>(&session);
             if (asioSession) {
                 auto swMsg = session.sourceMessage();
@@ -343,20 +373,20 @@ public:
         return _tempDir->getPEMKeyFile();
     }
 
-    void assertConnectingSucceedsASIO() {
-        auto swSession = getAsioTransportLayer().connect(
-            HostAndPort("localhost", 27017),
-            ConnectSSLMode::kEnableSSL,
-            grpc::CommandServiceTestFixtures::kDefaultConnectTimeout,
-            boost::none);
-        ASSERT_OK(swSession);
-        ON_BLOCK_EXIT([&] { swSession.getValue()->end(); });
-        grpc::assertEchoSucceeds(*swSession.getValue());
-    }
-
 private:
     std::unique_ptr<test::TempCertificatesDir> _tempDir;
 };
+
+#define ASSERT_ASIO_ECHO_SUCCEEDS(tl)                                                         \
+    {                                                                                         \
+        auto swSession = tl.connect(HostAndPort("localhost", tl.listenerPort()),              \
+                                    ConnectSSLMode::kEnableSSL,                               \
+                                    grpc::CommandServiceTestFixtures::kDefaultConnectTimeout, \
+                                    boost::none);                                             \
+        ASSERT_OK(swSession);                                                                 \
+        ON_BLOCK_EXIT([&] { swSession.getValue()->end(); });                                  \
+        grpc::assertEchoSucceeds(*swSession.getValue());                                      \
+    }
 
 TEST_F(RotateCertificatesTransportLayerManagerTest, RotateCertificatesSucceeds) {
     runTest([&](auto&) {
@@ -366,14 +396,15 @@ TEST_F(RotateCertificatesTransportLayerManagerTest, RotateCertificatesSucceeds) 
         const std::string kEcdsaClientFile = "jstests/libs/ecdsa-client.pem";
 
         auto initialGoodStub = grpc::CommandServiceTestFixtures::makeStubWithCerts(
+            getGRPCListenAddress(),
             grpc::CommandServiceTestFixtures::kCAFile,
             grpc::CommandServiceTestFixtures::kClientCertificateKeyFile);
-        auto initialBadStub =
-            grpc::CommandServiceTestFixtures::makeStubWithCerts(kEcdsaCAFile, kEcdsaClientFile);
+        auto initialBadStub = grpc::CommandServiceTestFixtures::makeStubWithCerts(
+            getGRPCListenAddress(), kEcdsaCAFile, kEcdsaClientFile);
 
-        assertConnectingSucceedsASIO();
-        initialGoodStub.assertConnected();
-        initialBadStub.assertNotConnected();
+        ASSERT_ASIO_ECHO_SUCCEEDS(getAsioTransportLayer());
+        ASSERT_GRPC_STUB_CONNECTED(initialGoodStub);
+        ASSERT_GRPC_STUB_NOT_CONNECTED(initialBadStub);
 
         // Overwrite the tmp files to hold new certs.
         boost::filesystem::copy_file(kEcdsaCAFile,
@@ -385,9 +416,9 @@ TEST_F(RotateCertificatesTransportLayerManagerTest, RotateCertificatesSucceeds) 
 
         ASSERT_DOES_NOT_THROW(SSLManagerCoordinator::get()->rotate());
 
-        assertConnectingSucceedsASIO();
-        initialGoodStub.assertConnected();
-        initialBadStub.assertConnected();
+        ASSERT_ASIO_ECHO_SUCCEEDS(getAsioTransportLayer());
+        ASSERT_GRPC_STUB_CONNECTED(initialGoodStub);
+        ASSERT_GRPC_STUB_CONNECTED(initialBadStub);
     });
 }
 
@@ -396,11 +427,12 @@ TEST_F(RotateCertificatesTransportLayerManagerTest,
     runTest([&](auto&) {
         // Connect using the existing certs.
         auto stub = grpc::CommandServiceTestFixtures::makeStubWithCerts(
+            getGRPCListenAddress(),
             grpc::CommandServiceTestFixtures::kCAFile,
             grpc::CommandServiceTestFixtures::kClientCertificateKeyFile);
 
-        stub.assertConnected();
-        assertConnectingSucceedsASIO();
+        ASSERT_GRPC_STUB_CONNECTED(stub);
+        ASSERT_ASIO_ECHO_SUCCEEDS(getAsioTransportLayer());
 
         boost::filesystem::resize_file(getFilePathCA().toString(), 0);
 
@@ -408,11 +440,12 @@ TEST_F(RotateCertificatesTransportLayerManagerTest,
                            DBException,
                            ErrorCodes::InvalidSSLConfiguration);
 
-        assertConnectingSucceedsASIO();
+        ASSERT_ASIO_ECHO_SUCCEEDS(getAsioTransportLayer());
         auto stub2 = grpc::CommandServiceTestFixtures::makeStubWithCerts(
+            getGRPCListenAddress(),
             grpc::CommandServiceTestFixtures::kCAFile,
             grpc::CommandServiceTestFixtures::kClientCertificateKeyFile);
-        stub2.assertConnected();
+        ASSERT_GRPC_STUB_CONNECTED(stub2);
     });
 }
 
@@ -422,10 +455,11 @@ TEST_F(RotateCertificatesTransportLayerManagerTest, RotateCertificatesUsesOldCer
 
         // Connect using the existing certs.
         auto stub = grpc::CommandServiceTestFixtures::makeStubWithCerts(
+            getGRPCListenAddress(),
             grpc::CommandServiceTestFixtures::kCAFile,
             grpc::CommandServiceTestFixtures::kClientCertificateKeyFile);
-        stub.assertConnected();
-        assertConnectingSucceedsASIO();
+        ASSERT_GRPC_STUB_CONNECTED(stub);
+        ASSERT_ASIO_ECHO_SUCCEEDS(getAsioTransportLayer());
 
         // Overwrite the tmp files to hold new, invalid certs.
         boost::filesystem::copy_file(kInvalidPEMFile,
@@ -437,10 +471,11 @@ TEST_F(RotateCertificatesTransportLayerManagerTest, RotateCertificatesUsesOldCer
                            ErrorCodes::InvalidSSLConfiguration);
 
         auto stub2 = grpc::CommandServiceTestFixtures::makeStubWithCerts(
+            getGRPCListenAddress(),
             grpc::CommandServiceTestFixtures::kCAFile,
             grpc::CommandServiceTestFixtures::kClientCertificateKeyFile);
-        stub2.assertConnected();
-        assertConnectingSucceedsASIO();
+        ASSERT_GRPC_STUB_CONNECTED(stub2);
+        ASSERT_ASIO_ECHO_SUCCEEDS(getAsioTransportLayer());
     });
 }
 

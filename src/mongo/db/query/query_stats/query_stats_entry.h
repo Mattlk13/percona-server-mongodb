@@ -29,13 +29,16 @@
 
 #pragma once
 
+#include "mongo/db/query/query_stats/supplemental_metrics_stats.h"
 #include <algorithm>
 #include <cstdint>
 #include <memory>
 
+#include "mongo/base/clonable_ptr.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/query/query_stats/aggregated_metric.h"
-#include "mongo/db/query/query_stats/key_generator.h"
+#include "mongo/db/query/query_stats/key.h"
+#include "mongo/db/query/query_stats/optimizer_metrics_stats_entry.h"
 #include "mongo/db/query/query_stats/transform_algorithm_gen.h"
 #include "mongo/util/time_support.h"
 
@@ -52,7 +55,7 @@ struct QueryStatsEntry {
     QueryStatsEntry(std::unique_ptr<const Key> key_)
         : firstSeenTimestamp(Date_t::now()), key(std::move(key_)) {}
 
-    BSONObj toBSON() const;
+    BSONObj toBSON(bool includeDiskUsageMetrics) const;
 
     /**
      * Timestamp for when this query shape was added to the store. Set on construction.
@@ -77,19 +80,63 @@ struct QueryStatsEntry {
     /**
      * Aggregates the total time for execution including getMore requests.
      */
-    AggregatedMetric totalExecMicros;
+    AggregatedMetric<uint64_t> totalExecMicros;
 
     /**
      * Aggregates the time for execution for first batch only.
      */
-    AggregatedMetric firstResponseExecMicros;
+    AggregatedMetric<uint64_t> firstResponseExecMicros;
 
-    AggregatedMetric docsReturned;
+    /**
+     * Aggregates the number of documents returned for the query including getMore requests.
+     */
+    AggregatedMetric<uint64_t> docsReturned;
+
+    /**
+     * Aggregates the number of keys examined including getMore requests.
+     */
+    AggregatedMetric<uint64_t> keysExamined;
+
+    /**
+     * Aggregates the number of documents examined including getMore requests.
+     */
+    AggregatedMetric<uint64_t> docsExamined;
+
+    /**
+     * Counts the frequency of the boolean value hasSortStage.
+     */
+    AggregatedBool hasSortStage;
+
+    /**
+     * Counts the frequency of the boolean value usedDisk.
+     */
+    AggregatedBool usedDisk;
+
+    /**
+     * Counts the frequency of the boolean value fromMultiPlanner.
+     */
+    AggregatedBool fromMultiPlanner;
+
+    /**
+     * Counts the frequency of the boolean value fromPlanCache.
+     */
+    AggregatedBool fromPlanCache;
 
     /**
      * The Key that can generate the query stats key for this request.
      */
     std::shared_ptr<const Key> key;
+
+    /**
+     * Adds supplemental metric to supplementalStatsMap.
+     */
+    void addSupplementalStats(std::unique_ptr<SupplementalStatsEntry> metric);
+
+    /**
+     *  Supplemental metrics. The data structure is not allocated and the pointer is null if
+     * optional metrics are not collected.
+     */
+    clonable_ptr<SupplementalStatsMap> supplementalStatsMap;
 };
 
 }  // namespace mongo::query_stats

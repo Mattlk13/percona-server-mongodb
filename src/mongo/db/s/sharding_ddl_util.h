@@ -196,38 +196,15 @@ void removeCollAndChunksMetadataFromConfig(
 void removeQueryAnalyzerMetadataFromConfig(OperationContext* opCtx, const BSONObj& filter);
 
 /**
- * Ensure source collection uuid is consistent on every shard
- * Ensure target collection is not present on any shard when `dropTarget` is false
- */
-void checkCatalogConsistencyAcrossShardsForRename(
-    OperationContext* opCtx,
-    const NamespaceString& fromNss,
-    const NamespaceString& toNss,
-    bool dropTarget,
-    std::shared_ptr<executor::ScopedTaskExecutor> executor);
-
-/**
  * Ensures rename preconditions for collections are met:
  * - Check that the namespace of the destination collection is not too long
  * - Check that `dropTarget` is true if the destination collection exists
  * - Check that no tags exist for the destination collection
  */
 void checkRenamePreconditions(OperationContext* opCtx,
-                              const NamespaceString& fromNss,
-                              const boost::optional<CollectionType>& sourceCollType,
                               const NamespaceString& toNss,
                               const boost::optional<CollectionType>& optTargetCollType,
                               bool dropTarget);
-
-/**
- * Throws if the DB primary shards of the provided namespaces differs.
- *
- * Optimistically assume that no movePrimary is performed during the check: it's currently not
- * possible to ensure primary shard stability for both databases.
- */
-void checkDbPrimariesOnTheSameShard(OperationContext* opCtx,
-                                    const NamespaceString& fromNss,
-                                    const NamespaceString& toNss);
 
 /**
  * Throws an exception if the collection is already tracked with different options.
@@ -298,12 +275,15 @@ void performNoopMajorityWriteLocally(OperationContext* opCtx);
 /**
  * Sends the _shardsvrDropCollectionParticipant command to the specified shards.
  */
-void sendDropCollectionParticipantCommandToShards(OperationContext* opCtx,
-                                                  const NamespaceString& nss,
-                                                  const std::vector<ShardId>& shardIds,
-                                                  std::shared_ptr<executor::TaskExecutor> executor,
-                                                  const OperationSessionInfo& osi,
-                                                  bool fromMigrate);
+void sendDropCollectionParticipantCommandToShards(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const std::vector<ShardId>& shardIds,
+    std::shared_ptr<executor::TaskExecutor> executor,
+    const OperationSessionInfo& osi,
+    bool fromMigrate,
+    bool dropSystemCollections,
+    const boost::optional<UUID>& collectionUUID = boost::none);
 
 BSONObj getCriticalSectionReasonForRename(const NamespaceString& from, const NamespaceString& to);
 
@@ -320,6 +300,16 @@ void runTransactionOnShardingCatalog(
     bool useClusterTransaction,
     const std::shared_ptr<executor::TaskExecutor>& inputExecutor = nullptr);
 
+/*
+ * Same as `runTransactionOnShardingCatalog` but automatically adding StmtsIds to passed in
+ * operations
+ */
+void runTransactionWithStmtIdsOnShardingCatalog(
+    OperationContext* opCtx,
+    const std::shared_ptr<executor::TaskExecutor>& executor,
+    const OperationSessionInfo& osi,
+    const std::vector<BatchedCommandRequest>&& ops);
+
 /**
  * Returns the default key pattern value for unsplittable collections.
  */
@@ -327,6 +317,32 @@ const KeyPattern& unsplittableCollectionShardKey();
 
 boost::optional<CollectionType> getCollectionFromConfigServer(OperationContext* opCtx,
                                                               const NamespaceString& nss);
+
+/*
+ * The returned operations to execute on the sharding catalog are the following:
+ * 1. Delete any existing chunk entries (there can be 0 or 1 depending on whether we are
+ * creating a new collection or sharding a pre-existing unsplittable collection).
+ * 2. Insert new chunk entries.
+ * 3. Upsert the collection entry (update in case of pre-existing unspittable collection or insert
+ * if the collection did not exist).
+ * 4. Insert the placement information.
+ */
+std::vector<BatchedCommandRequest> getOperationsToCreateOrShardCollectionOnShardingCatalog(
+    const CollectionType& coll,
+    const std::vector<ChunkType>& chunks,
+    const ChunkVersion& placementVersion,
+    const std::set<ShardId>& shardIds);
+
+/*
+ * Same as `getOperationsToCreateOrShardCollectionOnShardingCatalog`, with the difference that it
+ * generates the collection and chunk entries for an unsplittable collection.
+ */
+std::vector<BatchedCommandRequest> getOperationsToCreateUnsplittableCollectionOnShardingCatalog(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const UUID& collectionUuid,
+    const BSONObj& defaultCollation,
+    const ShardId& shardId);
 
 }  // namespace sharding_ddl_util
 }  // namespace mongo

@@ -135,14 +135,22 @@ protected:
     }
 };
 
-using SlotExprPairVector = std::vector<std::pair<value::SlotId, std::unique_ptr<EExpression>>>;
+using SlotExprPair = std::pair<value::SlotId, std::unique_ptr<EExpression>>;
+using SlotExprPairVector = std::vector<SlotExprPair>;
 
 struct AggExprPair {
     std::unique_ptr<EExpression> init;
-    std::unique_ptr<EExpression> acc;
+    std::unique_ptr<EExpression> agg;
+};
+
+struct AggExprTuple {
+    std::unique_ptr<EExpression> init;
+    std::unique_ptr<EExpression> blockAgg;
+    std::unique_ptr<EExpression> agg;
 };
 
 using AggExprVector = std::vector<std::pair<value::SlotId, AggExprPair>>;
+using AggExprTupleVector = std::vector<std::pair<value::SlotId, AggExprTuple>>;
 
 template <typename T, typename... Args>
 inline std::unique_ptr<EExpression> makeE(Args&&... args) {
@@ -231,16 +239,6 @@ auto makeSlotExprPairVec(Ts&&... pack) {
 template <typename... Ts>
 auto makeAggExprVector(Ts&&... pack) {
     AggExprVector v;
-    if constexpr (sizeof...(pack) > 0) {
-        v.reserve(sizeof...(Ts) / 3);
-        detail::makeAggExprPairHelper(v, std::forward<Ts>(pack)...);
-    }
-    return v;
-}
-
-template <typename... Ts>
-auto makeAggExprSlotMap(Ts&&... pack) {
-    value::SlotMap<AggExprPair> v;
     if constexpr (sizeof...(pack) > 0) {
         v.reserve(sizeof...(Ts) / 3);
         detail::makeAggExprPairHelper(v, std::forward<Ts>(pack)...);

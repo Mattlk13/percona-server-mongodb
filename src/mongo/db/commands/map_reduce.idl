@@ -32,7 +32,6 @@ global:
         - "mongo/db/commands/map_reduce_out_options.h"
         - "mongo/db/commands/map_reduce_javascript_code.h"
         - "mongo/db/commands/map_reduce_global_variable_scope.h"
-        - "mongo/db/write_concern_options.h"
 
 imports:
     - "mongo/db/basic_types.idl"
@@ -44,6 +43,8 @@ types:
         cpp_type: "mongo::MapReduceOutOptions"
         serializer: mongo::MapReduceOutOptions::serializeToBSON
         deserializer: mongo::MapReduceOutOptions::parseFromBSON
+        # MapReduceOutOptions has only scalar members.
+        is_view: false
 
     mapReduceJavascriptCodeType:
         bson_serialization_type: any
@@ -51,6 +52,8 @@ types:
         cpp_type: "mongo::MapReduceJavascriptCode"
         serializer: mongo::MapReduceJavascriptCode::serializeToBSON
         deserializer: mongo::MapReduceJavascriptCode::parseFromBSON
+        # MapReduceJavascriptCode has only scalar members.
+        is_view: false
 
     mapReduceJavascriptCodeNullPermittedType:
         bson_serialization_type: any
@@ -58,6 +61,8 @@ types:
         cpp_type: "mongo::MapReduceJavascriptCodeOrNull"
         serializer: mongo::MapReduceJavascriptCodeOrNull::serializeToBSON
         deserializer: mongo::MapReduceJavascriptCodeOrNull::parseFromBSON
+        # MapReduceJavascriptCodeOrNull has only scalar members.
+        is_view: false
 
     mapReduceGlobalVariableScopeType:
         bson_serialization_type: any
@@ -65,6 +70,8 @@ types:
         cpp_type: "mongo::MapReduceGlobalVariableScope"
         serializer: mongo::MapReduceGlobalVariableScope::serializeToBSON
         deserializer: mongo::MapReduceGlobalVariableScope::parseFromBSON
+        # Deserializer uses getOwned.
+        is_view: false
 
 
 commands:

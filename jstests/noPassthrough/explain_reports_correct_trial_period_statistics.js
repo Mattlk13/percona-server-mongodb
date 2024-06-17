@@ -1,5 +1,6 @@
 // This test checks that .explain() reports the correct trial period statistics for a winning plan
 // in the "allPlansExecution" section.
+
 const dbName = "test";
 const collName = jsTestName();
 

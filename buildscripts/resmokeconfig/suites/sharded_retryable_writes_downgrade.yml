@@ -3,6 +3,7 @@ test_kind: js_test
 selector:
   roots:
   - jstests/core/**/*.js
+  - jstests/core_sharding/**/*.js
   exclude_files:
   # Transactions do not support retryability of individual operations.
   # TODO: Remove this once it is supported (SERVER-33952).
@@ -26,7 +27,6 @@ selector:
   # Stepdown commands during fsync lock will fail.
   - jstests/core/**/currentop.js
   - jstests/core/**/fsync.js
-  - jstests/core/**/killop_drop_collection.js
 
   # Expect drops/creates to fail or have a certain response:
   - jstests/core/**/explain_upsert.js
@@ -57,11 +57,9 @@ selector:
   # The following tests fail because a certain command or functionality is not supported on
   # mongos. This command or functionality is placed in a comment next to the failing test.
   - jstests/core/**/dbhash.js  # dbhash.
-  - jstests/core/**/dbhash2.js  # dbhash.
 
   # The following tests fail because mongos behaves differently from mongod when testing certain
   # functionality. The differences are in a comment next to the failing test.
-  - jstests/core/**/explain_missing_database.js  # Behavior with no db different on mongos.
   - jstests/core/**/geo_2d_explain.js  # executionSuccess in different spot in explain().
   - jstests/core/**/geo_s2explain.js  # inputStage in different spot in explain().
   - jstests/core/**/geo_s2sparse.js  # keysPerIndex in different spot in validate().
@@ -173,6 +171,7 @@ executor:
             readPreference:
               mode: "primary"
             retryWrites: true
+          nonClusteredConfigTransactions: true
       # We specify nodb so the shell used by each test will attempt to connect after loading the
       # retry logic in auto_retry_on_network_error.js.
       nodb: ""

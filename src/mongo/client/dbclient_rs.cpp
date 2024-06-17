@@ -292,6 +292,7 @@ DBClientConnection* DBClientReplicaSet::checkPrimary() {
 
     resetPrimary();
 
+    newConn->setShouldThrowOnStaleConfigError(_shouldThrowOnStaleConfigError);
     _primaryHost = h;
     _primary.reset(newConn);
     _primary->setParentReplSetName(_setName);
@@ -461,10 +462,8 @@ void DBClientReplicaSet::_auth(const BSONObj& params) {
     _runAuthLoop([&](DBClientConnection* conn) {
         conn->auth(params);
         // Cache the new auth information since we now validated it's good
-        const DatabaseName dbName =
-            DatabaseNameUtil::deserialize(boost::none,
-                                          params[saslCommandUserDBFieldName].valueStringDataSafe(),
-                                          SerializationContext::stateAuthPrevalidated());
+        const DatabaseName dbName = AuthDatabaseNameUtil::deserialize(
+            params[saslCommandUserDBFieldName].valueStringDataSafe());
         _auths[dbName] = params.getOwned();
     });
 }
@@ -683,6 +682,7 @@ DBClientConnection* DBClientReplicaSet::selectNodeUsingTags(
             str::stream() << "Failed to connect to " << _lastSecondaryOkHost.toString(),
             newConn != nullptr);
 
+    newConn->setShouldThrowOnStaleConfigError(_shouldThrowOnStaleConfigError);
     _lastSecondaryOkConn = std::shared_ptr<DBClientConnection>(newConn, std::move(dtor));
     _lastSecondaryOkConn->setParentReplSetName(_setName);
     _lastSecondaryOkConn->setRequestMetadataWriter(getRequestMetadataWriter());

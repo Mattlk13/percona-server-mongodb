@@ -46,9 +46,11 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog/import_options.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/operation_context.h"
 #include "mongo/db/storage/durable_catalog.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/platform/compiler.h"
+#include "mongo/platform/mutex.h"
+#include "mongo/stdx/condition_variable.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -162,9 +164,53 @@ public:
         _wtIncompatible = true;
     }
 
+    /**
+     * If WT is setting _wtConnReady to true or WT is idle (one of the readers is not generating
+     * sections), the following function returns immediately. Otherwise (if WT is active and
+     * WT_CONN_CLOSE event is trying to set it _wtConnReady to false), this function waits until WT
+     * is idle and WT Connection is allowed to be closed.
+     */
+    void setWtConnReadyStatus(bool status);
+
+    /**
+     * If WT connection is ready and it is not shutting down, WT
+     * WiredTigerServerStatusSection::generateSection acitivity is permitted. When this function
+     * returns true, the caller may safely collect metrics, but this blocks storage engine shutdown.
+     * The caller *must* make a subsequent call to `releaseSectionActivityPermit` to allow the
+     * storage engine to shut down.
+     */
+    bool getSectionActivityPermit();
+
+    /**
+     * The following call releases section generation activity permits. When there is no section
+     * generation activity, WT connection is allowed to shut down cleanly.
+     */
+    void releaseSectionActivityPermit();
+
+    /**
+     * Each successful ongoing WiredTigerServerStatusSection::generateSection call is counted as a
+     * single active section. The number of current active sections are returned by this call.
+     */
+    int32_t getActiveSections() {
+        stdx::lock_guard<mongo::Mutex> lock(_mutex);
+        return _activeSections;
+    }
+
+    /**
+     * If WT connection is made and there is no outstanding shutdown, WT Connection Ready Status is
+     * true. This function should only be used for tests.
+     */
+    bool getWtConnReadyStatus() {
+        return _wtConnReady;
+    }
+
 private:
     bool _startupSuccessful = false;
     bool _wtIncompatible = false;
+    mongo::Mutex _mutex = MONGO_MAKE_LATCH("mongo::WiredTigerEventHandler::_mutex");
+    bool _wtConnReady = false;
+    stdx::condition_variable _idleCondition;
+    int32_t _activeSections{0};
 };
 
 class WiredTigerUtil {
@@ -181,7 +227,7 @@ public:
      * Fetch the type and source fields out of the colgroup metadata.  'tableUri' must be a
      * valid table: uri.
      */
-    static void fetchTypeAndSourceURI(OperationContext* opCtx,
+    static void fetchTypeAndSourceURI(WiredTigerRecoveryUnit&,
                                       const std::string& tableUri,
                                       std::string* type,
                                       std::string* source);
@@ -207,7 +253,7 @@ public:
      *
      * Returns the FailedToParse status if the storage engine metadata object is malformed.
      */
-    static StatusWith<std::string> generateImportString(const StringData& ident,
+    static StatusWith<std::string> generateImportString(StringData ident,
                                                         const BSONObj& storageMetadata,
                                                         const ImportOptions& importOptions);
 
@@ -248,31 +294,31 @@ public:
      *
      * This returns more information, but is slower than getMetadata().
      */
-    static StatusWith<std::string> getMetadataCreate(OperationContext* opCtx, StringData uri);
+    static StatusWith<std::string> getMetadataCreate(WiredTigerRecoveryUnit&, StringData uri);
     static StatusWith<std::string> getMetadataCreate(WT_SESSION* session, StringData uri);
 
     /**
      * Gets the entire metadata string for collection or index at URI. Accepts an OperationContext
      * or session.
      */
-    static StatusWith<std::string> getMetadata(OperationContext* opCtx, StringData uri);
+    static StatusWith<std::string> getMetadata(WiredTigerRecoveryUnit&, StringData uri);
     static StatusWith<std::string> getMetadata(WT_SESSION* session, StringData uri);
 
     /**
      * Reads app_metadata for collection/index at URI as a BSON document.
      */
-    static Status getApplicationMetadata(OperationContext* opCtx,
+    static Status getApplicationMetadata(WiredTigerRecoveryUnit&,
                                          StringData uri,
                                          BSONObjBuilder* bob);
 
-    static StatusWith<BSONObj> getApplicationMetadata(OperationContext* opCtx, StringData uri);
+    static StatusWith<BSONObj> getApplicationMetadata(WiredTigerRecoveryUnit&, StringData uri);
 
     /**
      * Validates formatVersion in application metadata for 'uri'.
      * Version must be numeric and be in the range [minimumVersion, maximumVersion].
      * URI is used in error messages only. Returns actual version.
      */
-    static StatusWith<int64_t> checkApplicationMetadataFormatVersion(OperationContext* opCtx,
+    static StatusWith<int64_t> checkApplicationMetadataFormatVersion(WiredTigerRecoveryUnit&,
                                                                      StringData uri,
                                                                      int64_t minimumVersion,
                                                                      int64_t maximumVersion);
@@ -301,6 +347,11 @@ public:
      */
     static int64_t getIdentReuseSize(WT_SESSION* s, const std::string& uri);
 
+    /**
+     * Returns the bytes compaction may reclaim for an ident. This is the amount of allocated space
+     * on disk that can be potentially reclaimed.
+     */
+    static int64_t getIdentCompactRewrittenExpectedSize(WT_SESSION* s, const std::string& uri);
 
     /**
      * Return amount of memory to use for the WiredTiger cache based on either the startup
@@ -330,7 +381,7 @@ public:
      *
      * If errors is non-NULL, all error messages will be appended to the array.
      */
-    static int verifyTable(OperationContext* opCtx,
+    static int verifyTable(WiredTigerRecoveryUnit&,
                            const std::string& uri,
                            std::vector<std::string>* errors = nullptr);
 
@@ -338,7 +389,7 @@ public:
      * Checks the table logging setting in the metadata for the given uri, comparing it against
      * 'isLogged'. Populates 'valid', 'errors', and 'warnings' accordingly.
      */
-    static void validateTableLogging(OperationContext* opCtx,
+    static void validateTableLogging(WiredTigerRecoveryUnit&,
                                      StringData uri,
                                      bool isLogged,
                                      boost::optional<StringData> indexName,
@@ -346,11 +397,11 @@ public:
                                      std::vector<std::string>& errors,
                                      std::vector<std::string>& warnings);
 
-    static void notifyStartupComplete();
+    static void notifyStorageStartupRecoveryComplete();
 
     static bool useTableLogging(const NamespaceString& nss);
 
-    static Status setTableLogging(OperationContext* opCtx, const std::string& uri, bool on);
+    static Status setTableLogging(WiredTigerRecoveryUnit&, const std::string& uri, bool on);
 
     /**
      * Generates a WiredTiger connection configuration given the LOGV2 WiredTiger components
@@ -372,6 +423,22 @@ public:
      * initial sync or replication to fail. See SERVER-68122.
      */
     static void removeEncryptionFromConfigString(std::string* configString);
+
+    /**
+     * Removes encryption configuration from storage engine collection options.
+     * See CollectionOptions.storageEngine and WiredTigerUtil::removeEncryptionFromConfigString().
+     * TODO(SERVER-81069): Remove this since it's intrinsically tied to encryption options only.
+     */
+    static BSONObj getSanitizedStorageOptionsForSecondaryReplication(const BSONObj& options);
+
+    /**
+     * Background compaction should not be executed if:
+     * - the feature flag is disabled or,
+     * - it is an in-memory configuration,
+     * - checkpoints are disabled or,
+     * - user writes are not allowed.
+     */
+    static Status canRunAutoCompact(OperationContext* opCtx, bool isEphemeral);
 
 private:
     /**

@@ -43,6 +43,7 @@ server_parameters:
     cpp_vartype: bool
     cpp_varname: "gLoadRoutingTableOnStartup"
     default: true
+    redact: false
 
   warmMinConnectionsInShardingTaskExecutorPoolOnStartup:
     description: >-
@@ -51,6 +52,7 @@ server_parameters:
     cpp_vartype: bool
     cpp_varname: "gWarmMinConnectionsInShardingTaskExecutorPoolOnStartup"
     default: true
+    redact: false
 
   warmMinConnectionsInShardingTaskExecutorPoolOnStartupWaitMS:
     description: >-
@@ -61,14 +63,16 @@ server_parameters:
     default: 2000 # 2secs
     validator:
       gte: 0
+    redact: false
 
   enableFinerGrainedCatalogCacheRefresh:
     description: >-
-        Enables the finer grained catalog cache refresh behavior.
+        DEPRECATED: This parameter has been deprecated and is here only for maintaining backward compatibility.
     set_at: [ startup ]
     cpp_vartype: bool
     cpp_varname: "gEnableFinerGrainedCatalogCacheRefresh"
     default: false
+    redact: false
 
   routingTableCacheChunkBucketSize:
     description: >-
@@ -79,3 +83,4 @@ server_parameters:
     default: 500
     validator:
       gt: 0
+    redact: false

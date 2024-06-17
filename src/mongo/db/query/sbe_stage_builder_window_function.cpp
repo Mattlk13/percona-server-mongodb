@@ -28,766 +28,927 @@
  */
 
 #include "mongo/db/query/sbe_stage_builder_window_function.h"
-#include "mongo/db/query/sbe_stage_builder_accumulator.h"
+
+#include "mongo/db/query/sbe_stage_builder_sbexpr_helpers.h"
 
 namespace mongo::stage_builder {
+namespace {
+template <typename ReturnT, typename InputsT, typename... Args>
+using BuildFnType =
+    std::function<ReturnT(const WindowOp&, std::unique_ptr<InputsT>, StageBuilderState&, Args...)>;
 
-template <int N>
-std::vector<std::unique_ptr<sbe::EExpression>> emptyInitializer(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> argExpr,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    return std::vector<std::unique_ptr<sbe::EExpression>>{N};
+template <typename ReturnT, typename... Args>
+using BuildNoInputsFnType = std::function<ReturnT(const WindowOp&, StageBuilderState&, Args...)>;
+
+// std::function type for buildAddAggs() with inputs and without inputs.
+using BuildAddAggsNoInputsFn = BuildNoInputsFnType<SbExpr::Vector>;
+
+template <typename T>
+using BuildAddAggsFnType = BuildFnType<SbExpr::Vector, T>;
+
+using BuildAddAggsFn = BuildAddAggsFnType<AccumInputs>;
+
+// std::function type for buildRemoveAggs() with inputs and without inputs.
+using BuildRemoveAggsNoInputsFn = BuildNoInputsFnType<SbExpr::Vector>;
+
+template <typename T>
+using BuildRemoveAggsFnType = BuildFnType<SbExpr::Vector, T>;
+
+using BuildRemoveAggsFn = BuildRemoveAggsFnType<AccumInputs>;
+
+// std::function type for buildInit() with inputs and without inputs.
+using BuildInitNoInputsFn = BuildNoInputsFnType<SbExpr::Vector>;
+
+template <typename T>
+using BuildInitFnType = BuildFnType<SbExpr::Vector, T>;
+
+using BuildInitFn = BuildInitFnType<AccumInputs>;
+
+// std::function type for buildFinalize() with inputs and without inputs.
+using BuildFinalizeNoInputsFn = BuildNoInputsFnType<SbExpr, const SbSlotVector&>;
+
+template <typename T>
+using BuildFinalizeFnType = BuildFnType<SbExpr, T, const SbSlotVector&>;
+
+using BuildFinalizeFn = BuildFinalizeFnType<AccumInputs>;
+
+template <typename T>
+std::unique_ptr<T> castInputsTo(AccumInputsPtr inputs) {
+    // Try casting 'inputs.get()' to T* and check if the cast was succeesful.
+    const bool castSuccessful = inputs && dynamic_cast<T*>(inputs.get()) != nullptr;
+
+    uassert(8859900, "Casting window function input to expected type failed", castSuccessful);
+
+    // Extract the pointer from 'inputs', wrap it in a 'std::unique_ptr<T>' and return it.
+    return std::unique_ptr<T>{static_cast<T*>(inputs.release())};
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> addDocument() {
-    std::vector<std::unique_ptr<sbe::EExpression>> exprs;
-    exprs.push_back(makeFunction("sum", makeInt64Constant(1)));
-    return exprs;
+/**
+ * The makeBuildFn() helper function takes a build callback and returns a "wrapped" build
+ * callback.
+ *
+ * Given an original build callback with an "inputs" parameter of type 'std::unique_ptr<T>'
+ * (where T is a subclass of AccumInputs), the "wrapped" build callback returned will have the same
+ * parameters and return type as the original, except that the type of its "inputs" parameter
+ * will be 'std::unique_ptr<AccumInputs>' instead.
+ *
+ * When invoked, the wrapped callback will check if the "inputs" arg provided by the caller can
+ * be cast to the type of the original callback's "inputs" parameter. If the cast is possible,
+ * the wrapped callback will perform the cast, invoke the original callback, and return whatever
+ * the original callback returns. If the cast is not possible, the wrapped callback will uassert.
+ */
+template <typename ReturnT, typename T, typename... Args>
+BuildFnType<ReturnT, AccumInputs, Args...> makeBuildFnImpl(BuildFnType<ReturnT, T, Args...> fn) {
+    return
+        [fn = std::move(fn)](
+            const WindowOp& op, AccumInputsPtr inputs, StageBuilderState& state, Args&&... args) {
+            return fn(op, castInputsTo<T>(std::move(inputs)), state, std::forward<Args>(args)...);
+        };
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> removeDocument() {
-    std::vector<std::unique_ptr<sbe::EExpression>> exprs;
-    exprs.push_back(makeFunction("sum", makeInt64Constant(-1)));
-    return exprs;
+template <typename ReturnT, typename... Args>
+BuildFnType<ReturnT, AccumInputs, Args...> makeBuildFnImpl(
+    BuildNoInputsFnType<ReturnT, Args...> fn) {
+    return
+        [fn = std::move(fn)](
+            const WindowOp& op, AccumInputsPtr inputs, StageBuilderState& state, Args&&... args) {
+            return fn(op, state, std::forward<Args>(args)...);
+        };
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowAddSum(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> arg,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    std::vector<std::unique_ptr<sbe::EExpression>> exprs;
-    exprs.push_back(makeFunction("aggRemovableSumAdd", std::move(arg)));
-    return exprs;
+template <typename FuncT>
+auto makeBuildFn(FuncT fn) {
+    return makeBuildFnImpl(std::function(std::move(fn)));
+}
+}  // namespace
+
+/**
+ * The WindowOpInfo struct contains function pointers and other useful information about an AccumOp.
+ * The 'accumOpInfoMap' map (defined below) maps the name of each op to the corresponding
+ * WindowOpInfo for that op.
+ */
+struct WindowOpInfo {
+    size_t numAggs = 1;
+    BuildAddAggsFn buildAddAggs = nullptr;
+    BuildRemoveAggsFn buildRemoveAggs = nullptr;
+    BuildInitFn buildInit = nullptr;
+    BuildFinalizeFn buildFinalize = nullptr;
+};
+
+namespace {
+SbExpr::Vector buildAccumOpAccumAggsForWindowFunc(const WindowOp& op,
+                                                  AccumInputsPtr inputs,
+                                                  StageBuilderState& state) {
+    // Call buildAddExprs() on the AccumOp corresponding to 'op' to generate the accum exprs,
+    // and then call buildAddAggs() to generate the accum aggs.
+    auto acc = AccumOp{op.getOpName()};
+    return acc.buildAddAggs(state, acc.buildAddExprs(state, std::move(inputs)));
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowRemoveSum(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> arg,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    std::vector<std::unique_ptr<sbe::EExpression>> exprs;
-    exprs.push_back(makeFunction("aggRemovableSumRemove", std::move(arg)));
-    return exprs;
+SbExpr::Vector buildAccumOpInitializeForWindowFunc(const WindowOp& op,
+                                                   AccumInputsPtr inputs,
+                                                   StageBuilderState& state) {
+    // Call buildInitialize() on the AccumOp corresponding to 'op'.
+    auto acc = AccumOp{op.getOpName()};
+    return acc.buildInitialize(state, std::move(inputs));
 }
 
-std::unique_ptr<sbe::EExpression> buildWindowFinalizeSum(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    sbe::value::SlotVector slots,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    sbe::EExpression::Vector exprs;
+SbExpr::Vector buildAccumOpInitializeForWindowFunc(const WindowOp& op, StageBuilderState& state) {
+    return buildAccumOpInitializeForWindowFunc(op, AccumInputsPtr{}, state);
+}
+
+SbExpr buildAccumOpFinalizeForWindowFunc(const WindowOp& op,
+                                         AccumInputsPtr inputs,
+                                         StageBuilderState& state,
+                                         const SbSlotVector& aggSlots) {
+    // Call buildFinalize() on the AccumOp.
+    auto acc = AccumOp{op.getOpName()};
+    return acc.buildFinalize(state, std::move(inputs), aggSlots);
+}
+
+SbExpr buildAccumOpFinalizeForWindowFunc(const WindowOp& op,
+                                         StageBuilderState& state,
+                                         const SbSlotVector& aggSlots) {
+    return buildAccumOpFinalizeForWindowFunc(op, AccumInputsPtr{}, state, aggSlots);
+}
+
+SbExpr::Vector buildWindowAddSum(const WindowOp& op,
+                                 std::unique_ptr<AddSingleInput> inputs,
+                                 StageBuilderState& state) {
+    SbExprBuilder b(state);
+    return SbExpr::makeSeq(b.makeFunction("aggRemovableSumAdd", std::move(inputs->inputExpr)));
+}
+
+SbExpr::Vector buildWindowRemoveSum(const WindowOp& op,
+                                    std::unique_ptr<AddSingleInput> inputs,
+                                    StageBuilderState& state) {
+    SbExprBuilder b(state);
+    return SbExpr::makeSeq(b.makeFunction("aggRemovableSumRemove", std::move(inputs->inputExpr)));
+}
+
+SbExpr buildWindowFinalizeSum(const WindowOp& op, StageBuilderState& state, SbSlotVector slots) {
+    SbExprBuilder b(state);
+
+    SbExpr::Vector exprs;
     for (auto slot : slots) {
-        exprs.push_back(makeVariable(slot));
+        exprs.push_back(b.makeVariable(slot));
     }
-    return makeE<sbe::EFunction>("aggRemovableSumFinalize", std::move(exprs));
+    return b.makeFunction("aggRemovableSumFinalize", std::move(exprs));
 }
 
-AccumulationStatement createFakeAccumulationStatement(StageBuilderState& state,
-                                                      const WindowFunctionStatement& stmt) {
-    NamespaceString nss;
-    auto expCtx = make_intrusive<ExpressionContext>(state.opCtx, nullptr, nss);
-    AccumulationExpression accExpr{ExpressionConstant::create(expCtx.get(), Value(BSONNULL)),
-                                   stmt.expr->input(),
-                                   []() { return nullptr; },
-                                   stmt.expr->getOpName()};
-    return {"", accExpr};
+SbExpr::Vector buildWindowAddCovariance(const WindowOp& op,
+                                        std::unique_ptr<AddCovarianceInputs> inputs,
+                                        StageBuilderState& state) {
+    return buildAccumOpAccumAggsForWindowFunc(op, std::move(inputs), state);
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowAddCovariance(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    StringDataMap<std::unique_ptr<sbe::EExpression>> args,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    auto accStmt = createFakeAccumulationStatement(state, stmt);
-    return buildAccumulator(accStmt, std::move(args), collatorSlot, *state.frameIdGenerator);
+SbExpr::Vector buildWindowRemoveCovariance(const WindowOp& op,
+                                           std::unique_ptr<AddCovarianceInputs> inputs,
+                                           StageBuilderState& state) {
+    SbExprBuilder b(state);
+
+    auto argX = std::move(inputs->covarianceX);
+    auto argY = std::move(inputs->covarianceY);
+
+    return SbExpr::makeSeq(b.makeFunction("aggCovarianceRemove", std::move(argX), std::move(argY)));
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowRemoveCovariance(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    StringDataMap<std::unique_ptr<sbe::EExpression>> args) {
-    tassert(7820811, "Incorrect number of arguments", args.size() == 2);
-
-    auto it = args.find(AccArgs::kCovarianceX);
-    tassert(7820812,
-            str::stream() << "Window function expects '" << AccArgs::kCovarianceX << "' argument",
-            it != args.end());
-    auto argX = std::move(it->second);
-
-    it = args.find(AccArgs::kCovarianceY);
-    tassert(7820813,
-            str::stream() << "Window function expects '" << AccArgs::kCovarianceY << "' argument",
-            it != args.end());
-    auto argY = std::move(it->second);
-
-    std::vector<std::unique_ptr<sbe::EExpression>> exprs;
-    exprs.push_back(makeFunction("aggCovarianceRemove", std::move(argX), std::move(argY)));
-    return exprs;
+SbExpr buildWindowFinalizeCovarianceSamp(const WindowOp& op,
+                                         StageBuilderState& state,
+                                         SbSlotVector slots) {
+    return buildAccumOpFinalizeForWindowFunc(op, state, slots);
 }
 
-std::unique_ptr<sbe::EExpression> buildWindowFinalizeCovarianceSamp(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    sbe::value::SlotVector slots,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    auto accStmt = createFakeAccumulationStatement(state, stmt);
-    return buildFinalize(state, accStmt, slots, collatorSlot, *state.frameIdGenerator);
+SbExpr buildWindowFinalizeCovariancePop(const WindowOp& op,
+                                        StageBuilderState& state,
+                                        SbSlotVector slots) {
+    return buildAccumOpFinalizeForWindowFunc(op, state, slots);
 }
 
-std::unique_ptr<sbe::EExpression> buildWindowFinalizeCovariancePop(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    sbe::value::SlotVector slots,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    auto accStmt = createFakeAccumulationStatement(state, stmt);
-    return buildFinalize(state, accStmt, slots, collatorSlot, *state.frameIdGenerator);
+SbExpr::Vector buildWindowAddPush(const WindowOp& op,
+                                  std::unique_ptr<AddSingleInput> inputs,
+                                  StageBuilderState& state) {
+    SbExprBuilder b(state);
+    return SbExpr::makeSeq(b.makeFunction("aggRemovablePushAdd", std::move(inputs->inputExpr)));
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowAddPush(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> arg,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    std::vector<std::unique_ptr<sbe::EExpression>> exprs;
-    exprs.push_back(makeFunction("aggRemovablePushAdd", std::move(arg)));
-    return exprs;
+SbExpr::Vector buildWindowRemovePush(const WindowOp& op,
+                                     std::unique_ptr<AddSingleInput> inputs,
+                                     StageBuilderState& state) {
+    SbExprBuilder b(state);
+    return SbExpr::makeSeq(b.makeFunction("aggRemovablePushRemove", std::move(inputs->inputExpr)));
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowRemovePush(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> arg,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    std::vector<std::unique_ptr<sbe::EExpression>> exprs;
-    exprs.push_back(makeFunction("aggRemovablePushRemove", std::move(arg)));
-    return exprs;
-}
+SbExpr buildWindowFinalizePush(const WindowOp& op, StageBuilderState& state, SbSlotVector slots) {
+    SbExprBuilder b(state);
 
-std::unique_ptr<sbe::EExpression> buildWindowFinalizePush(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    sbe::value::SlotVector slots,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    sbe::EExpression::Vector exprs;
+    SbExpr::Vector exprs;
     for (auto slot : slots) {
-        exprs.push_back(makeVariable(slot));
+        exprs.push_back(b.makeVariable(slot));
     }
-    return makeE<sbe::EFunction>("aggRemovablePushFinalize", std::move(exprs));
+    return b.makeFunction("aggRemovablePushFinalize", std::move(exprs));
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowInitializeIntegral(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> unitExpr,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    std::vector<std::unique_ptr<sbe::EExpression>> aggs;
-    aggs.push_back(makeFunction("aggIntegralInit", std::move(unitExpr), makeBoolConstant(false)));
-    return aggs;
+SbExpr::Vector buildWindowInitializeIntegral(const WindowOp& op,
+                                             std::unique_ptr<InitIntegralInputs> inputs,
+                                             StageBuilderState& state) {
+    SbExprBuilder b(state);
+
+    auto unitExpr = std::move(inputs->inputExpr);
+
+    return SbExpr::makeSeq(
+        b.makeFunction("aggIntegralInit", std::move(unitExpr), b.makeBoolConstant(false)));
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowAddIntegral(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    StringDataMap<std::unique_ptr<sbe::EExpression>> args,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    auto accStmt = createFakeAccumulationStatement(state, stmt);
-    return buildAccumulator(accStmt, std::move(args), collatorSlot, *state.frameIdGenerator);
+SbExpr::Vector buildWindowAddIntegral(const WindowOp& op,
+                                      std::unique_ptr<AddIntegralInputs> inputs,
+                                      StageBuilderState& state) {
+    return buildAccumOpAccumAggsForWindowFunc(op, std::move(inputs), state);
 }
 
+SbExpr::Vector buildWindowRemoveIntegral(const WindowOp& op,
+                                         std::unique_ptr<AddIntegralInputs> inputs,
+                                         StageBuilderState& state) {
+    SbExprBuilder b(state);
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowRemoveIntegral(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    StringDataMap<std::unique_ptr<sbe::EExpression>> args) {
-    tassert(7996814, "Incorrect number of arguments", args.size() == 2);
+    auto inputExpr = std::move(inputs->inputExpr);
+    auto sortByExpr = std::move(inputs->sortBy);
 
-    auto it = args.find(AccArgs::kInput);
-    tassert(7996815,
-            str::stream() << "Window function expects '" << AccArgs::kInput << "' argument",
-            it != args.end());
-    auto input = std::move(it->second);
-
-    it = args.find(AccArgs::kSortBy);
-    tassert(7996816,
-            str::stream() << "Window function expects '" << AccArgs::kSortBy << "' argument",
-            it != args.end());
-    auto sortBy = std::move(it->second);
-
-    std::vector<std::unique_ptr<sbe::EExpression>> exprs;
-    exprs.push_back(makeFunction("aggIntegralRemove", std::move(input), std::move(sortBy)));
-    return exprs;
+    return SbExpr::makeSeq(
+        b.makeFunction("aggIntegralRemove", std::move(inputExpr), std::move(sortByExpr)));
 }
 
-std::unique_ptr<sbe::EExpression> buildWindowFinalizeIntegral(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    sbe::value::SlotVector slots,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    auto accStmt = createFakeAccumulationStatement(state, stmt);
-    return buildFinalize(state, accStmt, slots, collatorSlot, *state.frameIdGenerator);
+SbExpr buildWindowFinalizeIntegral(const WindowOp& op,
+                                   StageBuilderState& state,
+                                   SbSlotVector slots) {
+    return buildAccumOpFinalizeForWindowFunc(op, state, slots);
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowInitializeDerivative(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> unitExpr,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    auto accStmt = createFakeAccumulationStatement(state, stmt);
-    return buildInitialize(accStmt, std::move(unitExpr), *state.frameIdGenerator);
+SbExpr::Vector buildWindowInitializeDerivative(const WindowOp& op, StageBuilderState& state) {
+    return buildAccumOpInitializeForWindowFunc(op, state);
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowAddDerivative(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    StringDataMap<std::unique_ptr<sbe::EExpression>> args,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    return addDocument();
+SbExpr::Vector buildWindowAddDerivative(const WindowOp& op, StageBuilderState& state) {
+    SbExprBuilder b(state);
+    return SbExpr::makeSeq(b.makeFunction("sum", b.makeInt64Constant(1)));
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowRemoveDerivative(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    StringDataMap<std::unique_ptr<sbe::EExpression>> args) {
-    return removeDocument();
+SbExpr::Vector buildWindowRemoveDerivative(const WindowOp& op, StageBuilderState& state) {
+    SbExprBuilder b(state);
+    return SbExpr::makeSeq(b.makeFunction("sum", b.makeInt64Constant(-1)));
 }
 
-std::unique_ptr<sbe::EExpression> buildWindowFinalizeDerivative(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    sbe::value::SlotVector slots,
-    StringDataMap<std::unique_ptr<sbe::EExpression>> args,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    auto accStmt = createFakeAccumulationStatement(state, stmt);
-    return buildFinalize(
-        state, accStmt, slots, std::move(args), collatorSlot, *state.frameIdGenerator);
+SbExpr buildWindowFinalizeDerivative(const WindowOp& op,
+                                     std::unique_ptr<FinalizeDerivativeInputs> inputs,
+                                     StageBuilderState& state,
+                                     SbSlotVector slots) {
+    return buildAccumOpFinalizeForWindowFunc(op, std::move(inputs), state, slots);
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowAddStdDev(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> arg,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    std::vector<std::unique_ptr<sbe::EExpression>> exprs;
-    exprs.push_back(makeFunction("aggRemovableStdDevAdd", std::move(arg)));
-    return exprs;
+SbExpr::Vector buildWindowAddStdDev(const WindowOp& op,
+                                    std::unique_ptr<AddSingleInput> inputs,
+                                    StageBuilderState& state) {
+    SbExprBuilder b(state);
+    return SbExpr::makeSeq(b.makeFunction("aggRemovableStdDevAdd", std::move(inputs->inputExpr)));
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowRemoveStdDev(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> arg,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    std::vector<std::unique_ptr<sbe::EExpression>> exprs;
-    exprs.push_back(makeFunction("aggRemovableStdDevRemove", std::move(arg)));
-    return exprs;
+SbExpr::Vector buildWindowRemoveStdDev(const WindowOp& op,
+                                       std::unique_ptr<AddSingleInput> inputs,
+                                       StageBuilderState& state) {
+    SbExprBuilder b(state);
+    return SbExpr::makeSeq(
+        b.makeFunction("aggRemovableStdDevRemove", std::move(inputs->inputExpr)));
 }
 
-std::unique_ptr<sbe::EExpression> buildWindowFinalizeStdDevSamp(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    sbe::value::SlotVector slots,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
+SbExpr buildWindowFinalizeStdDevSamp(const WindowOp& op,
+                                     StageBuilderState& state,
+                                     SbSlotVector slots) {
+    SbExprBuilder b(state);
+
     tassert(8019606, "Incorrect number of arguments", slots.size() == 1);
-    sbe::EExpression::Vector exprs;
+    SbExpr::Vector exprs;
     for (auto slot : slots) {
-        exprs.push_back(makeVariable(slot));
+        exprs.push_back(b.makeVariable(slot));
     }
-    return makeE<sbe::EFunction>("aggRemovableStdDevSampFinalize", std::move(exprs));
+    return b.makeFunction("aggRemovableStdDevSampFinalize", std::move(exprs));
 }
 
-std::unique_ptr<sbe::EExpression> buildWindowFinalizeStdDevPop(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    sbe::value::SlotVector slots,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
+SbExpr buildWindowFinalizeStdDevPop(const WindowOp& op,
+                                    StageBuilderState& state,
+                                    SbSlotVector slots) {
+    SbExprBuilder b(state);
+
     tassert(8019607, "Incorrect number of arguments", slots.size() == 1);
-    sbe::EExpression::Vector exprs;
+    SbExpr::Vector exprs;
     for (auto slot : slots) {
-        exprs.push_back(makeVariable(slot));
+        exprs.push_back(b.makeVariable(slot));
     }
-    return makeE<sbe::EFunction>("aggRemovableStdDevPopFinalize", std::move(exprs));
+    return b.makeFunction("aggRemovableStdDevPopFinalize", std::move(exprs));
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowAddAvg(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> arg,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
+SbExpr::Vector buildWindowAddAvg(const WindowOp& op,
+                                 std::unique_ptr<AddSingleInput> inputs,
+                                 StageBuilderState& state) {
+    SbExprBuilder b(state);
 
-    std::vector<std::unique_ptr<sbe::EExpression>> exprs;
+    SbExpr::Vector exprs;
 
-    exprs.push_back(makeFunction("aggRemovableSumAdd", arg->clone()));
+    exprs.push_back(b.makeFunction("aggRemovableSumAdd", inputs->inputExpr.clone()));
 
     // For the counter we need to skip non-numeric values ourselves.
-    auto addend = sbe::makeE<sbe::EIf>(makeFunction("isNumber", makeFillEmptyNull(std::move(arg))),
-                                       makeInt64Constant(1),
-                                       makeInt64Constant(0));
+    auto addend =
+        b.makeIf(b.makeFunction("isNumber", b.makeFillEmptyNull(std::move(inputs->inputExpr))),
+                 b.makeInt64Constant(1),
+                 b.makeInt64Constant(0));
 
-    auto counterExpr = makeFunction("sum", std::move(addend));
+    auto counterExpr = b.makeFunction("sum", std::move(addend));
     exprs.push_back(std::move(counterExpr));
 
     return exprs;
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowRemoveAvg(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> arg,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    std::vector<std::unique_ptr<sbe::EExpression>> exprs;
-    exprs.push_back(makeFunction("aggRemovableSumRemove", arg->clone()));
+SbExpr::Vector buildWindowRemoveAvg(const WindowOp& op,
+                                    std::unique_ptr<AddSingleInput> inputs,
+                                    StageBuilderState& state) {
+    SbExprBuilder b(state);
+
+    SbExpr::Vector exprs;
+    exprs.push_back(b.makeFunction("aggRemovableSumRemove", inputs->inputExpr.clone()));
 
     // For the counter we need to skip non-numeric values ourselves.
     auto subtrahend =
-        sbe::makeE<sbe::EIf>(makeFunction("isNumber", makeFillEmptyNull(std::move(arg))),
-                             makeInt64Constant(-1),
-                             makeInt64Constant(0));
-    auto counterExpr = makeFunction("sum", std::move(subtrahend));
+        b.makeIf(b.makeFunction("isNumber", b.makeFillEmptyNull(std::move(inputs->inputExpr))),
+                 b.makeInt64Constant(-1),
+                 b.makeInt64Constant(0));
+    auto counterExpr = b.makeFunction("sum", std::move(subtrahend));
     exprs.push_back(std::move(counterExpr));
     return exprs;
 }
 
-std::unique_ptr<sbe::EExpression> buildWindowFinalizeAvg(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    sbe::value::SlotVector slots,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
+SbExpr buildWindowFinalizeAvg(const WindowOp& op, StageBuilderState& state, SbSlotVector slots) {
+    SbExprBuilder b(state);
 
     // Slot 0 contains the accumulated sum, and slot 1 contains the count of summed items.
     tassert(7965900,
             str::stream() << "Expected two slots to finalize avg, got: " << slots.size(),
             slots.size() == 2);
 
-    sbe::EExpression::Vector exprs;
+    SbExpr::Vector exprs;
     for (auto slot : slots) {
-        exprs.push_back(makeVariable(slot));
+        exprs.push_back(b.makeVariable(slot));
     }
 
-    return makeFunction("aggRemovableAvgFinalize", std::move(exprs));
+    return b.makeFunction("aggRemovableAvgFinalize", std::move(exprs));
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowAddFirstLast(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> args,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    return addDocument();
+SbExpr::Vector buildWindowAddFirstLast(const WindowOp& op, StageBuilderState& state) {
+    SbExprBuilder b(state);
+    return SbExpr::makeSeq(b.makeFunction("sum", b.makeInt64Constant(1)));
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowRemoveFirstLast(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> args,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    return removeDocument();
+SbExpr::Vector buildWindowRemoveFirstLast(const WindowOp& op, StageBuilderState& state) {
+    SbExprBuilder b(state);
+    return SbExpr::makeSeq(b.makeFunction("sum", b.makeInt64Constant(-1)));
 }
 
-std::unique_ptr<sbe::EExpression> buildWindowFinalizeFirstLast(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    sbe::value::SlotVector slots,
-    StringDataMap<std::unique_ptr<sbe::EExpression>> args,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    tassert(8085500, "Expected a single slot", slots.size() == 1);
-    auto it = args.find(AccArgs::kInput);
-    tassert(8085501,
-            str::stream() << "Window function " << AccumulatorFirst::kName << " expects '"
-                          << AccArgs::kInput << "' argument",
-            it != args.end());
+SbExpr buildWindowFinalizeFirstLast(const WindowOp& op,
+                                    std::unique_ptr<FinalizeWindowFirstLastInputs> inputs,
+                                    StageBuilderState& state,
+                                    SbSlotVector slots) {
+    SbExprBuilder b(state);
 
-    return sbe::makeE<sbe::EIf>(
-        makeBinaryOp(
-            sbe::EPrimBinary::logicAnd,
-            makeFunction("exists", makeVariable(slots[0])),
-            makeBinaryOp(sbe::EPrimBinary::greater, makeVariable(slots[0]), makeInt64Constant(0))),
-        makeFillEmptyNull(std::move(it->second)),
-        makeNullConstant());
+    auto inputExpr = std::move(inputs->inputExpr);
+    auto defaultVal = std::move(inputs->defaultVal);
+
+    return b.makeIf(b.makeBinaryOp(sbe::EPrimBinary::logicAnd,
+                                   b.makeFunction("exists", b.makeVariable(slots[0])),
+                                   b.makeBinaryOp(sbe::EPrimBinary::greater,
+                                                  b.makeVariable(slots[0]),
+                                                  b.makeInt64Constant(0))),
+                    b.makeFillEmptyNull(std::move(inputExpr)),
+                    std::move(defaultVal));
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowInitializeFirstN(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    StringDataMap<std::unique_ptr<sbe::EExpression>> args,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    std::vector<std::unique_ptr<sbe::EExpression>> exprs;
-    auto it = args.find(AccArgs::kMaxSize);
-    uassert(8070617, "Expected max size argument", it != args.end());
-    auto maxSizeArg = std::move(it->second);
-    uassert(8070609,
-            "$firstN init argument should be a constant",
-            maxSizeArg->as<sbe::EConstant>() != nullptr);
-    exprs.push_back(makeFunction("aggRemovableFirstNInit", std::move(maxSizeArg)));
-    return exprs;
+SbExpr::Vector buildWindowInitializeFirstN(const WindowOp& op,
+                                           std::unique_ptr<InitAccumNInputs> inputs,
+                                           StageBuilderState& state) {
+    SbExprBuilder b(state);
+
+    auto maxSizeArg = std::move(inputs->maxSize);
+    uassert(8070609, "$firstN init argument should be a constant", maxSizeArg.isConstantExpr());
+
+    return SbExpr::makeSeq(b.makeFunction("aggRemovableFirstNInit", std::move(maxSizeArg)));
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowAddFirstN(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> arg,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    std::vector<std::unique_ptr<sbe::EExpression>> exprs;
-    exprs.push_back(makeFunction("aggRemovableFirstNAdd", makeFillEmptyNull(std::move(arg))));
-    return exprs;
+SbExpr::Vector buildWindowAddFirstN(const WindowOp& op,
+                                    std::unique_ptr<AddSingleInput> inputs,
+                                    StageBuilderState& state) {
+    SbExprBuilder b(state);
+    return SbExpr::makeSeq(
+        b.makeFunction("aggRemovableFirstNAdd", b.makeFillEmptyNull(std::move(inputs->inputExpr))));
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowRemoveFirstN(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> arg,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    std::vector<std::unique_ptr<sbe::EExpression>> exprs;
-    exprs.push_back(makeFunction("aggRemovableFirstNRemove", makeFillEmptyNull(std::move(arg))));
-    return exprs;
+SbExpr::Vector buildWindowRemoveFirstN(const WindowOp& op,
+                                       std::unique_ptr<AddSingleInput> inputs,
+                                       StageBuilderState& state) {
+    SbExprBuilder b(state);
+    return SbExpr::makeSeq(b.makeFunction("aggRemovableFirstNRemove",
+                                          b.makeFillEmptyNull(std::move(inputs->inputExpr))));
 }
 
-std::unique_ptr<sbe::EExpression> buildWindowFinalizeFirstN(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    sbe::value::SlotVector slots,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
+SbExpr buildWindowFinalizeFirstN(const WindowOp& op, StageBuilderState& state, SbSlotVector slots) {
+    SbExprBuilder b(state);
+
     tassert(8070605, "Expected a single slot", slots.size() == 1);
-    return makeFunction("aggRemovableFirstNFinalize", makeVariable(slots[0]));
+    return b.makeFunction("aggRemovableFirstNFinalize", b.makeVariable(slots[0]));
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowInitializeLastN(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    StringDataMap<std::unique_ptr<sbe::EExpression>> args,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    std::vector<std::unique_ptr<sbe::EExpression>> exprs;
-    auto it = args.find(AccArgs::kMaxSize);
-    uassert(8070616, "Expected max size argument", it != args.end());
-    auto maxSizeArg = std::move(it->second);
-    uassert(8070610,
-            "$lastN init argument should be a constant",
-            maxSizeArg->as<sbe::EConstant>() != nullptr);
-    exprs.push_back(makeFunction("aggRemovableLastNInit", std::move(maxSizeArg)));
-    return exprs;
+SbExpr::Vector buildWindowInitializeLastN(const WindowOp& op,
+                                          std::unique_ptr<InitAccumNInputs> inputs,
+                                          StageBuilderState& state) {
+    SbExprBuilder b(state);
+
+    auto maxSizeArg = std::move(inputs->maxSize);
+    uassert(8070610, "$lastN init argument should be a constant", maxSizeArg.isConstantExpr());
+
+    return SbExpr::makeSeq(b.makeFunction("aggRemovableLastNInit", std::move(maxSizeArg)));
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowAddLastN(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> arg,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    std::vector<std::unique_ptr<sbe::EExpression>> exprs;
-    exprs.push_back(makeFunction("aggRemovableLastNAdd", makeFillEmptyNull(std::move(arg))));
-    return exprs;
+SbExpr::Vector buildWindowAddLastN(const WindowOp& op,
+                                   std::unique_ptr<AddSingleInput> inputs,
+                                   StageBuilderState& state) {
+    SbExprBuilder b(state);
+    return SbExpr::makeSeq(
+        b.makeFunction("aggRemovableLastNAdd", b.makeFillEmptyNull(std::move(inputs->inputExpr))));
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowRemoveLastN(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> arg,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    std::vector<std::unique_ptr<sbe::EExpression>> exprs;
-    exprs.push_back(makeFunction("aggRemovableLastNRemove", makeFillEmptyNull(std::move(arg))));
-    return exprs;
+SbExpr::Vector buildWindowRemoveLastN(const WindowOp& op,
+                                      std::unique_ptr<AddSingleInput> inputs,
+                                      StageBuilderState& state) {
+    SbExprBuilder b(state);
+    return SbExpr::makeSeq(b.makeFunction("aggRemovableLastNRemove",
+                                          b.makeFillEmptyNull(std::move(inputs->inputExpr))));
 }
 
-std::unique_ptr<sbe::EExpression> buildWindowFinalizeLastN(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    sbe::value::SlotVector slots,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
+SbExpr buildWindowFinalizeLastN(const WindowOp& op, StageBuilderState& state, SbSlotVector slots) {
+    SbExprBuilder b(state);
+
     tassert(8070606, "Expected a single slot", slots.size() == 1);
-    return makeFunction("aggRemovableLastNFinalize", makeVariable(slots[0]));
+    return b.makeFunction("aggRemovableLastNFinalize", b.makeVariable(slots[0]));
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowInitializeAddToSet(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> unitExpr,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    std::vector<std::unique_ptr<sbe::EExpression>> exprs;
+SbExpr::Vector buildWindowInitializeAddToSet(const WindowOp& op, StageBuilderState& state) {
+    SbExprBuilder b(state);
+    auto collatorSlot = state.getCollatorSlot();
+
+    SbExpr::Vector exprs;
+
     if (collatorSlot) {
-        exprs.push_back(makeFunction("aggRemovableAddToSetCollInit",
-                                     sbe::makeE<sbe::EVariable>(*collatorSlot)));
+        exprs.push_back(
+            b.makeFunction("aggRemovableAddToSetCollInit", b.makeVariable(*collatorSlot)));
     } else {
-        exprs.push_back(makeFunction("aggRemovableAddToSetInit"));
+        exprs.push_back(b.makeFunction("aggRemovableAddToSetInit"));
     }
     return exprs;
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowAddAddToSet(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> arg,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
+SbExpr::Vector buildWindowAddAddToSet(const WindowOp& op,
+                                      std::unique_ptr<AddSingleInput> inputs,
+                                      StageBuilderState& state) {
+    SbExprBuilder b(state);
+
     const int cap = internalQueryMaxAddToSetBytes.load();
-    std::vector<std::unique_ptr<sbe::EExpression>> exprs;
-    exprs.push_back(
-        makeFunction("aggRemovableAddToSetAdd", std::move(arg), makeInt32Constant(cap)));
-    return exprs;
+    return SbExpr::makeSeq(b.makeFunction(
+        "aggRemovableAddToSetAdd", std::move(inputs->inputExpr), b.makeInt32Constant(cap)));
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowRemoveAddToSet(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> arg,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    std::vector<std::unique_ptr<sbe::EExpression>> exprs;
-    exprs.push_back(makeFunction("aggRemovableAddToSetRemove", std::move(arg)));
-    return exprs;
+SbExpr::Vector buildWindowRemoveAddToSet(const WindowOp& op,
+                                         std::unique_ptr<AddSingleInput> inputs,
+                                         StageBuilderState& state) {
+    SbExprBuilder b(state);
+    return SbExpr::makeSeq(
+        b.makeFunction("aggRemovableAddToSetRemove", std::move(inputs->inputExpr)));
 }
 
-std::unique_ptr<sbe::EExpression> buildWindowFinalizeAddToSet(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    sbe::value::SlotVector slots,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    sbe::EExpression::Vector exprs;
+SbExpr buildWindowFinalizeAddToSet(const WindowOp& op,
+                                   StageBuilderState& state,
+                                   SbSlotVector slots) {
+    SbExprBuilder b(state);
+
+    SbExpr::Vector exprs;
     for (auto slot : slots) {
-        exprs.push_back(makeVariable(slot));
+        exprs.push_back(b.makeVariable(slot));
     }
-    return makeE<sbe::EFunction>("aggRemovableAddToSetFinalize", std::move(exprs));
+    return b.makeFunction("aggRemovableAddToSetFinalize", std::move(exprs));
 }
 
+SbExpr::Vector buildWindowInitializeMinMax(const WindowOp& op, StageBuilderState& state) {
+    SbExprBuilder b(state);
+    auto collatorSlot = state.getCollatorSlot();
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowInit(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> arg,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    using BuildInitFn = std::function<std::vector<std::unique_ptr<sbe::EExpression>>(
-        StageBuilderState&,
-        const WindowFunctionStatement&,
-        std::unique_ptr<sbe::EExpression>,
-        boost::optional<sbe::value::SlotId>)>;
+    SbExpr::Vector exprs;
 
-    static const StringDataMap<BuildInitFn> kWindowFunctionBuilders = {
-        {"$sum", &emptyInitializer<1>},
-        {"$covarianceSamp", &emptyInitializer<1>},
-        {"$covariancePop", &emptyInitializer<1>},
-        {"$push", &emptyInitializer<1>},
-        {"$integral", &buildWindowInitializeIntegral},
-        {"$derivative", &buildWindowInitializeDerivative},
-        {"$stdDevSamp", &emptyInitializer<1>},
-        {"$stdDevPop", &emptyInitializer<1>},
-        {AccumulatorAvg::kName, &emptyInitializer<2>},
-        {AccumulatorFirst::kName, &emptyInitializer<1>},
-        {AccumulatorLast::kName, &emptyInitializer<1>},
-        {AccumulatorAddToSet::kName, &buildWindowInitializeAddToSet},
-    };
+    auto cap = internalQueryTopNAccumulatorBytes.load();
 
-    auto opName = stmt.expr->getOpName();
-    uassert(7914603,
-            str::stream() << "Unsupported window function in SBE stage builder: " << opName,
-            kWindowFunctionBuilders.find(opName) != kWindowFunctionBuilders.end());
-
-    return std::invoke(
-        kWindowFunctionBuilders.at(opName), state, stmt, std::move(arg), collatorSlot);
+    if (collatorSlot) {
+        exprs.push_back(b.makeFunction("aggRemovableMinMaxNCollInit",
+                                       b.makeInt32Constant(1),
+                                       b.makeInt32Constant(cap),
+                                       b.makeVariable(*collatorSlot)));
+    } else {
+        exprs.push_back(b.makeFunction(
+            "aggRemovableMinMaxNInit", b.makeInt32Constant(1), b.makeInt32Constant(cap)));
+    }
+    return exprs;
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowInit(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    StringDataMap<std::unique_ptr<sbe::EExpression>> args,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    using BuildInitFn = std::function<std::vector<std::unique_ptr<sbe::EExpression>>(
-        StageBuilderState&,
-        const WindowFunctionStatement&,
-        StringDataMap<std::unique_ptr<sbe::EExpression>>,
-        boost::optional<sbe::value::SlotId>)>;
+SbExpr::Vector buildWindowInitializeMinMaxN(const WindowOp& op,
+                                            std::unique_ptr<InitAccumNInputs> inputs,
+                                            StageBuilderState& state) {
+    SbExprBuilder b(state);
 
-    static const StringDataMap<BuildInitFn> kWindowFunctionBuilders = {
-        {"$firstN", &buildWindowInitializeFirstN},
-        {"$lastN", &buildWindowInitializeLastN},
-    };
+    auto maxSizeArg = std::move(inputs->maxSize);
+    uassert(8178113, "$minN/$maxN init argument should be a constant", maxSizeArg.isConstantExpr());
 
-    auto opName = stmt.expr->getOpName();
-    uassert(8070615,
-            str::stream() << "Unsupported window function in SBE stage builder: " << opName,
-            kWindowFunctionBuilders.find(opName) != kWindowFunctionBuilders.end());
+    SbExpr::Vector exprs;
 
-    return std::invoke(
-        kWindowFunctionBuilders.at(opName), state, stmt, std::move(args), collatorSlot);
+    auto cap = internalQueryTopNAccumulatorBytes.load();
+
+    auto collatorSlot = state.getCollatorSlot();
+
+    if (collatorSlot) {
+        exprs.push_back(b.makeFunction("aggRemovableMinMaxNCollInit",
+                                       std::move(maxSizeArg),
+                                       b.makeInt32Constant(cap),
+
+                                       b.makeVariable(*collatorSlot)));
+    } else {
+        exprs.push_back(b.makeFunction(
+            "aggRemovableMinMaxNInit", std::move(maxSizeArg), b.makeInt32Constant(cap)));
+    }
+    return exprs;
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowAdd(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> arg,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    using BuildAddFn = std::function<std::vector<std::unique_ptr<sbe::EExpression>>(
-        StageBuilderState&,
-        const WindowFunctionStatement&,
-        std::unique_ptr<sbe::EExpression>,
-        boost::optional<sbe::value::SlotId>)>;
+SbExpr::Vector buildWindowAddMinMaxN(const WindowOp& op,
+                                     std::unique_ptr<AddSingleInput> inputs,
+                                     StageBuilderState& state) {
+    SbExprBuilder b(state);
+    return SbExpr::makeSeq(b.makeFunction(
+        "aggRemovableMinMaxNAdd", b.makeFunction("setToArray", std::move(inputs->inputExpr))));
+}
 
-    static const StringDataMap<BuildAddFn> kWindowFunctionBuilders = {
-        {"$sum", &buildWindowAddSum},
-        {"$push", &buildWindowAddPush},
-        {"$stdDevSamp", &buildWindowAddStdDev},
-        {"$stdDevPop", &buildWindowAddStdDev},
-        {AccumulatorAvg::kName, &buildWindowAddAvg},
-        {AccumulatorFirst::kName, &buildWindowAddFirstLast},
-        {AccumulatorLast::kName, &buildWindowAddFirstLast},
-        {"$firstN", &buildWindowAddFirstN},
-        {"$lastN", &buildWindowAddLastN},
-        {AccumulatorAddToSet::kName, &buildWindowAddAddToSet},
-    };
+SbExpr::Vector buildWindowRemoveMinMaxN(const WindowOp& op,
+                                        std::unique_ptr<AddSingleInput> inputs,
+                                        StageBuilderState& state) {
+    SbExprBuilder b(state);
+    return SbExpr::makeSeq(b.makeFunction(
+        "aggRemovableMinMaxNRemove", b.makeFunction("setToArray", std::move(inputs->inputExpr))));
+}
 
-    auto opName = stmt.expr->getOpName();
+SbExpr buildWindowFinalizeMinN(const WindowOp& op, StageBuilderState& state, SbSlotVector slots) {
+    SbExprBuilder b(state);
+
+    tassert(8178130, "Expected a single slot", slots.size() == 1);
+    return b.makeFunction("aggRemovableMinNFinalize", b.makeVariable(slots[0]));
+}
+
+SbExpr buildWindowFinalizeMaxN(const WindowOp& op, StageBuilderState& state, SbSlotVector slots) {
+    SbExprBuilder b(state);
+
+    tassert(8178131, "Expected a single slot", slots.size() == 1);
+    return b.makeFunction("aggRemovableMaxNFinalize", b.makeVariable(slots[0]));
+}
+
+SbExpr buildWindowFinalizeMin(const WindowOp& op, StageBuilderState& state, SbSlotVector slots) {
+    SbExprBuilder b(state);
+
+    tassert(8124914, "Expected a single slot", slots.size() == 1);
+    return b.makeFillEmptyNull(
+        b.makeFunction("getElement",
+                       b.makeFunction("aggRemovableMinNFinalize", b.makeVariable(slots[0])),
+                       b.makeInt32Constant(0)));
+}
+
+SbExpr buildWindowFinalizeMax(const WindowOp& op, StageBuilderState& state, SbSlotVector slots) {
+    SbExprBuilder b(state);
+
+    tassert(8124915, "Expected a single slot", slots.size() == 1);
+    return b.makeFillEmptyNull(
+        b.makeFunction("getElement",
+                       b.makeFunction("aggRemovableMaxNFinalize", b.makeVariable(slots[0])),
+                       b.makeInt32Constant(0)));
+}
+
+SbExpr::Vector buildWindowInitializeTopBottomN(StageBuilderState& state,
+                                               std::string func,
+                                               std::unique_ptr<InitAccumNInputs> inputs) {
+    SbExprBuilder b(state);
+
+    auto maxAccumulatorBytes = internalQueryTopNAccumulatorBytes.load();
+
+    auto nExpr = std::move(inputs->maxSize);
+    uassert(8155720, "$topN/$bottomN init argument should be a constant", nExpr.isConstantExpr());
+
+    return SbExpr::makeSeq(
+        b.makeFunction(func, std::move(nExpr), b.makeInt32Constant(maxAccumulatorBytes)));
+}
+
+SbExpr::Vector buildWindowInitializeTopN(const WindowOp& op,
+                                         std::unique_ptr<InitAccumNInputs> inputs,
+                                         StageBuilderState& state) {
+    return buildWindowInitializeTopBottomN(state, "aggRemovableTopNInit", std::move(inputs));
+}
+
+SbExpr::Vector buildRemovableTopBottomN(StageBuilderState& state,
+                                        std::string func,
+                                        std::unique_ptr<AddTopBottomNInputs> inputs) {
+    SbExprBuilder b(state);
+
+    auto key = std::move(inputs->sortBy);
+    auto value = std::move(inputs->value);
+
+    return SbExpr::makeSeq(b.makeFunction(func, std::move(key), std::move(value)));
+}
+
+SbExpr::Vector buildWindowAddTopN(const WindowOp& op,
+                                  std::unique_ptr<AddTopBottomNInputs> inputs,
+                                  StageBuilderState& state) {
+    return buildRemovableTopBottomN(state, "aggRemovableTopNAdd", std::move(inputs));
+}
+
+SbExpr::Vector buildWindowRemoveTopN(const WindowOp& op,
+                                     std::unique_ptr<AddTopBottomNInputs> inputs,
+                                     StageBuilderState& state) {
+    return buildRemovableTopBottomN(state, "aggRemovableTopNRemove", std::move(inputs));
+}
+
+SbExpr buildWindowFinalizeTopN(const WindowOp& op, StageBuilderState& state, SbSlotVector slots) {
+    SbExprBuilder b(state);
+
+    tassert(8155710, "Expected a single slot", slots.size() == 1);
+    return b.makeFunction("aggRemovableTopNFinalize", b.makeVariable(slots[0]));
+}
+
+SbExpr buildWindowFinalizeTop(const WindowOp& op, StageBuilderState& state, SbSlotVector slots) {
+    SbExprBuilder b(state);
+
+    tassert(8155721, "Expected a single slot", slots.size() == 1);
+    return b.makeFillEmptyNull(
+        b.makeFunction("getElement",
+                       b.makeFunction("aggRemovableTopNFinalize", b.makeVariable(slots[0])),
+                       b.makeInt32Constant(0)));
+}
+
+SbExpr::Vector buildWindowInitializeBottomN(const WindowOp& op,
+                                            std::unique_ptr<InitAccumNInputs> inputs,
+                                            StageBuilderState& state) {
+    return buildWindowInitializeTopBottomN(state, "aggRemovableBottomNInit", std::move(inputs));
+}
+
+SbExpr::Vector buildWindowAddBottomN(const WindowOp& op,
+                                     std::unique_ptr<AddTopBottomNInputs> inputs,
+                                     StageBuilderState& state) {
+    return buildRemovableTopBottomN(state, "aggRemovableBottomNAdd", std::move(inputs));
+}
+
+SbExpr::Vector buildWindowRemoveBottomN(const WindowOp& op,
+                                        std::unique_ptr<AddTopBottomNInputs> inputs,
+                                        StageBuilderState& state) {
+    return buildRemovableTopBottomN(state, "aggRemovableBottomNRemove", std::move(inputs));
+}
+
+SbExpr buildWindowFinalizeBottomN(const WindowOp& op,
+                                  StageBuilderState& state,
+                                  SbSlotVector slots) {
+    SbExprBuilder b(state);
+
+    tassert(8155714, "Expected a single slot", slots.size() == 1);
+    return b.makeFunction("aggRemovableBottomNFinalize", b.makeVariable(slots[0]));
+}
+
+SbExpr buildWindowFinalizeBottom(const WindowOp& op, StageBuilderState& state, SbSlotVector slots) {
+    SbExprBuilder b(state);
+
+    tassert(8155722, "Expected a single slot", slots.size() == 1);
+    return b.makeFillEmptyNull(
+        b.makeFunction("getElement",
+                       b.makeFunction("aggRemovableBottomNFinalize", b.makeVariable(slots[0])),
+                       b.makeInt32Constant(0)));
+}
+
+static const StringDataMap<WindowOpInfo> windowOpInfoMap = {
+    // AddToSet
+    {AccumulatorAddToSet::kName,
+     WindowOpInfo{.buildAddAggs = makeBuildFn(&buildWindowAddAddToSet),
+                  .buildRemoveAggs = makeBuildFn(&buildWindowRemoveAddToSet),
+                  .buildInit = makeBuildFn(&buildWindowInitializeAddToSet),
+                  .buildFinalize = makeBuildFn(&buildWindowFinalizeAddToSet)}},
+
+    // Avg
+    {AccumulatorAvg::kName,
+     WindowOpInfo{.numAggs = 2,
+                  .buildAddAggs = makeBuildFn(&buildWindowAddAvg),
+                  .buildRemoveAggs = makeBuildFn(&buildWindowRemoveAvg),
+                  .buildFinalize = makeBuildFn(&buildWindowFinalizeAvg)}},
+
+    // Bottom
+    {"$bottom",
+     WindowOpInfo{.buildAddAggs = makeBuildFn(&buildWindowAddBottomN),
+                  .buildRemoveAggs = makeBuildFn(&buildWindowRemoveBottomN),
+                  .buildInit = makeBuildFn(&buildWindowInitializeBottomN),
+                  .buildFinalize = makeBuildFn(&buildWindowFinalizeBottom)}},
+
+    // BottomN
+    {"$bottomN",
+     WindowOpInfo{.buildAddAggs = makeBuildFn(&buildWindowAddBottomN),
+                  .buildRemoveAggs = makeBuildFn(&buildWindowRemoveBottomN),
+                  .buildInit = makeBuildFn(&buildWindowInitializeBottomN),
+                  .buildFinalize = makeBuildFn(&buildWindowFinalizeBottomN)}},
+
+    // CovariancePop
+    {"$covariancePop",
+     WindowOpInfo{.buildAddAggs = makeBuildFn(&buildWindowAddCovariance),
+                  .buildRemoveAggs = makeBuildFn(&buildWindowRemoveCovariance),
+                  .buildFinalize = makeBuildFn(&buildWindowFinalizeCovariancePop)}},
+
+    // CovarianceSamp
+    {"$covarianceSamp",
+     WindowOpInfo{.buildAddAggs = makeBuildFn(&buildWindowAddCovariance),
+                  .buildRemoveAggs = makeBuildFn(&buildWindowRemoveCovariance),
+                  .buildFinalize = makeBuildFn(&buildWindowFinalizeCovarianceSamp)}},
+
+    // Derivative
+    {"$derivative",
+     WindowOpInfo{.buildAddAggs = makeBuildFn(&buildWindowAddDerivative),
+                  .buildRemoveAggs = makeBuildFn(&buildWindowRemoveDerivative),
+                  .buildInit = makeBuildFn(&buildWindowInitializeDerivative),
+                  .buildFinalize = makeBuildFn(&buildWindowFinalizeDerivative)}},
+
+    // First
+    {AccumulatorFirst::kName,
+     WindowOpInfo{.buildAddAggs = makeBuildFn(&buildWindowAddFirstLast),
+                  .buildRemoveAggs = makeBuildFn(&buildWindowRemoveFirstLast),
+                  .buildFinalize = makeBuildFn(&buildWindowFinalizeFirstLast)}},
+
+    // FirstN
+    {"$firstN",
+     WindowOpInfo{.buildAddAggs = makeBuildFn(&buildWindowAddFirstN),
+                  .buildRemoveAggs = makeBuildFn(&buildWindowRemoveFirstN),
+                  .buildInit = makeBuildFn(&buildWindowInitializeFirstN),
+                  .buildFinalize = makeBuildFn(&buildWindowFinalizeFirstN)}},
+
+    // Integral
+    {"$integral",
+     WindowOpInfo{.buildAddAggs = makeBuildFn(&buildWindowAddIntegral),
+                  .buildRemoveAggs = makeBuildFn(&buildWindowRemoveIntegral),
+                  .buildInit = makeBuildFn(&buildWindowInitializeIntegral),
+                  .buildFinalize = makeBuildFn(&buildWindowFinalizeIntegral)}},
+
+    // Last
+    {AccumulatorLast::kName,
+     WindowOpInfo{.buildAddAggs = makeBuildFn(&buildWindowAddFirstLast),
+                  .buildRemoveAggs = makeBuildFn(&buildWindowRemoveFirstLast),
+                  .buildFinalize = makeBuildFn(&buildWindowFinalizeFirstLast)}},
+
+    // LastN
+    {"$lastN",
+     WindowOpInfo{.buildAddAggs = makeBuildFn(&buildWindowAddLastN),
+                  .buildRemoveAggs = makeBuildFn(&buildWindowRemoveLastN),
+                  .buildInit = makeBuildFn(&buildWindowInitializeLastN),
+                  .buildFinalize = makeBuildFn(&buildWindowFinalizeLastN)}},
+
+    // Max
+    {AccumulatorMax::kName,
+     WindowOpInfo{.buildAddAggs = makeBuildFn(&buildWindowAddMinMaxN),
+                  .buildRemoveAggs = makeBuildFn(&buildWindowRemoveMinMaxN),
+                  .buildInit = makeBuildFn(&buildWindowInitializeMinMax),
+                  .buildFinalize = makeBuildFn(&buildWindowFinalizeMax)}},
+
+    // MaxN
+    {AccumulatorMaxN::kName,
+     WindowOpInfo{.buildAddAggs = makeBuildFn(&buildWindowAddMinMaxN),
+                  .buildRemoveAggs = makeBuildFn(&buildWindowRemoveMinMaxN),
+                  .buildInit = makeBuildFn(&buildWindowInitializeMinMaxN),
+                  .buildFinalize = makeBuildFn(&buildWindowFinalizeMaxN)}},
+
+    // Min
+    {AccumulatorMin::kName,
+     WindowOpInfo{.buildAddAggs = makeBuildFn(&buildWindowAddMinMaxN),
+                  .buildRemoveAggs = makeBuildFn(&buildWindowRemoveMinMaxN),
+                  .buildInit = makeBuildFn(&buildWindowInitializeMinMax),
+                  .buildFinalize = makeBuildFn(&buildWindowFinalizeMin)}},
+
+    // MinN
+    {AccumulatorMinN::kName,
+     WindowOpInfo{.buildAddAggs = makeBuildFn(&buildWindowAddMinMaxN),
+                  .buildRemoveAggs = makeBuildFn(&buildWindowRemoveMinMaxN),
+                  .buildInit = makeBuildFn(&buildWindowInitializeMinMaxN),
+                  .buildFinalize = makeBuildFn(&buildWindowFinalizeMinN)}},
+
+    // Push
+    {"$push",
+     WindowOpInfo{.buildAddAggs = makeBuildFn(&buildWindowAddPush),
+                  .buildRemoveAggs = makeBuildFn(&buildWindowRemovePush),
+                  .buildFinalize = makeBuildFn(&buildWindowFinalizePush)}},
+
+    // Shift
+    {"$shift",
+     WindowOpInfo{.buildAddAggs = makeBuildFn(&buildWindowAddFirstLast),
+                  .buildRemoveAggs = makeBuildFn(&buildWindowRemoveFirstLast),
+                  .buildFinalize = makeBuildFn(&buildWindowFinalizeFirstLast)}},
+
+    // StdDevPop
+    {"$stdDevPop",
+     WindowOpInfo{.buildAddAggs = makeBuildFn(&buildWindowAddStdDev),
+                  .buildRemoveAggs = makeBuildFn(&buildWindowRemoveStdDev),
+                  .buildFinalize = makeBuildFn(&buildWindowFinalizeStdDevPop)}},
+
+    // StdDevSamp
+    {"$stdDevSamp",
+     WindowOpInfo{.buildAddAggs = makeBuildFn(&buildWindowAddStdDev),
+                  .buildRemoveAggs = makeBuildFn(&buildWindowRemoveStdDev),
+                  .buildFinalize = makeBuildFn(&buildWindowFinalizeStdDevSamp)}},
+
+    // Sum
+    {"$sum",
+     WindowOpInfo{.buildAddAggs = makeBuildFn(&buildWindowAddSum),
+                  .buildRemoveAggs = makeBuildFn(&buildWindowRemoveSum),
+                  .buildFinalize = makeBuildFn(&buildWindowFinalizeSum)}},
+
+    // Top
+    {"$top",
+     WindowOpInfo{.buildAddAggs = makeBuildFn(&buildWindowAddTopN),
+                  .buildRemoveAggs = makeBuildFn(&buildWindowRemoveTopN),
+                  .buildInit = makeBuildFn(&buildWindowInitializeTopN),
+                  .buildFinalize = makeBuildFn(&buildWindowFinalizeTop)}},
+
+    // TopN
+    {"$topN",
+     WindowOpInfo{.buildAddAggs = makeBuildFn(&buildWindowAddTopN),
+                  .buildRemoveAggs = makeBuildFn(&buildWindowRemoveTopN),
+                  .buildInit = makeBuildFn(&buildWindowInitializeTopN),
+                  .buildFinalize = makeBuildFn(&buildWindowFinalizeTopN)}},
+};
+}  // namespace
+
+WindowOp::WindowOp(std::string opName)
+    : _opName(std::move(opName)), _opInfo(lookupOpInfo(_opName)) {}
+
+WindowOp::WindowOp(const WindowFunctionStatement& wfStmt)
+    : _opName(wfStmt.expr->getOpName()), _opInfo(lookupOpInfo(_opName)) {}
+
+const WindowOpInfo* WindowOp::lookupOpInfo(const std::string& opName) {
+    auto it = windowOpInfoMap.find(opName);
+    return it != windowOpInfoMap.end() ? &it->second : nullptr;
+}
+
+size_t WindowOp::getNumAggs() const {
+    return getOpInfo()->numAggs;
+}
+
+SbExpr::Vector WindowOp::buildAddAggs(StageBuilderState& state, AccumInputsPtr inputs) const {
     uassert(7914604,
-            str::stream() << "Unsupported window function in SBE stage builder: " << opName,
-            kWindowFunctionBuilders.find(opName) != kWindowFunctionBuilders.end());
+            str::stream() << "Unsupported op in SBE window function builder: " << _opName,
+            _opInfo && _opInfo->buildAddAggs);
 
-    return std::invoke(
-        kWindowFunctionBuilders.at(opName), state, stmt, std::move(arg), collatorSlot);
+    return _opInfo->buildAddAggs(*this, std::move(inputs), state);
 }
 
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowAdd(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    StringDataMap<std::unique_ptr<sbe::EExpression>> args,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    using BuildAddFn = std::function<std::vector<std::unique_ptr<sbe::EExpression>>(
-        StageBuilderState&,
-        const WindowFunctionStatement&,
-        StringDataMap<std::unique_ptr<sbe::EExpression>>,
-        boost::optional<sbe::value::SlotId>)>;
-
-    static const StringDataMap<BuildAddFn> kWindowFunctionBuilders = {
-        {"$covarianceSamp", &buildWindowAddCovariance},
-        {"$covariancePop", &buildWindowAddCovariance},
-        {"$integral", &buildWindowAddIntegral},
-        {"$derivative", &buildWindowAddDerivative},
-    };
-
-    auto opName = stmt.expr->getOpName();
-    uassert(7820816,
-            str::stream() << "Unsupported window function in SBE stage builder: " << opName,
-            kWindowFunctionBuilders.find(opName) != kWindowFunctionBuilders.end());
-
-    return std::invoke(
-        kWindowFunctionBuilders.at(opName), state, stmt, std::move(args), collatorSlot);
-}
-
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowRemove(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    std::unique_ptr<sbe::EExpression> arg,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    using BuildRemoveFn = std::function<std::vector<std::unique_ptr<sbe::EExpression>>(
-        StageBuilderState&,
-        const WindowFunctionStatement&,
-        std::unique_ptr<sbe::EExpression>,
-        boost::optional<sbe::value::SlotId>)>;
-
-    static const StringDataMap<BuildRemoveFn> kWindowFunctionBuilders = {
-        {"$sum", &buildWindowRemoveSum},
-        {"$push", &buildWindowRemovePush},
-        {"$stdDevSamp", &buildWindowRemoveStdDev},
-        {"$stdDevPop", &buildWindowRemoveStdDev},
-        {AccumulatorAvg::kName, &buildWindowRemoveAvg},
-        {AccumulatorFirst::kName, &buildWindowRemoveFirstLast},
-        {AccumulatorLast::kName, &buildWindowRemoveFirstLast},
-        {"$firstN", &buildWindowRemoveFirstN},
-        {"$lastN", &buildWindowRemoveLastN},
-        {AccumulatorAddToSet::kName, &buildWindowRemoveAddToSet},
-    };
-
-    auto opName = stmt.expr->getOpName();
+SbExpr::Vector WindowOp::buildRemoveAggs(StageBuilderState& state, AccumInputsPtr inputs) const {
     uassert(7914605,
-            str::stream() << "Unsupported window function in SBE stage builder: " << opName,
-            kWindowFunctionBuilders.find(opName) != kWindowFunctionBuilders.end());
+            str::stream() << "Unsupported op in SBE window function builder: " << _opName,
+            _opInfo && _opInfo->buildRemoveAggs);
 
-    return std::invoke(
-        kWindowFunctionBuilders.at(opName), state, stmt, std::move(arg), collatorSlot);
-}  // namespace mongo::stage_builder
-
-std::vector<std::unique_ptr<sbe::EExpression>> buildWindowRemove(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    StringDataMap<std::unique_ptr<sbe::EExpression>> args) {
-    using BuildRemoveFn = std::function<std::vector<std::unique_ptr<sbe::EExpression>>(
-        StageBuilderState&,
-        const WindowFunctionStatement&,
-        StringDataMap<std::unique_ptr<sbe::EExpression>>)>;
-
-    static const StringDataMap<BuildRemoveFn> kWindowFunctionBuilders = {
-        {"$covarianceSamp", &buildWindowRemoveCovariance},
-        {"$covariancePop", &buildWindowRemoveCovariance},
-        {"$integral", &buildWindowRemoveIntegral},
-        {"$derivative", &buildWindowRemoveDerivative},
-    };
-
-    auto opName = stmt.expr->getOpName();
-    uassert(7820817,
-            str::stream() << "Unsupported window function in SBE stage builder: " << opName,
-            kWindowFunctionBuilders.find(opName) != kWindowFunctionBuilders.end());
-
-    return std::invoke(kWindowFunctionBuilders.at(opName), state, stmt, std::move(args));
+    return _opInfo->buildRemoveAggs(*this, std::move(inputs), state);
 }
 
-std::unique_ptr<sbe::EExpression> buildWindowFinalize(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    sbe::value::SlotVector values,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    using BuildFinalizeFn =
-        std::function<std::unique_ptr<sbe::EExpression>(StageBuilderState&,
-                                                        const WindowFunctionStatement&,
-                                                        sbe::value::SlotVector values,
-                                                        boost::optional<sbe::value::SlotId>)>;
+SbExpr::Vector WindowOp::buildInitialize(StageBuilderState& state, AccumInputsPtr inputs) const {
+    uassert(8070615,
+            str::stream() << "Unsupported op in SBE window function builder: " << _opName,
+            _opInfo);
 
-    static const StringDataMap<BuildFinalizeFn> kWindowFunctionBuilders = {
-        {"$sum", &buildWindowFinalizeSum},
-        {"$covarianceSamp", &buildWindowFinalizeCovarianceSamp},
-        {"$covariancePop", &buildWindowFinalizeCovariancePop},
-        {"$push", &buildWindowFinalizePush},
-        {"$integral", &buildWindowFinalizeIntegral},
-        {"$stdDevSamp", &buildWindowFinalizeStdDevSamp},
-        {"$stdDevPop", &buildWindowFinalizeStdDevPop},
-        {AccumulatorAvg::kName, &buildWindowFinalizeAvg},
-        {"$firstN", &buildWindowFinalizeFirstN},
-        {"$lastN", &buildWindowFinalizeLastN},
-        {AccumulatorAddToSet::kName, &buildWindowFinalizeAddToSet},
-    };
+    if (!_opInfo->buildInit) {
+        // If the 'buildInit' callback wasn't defined for this op, perform default initialization.
+        SbExpr::Vector result;
+        result.resize(_opInfo->numAggs);
+        return result;
+    }
 
-    auto opName = stmt.expr->getOpName();
+    return _opInfo->buildInit(*this, std::move(inputs), state);
+}
+
+SbExpr WindowOp::buildFinalize(StageBuilderState& state,
+                               AccumInputsPtr inputs,
+                               const SbSlotVector& aggSlots) const {
     uassert(7914606,
-            str::stream() << "Unsupported window function in SBE stage builder: " << opName,
-            kWindowFunctionBuilders.find(opName) != kWindowFunctionBuilders.end());
+            str::stream() << "Unsupported op in SBE window function builder: " << _opName,
+            _opInfo);
 
-    return std::invoke(
-        kWindowFunctionBuilders.at(opName), state, stmt, std::move(values), collatorSlot);
+    if (!_opInfo->buildFinalize) {
+        // If the 'buildFinalize' callback wasn't defined for this op, perform default finalization.
+        return SbExpr{};
+    }
+
+    return _opInfo->buildFinalize(*this, std::move(inputs), state, aggSlots);
 }
-
-std::unique_ptr<sbe::EExpression> buildWindowFinalize(
-    StageBuilderState& state,
-    const WindowFunctionStatement& stmt,
-    sbe::value::SlotVector values,
-    StringDataMap<std::unique_ptr<sbe::EExpression>> args,
-    boost::optional<sbe::value::SlotId> collatorSlot) {
-    using BuildFinalizeFn = std::function<std::unique_ptr<sbe::EExpression>(
-        StageBuilderState&,
-        const WindowFunctionStatement&,
-        sbe::value::SlotVector,
-        StringDataMap<std::unique_ptr<sbe::EExpression>>,
-        boost::optional<sbe::value::SlotId>)>;
-
-    static const StringDataMap<BuildFinalizeFn> kWindowFunctionBuilders = {
-        {"$derivative", &buildWindowFinalizeDerivative},
-        {AccumulatorFirst::kName, &buildWindowFinalizeFirstLast},
-        {AccumulatorLast::kName, &buildWindowFinalizeFirstLast},
-    };
-
-    auto opName = stmt.expr->getOpName();
-    uassert(7993415,
-            str::stream() << "Unsupported window function in SBE stage builder: " << opName,
-            kWindowFunctionBuilders.find(opName) != kWindowFunctionBuilders.end());
-
-    return std::invoke(kWindowFunctionBuilders.at(opName),
-                       state,
-                       stmt,
-                       std::move(values),
-                       std::move(args),
-                       collatorSlot);
-}
-
 }  // namespace mongo::stage_builder

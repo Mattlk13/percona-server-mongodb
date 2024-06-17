@@ -45,6 +45,7 @@ server_parameters:
         cpp_vartype: AtomicWord<bool>
         cpp_varname: gBatchUserMultiDeletes
         default: true
+        redact: false
 
 types:
     yield_policy:
@@ -53,11 +54,13 @@ types:
         cpp_type: "PlanYieldPolicy::YieldPolicy"
         serializer: "::mongo::PlanYieldPolicy::serializeYieldPolicy"
         deserializer: "mongo::PlanYieldPolicy::parseFromBSON"
+        is_view: false
     stmt_id:
         bson_serialization_type: int
         description: ""
         cpp_type: "mongo::StmtId"
         deserializer: "mongo::BSONElement::_numberInt"
+        is_view: false
 
 structs:
     DeleteRequest:

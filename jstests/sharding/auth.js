@@ -4,7 +4,11 @@
  *
  * This test is labeled resource intensive because its total io_write is 30MB compared to a median
  * of 5MB across all sharding tests in wiredTiger.
- * @tags: [resource_intensive]
+ * @tags: [
+ *   resource_intensive,
+ *   # Test doesn't start enough mongods to have num_mongos routers
+ *   temp_disabled_embedded_router_num_routers,
+ * ]
  */
 import {traceMissingDoc} from "jstests/libs/trace_missing_docs.js";
 import {awaitRSClientHosts} from "jstests/replsets/rslib.js";
@@ -105,9 +109,19 @@ assert(thrown);
 
 print("start rs w/correct key");
 
-d1.stopSet();
-d1.startSet({keyFile: "jstests/libs/key1", restart: true});
-d1.initiate();
+d1.stopSet(null /* signal */, true /* forRestart */);
+// If we are using the in-memory storage engine, we need to re-initiate the replica set
+// after restart before an election can occur, since the config does not persist. So
+// we must disable the auto stepup-on-restart behavior.
+if (jsTest.options().storageEngine == "inMemory") {
+    d1.startSet({keyFile: "jstests/libs/key1"},
+                true /* restart */,
+                false /* isMixedVersionCluster */,
+                true /* skipStepUpOnRestart */);
+    d1.initiate();
+} else {
+    d1.startSet({keyFile: "jstests/libs/key1", restart: true});
+}
 
 var primary = d1.getPrimary();
 

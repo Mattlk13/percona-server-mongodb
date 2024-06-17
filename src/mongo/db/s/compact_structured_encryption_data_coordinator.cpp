@@ -92,7 +92,10 @@ template <typename Request>
 Status doRunCommand(OperationContext* opCtx, const DatabaseName& dbname, const Request& request) {
     DBDirectClient client(opCtx);
     BSONObj cmd = request.toBSON(kMajorityWriteConcern);
-    auto reply = client.runCommand(OpMsgRequest::fromDBAndBody(dbname, cmd))->getCommandReply();
+    auto reply = client
+                     .runCommand(OpMsgRequestBuilder::create(
+                         auth::ValidatedTenancyScope::get(opCtx), dbname, cmd))
+                     ->getCommandReply();
     return getStatusFromCommandResult(reply);
 }
 
@@ -212,7 +215,7 @@ bool doRenameOperation(const CompactionState& state,
         cmd.setDropTarget(false);
         cmd.setCollectionUUID(state.getEcocUuid().value());
 
-        uassertStatusOK(doRunCommand(opCtx.get(), ecocNss.dbName(), cmd));
+        uassertStatusOK(doRunCommand(opCtx.get(), DatabaseName::kAdmin, cmd));
         *newEcocRenameUuid = state.getEcocUuid();
     }
 
@@ -227,7 +230,7 @@ bool doRenameOperation(const CompactionState& state,
         mongo::ClusteredIndexSpec clusterIdxSpec(BSON("_id" << 1), true);
         CreateCollectionRequest request;
         request.setClusteredIndex(
-            stdx::variant<bool, mongo::ClusteredIndexSpec>(std::move(clusterIdxSpec)));
+            std::variant<bool, mongo::ClusteredIndexSpec>(std::move(clusterIdxSpec)));
         createCmd.setCreateCollectionRequest(std::move(request));
         auto status = doRunCommand(opCtx.get(), ecocNss.dbName(), createCmd);
         if (!status.isOK()) {
@@ -266,6 +269,8 @@ void doCompactOperation(const CompactStructuredEncryptionDataState& state,
     namespaces.ecocRenameNss = state.getEcocRenameNss();
     auto opCtx = cc().makeOperationContext();
     CompactStructuredEncryptionData request(namespaces.edcNss, state.getCompactionTokens());
+    request.setEncryptionInformation(state.getEncryptionInformation());
+    request.setAnchorPaddingFactor(state.getAnchorPaddingFactor());
 
     processFLECompactV2(
         opCtx.get(), request, &getTransactionWithRetriesForMongoS, namespaces, escStats, ecocStats);

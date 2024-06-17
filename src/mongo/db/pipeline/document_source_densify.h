@@ -30,8 +30,6 @@
 #pragma once
 
 #include <boost/smart_ptr.hpp>
-#include <cstddef>
-#include <iosfwd>
 #include <list>
 #include <set>
 #include <string>
@@ -59,7 +57,6 @@
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/field_path.h"
-#include "mongo/db/pipeline/memory_usage_tracker.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/stage_constraints.h"
 #include "mongo/db/pipeline/variables.h"
@@ -67,9 +64,9 @@
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_shape/serialization_options.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/intrusive_counter.h"
+#include "mongo/util/memory_usage_tracker.h"
 #include "mongo/util/overloaded_visitor.h"  // IWYU pragma: keep
 #include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
@@ -80,7 +77,7 @@ namespace mongo {
 class RangeStatement;
 class DensifyValue {
 public:
-    // Delegate to the zero-argument constructor for stdx::variant<T>. This constructor is needed
+    // Delegate to the zero-argument constructor for std::variant<T>. This constructor is needed
     // for DensifyValue to be able to be the value type in a ValueUnorderedMap.
     DensifyValue() : _value() {}
     DensifyValue(Value val) : _value(val) {}
@@ -94,13 +91,13 @@ public:
      * Convert a DensifyValue into a Value for use in documents/serialization.
      */
     Value toValue() const {
-        return stdx::visit(OverloadedVisitor{[&](Value unwrappedVal) { return unwrappedVal; },
-                                             [&](Date_t dateVal) {
-                                                 return Value(dateVal);
-                                             }
+        return visit(OverloadedVisitor{[&](Value unwrappedVal) { return unwrappedVal; },
+                                       [&](Date_t dateVal) {
+                                           return Value(dateVal);
+                                       }
 
-                           },
-                           _value);
+                     },
+                     _value);
     }
 
     /**
@@ -108,16 +105,16 @@ public:
      * of (lhs - rhs). Returns -1 if lhs < rhs, 0 if lhs == rhs, and 1 if lhs > rhs.
      */
     static int compare(const DensifyValue& lhs, const DensifyValue& rhs) {
-        return stdx::visit(OverloadedVisitor{[&](Value lhsVal) {
-                                                 Value rhsVal = stdx::get<Value>(rhs._value);
-                                                 return Value::compare(lhsVal, rhsVal, nullptr);
-                                             },
-                                             [&](Date_t lhsVal) {
-                                                 Date_t rhsVal = stdx::get<Date_t>(rhs._value);
-                                                 return Value::compare(
-                                                     Value(lhsVal), Value(rhsVal), nullptr);
-                                             }},
-                           lhs._value);
+        return visit(OverloadedVisitor{[&](Value lhsVal) {
+                                           Value rhsVal = get<Value>(rhs._value);
+                                           return Value::compare(lhsVal, rhsVal, nullptr);
+                                       },
+                                       [&](Date_t lhsVal) {
+                                           Date_t rhsVal = get<Date_t>(rhs._value);
+                                           return Value::compare(
+                                               Value(lhsVal), Value(rhsVal), nullptr);
+                                       }},
+                     lhs._value);
     }
 
     /**
@@ -125,8 +122,7 @@ public:
      * the document has either a numeric value or a date in the proper field, and throws an error
      * otherwise.
      */
-    static DensifyValue getFromDocument(const Document& doc, const FieldPath& path) {
-        Value val = doc.getNestedField(path);
+    static DensifyValue getFromValue(const Value& val) {
         uassert(5733201,
                 "Densify field type must be numeric or a date",
                 val.numeric() || val.getType() == BSONType::Date);
@@ -135,13 +131,17 @@ public:
         }
         return val;
     }
+    static DensifyValue getFromDocument(const Document& doc, const FieldPath& path) {
+        Value val = doc.getNestedField(path);
+        return getFromValue(val);
+    }
 
     std::string toString() const {
-        return stdx::visit(OverloadedVisitor{[&](Value v) { return v.toString(); },
-                                             [&](Date_t d) {
-                                                 return d.toString();
-                                             }},
-                           _value);
+        return visit(OverloadedVisitor{[&](Value v) { return v.toString(); },
+                                       [&](Date_t d) {
+                                           return d.toString();
+                                       }},
+                     _value);
     }
 
     /**
@@ -158,18 +158,18 @@ public:
      * Delegate to Value::getApproximateSize().
      */
     size_t getApproximateSize() const {
-        return stdx::visit(OverloadedVisitor{[&](Value v) { return v.getApproximateSize(); },
-                                             [&](Date_t d) {
-                                                 return Value(d).getApproximateSize();
-                                             }},
-                           _value);
+        return visit(OverloadedVisitor{[&](Value v) { return v.getApproximateSize(); },
+                                       [&](Date_t d) {
+                                           return Value(d).getApproximateSize();
+                                       }},
+                     _value);
     }
 
     /**
      * Returns true if this DensifyValue is a date.
      */
     bool isDate() const {
-        return stdx::holds_alternative<Date_t>(_value);
+        return holds_alternative<Date_t>(_value);
     }
 
     /**
@@ -177,14 +177,14 @@ public:
      */
     Date_t getDate() const {
         tassert(5733701, "DensifyValue must be a date", isDate());
-        return stdx::get<Date_t>(_value);
+        return get<Date_t>(_value);
     }
 
     /**
      * Returns true if this DensifyValue is a number.
      */
     bool isNumber() const {
-        return stdx::holds_alternative<Value>(_value);
+        return holds_alternative<Value>(_value);
     }
 
     /**
@@ -192,7 +192,7 @@ public:
      */
     Value getNumber() const {
         tassert(5733702, "DensifyValue must be a number", isNumber());
-        return stdx::get<Value>(_value);
+        return get<Value>(_value);
     }
 
     /**
@@ -201,12 +201,6 @@ public:
     bool isSameTypeAs(const DensifyValue& other) const {
         return (this->isDate() && other.isDate()) || (this->isNumber() && other.isNumber());
     }
-
-    /**
-     * Checks if the value is exactly on the step defined in the given RangeStatement
-     * relative to the provided base value.
-     */
-    bool isOnStepRelativeTo(DensifyValue base, RangeStatement range) const;
 
     /**
      * Comparison operator overloads.
@@ -244,7 +238,7 @@ public:
     }
 
 private:
-    stdx::variant<Value, Date_t> _value;
+    std::variant<Value, Date_t> _value;
 };
 class RangeStatement {
 public:
@@ -258,7 +252,7 @@ public:
     struct Full {};
     struct Partition {};
     typedef std::pair<DensifyValue, DensifyValue> ExplicitBounds;
-    using Bounds = stdx::variant<Full, Partition, ExplicitBounds>;
+    using Bounds = std::variant<Full, Partition, ExplicitBounds>;
 
     Bounds getBounds() const {
         return _bounds;
@@ -280,17 +274,17 @@ public:
     Value serialize(const SerializationOptions& opts) const {
         MutableDocument spec;
         spec[kArgStep] = opts.serializeLiteral(_step);
-        spec[kArgBounds] = stdx::visit(
-            OverloadedVisitor{[&](Full) { return Value(kValFull); },
-                              [&](Partition) { return Value(kValPartition); },
-                              [&](ExplicitBounds bounds) {
-                                  return Value(std::vector<Value>(
-                                      {opts.serializeLiteral(bounds.first.toValue()),
-                                       opts.serializeLiteral(bounds.second.toValue())}));
-                              }},
-            _bounds);
+        spec[kArgBounds] =
+            visit(OverloadedVisitor{[&](Full) { return Value(kValFull); },
+                                    [&](Partition) { return Value(kValPartition); },
+                                    [&](ExplicitBounds bounds) {
+                                        return Value(std::vector<Value>(
+                                            {opts.serializeLiteral(bounds.first.toValue()),
+                                             opts.serializeLiteral(bounds.second.toValue())}));
+                                    }},
+                  _bounds);
         if (_unit)
-            spec[kArgUnit] = opts.serializeLiteral(serializeTimeUnit(*_unit));
+            spec[kArgUnit] = Value(serializeTimeUnit(*_unit));
         return spec.freezeToValue();
     }
 
@@ -344,7 +338,7 @@ public:
           _partitions(std::move(partitions)),
           _range(std::move(range)),
           _partitionTable(pExpCtx->getValueComparator()
-                              .makeUnorderedValueMap<SimpleMemoryTokenWith<DensifyValue>>()) {
+                              .makeUnorderedValueMap<SimpleMemoryUsageTokenWith<DensifyValue>>()) {
         _maxDocs = internalQueryMaxAllowedDensifyDocs.load();
     };
 
@@ -355,10 +349,16 @@ public:
                      FieldPath fieldName,
                      boost::optional<Document> includeFields,
                      boost::optional<Document> finalDoc,
+                     boost::optional<Value> partitionKey,
                      ValueComparator comp,
-                     size_t* counter);
+                     size_t* counter,
+                     bool maxInclusive);
         Document getNextDocument();
         bool done() const;
+        // Helper to return whether this is the last generated document. This is useful because
+        // the last generated document is always on the step. Expected to be called after generating
+        // a document to describe the document that was just generated as 'last' or 'not last'.
+        bool lastGeneratedDoc() const;
 
 
     private:
@@ -371,9 +371,12 @@ public:
         // creation of this generator. Will be returned after the final generated document. Can
         // be boost::none if we are generating the values at the end of the range.
         boost::optional<Document> _finalDoc;
+        // The partition key for all documents created by this generator.
+        boost::optional<Value> _partitionKey;
         // The minimum value that this generator will create, therefore the next generated
         // document will have this value.
         DensifyValue _min;
+        bool _maxInclusive = false;
 
         enum class GeneratorState {
             // Generating documents between '_min' and the upper bound.
@@ -417,7 +420,7 @@ public:
         return kStageName.rawData();
     }
 
-    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final override;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final {
         deps->fields.insert(_field.fullPath());
@@ -452,15 +455,32 @@ private:
         kAbove,
     };
 
-    DensifyValue getDensifyValue(const Document& doc) {
-        auto val = DensifyValue::getFromDocument(doc, _field);
+    /**
+     * Helper to pull a document from the previous stage and verify that it is eligible for
+     * densification. Returns a tuple of <Return immediately, pulled document, value to be
+     * densified, partition key>.
+     */
+    std::tuple<bool, DocumentSource::GetNextResult, DensifyValue, Value> getAndCheckInvalidDoc();
+
+    void assertDensifyType(DensifyValue val) {
         uassert(6053600,
                 val.isNumber()
                     ? "Encountered numeric densify value in collection when step has a date unit."
                     : "Encountered date densify value in collection when step does not have a date "
                       "unit.",
                 (!_range.getUnit() && val.isNumber()) || (_range.getUnit() && val.isDate()));
+    }
+
+    DensifyValue getDensifyValue(const Document& doc) {
+        auto val = DensifyValue::getFromDocument(doc, _field);
+        assertDensifyType(val);
         return val;
+    }
+
+    DensifyValue getDensifyValue(const Value& val) {
+        auto densifyVal = DensifyValue::getFromValue(val);
+        assertDensifyType(densifyVal);
+        return densifyVal;
     }
 
     Value getDensifyPartition(const Document& doc) {
@@ -470,108 +490,96 @@ private:
 
     /**
      * Decides whether or not to build a DocGen and return the first document generated or return
-     * the current doc if the rangeMin + step is greater than rangeMax. Used for both 'full' and
-     * 'partition' bounds.
+     * the current doc if the rangeMin + step is greater than rangeMax.
+     * Optionally include the densify and partition values for the generator if they've already
+     * been calculated.
      */
-    DocumentSource::GetNextResult handleNeedGen(Document currentDoc);
+    DocumentSource::GetNextResult handleNeedGen(Document currentDoc,
+                                                DensifyValue lastSeen,
+                                                DensifyValue& densifyVal,
+                                                Value& partitinKey);
 
     /**
-     * Checks where the current doc's value lies compared to the range and creates the correct
-     * DocGen if needed and returns the next doc.
+     * Check whether or not the first document in the partition needs to be densified. Returns the
+     * document this iteration should return.
      */
-    DocumentSource::GetNextResult handleNeedGenExplicit(Document currentDoc);
+    DocumentSource::GetNextResult checkFirstDocAgainstRangeStart(Document doc,
+                                                                 DensifyValue& densifyVal,
+                                                                 Value& partitionKey);
 
     /**
-     * Takes care of when an EOF has been hit for the explicit case. It checks if we have finished
-     * densifying over the range, and if so changes the state to be kDensify done. Otherwise it
-     * builds a new generator that will finish densifying over the range and changes the state to
-     * kHaveGen. Only used if the input is not partitioned.
-     */
-    DocumentSource::GetNextResult densifyExplicitRangeAfterEOF();
-
-    /**
-     * Decide what to do for the first document in a given partition for explicit range. Either
-     * generate documents between the minimum and the value, or just return it.
-     */
-    DocumentSource::GetNextResult processFirstDocForExplicitRange(Document doc);
-
-    /**
-     * Creates a document generator based on the value passed in, the current _current, and the
-     * ExplicitBounds on the stage. Once created, the state changes to kHaveGenerator and the first
-     * document from the generator is returned.
-     */
-    DocumentSource::GetNextResult processDocAboveExplicitMinBound(Document doc);
-
-    /**
-     * Takes in a value and checks if the value is below, on the bottom, inside, or above the
-     * range, and returns the equivelant state from ValComparedToRange.
-     */
-    ValComparedToRange getPositionRelativeToRange(DensifyValue val);
-
-    /**
-     * Handles when the pSource has been exhausted. In the full case we are done with the
-     * densification process and the state becomes kDensifyDone, however in the explicit case we
-     * may still need to densify over the remainder of the range, so the
-     * densifyExplicitRangeAfterEOF() function is called.
+     * Handles when the pSource has been exhausted. Has different behavior depending on the densify
+     * mode, but generally speaking sets the min/max for what still needs to be done, and then
+     * delegates to helpers to finish densifying each partition individually. In the non-partitioned
+     * case, this is the "trivial" partition of the whole collection.
      */
     DocumentSource::GetNextResult handleSourceExhausted();
+
+    /**
+     * Set up necessary tracking variables based on the densify mode. Only called once at the
+     * beginning of execution.
+     */
+    void initializeState();
 
     /**
      * Handles building a document generator once we've seen an EOF for partitioned input. Min will
      * be the last seen value in the partition unless it is less than the optional 'minOverride'.
      * Helper is to share code between visit functions.
      */
-    DocumentSource::GetNextResult finishDensifyingPartitionedInput();
     DocumentSource::GetNextResult finishDensifyingPartitionedInputHelper(
-        DensifyValue max, boost::optional<DensifyValue> minOverride = boost::none);
+        DensifyValue max,
+        boost::optional<DensifyValue> minOverride = boost::none,
+        bool maxInclusive = false);
 
-    /**
-     * Checks if the current document generator is done. If it is and we have finished densifying,
-     * it changes the state to be kDensifyDone. If there is more to densify, the state becomes
-     * kNeedGen. The generator is also deleted.
-     */
-    void resetDocGen(RangeStatement::ExplicitBounds bounds);
-
-    /**
-     * Set up the state for densifying over partitions.
-     */
-    void initializePartitionState(Document initialDoc);
-
+    boost::optional<Document> createIncludeFieldsObj(Value partitionKey);
     /**
      * Helper to set the value in the partition table.
      */
-    void setPartitionValue(Document doc) {
-        if (_partitionExpr) {
-            auto partitionKey = getDensifyPartition(doc);
-            auto partitionVal = getDensifyValue(doc);
-            SimpleMemoryToken memoryToken{partitionKey.getApproximateSize() +
-                                              partitionVal.getApproximateSize(),
-                                          &_memTracker};
-            _partitionTable[partitionKey] = {std::move(memoryToken), std::move(partitionVal)};
-            uassert(6007200,
-                    str::stream() << "$densify exceeded memory limit of "
-                                  << _memTracker.maxAllowedMemoryUsageBytes(),
-                    _memTracker.withinMemoryLimit());
-        }
+    void setPartitionValue(DensifyValue partitionVal, Value partitionKey) {
+        SimpleMemoryUsageToken memoryToken{
+            partitionKey.getApproximateSize() + partitionVal.getApproximateSize(), &_memTracker};
+        _partitionTable[partitionKey] = {std::move(memoryToken), std::move(partitionVal)};
+        uassert(6007200,
+                str::stream() << "$densify exceeded memory limit of "
+                              << _memTracker.maxAllowedMemoryUsageBytes(),
+                _memTracker.withinMemoryLimit());
+    }
+
+    void setPartitionValue(Document doc,
+                           boost::optional<DensifyValue> valueOverride = boost::none) {
+        tassert(8246103, "partitionExpr", _partitionExpr);
+        auto partitionKey = getDensifyPartition(doc);
+        auto partitionVal = valueOverride ? *valueOverride : getDensifyValue(doc);
+        setPartitionValue(partitionVal, partitionKey);
     }
 
     /**
-     * Helpers to create doc generators. Sets _docGenerator to the created generator.
+     * Create a document generator for the given range statement. The generation will start at 'min'
+     * (inclusive) and will go to the end of the given 'range'. Whether or not a document at the
+     * range maximum depends on 'maxInclusive' -- if true, the range will be inclusive on both ends.
+     * Will output documents that include any given 'includeFields' (with their values) and, if
+     * given, will output 'finalDoc' unchanged at the end of the generated documents.
+     * Pass the partition key to the generator to avoid having to compute it for each document
+     * the generator creates.
      */
     void createDocGenerator(DensifyValue min,
                             RangeStatement range,
                             boost::optional<Document> includeFields,
-                            boost::optional<Document> finalDoc) {
+                            boost::optional<Document> finalDoc,
+                            boost::optional<Value> partitionKey,
+                            bool maxInclusive = false) {
         _docGenerator = DocGenerator(min,
                                      range,
                                      _field,
                                      includeFields,
                                      finalDoc,
+                                     partitionKey,
                                      pExpCtx->getValueComparator(),
-                                     &_docsGenerated);
+                                     &_docsGenerated,
+                                     maxInclusive);
     }
     void createDocGenerator(DensifyValue min, RangeStatement range) {
-        createDocGenerator(min, range, boost::none, boost::none);
+        createDocGenerator(min, range, boost::none, boost::none, boost::none);
     }
 
 
@@ -580,29 +588,32 @@ private:
 
     boost::optional<DocGenerator> _docGenerator = boost::none;
 
-    /**
-     * The last value seen or generated by the stage that is also in line with the step.
-     */
-    boost::optional<DensifyValue> _current = boost::none;
-
-    // Used to keep track of the bounds for densification in the full case.
-    boost::optional<DensifyValue> _globalMin = boost::none;
-    boost::optional<DensifyValue> _globalMax = boost::none;
+    // Used to keep track of the bounds for densification.
+    // Track the minimum seen across the input set. Should be the first document seen.
+    boost::optional<DensifyValue> _fullDensifyGlobalMin = boost::none;
+    // Track the maximum seen across the input set. Should be the last document seen.
+    boost::optional<DensifyValue> _fullDensifyGlobalMax = boost::none;
+    bool _isFullDensify = false;
+    // Value to store the beginning/end of the densification range. Note that these may also be
+    // stored in the range object we had parsed initially, but we store them here again for easier
+    // access and to avoid using parsing objects during execution.
+    boost::optional<DensifyValue> _rangeDensifyStart = boost::none;
+    boost::optional<DensifyValue> _rangeDensifyEnd = boost::none;
 
     // _partitionExpr has two purposes:
     // 1. to determine which partition a document belongs in.
     // 2. to initialize new documents with the right partition key.
     // For example, if the stage had 'partitionByFields: ["a", "x.y"]' then this expression
     // would be {a: "$a", {x: {y: "$x.y"}}}.
-    boost::intrusive_ptr<ExpressionObject> _partitionExpr;
-
-    bool _eof = false;
+    // In the non-partitioned case, this is set to be a constant expression "true".
+    boost::intrusive_ptr<Expression> _partitionExpr;
 
     enum class DensifyState {
-        kUninitializedOrBelowRange,
+        kUninitialized,
         kNeedGen,
         kHaveGenerator,
-        kFinishingDensify,
+        kFinishingDensifyNoGenerator,
+        kFinishingDensifyWithGenerator,
         kDensifyDone
     };
 
@@ -611,11 +622,16 @@ private:
     size_t _maxDocs = 0;
     SimpleMemoryUsageTracker _memTracker;
 
-    DensifyState _densifyState = DensifyState::kUninitializedOrBelowRange;
+    DensifyState _densifyState = DensifyState::kUninitialized;
+    // The field on which we are densifying.
     FieldPath _field;
+    // The list of partitions we are using to densify taken from the original stage object.
     std::list<FieldPath> _partitions;
+    // Range statement taken from the original stage object.
     RangeStatement _range;
-    // Store of the value we've seen for each partition.
-    ValueUnorderedMap<SimpleMemoryTokenWith<DensifyValue>> _partitionTable;
+    // Store of the value we've seen for each partition. In the non-partitioned case should only
+    // have one key -- "true". This allows us to pretend that all input is partitioned and use the
+    // same codepath.
+    ValueUnorderedMap<SimpleMemoryUsageTokenWith<DensifyValue>> _partitionTable;
 };
 }  // namespace mongo

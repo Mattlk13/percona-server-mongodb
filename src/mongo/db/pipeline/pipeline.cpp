@@ -64,7 +64,7 @@
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/resume_token.h"
-#include "mongo/db/pipeline/search_helper.h"
+#include "mongo/db/pipeline/search/search_helper.h"
 #include "mongo/db/pipeline/stage_constraints.h"
 #include "mongo/db/pipeline/transformer_interface.h"
 #include "mongo/db/query/explain_options.h"
@@ -91,9 +91,17 @@ Value appendCommonExecStats(Value docSource, const CommonStats& stats) {
     auto nReturned = static_cast<long long>(stats.advanced);
     doc.addField("nReturned", Value(nReturned));
 
-    invariant(stats.executionTime);
-    auto executionTimeMillisEstimate = durationCount<Milliseconds>(*stats.executionTime);
-    doc.addField("executionTimeMillisEstimate", Value(executionTimeMillisEstimate));
+    if (stats.executionTime.precision == QueryExecTimerPrecision::kMillis) {
+        doc.addField("executionTimeMillisEstimate",
+                     Value(durationCount<Milliseconds>(stats.executionTime.executionTimeEstimate)));
+    } else if (stats.executionTime.precision == QueryExecTimerPrecision::kNanos) {
+        doc.addField("executionTimeMillisEstimate",
+                     Value(durationCount<Milliseconds>(stats.executionTime.executionTimeEstimate)));
+        doc.addField("executionTimeMicros",
+                     Value(durationCount<Microseconds>(stats.executionTime.executionTimeEstimate)));
+        doc.addField("executionTimeNanos",
+                     Value(durationCount<Nanoseconds>(stats.executionTime.executionTimeEstimate)));
+    }
     return Value(doc.freeze());
 }
 
@@ -164,8 +172,7 @@ void validateTopLevelPipeline(const Pipeline& pipeline) {
     // Verify that usage of $searchMeta and $search is legal. Note that on mongos, we defer this
     // check until after we've established cursors on the shards to resolve any views.
     if (expCtx->opCtx->getServiceContext() && !expCtx->inMongos) {
-        getSearchHelpers(expCtx->opCtx->getServiceContext())
-            ->assertSearchMetaAccessValid(sources, expCtx.get());
+        search_helpers::assertSearchMetaAccessValid(sources, expCtx.get());
     }
 }
 
@@ -351,7 +358,7 @@ void Pipeline::validateCommon(bool alreadyOptimized) const {
 
         tassert(7355707,
                 "If a stage is broadcast to all shard servers then it must be a data source.",
-                constraints.hostRequirement != HostTypeRequirement::kAllShardServers ||
+                constraints.hostRequirement != HostTypeRequirement::kAllShardHosts ||
                     !constraints.requiresInputDocSource);
     }
 }
@@ -361,21 +368,29 @@ void Pipeline::optimizePipeline() {
     if (MONGO_unlikely(disablePipelineOptimization.shouldFail())) {
         return;
     }
-
     optimizeContainer(&_sources);
+    optimizeEachStage(&_sources);
 }
 
 void Pipeline::optimizeContainer(SourceContainer* container) {
-    SourceContainer optimizedSources;
-
     SourceContainer::iterator itr = container->begin();
     try {
         while (itr != container->end()) {
             invariant((*itr).get());
             itr = (*itr).get()->optimizeAt(itr, container);
         }
+    } catch (DBException& ex) {
+        ex.addContext("Failed to optimize pipeline");
+        throw;
+    }
 
-        // Once we have reached our final number of stages, optimize each individually.
+    stitch(container);
+}
+
+void Pipeline::optimizeEachStage(SourceContainer* container) {
+    SourceContainer optimizedSources;
+    try {
+        // We should have our final number of stages. Optimize each individually.
         for (auto&& source : *container) {
             if (auto out = source->optimize()) {
                 optimizedSources.push_back(out);
@@ -482,11 +497,32 @@ BSONObj Pipeline::getInitialQuery() const {
     return BSONObj{};
 }
 
-bool Pipeline::needsPrimaryShardMerger() const {
-    return std::any_of(_sources.begin(), _sources.end(), [&](const auto& stage) {
-        return stage->constraints(SplitState::kSplitForMerge).hostRequirement ==
-            HostTypeRequirement::kPrimaryShard;
-    });
+void Pipeline::parameterize() {
+    if (!_sources.empty()) {
+        if (auto matchStage = dynamic_cast<DocumentSourceMatch*>(_sources.front().get())) {
+            MatchExpression::parameterize(matchStage->getMatchExpression());
+            _isParameterized = true;
+        }
+    }
+}
+
+void Pipeline::unparameterize() {
+    if (!_sources.empty()) {
+        if (auto matchStage = dynamic_cast<DocumentSourceMatch*>(_sources.front().get())) {
+            // Sets max param count in MatchExpression::parameterize() to 0, clearing
+            // MatchExpression auto-parameterization before pipeline to ABT translation.
+            MatchExpression::unparameterize(matchStage->getMatchExpression());
+            _isParameterized = false;
+        }
+    }
+}
+
+bool Pipeline::canParameterize() {
+    if (!_sources.empty()) {
+        // First stage must be a DocumentSourceMatch.
+        return _sources.begin()->get()->getSourceName() == DocumentSourceMatch::kStageName;
+    }
+    return false;
 }
 
 boost::optional<ShardId> Pipeline::needsSpecificShardMerger() const {
@@ -505,10 +541,10 @@ bool Pipeline::needsMongosMerger() const {
     });
 }
 
-bool Pipeline::needsAllShardServers() const {
+bool Pipeline::needsAllShardHosts() const {
     return std::any_of(_sources.begin(), _sources.end(), [&](const auto& stage) {
         return stage->constraints().resolvedHostTypeRequirement(pCtx) ==
-            HostTypeRequirement::kAllShardServers;
+            HostTypeRequirement::kAllShardHosts;
     });
 }
 
@@ -516,13 +552,8 @@ bool Pipeline::needsShard() const {
     return std::any_of(_sources.begin(), _sources.end(), [&](const auto& stage) {
         auto hostType = stage->constraints().resolvedHostTypeRequirement(pCtx);
         return (hostType == HostTypeRequirement::kAnyShard ||
-                hostType == HostTypeRequirement::kPrimaryShard ||
-                hostType == HostTypeRequirement::kAllShardServers);
+                hostType == HostTypeRequirement::kAllShardHosts);
     });
-}
-
-bool Pipeline::canRunOnMongos() const {
-    return _pipelineCanRunOnMongoS().isOK();
 }
 
 bool Pipeline::requiredToRunOnMongos() const {
@@ -540,13 +571,10 @@ bool Pipeline::requiredToRunOnMongos() const {
         // If a mongoS-only stage occurs before a splittable stage, or if the pipeline is already
         // split, this entire pipeline must run on mongoS.
         if (hostRequirement == HostTypeRequirement::kMongoS) {
-            // Verify that the remainder of this pipeline can run on mongoS.
-            auto mongosRunStatus = _pipelineCanRunOnMongoS();
-
-            uassertStatusOKWithContext(mongosRunStatus,
-                                       str::stream() << stage->getSourceName()
-                                                     << " must run on mongoS, but cannot");
-
+            LOGV2_DEBUG(8346100,
+                        1,
+                        "stage {stage} is required to run on mongoS",
+                        "stage"_attr = stage->getSourceName());
             return true;
         }
     }
@@ -720,6 +748,7 @@ DepsTracker Pipeline::getDependenciesForContainer(
             deps.requestMetadata(localDeps.metadataDeps());
             knowAllMeta = status & DepsTracker::State::EXHAUSTIVE_META;
         }
+        deps.requestMetadata(localDeps.searchMetadataDeps());
     }
 
     if (!knowAllFields)
@@ -740,14 +769,13 @@ DepsTracker Pipeline::getDependenciesForContainer(
     return deps;
 }
 
-Status Pipeline::_pipelineCanRunOnMongoS() const {
+Status Pipeline::canRunOnMongos() const {
     for (auto&& stage : _sources) {
         auto constraints = stage->constraints(_splitState);
         auto hostRequirement = constraints.resolvedHostTypeRequirement(pCtx);
 
         const bool needsShard = (hostRequirement == HostTypeRequirement::kAnyShard ||
-                                 hostRequirement == HostTypeRequirement::kPrimaryShard ||
-                                 hostRequirement == HostTypeRequirement::kAllShardServers);
+                                 hostRequirement == HostTypeRequirement::kAllShardHosts);
 
         const bool mustWriteToDisk =
             (constraints.diskRequirement == DiskUseRequirement::kWritesPersistentData);
@@ -860,13 +888,11 @@ std::unique_ptr<Pipeline, PipelineDeleter> Pipeline::makePipeline(
     pipeline->validateCommon(alreadyOptimized);
 
     if (opts.attachCursorSource) {
-        pipeline = expCtx->mongoProcessInterface->attachCursorSourceToPipeline(
+        pipeline = expCtx->mongoProcessInterface->preparePipelineForExecution(
             pipeline.release(), opts.shardTargetingPolicy, std::move(opts.readConcern));
     }
 
-    // After parsing the pipeline to detect if $$USER_ROLES is referenced, set the value of
-    // $$USER_ROLES for the pipeline.
-    expCtx->setUserRoles();
+    expCtx->initializeReferencedSystemVariables();
 
     return pipeline;
 }
@@ -898,12 +924,12 @@ std::unique_ptr<Pipeline, PipelineDeleter> Pipeline::makePipeline(
     pipeline->validateCommon(alreadyOptimized);
     aggRequest.setPipeline(pipeline->serializeToBson());
 
-    return expCtx->mongoProcessInterface->attachCursorSourceToPipeline(aggRequest,
-                                                                       pipeline.release(),
-                                                                       expCtx,
-                                                                       shardCursorsSortSpec,
-                                                                       opts.shardTargetingPolicy,
-                                                                       std::move(readConcern));
+    return expCtx->mongoProcessInterface->preparePipelineForExecution(aggRequest,
+                                                                      pipeline.release(),
+                                                                      expCtx,
+                                                                      shardCursorsSortSpec,
+                                                                      opts.shardTargetingPolicy,
+                                                                      std::move(readConcern));
 }
 
 Pipeline::SourceContainer::iterator Pipeline::optimizeEndOfPipeline(
@@ -912,28 +938,11 @@ Pipeline::SourceContainer::iterator Pipeline::optimizeEndOfPipeline(
     // optimize, since otherwise calls to optimizeAt() will overrun these limits.
     auto endOfPipeline = Pipeline::SourceContainer(std::next(itr), container->end());
     Pipeline::optimizeContainer(&endOfPipeline);
+    Pipeline::optimizeEachStage(&endOfPipeline);
     container->erase(std::next(itr), container->end());
     container->splice(std::next(itr), endOfPipeline);
 
     return std::next(itr);
-}
-
-Pipeline::SourceContainer::iterator Pipeline::optimizeAtEndOfPipeline(
-    Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
-    if (itr == container->end()) {
-        return itr;
-    }
-    itr = std::next(itr);
-    try {
-        while (itr != container->end()) {
-            invariant((*itr).get());
-            itr = (*itr).get()->optimizeAt(itr, container);
-        }
-    } catch (DBException& ex) {
-        ex.addContext("Failed to optimize pipeline");
-        throw;
-    }
-    return itr;
 }
 
 std::unique_ptr<Pipeline, PipelineDeleter> Pipeline::makePipelineFromViewDefinition(

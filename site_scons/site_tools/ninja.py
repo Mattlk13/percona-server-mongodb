@@ -529,7 +529,7 @@ class NinjaState:
 
         self.rules = {
             "CMD": {
-                "command": "cmd /c $env$cmd" if sys.platform == "win32" else "$env$cmd",
+                "command": "cmd.exe /c $env$cmd" if sys.platform == "win32" else "$env$cmd",
                 "description": "Built $out",
                 "pool": "local_pool",
             },
@@ -567,14 +567,14 @@ class NinjaState:
                 "description": "Linked $out",
                 "rspfile": "$out.rsp",
                 "rspfile_content": "$rspc",
-                "pool": "local_pool",
+                "pool": "link_pool",
             },
             "LINK_CHAINED_CMD": {
                 "command": "$env$LINK @$out.rsp && $cmd",
                 "description": "Linked $out",
                 "rspfile": "$out.rsp",
                 "rspfile_content": "$rspc",
-                "pool": "local_pool",
+                "pool": "link_pool",
             },
             "AR": {
                 "command": "$env$AR @$out.rsp",
@@ -643,6 +643,28 @@ class NinjaState:
                 "restat": 1,
             },
         }
+
+        if self.env.get('BAZEL_BUILD_ENABLED'):
+
+            command = [
+                f"{sys.executable}",
+                "site_scons/mongo/ninja_bazel_build.py",
+                f"--ninja-file={self.env.get('NINJA_PREFIX')}.{self.env.get('NINJA_SUFFIX')}",
+            ]
+            if self.env.get('VERBOSE'):
+                command += ["--verbose"]
+            if self.env.get('BAZEL_INTEGRATION_DEBUG'):
+                command += ["--integration-debug"]
+
+            self.rules.update({
+                "RUN_BAZEL_BUILD": {
+                    "command": " ".join(command),
+                    "description": "Running bazel build",
+                    "pool": "console",
+                    "restat": 1,
+                }
+            })
+
         num_jobs = self.env.get('NINJA_MAX_JOBS', self.env.GetOption("num_jobs"))
         self.pools = {
             "local_pool": num_jobs,
@@ -712,6 +734,9 @@ class NinjaState:
         ninja.variable("ninja_required_version", "1.10")
         ninja.variable("builddir", get_path(self.env['NINJA_BUILDDIR']))
         ninja.variable("artifact_dir", self.env.Dir('$BUILD_DIR'))
+
+        link_jobs = self.env.get('NINJA_LINK_JOBS', self.env.GetOption("num_jobs"))
+        self.pools.update({"link_pool": link_jobs})
 
         for pool_name, size in self.pools.items():
             ninja.pool(pool_name, min(self.env.get('NINJA_MAX_JOBS', size), size))
@@ -1007,6 +1032,14 @@ class NinjaState:
                 "self": ninja_file_path,
             },
         )
+
+        if self.env.get("BAZEL_BUILD_ENABLED"):
+            ninja_sorted_build(
+                ninja,
+                outputs=self.env["NINJA_BAZEL_OUTPUTS"],
+                inputs=self.env["NINJA_BAZEL_INPUTS"],
+                rule="RUN_BAZEL_BUILD",
+            )
 
         # This sets up a dependency edge between build.ninja.in and build.ninja
         # without actually taking any action to transform one into the other

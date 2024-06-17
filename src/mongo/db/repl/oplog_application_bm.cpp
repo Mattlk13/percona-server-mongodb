@@ -66,7 +66,7 @@
 #include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/op_observer/op_observer_impl.h"
 #include "mongo/db/op_observer/op_observer_registry.h"
-#include "mongo/db/op_observer/oplog_writer_impl.h"
+#include "mongo/db/op_observer/operation_logger_impl.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/member_state.h"
@@ -85,14 +85,13 @@
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/s/collection_sharding_state.h"
-#include "mongo/db/s/collection_sharding_state_factory_standalone.h"
+#include "mongo/db/s/collection_sharding_state_factory_shard.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_entry_point_mongod.h"
 #include "mongo/db/session/session_catalog.h"
 #include "mongo/db/session/session_catalog_mongod.h"
 #include "mongo/db/session_manager_mongod.h"
-#include "mongo/db/storage/execution_control/concurrency_adjustment_parameters_gen.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/recovery_unit_noop.h"
 #include "mongo/db/storage/storage_engine_init.h"
@@ -103,6 +102,7 @@
 #include "mongo/logv2/log_component_settings.h"
 #include "mongo/logv2/log_manager.h"
 #include "mongo/logv2/log_severity.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/util/assert_util.h"
@@ -120,20 +120,18 @@
 namespace mongo {
 namespace {
 
+constexpr std::size_t kOplogBufferSize = 256 * 1024 * 1024;
+
 class TestServiceContext {
 public:
     TestServiceContext() {
-        // Disable execution control.
-        gStorageEngineConcurrencyAdjustmentAlgorithm = "fixedConcurrentTransactions";
-
         // Disable server info logging so that the benchmark output is cleaner.
         logv2::LogManager::global().getGlobalSettings().setMinimumLoggedSeverity(
             mongo::logv2::LogComponent::kDefault, mongo::logv2::LogSeverity::Error());
 
         // (Generic FCV reference): Test latest FCV behavior. This FCV reference should exist across
         // LTS binary versions.
-        serverGlobalParams.mutableFeatureCompatibility.setVersion(
-            multiversion::GenericFCV::kLatest);
+        serverGlobalParams.mutableFCV.setVersion(multiversion::GenericFCV::kLatest);
 
         if (haveClient()) {
             Client::releaseCurrent();
@@ -183,10 +181,18 @@ public:
         // Disable fast shutdown so that WT can free memory.
         globalFailPointRegistry().find("WTDisableFastShutDown")->setMode(FailPoint::alwaysOn);
 
-        auto startupOpCtx = _svcCtx->makeOperationContext(&cc());
-        initializeStorageEngine(startupOpCtx.get(),
-                                StorageEngineInitFlags::kAllowNoLockFile |
-                                    StorageEngineInitFlags::kSkipMetadataFile);
+        {
+            auto initializeStorageEngineOpCtx = _svcCtx->makeOperationContext(&cc());
+            shard_role_details::setRecoveryUnit(
+                initializeStorageEngineOpCtx.get(),
+                std::make_unique<RecoveryUnitNoop>(),
+                WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+
+            initializeStorageEngine(initializeStorageEngineOpCtx.get(),
+                                    StorageEngineInitFlags::kAllowNoLockFile |
+                                        StorageEngineInitFlags::kSkipMetadataFile);
+        }
+
         DatabaseHolder::set(_svcCtx, std::make_unique<DatabaseHolderImpl>());
         repl::StorageInterface::set(_svcCtx, std::make_unique<repl::StorageInterfaceImpl>());
         auto storageInterface = repl::StorageInterface::get(_svcCtx);
@@ -197,26 +203,29 @@ public:
 
         auto registry = std::make_unique<OpObserverRegistry>();
         registry->addObserver(
-            std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterImpl>()));
+            std::make_unique<OpObserverImpl>(std::make_unique<OperationLoggerImpl>()));
         _svcCtx->setOpObserver(std::move(registry));
+        ShardingState::create(_svcCtx);
         CollectionShardingStateFactory::set(
-            _svcCtx, std::make_unique<CollectionShardingStateFactoryStandalone>(_svcCtx));
+            _svcCtx, std::make_unique<CollectionShardingStateFactoryShard>(_svcCtx));
 
         MongoDSessionCatalog::set(
             _svcCtx,
             std::make_unique<MongoDSessionCatalog>(
                 std::make_unique<MongoDSessionCatalogTransactionInterfaceImpl>()));
 
+        _oplogBuffer = std::make_unique<repl::OplogBufferBlockingQueue>(kOplogBufferSize);
         _oplogApplierThreadPool = repl::makeReplWriterPool();
 
         // Act as a secondary to get optimizations due to parallizing 'prepare' oplog entries. But
         // do not include in the benchmark the time to write to the oplog.
         repl::OplogApplier::Options oplogApplierOptions(
             repl::OplogApplication::Mode::kSecondary,
-            false /*allowNamespaceNotFoundErrorsOnCrudOps*/,
-            true /*skipWritesToOplog*/);
+            false /* allowNamespaceNotFoundErrorsOnCrudOps */,
+            true /* skipWritesToOplog */,
+            true /* skipWritesToChangeCollection */);
         _oplogApplier = std::make_unique<repl::OplogApplierImpl>(nullptr,
-                                                                 &_oplogBuffer,
+                                                                 _oplogBuffer.get(),
                                                                  &repl::noopOplogApplierObserver,
                                                                  _replCoord,
                                                                  &_consistencyMarkers,
@@ -224,7 +233,7 @@ public:
                                                                  oplogApplierOptions,
                                                                  _oplogApplierThreadPool.get());
 
-        _svcCtx->notifyStartupComplete();
+        _svcCtx->notifyStorageStartupRecoveryComplete();
     }
 
     ~TestServiceContext() {
@@ -266,10 +275,12 @@ public:
         storageGlobalParams.dbpath = _tempDir->path();
         storageGlobalParams.ephemeral = false;
 
-        auto uniqueOpCtx = _svcCtx->makeOperationContext(&cc());
-        uniqueOpCtx->setRecoveryUnit(std::make_unique<RecoveryUnitNoop>(),
-                                     WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
-        initializeStorageEngine(uniqueOpCtx.get(),
+        auto initializeStorageEngineOpCtx = _svcCtx->makeOperationContext(&cc());
+        shard_role_details::setRecoveryUnit(initializeStorageEngineOpCtx.get(),
+                                            std::make_unique<RecoveryUnitNoop>(),
+                                            WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+
+        initializeStorageEngine(initializeStorageEngineOpCtx.get(),
                                 StorageEngineInitFlags::kAllowNoLockFile |
                                     StorageEngineInitFlags::kSkipMetadataFile |
                                     StorageEngineInitFlags::kForRestart);
@@ -298,7 +309,7 @@ private:
     std::unique_ptr<repl::OplogApplier> _oplogApplier;
 
     // This class also owns objects necessary for `_oplogApplier`.
-    repl::OplogBufferBlockingQueue _oplogBuffer;
+    std::unique_ptr<repl::OplogBufferBlockingQueue> _oplogBuffer;
     repl::ReplicationConsistencyMarkersMock _consistencyMarkers;
     std::unique_ptr<ThreadPool> _oplogApplierThreadPool;
     boost::optional<unittest::TempDir> _tempDir;
@@ -528,8 +539,9 @@ public:
 
     void applyOplog(OperationContext* opCtx) {
         while (!_testSvcCtx->getOplogApplier()->getBuffer()->isEmpty()) {
-            auto oplogBatch = invariantStatusOK(
-                _testSvcCtx->getOplogApplier()->getNextApplierBatch(opCtx, _batchLimits));
+            auto oplogBatch = invariantStatusOK(_testSvcCtx->getOplogApplier()->getNextApplierBatch(
+                                                    opCtx, _batchLimits))
+                                  .releaseBatch();
 
             const auto lastOpInBatch = oplogBatch.back();
             const auto lastOpTimeInBatch = lastOpInBatch.getOpTime();
@@ -540,7 +552,7 @@ public:
 
             // Advance timestamps.
             _testSvcCtx->getReplCoordMock()->setMyLastAppliedOpTimeAndWallTimeForward(
-                {lastOpTimeInBatch, lastWallTimeInBatch}, true);
+                {lastOpTimeInBatch, lastWallTimeInBatch});
             _testSvcCtx->getReplCoordMock()->setMyLastDurableOpTimeAndWallTimeForward(
                 {lastOpTimeInBatch, lastWallTimeInBatch});
             repl::StorageInterface::get(opCtx)->setStableTimestamp(

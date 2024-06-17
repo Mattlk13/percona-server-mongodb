@@ -395,6 +395,12 @@ jsTestOptions = function() {
             setParametersMongocryptd: TestData.setParametersMongocryptd,
             storageEngine: TestData.storageEngine,
             storageEngineCacheSizeGB: TestData.storageEngineCacheSizeGB,
+            shellTlsEnabled: TestData.shellTlsEnabled || false,
+            shellTlsCertificateKeyFile: TestData.shellTlsCertificateKeyFile,
+            tlsCAFile: TestData.tlsCAFile,
+            tlsMode: TestData.tlsMode,
+            mongodTlsCertificateKeyFile: TestData.mongodTlsCertificateKeyFile,
+            mongosTlsCertificateKeyFile: TestData.mongosTlsCertificateKeyFile,
             wiredTigerEngineConfigString: TestData.wiredTigerEngineConfigString,
             wiredTigerCollectionConfigString: TestData.wiredTigerCollectionConfigString,
             wiredTigerIndexConfigString: TestData.wiredTigerIndexConfigString,
@@ -508,6 +514,9 @@ jsTestOptions = function() {
             configShard: TestData.configShard || false,
 
             useAutoBootstrapProcedure: TestData.useAutoBootstrapProcedure || false,
+            nonClusteredConfigTransactions: TestData.nonClusteredConfigTransactions || false,
+
+            embeddedRouter: TestData.embeddedRouter || false,
         });
     }
     return _jsTestOptions;

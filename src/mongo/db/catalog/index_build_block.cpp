@@ -44,7 +44,6 @@
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/client.h"
 #include "mongo/db/collection_index_usage_tracker.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/skipped_record_tracker.h"
 #include "mongo/db/index_names.h"
@@ -58,6 +57,7 @@
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/ident.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/ttl_collection_cache.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
@@ -138,7 +138,7 @@ Status IndexBuildBlock::initForResume(OperationContext* opCtx,
 
 Status IndexBuildBlock::init(OperationContext* opCtx, Collection* collection, bool forRecovery) {
     // Being in a WUOW means all timestamping responsibility can be pushed up to the caller.
-    invariant(opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
     // need this first for names, etc...
     BSONObj keyPattern = _spec.getObjectField("key");
@@ -197,7 +197,7 @@ IndexBuildBlock::~IndexBuildBlock() {
 
 void IndexBuildBlock::fail(OperationContext* opCtx, Collection* collection) {
     // Being in a WUOW means all timestamping responsibility can be pushed up to the caller.
-    invariant(opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
     // Audit that the index build is being aborted.
     audit::logCreateIndex(opCtx->getClient(),
@@ -222,7 +222,7 @@ void IndexBuildBlock::fail(OperationContext* opCtx, Collection* collection) {
 
 void IndexBuildBlock::success(OperationContext* opCtx, Collection* collection) {
     // Being in a WUOW means all timestamping responsibility can be pushed up to the caller.
-    invariant(opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
     CollectionCatalog::get(opCtx)->invariantHasExclusiveAccessToCollection(opCtx, collection->ns());
 
@@ -250,7 +250,7 @@ void IndexBuildBlock::success(OperationContext* opCtx, Collection* collection) {
                           "IndexBuildSucceeded",
                           ErrorCodes::OK);
 
-    opCtx->recoveryUnit()->onCommit(
+    shard_role_details::getRecoveryUnit(opCtx)->onCommit(
         [svcCtx,
          indexName = _indexName,
          spec = _spec,
@@ -273,15 +273,14 @@ void IndexBuildBlock::success(OperationContext* opCtx, Collection* collection) {
             // Add the index to the TTLCollectionCache upon successfully committing the index build.
             // Note that TTL deletion is supported on capped clustered collections via bounded
             // collection scan, which does not use an index.
-            if (spec.hasField(IndexDescriptor::kExpireAfterSecondsFieldName) &&
-                (feature_flags::gFeatureFlagTTLIndexesOnCappedCollections.isEnabled(
-                     serverGlobalParams.featureCompatibility) ||
-                 !coll->isCapped())) {
-                auto validateStatus = index_key_validate::validateExpireAfterSeconds(
+            if (spec.hasField(IndexDescriptor::kExpireAfterSecondsFieldName)) {
+                auto swType = index_key_validate::validateExpireAfterSeconds(
                     spec[IndexDescriptor::kExpireAfterSecondsFieldName],
                     index_key_validate::ValidateExpireAfterSecondsMode::kSecondaryTTLIndex);
                 TTLCollectionCache::get(svcCtx).registerTTLInfo(
-                    coll->uuid(), TTLCollectionCache::Info{indexName, !validateStatus.isOK()});
+                    coll->uuid(),
+                    TTLCollectionCache::Info{
+                        indexName, index_key_validate::extractExpireAfterSecondsType(swType)});
             }
         });
 }

@@ -29,6 +29,7 @@
 
 #include "mongo/db/commands/update_metrics.h"
 
+#include <fmt/format.h>
 #include <string>
 
 #include <boost/optional/optional.hpp>
@@ -38,39 +39,46 @@
 #include "mongo/db/ops/write_ops_parsers.h"
 
 namespace mongo {
-UpdateMetrics::UpdateMetrics(StringData commandName)
-    : _commandsWithAggregationPipeline("commands." + commandName + ".pipeline"),
-      _commandsWithArrayFilters("commands." + commandName + ".arrayFilters") {}
+namespace {
+Counter64* getSingletonMetricPtr(StringData commandName, StringData stat, ClusterRole role) {
+    using namespace fmt::literals;
+    return &*MetricBuilder<Counter64>{"commands.{}.{}"_format(commandName, stat)}.setRole(role);
+}
+}  // namespace
+
+UpdateMetrics::UpdateMetrics(StringData commandName, ClusterRole role)
+    : _commandsWithAggregationPipeline(getSingletonMetricPtr(commandName, "pipeline", role)),
+      _commandsWithArrayFilters(getSingletonMetricPtr(commandName, "arrayFilters", role)) {}
 
 void UpdateMetrics::incrementExecutedWithAggregationPipeline() {
-    _commandsWithAggregationPipeline.increment();
+    _commandsWithAggregationPipeline->increment();
 }
 
 void UpdateMetrics::incrementExecutedWithArrayFilters() {
-    _commandsWithArrayFilters.increment();
+    _commandsWithArrayFilters->increment();
 }
 
 void UpdateMetrics::collectMetrics(const BSONObj& cmdObj) {
     // If this command is a pipeline-style update, record that it was used.
     if (cmdObj.hasField("update") && (cmdObj.getField("update").type() == BSONType::Array)) {
-        _commandsWithAggregationPipeline.increment();
+        _commandsWithAggregationPipeline->increment();
     }
 
     // If this command had arrayFilters option, record that it was used.
     if (cmdObj.hasField("arrayFilters")) {
-        _commandsWithArrayFilters.increment();
+        _commandsWithArrayFilters->increment();
     }
 }
 
 void UpdateMetrics::collectMetrics(const write_ops::FindAndModifyCommandRequest& cmd) {
     if (auto update = cmd.getUpdate()) {
         if (update->type() == write_ops::UpdateModification::Type::kPipeline) {
-            _commandsWithAggregationPipeline.increment();
+            _commandsWithAggregationPipeline->increment();
         }
     }
 
     if (cmd.getArrayFilters()) {
-        _commandsWithArrayFilters.increment();
+        _commandsWithArrayFilters->increment();
     }
 }
 

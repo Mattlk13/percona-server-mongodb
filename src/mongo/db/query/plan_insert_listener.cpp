@@ -40,6 +40,7 @@
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_insert_listener.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/util/clock_source.h"
@@ -97,7 +98,8 @@ std::unique_ptr<Notifier> getCappedInsertNotifier(OperationContext* opCtx,
     //
     // We can only wait on the capped collection insert notifier if the collection is present,
     // otherwise we should retry immediately when we hit EOF.
-    if (opCtx->recoveryUnit()->getTimestampReadSource() == RecoveryUnit::kMajorityCommitted) {
+    if (shard_role_details::getRecoveryUnit(opCtx)->getTimestampReadSource() ==
+        RecoveryUnit::kMajorityCommitted) {
         return std::make_unique<MajorityCommittedPointNotifier>();
     } else {
         auto collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
@@ -116,13 +118,12 @@ void waitForInserts(OperationContext* opCtx,
     // of the notifier at the time of the previous EOF, we require two EOFs in a row with no
     // notifier version change in order to wait.  This is sufficient to ensure we never wait
     // when data is available.
-    auto curOp = CurOp::get(opCtx);
-    curOp->pauseTimer();
-    ON_BLOCK_EXIT([curOp] { curOp->resumeTimer(); });
-
     notifier->prepareForWait(opCtx);
     auto yieldResult = yieldPolicy->yieldOrInterrupt(opCtx, [opCtx, &notifier] {
         const auto deadline = awaitDataState(opCtx).waitForInsertsDeadline;
+        auto curOp = CurOp::get(opCtx);
+        curOp->pauseTimer();
+        ON_BLOCK_EXIT([curOp] { curOp->resumeTimer(); });
         notifier->waitUntil(opCtx, deadline);
         if (MONGO_unlikely(planExecutorHangWhileYieldedInWaitForInserts.shouldFail())) {
             LOGV2(4452903,

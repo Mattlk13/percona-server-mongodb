@@ -77,6 +77,8 @@ namespace mongo {
 namespace RollbackTests {
 namespace {
 
+using unittest::assertGet;
+
 const auto kIndexVersion = IndexDescriptor::IndexVersion::kV2;
 
 void dropDatabase(OperationContext* opCtx, const NamespaceString& nss) {
@@ -171,10 +173,7 @@ size_t getNumIndexEntries(OperationContext* opCtx,
     if (desc) {
         auto iam = catalog->getEntry(desc)->accessMethod()->asSortedData();
         auto cursor = iam->newCursor(opCtx);
-        key_string::Builder keyString(iam->getSortedDataInterface()->getKeyStringVersion(),
-                                      BSONObj(),
-                                      iam->getSortedDataInterface()->getOrdering());
-        for (auto kv = cursor->seek(keyString.getValueCopy()); kv; kv = cursor->next()) {
+        for (auto kv = cursor->next(); kv; kv = cursor->next()) {
             numEntries++;
         }
     }
@@ -719,8 +718,7 @@ public:
     }
 };
 
-
-class All : public OldStyleSuiteSpecification {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("rollback") {}
 
@@ -749,7 +747,7 @@ public:
         add<T<true, true, true>>();
     }
 
-    void setupTests() {
+    void setupTests() override {
         addAll<CreateCollection>();
         addAll<RenameCollection>();
         addAll<DropCollection>();
@@ -763,7 +761,7 @@ public:
     }
 };
 
-OldStyleSuiteInitializer<All> all;
+unittest::OldStyleSuiteInitializer<All> all;
 
 }  // namespace RollbackTests
 }  // namespace mongo

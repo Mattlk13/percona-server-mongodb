@@ -34,11 +34,11 @@
 
 
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/topology_time_ticker.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/vector_clock_mutable.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
@@ -66,7 +66,7 @@ const auto serviceDecorator = ServiceContext::declareDecoration<TopologyTimeTick
 namespace topology_time_ticker_utils {
 
 bool inRecoveryMode(OperationContext* opCtx) {
-    invariant(opCtx->lockState()->isRSTLLocked());
+    invariant(shard_role_details::getLocker(opCtx)->isRSTLLocked());
 
     const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     if (!replCoord->getSettings().isReplSet()) {

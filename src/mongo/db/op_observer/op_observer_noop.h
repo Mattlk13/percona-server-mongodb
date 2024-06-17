@@ -97,6 +97,7 @@ public:
                    const CollectionPtr& coll,
                    std::vector<InsertStatement>::const_iterator begin,
                    std::vector<InsertStatement>::const_iterator end,
+                   const std::vector<RecordId>& recordIds,
                    std::vector<bool> fromMigrate,
                    bool defaultFromMigrate,
                    OpStateAccumulator* opAccumulator = nullptr) override {}
@@ -224,7 +225,9 @@ public:
 
     void onBatchedWriteStart(OperationContext* opCtx) override {}
 
-    void onBatchedWriteCommit(OperationContext* opCtx) override {}
+    void onBatchedWriteCommit(OperationContext* opCtx,
+                              WriteUnitOfWork::OplogEntryGroupType oplogGroupingFormat,
+                              OpStateAccumulator* opStateAccumulator = nullptr) override {}
 
     void onBatchedWriteAbort(OperationContext* opCtx) override {}
 

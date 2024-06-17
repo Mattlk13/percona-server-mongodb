@@ -10,7 +10,7 @@ env.CppUnitTest(
     target='platform_test',
     source=[
         'atomic_proxy_test.cpp',
-        'atomic_word_test.cpp',
+        'atomic_test.cpp',
         'bits_test.cpp',
         'endian_test.cpp',
         'int128_test.cpp',
@@ -22,6 +22,7 @@ env.CppUnitTest(
         'decimal128_test.cpp',
         'decimal128_bson_test.cpp',
         'overflow_arithmetic_test.cpp',
+        'waitable_atomic_test.cpp',
     ],
 )
 
@@ -41,20 +42,14 @@ env.BazelLibrary(
     source=[
         "visibility_test_libcommon.cpp",
     ],
-    LIBDEPS_NO_INHERIT=[
-        '$BUILD_DIR/third_party/shim_allocator',
-    ],
     LIBDEPS=[],
     MONGO_API_NAME="visibility_test_libcommon",
 )
 
-env.Library(
+env.BazelLibrary(
     target="visibility_test_lib1",
     source=[
         "visibility_test_lib1.cpp",
-    ],
-    LIBDEPS_NO_INHERIT=[
-        '$BUILD_DIR/third_party/shim_allocator',
     ],
     LIBDEPS=[],
     LIBDEPS_PRIVATE=[
@@ -63,13 +58,10 @@ env.Library(
     MONGO_API_NAME="visibility_test_lib1",
 )
 
-env.Library(
+env.BazelLibrary(
     target="visibility_test_lib2",
     source=[
         "visibility_test_lib2.cpp",
-    ],
-    LIBDEPS_NO_INHERIT=[
-        '$BUILD_DIR/third_party/shim_allocator',
     ],
     LIBDEPS=[
         "visibility_test_lib1",
@@ -85,9 +77,6 @@ visibility_test1 = env.BazelProgram(
     source=[
         "visibility_test1.cpp",
     ],
-    LIBDEPS_NO_INHERIT=[
-        '$BUILD_DIR/third_party/shim_allocator',
-    ],
     LIBDEPS=[
         "visibility_test_lib1",
     ],
@@ -95,6 +84,7 @@ visibility_test1 = env.BazelProgram(
     AIB_COMPONENTS_EXTRA=[
         "unittests",
         "tests",
+        "first-quarter-unittests",
     ],
 )
 env.RegisterTest("$UNITTEST_LIST", visibility_test1[0])
@@ -104,9 +94,6 @@ visibility_test2 = env.Program(
     source=[
         "visibility_test2.cpp",
     ],
-    LIBDEPS_NO_INHERIT=[
-        '$BUILD_DIR/third_party/shim_allocator',
-    ],
     LIBDEPS=[
         "visibility_test_lib2",
     ],
@@ -114,6 +101,7 @@ visibility_test2 = env.Program(
     AIB_COMPONENTS_EXTRA=[
         "unittests",
         "tests",
+        "first-quarter-unittests",
     ],
 )
 env.RegisterTest("$UNITTEST_LIST", visibility_test2[0])

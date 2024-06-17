@@ -78,13 +78,14 @@ namespace mongo {
 
 namespace {
 std::string kWiredTigerBackupFile = "WiredTiger.backup";
+std::once_flag initializeServerStatusSectionFlag;
 
 class WiredTigerFactory : public StorageEngine::Factory {
 public:
-    virtual ~WiredTigerFactory() {}
-    virtual std::unique_ptr<StorageEngine> create(OperationContext* opCtx,
-                                                  const StorageGlobalParams& params,
-                                                  const StorageEngineLockFile* lockFile) const {
+    ~WiredTigerFactory() override {}
+    std::unique_ptr<StorageEngine> create(OperationContext* opCtx,
+                                          const StorageGlobalParams& params,
+                                          const StorageEngineLockFile* lockFile) const override {
         if (lockFile && lockFile->createdByUncleanShutdown()) {
             LOGV2_WARNING(22302, "Recovering data from the last clean checkpoint.");
 
@@ -133,8 +134,7 @@ public:
             }
         }
         auto kv =
-            std::make_unique<WiredTigerKVEngine>(opCtx,
-                                                 getCanonicalName().toString(),
+            std::make_unique<WiredTigerKVEngine>(getCanonicalName().toString(),
                                                  params.dbpath,
                                                  getGlobalServiceContext()->getFastClockSource(),
                                                  wiredTigerGlobalOptions.engineConfig,
@@ -145,19 +145,14 @@ public:
         kv->setRecordStoreExtraOptions(wiredTigerGlobalOptions.collectionConfig);
         kv->setSortedDataInterfaceExtraOptions(wiredTigerGlobalOptions.indexConfig);
 
-        // We must only add the server parameters to the global registry once during unit testing.
-        static int setupCountForUnitTests = 0;
-        if (setupCountForUnitTests == 0) {
-            ++setupCountForUnitTests;
-
-            // Intentionally leaked.
-            [[maybe_unused]] auto leakedSection = new WiredTigerServerStatusSection();
-
-            // This allows unit tests to run this code without encountering memory leaks
-#if __has_feature(address_sanitizer)
-            __lsan_ignore_object(leakedSection);
-#endif
-        }
+        // We're using the WT engine; register the ServerStatusSection for it.
+        // Only do so once; even if we re-create the StorageEngine for FCBIS. The section is
+        // stateless.
+        std::call_once(initializeServerStatusSectionFlag, [] {
+            *ServerStatusSectionBuilder<WiredTigerServerStatusSection>(
+                 std::string{kWiredTigerEngineName})
+                 .forShard();
+        });
 
         // Register WiredTiger backup cursor hooks
         WiredTigerBackupCursorHooks::registerInitializer();
@@ -171,20 +166,20 @@ public:
         return std::make_unique<StorageEngineImpl>(opCtx, std::move(kv), options);
     }
 
-    virtual StringData getCanonicalName() const {
+    StringData getCanonicalName() const override {
         return kWiredTigerEngineName;
     }
 
-    virtual Status validateCollectionStorageOptions(const BSONObj& options) const {
+    Status validateCollectionStorageOptions(const BSONObj& options) const override {
         return WiredTigerRecordStore::parseOptionsField(options).getStatus();
     }
 
-    virtual Status validateIndexStorageOptions(const BSONObj& options) const {
+    Status validateIndexStorageOptions(const BSONObj& options) const override {
         return WiredTigerIndex::parseIndexOptions(options).getStatus();
     }
 
-    virtual Status validateMetadata(const StorageEngineMetadata& metadata,
-                                    const StorageGlobalParams& params) const {
+    Status validateMetadata(const StorageEngineMetadata& metadata,
+                            const StorageGlobalParams& params) const override {
         Status status =
             metadata.validateStorageEngineOption("directoryPerDB", params.directoryperdb);
         if (!status.isOK()) {
@@ -213,7 +208,7 @@ public:
         return Status::OK();
     }
 
-    virtual BSONObj createMetadataOptions(const StorageGlobalParams& params) const {
+    BSONObj createMetadataOptions(const StorageGlobalParams& params) const override {
         BSONObjBuilder builder;
         builder.appendBool("directoryPerDB", params.directoryperdb);
         builder.appendBool("directoryForIndexes", wiredTigerGlobalOptions.directoryForIndexes);
@@ -230,5 +225,6 @@ ServiceContext::ConstructorActionRegisterer registerWiredTiger(
     "WiredTigerEngineInit", [](ServiceContext* service) {
         registerStorageEngine(service, std::make_unique<WiredTigerFactory>());
     });
+
 }  // namespace
 }  // namespace mongo

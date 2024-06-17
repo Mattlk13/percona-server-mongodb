@@ -12,6 +12,19 @@ env.Library(
     ],
 )
 
+env.Library(
+    target='query_sbe_makeobj_spec',
+    source=[
+        'makeobj_spec.cpp',
+        'size_estimator.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/sbe_values',
+        '$BUILD_DIR/mongo/util/field_set',
+    ],
+)
+
 sbeEnv = env.Clone()
 sbeEnv.InjectThirdParty(libraries=['snappy'])
 sbeEnv.Library(
@@ -23,9 +36,7 @@ sbeEnv.Library(
         'expressions/expression.cpp',
         'expressions/runtime_environment.cpp',
         'extended_types.cpp',
-        'makeobj_spec.cpp',
         'sbe_pattern_value_cmp.cpp',
-        'size_estimator.cpp',
         'sort_spec.cpp',
         'util/debug_print.cpp',
         'util/pcre.cpp',
@@ -36,22 +47,27 @@ sbeEnv.Library(
         'vm/makeobj.cpp',
         'vm/vm.cpp',
         'vm/vm_block.cpp',
+        'vm/vm_date_ops.cpp',
         'vm/vm_printer.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/exec/sbe/query_sbe_makeobj_spec',
         '$BUILD_DIR/mongo/db/fts/base_fts',
         '$BUILD_DIR/mongo/db/index/index_access_method',
         '$BUILD_DIR/mongo/db/mongohasher',
         '$BUILD_DIR/mongo/db/query/query_index_bounds',
         '$BUILD_DIR/mongo/db/sbe_values',
         '$BUILD_DIR/mongo/db/storage/record_store_base',
+        '$BUILD_DIR/mongo/util/field_set',
         '$BUILD_DIR/third_party/shim_snappy',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/bson/dotted_path_support',
+        '$BUILD_DIR/mongo/db/query/sort_pattern',
         '$BUILD_DIR/mongo/db/query/str_trim_utils',
-        '$BUILD_DIR/mongo/db/sorter/sorter_idl',
+        '$BUILD_DIR/mongo/db/shard_role_api',
+        '$BUILD_DIR/mongo/db/sorter/sorter_base',
         '$BUILD_DIR/mongo/db/sorter/sorter_stats',
     ],
 )
@@ -62,13 +78,17 @@ sbeEnv.Library(
         'stages/agg_project.cpp',
         'stages/branch.cpp',
         'stages/bson_scan.cpp',
+        'stages/block_hashagg.cpp',
         'stages/block_to_row.cpp',
         'stages/co_scan.cpp',
         'stages/exchange.cpp',
+        'stages/hashagg_base.cpp',
         'stages/hash_agg.cpp',
         'stages/hash_join.cpp',
         'stages/hash_lookup.cpp',
+        'stages/hash_lookup_unwind.cpp',
         'stages/limit_skip.cpp',
+        'stages/lookup_hash_table.cpp',
         'stages/loop_join.cpp',
         'stages/makeobj.cpp',
         'stages/merge_join.cpp',
@@ -85,8 +105,6 @@ sbeEnv.Library(
         'stages/window.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/exec/js_function',
         '$BUILD_DIR/mongo/db/exec/scoped_timer',
         '$BUILD_DIR/mongo/db/query/plan_yield_policy',
@@ -103,9 +121,12 @@ sbeEnv.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/bson/dotted_path_support',
+        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/pipeline/pipeline',
-        '$BUILD_DIR/mongo/db/sorter/sorter_idl',
+        '$BUILD_DIR/mongo/db/server_base',
+        '$BUILD_DIR/mongo/db/sorter/sorter_base',
         '$BUILD_DIR/mongo/db/sorter/sorter_stats',
+        '$BUILD_DIR/mongo/db/storage/storage_options',
         'query_sbe',
         'query_sbe_storage',
     ],
@@ -173,6 +194,7 @@ env.CppUnitTest(
         'column_store_encoder_test.cpp',
         'columnar_test.cpp',
         'expressions/sbe_block_expr_test.cpp',
+        'expressions/sbe_block_top_bottom_test.cpp',
         'expressions/sbe_bson_size_test.cpp',
         'expressions/sbe_coerce_to_string_test.cpp',
         'expressions/sbe_concat_test.cpp',
@@ -212,6 +234,8 @@ env.CppUnitTest(
         'expressions/sbe_removable_stddev_test.cpp',
         'expressions/sbe_removable_sum_test.cpp',
         'expressions/sbe_removable_avg_test.cpp',
+        'expressions/sbe_removable_min_max_test.cpp',
+        'expressions/sbe_removable_minn_maxn_test.cpp',
         'expressions/sbe_replace_one_expression_test.cpp',
         'expressions/sbe_reverse_array_builtin_test.cpp',
         'expressions/sbe_round_builtin_test.cpp',
@@ -219,18 +243,23 @@ env.CppUnitTest(
         'expressions/sbe_set_expressions_test.cpp',
         'expressions/sbe_shard_filter_builtin_test.cpp',
         'expressions/sbe_to_upper_to_lower_test.cpp',
+        'expressions/sbe_topn_bottomn_test.cpp',
         'expressions/sbe_trigonometric_expressions_test.cpp',
         'expressions/sbe_trunc_builtin_test.cpp',
         'expressions/sbe_ts_second_ts_increment_test.cpp',
         'expressions/sbe_variable_test.cpp',
+        'expressions/sbe_fill_type_test.cpp',
         'sbe_agg_project_test.cpp',
+        'sbe_block_hashagg_test.cpp',
         'sbe_block_stages_test.cpp',
         'sbe_code_fragment_test.cpp',
         'sbe_column_scan_test.cpp',
         'sbe_filter_test.cpp',
         'sbe_hash_agg_test.cpp',
         'sbe_hash_join_test.cpp',
+        'sbe_hash_lookup_shared_test.cpp',
         'sbe_hash_lookup_test.cpp',
+        'sbe_hash_lookup_unwind_test.cpp',
         'sbe_key_string_test.cpp',
         'sbe_limit_skip_test.cpp',
         'sbe_loop_join_test.cpp',
@@ -251,7 +280,9 @@ env.CppUnitTest(
         'sbe_window_test.cpp',
         'util/stage_results_printer_test.cpp',
         "values/block_test.cpp",
+        "values/bsoncolumn_materializer_test.cpp",
         'values/slot_printer_test.cpp',
+        'values/slot_test.cpp',
         'values/row_test.cpp',
         "values/ts_block_test.cpp",
         'values/value_serialization_test.cpp',
@@ -260,7 +291,6 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/auth/authmocks',
-        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/index/column_store_index',
         '$BUILD_DIR/mongo/db/query/collation/collator_interface_mock',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
@@ -297,6 +327,17 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/query/ce/query_ce_sampling',
+        'sbe_abt_test_util',
+    ],
+)
+
+env.CppUnitTest(
+    target='makeobj_spec_hash_test',
+    source=[
+        'makeobj_spec_hash_test.cpp',
+    ],
+    LIBDEPS=[
+        'query_sbe_makeobj_spec',
         'sbe_abt_test_util',
     ],
 )

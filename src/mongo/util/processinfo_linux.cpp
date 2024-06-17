@@ -88,6 +88,7 @@
 #include "mongo/util/errno_util.h"
 #include "mongo/util/file.h"
 #include "mongo/util/pcre.h"
+#include "mongo/util/procparser.h"
 #include "mongo/util/static_immortal.h"
 #include "mongo/util/str.h"
 
@@ -812,6 +813,11 @@ boost::optional<unsigned long> ProcessInfo::getNumCoresForProcess() {
 #endif
     }
 
+    auto ec = lastSystemError();
+    LOGV2(8366600,
+          "sched_getaffinity failed to collect cpu_set info",
+          "error"_attr = errorMessage(ec));
+
     return boost::none;
 }
 
@@ -823,6 +829,89 @@ int ProcessInfo::getVirtualMemorySize() {
 int ProcessInfo::getResidentSize() {
     LinuxProc p(_pid);
     return (int)((p.getResidentSizeInPages() * getPageSize()) / (1024.0 * 1024));
+}
+
+StatusWith<std::string> ProcessInfo::readTransparentHugePagesParameter(StringData parameter,
+                                                                       StringData directory) {
+    using namespace fmt::literals;
+    auto line = LinuxSysHelper::parseLineFromFile("{}/{}"_format(directory, parameter).c_str());
+    if (line.empty()) {
+        return {ErrorCodes::NonExistentPath,
+                "Empty or non-existent file at {}/{}"_format(directory, parameter)};
+    }
+
+    std::string opMode;
+    std::string::size_type posBegin = line.find('[');
+    std::string::size_type posEnd = line.find(']');
+    if (posBegin == std::string::npos || posEnd == std::string::npos || posBegin >= posEnd) {
+        return {ErrorCodes::FailedToParse, "Cannot parse line: '{}'"_format(line)};
+    }
+
+    opMode = line.substr(posBegin + 1, posEnd - posBegin - 1);
+    if (opMode.empty()) {
+        return {ErrorCodes::BadValue,
+                "Invalid mode in {}/{}: '{}'"_format(directory, parameter, line)};
+    }
+
+    // Check against acceptable values of opMode.
+    static constexpr std::array acceptableValues{
+        "always"_sd,
+        "defer"_sd,
+        "defer+madvise"_sd,
+        "madvise"_sd,
+        "never"_sd,
+    };
+    if (std::find(acceptableValues.begin(), acceptableValues.end(), opMode) ==
+        acceptableValues.end()) {
+        return {
+            ErrorCodes::BadValue,
+            "** WARNING: unrecognized transparent Huge Pages mode of operation in {}/{}: '{}'"_format(
+                directory, parameter, opMode)};
+    }
+
+    return std::move(opMode);
+}
+
+bool ProcessInfo::checkGlibcRseqTunable() {
+    using namespace fmt::literals;
+
+    StringData glibcEnv = getenv(kGlibcTunableEnvVar);
+    auto foundIndex = glibcEnv.find(kRseqKey);
+
+    if (foundIndex != std::string::npos) {
+        try {
+            auto rseqSetting = glibcEnv.at(foundIndex + strlen(kRseqKey) + 1);
+
+            return std::stoi(std::string{rseqSetting}) == 0;
+        } catch (std::exception const&) {
+            return false;
+        }
+    }
+
+    return false;
+}
+
+void collectPressureStallInfo(BSONObjBuilder& builder) {
+
+    auto parsePressureFile = [](StringData key, StringData filename, BSONObjBuilder& bob) {
+        BSONObjBuilder psiParseBuilder;
+        auto status = procparser::parseProcPressureFile(key, filename, &psiParseBuilder);
+        if (status.isOK()) {
+            bob.appendElements(psiParseBuilder.obj());
+        }
+        return status.isOK();
+    };
+
+    BSONObjBuilder psiBuilder;
+    bool parseStatus = false;
+
+    parseStatus |= parsePressureFile("memory", "/proc/pressure/memory"_sd, psiBuilder);
+    parseStatus |= parsePressureFile("cpu", "/proc/pressure/cpu"_sd, psiBuilder);
+    parseStatus |= parsePressureFile("io", "/proc/pressure/io"_sd, psiBuilder);
+
+    if (parseStatus) {
+        builder.append("pressure"_sd, psiBuilder.obj());
+    }
 }
 
 void ProcessInfo::getExtraInfo(BSONObjBuilder& info) {
@@ -863,6 +952,9 @@ void ProcessInfo::getExtraInfo(BSONObjBuilder& info) {
 
     // Append the number of thread in use
     appendNumber("threads", p._nlwp);
+
+    // Append Pressure Stall Information (PSI)
+    collectPressureStallInfo(info);
 }
 
 /**
@@ -891,7 +983,7 @@ unsigned long countNumaNodes() {
                 while (boost::filesystem::exists(
                     std::string(str::stream() << "/sys/devices/system/node/node" << i++)))
                     ;
-                return i;
+                return i - 1;
             }
         }
     } catch (boost::filesystem::filesystem_error& e) {
@@ -987,6 +1079,29 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
     appendIfExists(&bExtra, "cpuVariant", cpuVariant);
     appendIfExists(&bExtra, "cpuPart", cpuPart);
     appendIfExists(&bExtra, "cpuRevision", cpuRevision);
+
+    if (auto res = ProcessInfo::readTransparentHugePagesParameter("enabled"); res.isOK()) {
+        appendIfExists(&bExtra, "thp_enabled", res.getValue());
+    }
+
+    if (auto res = ProcessInfo::readTransparentHugePagesParameter("defrag"); res.isOK()) {
+        appendIfExists(&bExtra, "thp_defrag", res.getValue());
+    }
+
+    appendIfExists(&bExtra,
+                   "thp_max_ptes_none",
+                   LinuxSysHelper::parseLineFromFile(
+                       "{}/khugepaged/max_ptes_none"_format(kTranparentHugepageDirectory).c_str()));
+    appendIfExists(&bExtra,
+                   "overcommit_memory",
+                   LinuxSysHelper::parseLineFromFile("/proc/sys/vm/overcommit_memory"));
+
+#if defined(MONGO_CONFIG_GLIBC_RSEQ)
+    bExtra.append("glibc_rseq_present", true);
+    bExtra.append("glibc_pthread_rseq_disabled", checkGlibcRseqTunable());
+#else
+    bExtra.append("glibc_rseq_present", false);
+#endif
 
     appendMountInfo(bExtra);
 

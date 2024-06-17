@@ -55,7 +55,7 @@
 #include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/op_observer/op_observer_impl.h"
 #include "mongo/db/op_observer/op_observer_registry.h"
-#include "mongo/db/op_observer/oplog_writer_impl.h"
+#include "mongo/db/op_observer/operation_logger_impl.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/find_command.h"
 #include "mongo/db/repl/oplog.h"
@@ -143,7 +143,7 @@ public:
 
         auto registry = std::make_unique<OpObserverRegistry>();
         registry->addObserver(
-            std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterImpl>()));
+            std::make_unique<OpObserverImpl>(std::make_unique<OperationLoggerImpl>()));
         opCtx1.get()->getServiceContext()->setOpObserver(std::move(registry));
         repl::createOplog(opCtx1.get());
 
@@ -174,7 +174,7 @@ public:
         }
 
         BSONObj result;
-        Helpers::findById(opCtx1.get(), nss, idQuery, result, nullptr, nullptr);
+        Helpers::findById(opCtx1.get(), nss, idQuery, result);
         ASSERT_BSONOBJ_EQ(result, doc);
 
         // Assert that the same doc still exists after findByIdAndNoopUpdate
@@ -184,7 +184,8 @@ public:
             auto lastApplied = repl::ReplicationCoordinator::get(opCtx1->getServiceContext())
                                    ->getMyLastAppliedOpTime()
                                    .getTimestamp();
-            ASSERT_OK(opCtx1->recoveryUnit()->setTimestamp(lastApplied + 1));
+            ASSERT_OK(
+                shard_role_details::getRecoveryUnit(opCtx1.get())->setTimestamp(lastApplied + 1));
             auto foundDoc = Helpers::findByIdAndNoopUpdate(opCtx1.get(), collection1, idQuery, res);
             wuow.commit();
             ASSERT_TRUE(foundDoc);
@@ -230,7 +231,7 @@ private:
             auto lastApplied = repl::ReplicationCoordinator::get(opCtx2->getServiceContext())
                                    ->getMyLastAppliedOpTime()
                                    .getTimestamp();
-            ASSERT_OK(opCtx2->recoveryUnit()->setTimestamp(lastApplied + 1));
+            ASSERT_OK(shard_role_details::getRecoveryUnit(opCtx2)->setTimestamp(lastApplied + 1));
             BSONObj res;
             ASSERT_TRUE(Helpers::findByIdAndNoopUpdate(
                 opCtx2, collection2.getCollectionPtr(), idQuery, res));
@@ -242,11 +243,11 @@ private:
 
         // Assert that the doc still exists in the collection.
         BSONObj res1;
-        Helpers::findById(opCtx1, nss, idQuery, res1, nullptr, nullptr);
+        Helpers::findById(opCtx1, nss, idQuery, res1);
         ASSERT_BSONOBJ_EQ(res1, doc);
 
         BSONObj res2;
-        Helpers::findById(opCtx2, nss, idQuery, res2, nullptr, nullptr);
+        Helpers::findById(opCtx2, nss, idQuery, res2);
         ASSERT_BSONOBJ_EQ(res2, doc);
 
         // Assert that findByIdAndNoopUpdate did not generate an oplog entry.
@@ -273,7 +274,8 @@ private:
                 auto lastApplied = repl::ReplicationCoordinator::get(opCtx1->getServiceContext())
                                        ->getMyLastAppliedOpTime()
                                        .getTimestamp();
-                ASSERT_OK(opCtx1->recoveryUnit()->setTimestamp(lastApplied + 1));
+                ASSERT_OK(
+                    shard_role_details::getRecoveryUnit(opCtx1)->setTimestamp(lastApplied + 1));
                 Helpers::emptyCollection(opCtx1, coll);
             }
 
@@ -294,27 +296,27 @@ private:
 
         // Assert that the first storage transaction succeeded and that the doc is removed.
         BSONObj res1;
-        Helpers::findById(opCtx1, nss, idQuery, res1, nullptr, nullptr);
+        Helpers::findById(opCtx1, nss, idQuery, res1);
         ASSERT_BSONOBJ_EQ(res1, BSONObj());
 
         BSONObj res2;
-        Helpers::findById(opCtx2, nss, idQuery, res2, nullptr, nullptr);
+        Helpers::findById(opCtx2, nss, idQuery, res2);
         ASSERT_BSONOBJ_EQ(res2, BSONObj());
     }
 
     repl::ReplicationCoordinatorMock* _coordinatorMock;
 };
 
-class All : public OldStyleSuiteSpecification {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("dbhelpers") {}
-    void setupTests() {
+    void setupTests() override {
         add<RemoveRange>();
         add<FindAndNoopUpdateTest>();
     }
 };
 
-OldStyleSuiteInitializer<All> myall;
+unittest::OldStyleSuiteInitializer<All> myall;
 
 }  // namespace
 }  // namespace mongo

@@ -209,7 +209,10 @@ executor::RemoteCommandResponse initWireVersion(
     WireSpec::getWireSpec(getGlobalServiceContext()).appendInternalClientWireVersionIfNeeded(&bob);
 
     Date_t start{Date_t::now()};
-    auto result = conn->runCommand(OpMsgRequest::fromDBAndBody(DatabaseName::kAdmin, bob.obj()));
+    auto result = conn->runCommand(OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired /* admin is not per-tenant. */,
+        DatabaseName::kAdmin,
+        bob.obj()));
     Date_t finish{Date_t::now()};
 
     BSONObj helloObj = result->getCommandReply().getOwned();
@@ -233,6 +236,16 @@ executor::RemoteCommandResponse initWireVersion(
 
 } catch (...) {
     return exceptionToStatus();
+}
+
+boost::optional<Milliseconds> clampTimeout(double timeoutInSec) {
+    if (timeoutInSec <= 0) {
+        return boost::none;
+    }
+    double timeout = std::floor(timeoutInSec * 1000);
+    return (timeout >= static_cast<double>(Milliseconds::max().count()))
+        ? Milliseconds::max()
+        : Milliseconds{static_cast<Milliseconds::rep>(timeout)};
 }
 
 }  // namespace
@@ -375,15 +388,13 @@ void DBClientSession::connectNoHello(const HostAndPort& serverAddress,
 void DBClientSession::_markFailed(FailAction action) {
     _failed.store(true);
     if (_session) {
-        if (action == kEndSession) {
-            _session->end();
+        if (action == kKillSession) {
+            _killSession();
         } else if (action == kReleaseSession) {
             std::shared_ptr<transport::Session> destroyedOutsideMutex;
 
             stdx::lock_guard<Latch> lk(_sessionMutex);
             _session.swap(destroyedOutsideMutex);
-        } else if (action == kShutdownSession) {
-            _shutdownSession();
         }
     }
 }
@@ -426,25 +437,17 @@ bool DBClientSession::isStillConnected() {
 
 void DBClientSession::shutdown() {
     stdx::lock_guard<Latch> lk(_sessionMutex);
-    _markFailed(kShutdownSession);
+    _markFailed(kKillSession);
 }
 
 void DBClientSession::shutdownAndDisallowReconnect() {
     stdx::lock_guard<Latch> lk(_sessionMutex);
     _stayFailed.store(true);
-    _markFailed(kShutdownSession);
+    _markFailed(kKillSession);
 }
 
 void DBClientSession::setSoTimeout(double timeout) {
-    Milliseconds::rep timeoutMs = std::floor(timeout * 1000);
-    if (timeout <= 0) {
-        _socketTimeout = boost::none;
-    } else if (timeoutMs >= Milliseconds::max().count()) {
-        _socketTimeout = Milliseconds::max();
-    } else {
-        _socketTimeout = Milliseconds{timeoutMs};
-    }
-
+    _socketTimeout = clampTimeout(timeout);
     if (_session) {
         _session->setTimeout(_socketTimeout);
     }
@@ -465,19 +468,20 @@ Status DBClientSession::appendClientMetadata(StringData applicationName, BSONObj
         "MongoDB Internal Client", versionString, applicationName, bob);
 }
 
-DBClientSession::DBClientSession(bool _autoReconnect,
-                                 double so_timeout,
+DBClientSession::DBClientSession(bool autoReconnect,
+                                 double soTimeout,
                                  MongoURI uri,
                                  const HandshakeValidationHook& hook,
                                  const ClientAPIVersionParameters* apiParameters)
     : DBClientBase(apiParameters),
-      _autoReconnect(_autoReconnect),
+      _socketTimeout(clampTimeout(soTimeout)),
+      _autoReconnect(autoReconnect),
       _hook(hook),
       _uri(std::move(uri)) {}
 
 void DBClientSession::say(Message& toSend, bool isRetry, string* actualServer) {
     ensureConnection();
-    ScopeGuard killSessionOnError([this] { _markFailed(kEndSession); });
+    ScopeGuard killSessionOnError([this] { _markFailed(kKillSession); });
 
     toSend.header().setId(nextMessageId());
     toSend.header().setResponseToMsgId(0);
@@ -496,7 +500,7 @@ void DBClientSession::say(Message& toSend, bool isRetry, string* actualServer) {
 }
 
 Message DBClientSession::recv(int lastRequestId) {
-    ScopeGuard killSessionOnError([this] { _markFailed(kEndSession); });
+    ScopeGuard killSessionOnError([this] { _markFailed(kKillSession); });
     auto m = uassertStatusOK(_session->sourceMessage());
 
     uassert(40570,
@@ -513,7 +517,7 @@ Message DBClientSession::recv(int lastRequestId) {
 
 Message DBClientSession::_call(Message& toSend, string* actualServer) {
     ensureConnection();
-    ScopeGuard killSessionOnError([this] { _markFailed(kEndSession); });
+    ScopeGuard killSessionOnError([this] { _markFailed(kKillSession); });
 
     toSend.header().setId(nextMessageId());
     toSend.header().setResponseToMsgId(0);

@@ -1,3 +1,4 @@
+
 /**
  * Test that sort queries work properly on dates ouside the 32 bit epoch range,
  *  [1970-01-01 00:00:00 UTC - 2038-01-29 03:13:07 UTC], when a collection scan is used.
@@ -13,10 +14,21 @@
  *     tenant_migration_incompatible,
  *     # We need a timeseries collection.
  *     requires_timeseries,
+ *     # TODO (SERVER-88539) the timeseries setup runs a migration. Remove the upgrade-downgrade
+ *     # incompatible tag once migrations  work during downgrade.
+ *     cannot_run_during_upgrade_downgrade,
  * ]
  */
 import {getAggPlanStages} from "jstests/libs/analyze_plan.js";
 import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+
+if (FixtureHelpers.isMongos(db)) {
+    const shards = db.getSiblingDB('config').shards.find().toArray();
+    const shardName0 = shards.map(doc => doc._id)[0];
+    const dbName = db.getName();
+    db.getSiblingDB(dbName).dropDatabase();
+    assert.commandWorked(db.adminCommand({enableSharding: dbName, primaryShard: shardName0}));
+}
 
 // Create unindexed collection
 const coll = db.timeseries_internal_bounded_sort_extended_range;
@@ -46,7 +58,6 @@ for (const collection of [buckets, bucketsIndexed]) {
         const shards = db.getSiblingDB('config').shards.find().toArray();
         const [shardName0, shardName1] = shards.map(doc => doc._id);
 
-        assert.commandWorked(db.adminCommand({movePrimary: db.getName(), to: shardName0}));
         const collName = collection.getFullName();
         // Our example data has documents between 2000-2003, and these dates are non-wrapping.
         // So this goes on the primary shard, and everything else goes on the non-primary.

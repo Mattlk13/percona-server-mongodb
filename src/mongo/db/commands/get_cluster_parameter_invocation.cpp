@@ -41,12 +41,12 @@
 #include "mongo/db/commands/get_cluster_parameter_invocation.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/query/query_settings/query_settings_manager.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
@@ -58,6 +58,7 @@ std::pair<std::vector<std::string>, std::vector<BSONObj>>
 GetClusterParameterInvocation::retrieveRequestedParameters(
     OperationContext* opCtx,
     const CmdBody& cmdBody,
+    bool shouldOmitInFTDC,
     const boost::optional<TenantId>& tenantId,
     bool excludeClusterParameterTime) {
     ServerParameterSet* clusterParameters = ServerParameterSet::getClusterParameterSet();
@@ -67,61 +68,71 @@ GetClusterParameterInvocation::retrieveRequestedParameters(
     audit::logGetClusterParameter(opCtx->getClient(), cmdBody);
 
     // For each parameter, generate a BSON representation of it and retrieve its name.
-    auto makeBSON = [&](ServerParameter* requestedParameter) {
-        // Skip any disabled cluster parameters.
-        if (requestedParameter->isEnabled()) {
-            BSONObjBuilder bob;
-            requestedParameter->append(opCtx, &bob, requestedParameter->name(), tenantId);
-            auto paramObj = bob.obj().getOwned();
-            if (excludeClusterParameterTime) {
-                parameterValues.push_back(
-                    paramObj.filterFieldsUndotted(BSON("clusterParameterTime" << true), false));
-            } else {
-                parameterValues.push_back(paramObj);
-            }
-            parameterNames.push_back(requestedParameter->name());
+    auto makeBSON = [&](ServerParameter* requestedParameter, bool skipOnError) {
+        if (!requestedParameter->isEnabled()) {
+            uassert(ErrorCodes::BadValue,
+                    str::stream() << "Server parameter: '" << requestedParameter->name()
+                                  << "' is disabled",
+                    skipOnError);
+            return;
         }
+
+        // If the command is invoked with shouldOmitInFTDC, then any parameter that has that
+        // flag set should be omitted.
+        if (shouldOmitInFTDC && requestedParameter->isOmittedInFTDC()) {
+            return;
+        }
+
+        // The persistent query settings are stored in a cluster parameter, however, since this is
+        // an implementation detail, we don't want to expose it to our users.
+        if (requestedParameter->name() ==
+            query_settings::QuerySettingsManager::kQuerySettingsClusterParameterName) {
+            uassert(ErrorCodes::NoSuchKey,
+                    str::stream() << "Unknown server parameter: " << requestedParameter->name(),
+                    skipOnError);
+            return;
+        }
+
+        BSONObjBuilder bob;
+        requestedParameter->append(opCtx, &bob, requestedParameter->name(), tenantId);
+        auto paramObj = bob.obj().getOwned();
+        if (excludeClusterParameterTime) {
+            parameterValues.push_back(
+                paramObj.filterFieldsUndotted(BSON("clusterParameterTime" << true), false));
+        } else {
+            parameterValues.push_back(paramObj);
+        }
+        parameterNames.push_back(requestedParameter->name());
     };
 
-    stdx::visit(OverloadedVisitor{
-                    [&](const std::string& strParameterName) {
-                        if (strParameterName == "*"_sd) {
-                            // Retrieve all cluster parameter values.
-                            Map clusterParameterMap = clusterParameters->getMap();
-                            parameterValues.reserve(clusterParameterMap.size());
-                            parameterNames.reserve(clusterParameterMap.size());
-                            for (const auto& param : clusterParameterMap) {
-                                makeBSON(param.second);
-                            }
-                        } else {
-                            // Any other string must correspond to a single parameter name.
-                            // Return an error if a disabled cluster parameter is explicitly
-                            // requested.
-                            ServerParameter* sp = clusterParameters->get(strParameterName);
-                            uassert(ErrorCodes::BadValue,
-                                    str::stream() << "Server parameter: '" << strParameterName
-                                                  << "' is disabled",
-                                    sp->isEnabled());
-                            makeBSON(sp);
-                        }
-                    },
-                    [&](const std::vector<std::string>& listParameterNames) {
-                        uassert(ErrorCodes::BadValue,
-                                "Must supply at least one cluster server parameter name to "
-                                "getClusterParameter",
-                                listParameterNames.size() > 0);
-                        parameterValues.reserve(listParameterNames.size());
-                        parameterNames.reserve(listParameterNames.size());
-                        for (const auto& requestedParameterName : listParameterNames) {
-                            ServerParameter* sp = clusterParameters->get(requestedParameterName);
-                            uassert(ErrorCodes::BadValue,
-                                    str::stream() << "Server parameter: '" << requestedParameterName
-                                                  << "' is disabled'",
-                                    sp->isEnabled());
-                            makeBSON(sp);
-                        }
-                    }},
-                cmdBody);
+    visit(OverloadedVisitor{[&](const std::string& strParameterName) {
+                                if (strParameterName == "*"_sd) {
+                                    // Retrieve all cluster parameter values.
+                                    Map clusterParameterMap = clusterParameters->getMap();
+                                    parameterValues.reserve(clusterParameterMap.size());
+                                    parameterNames.reserve(clusterParameterMap.size());
+                                    for (const auto& param : clusterParameterMap) {
+                                        makeBSON(param.second, true);
+                                    }
+                                } else {
+                                    // Any other string must correspond to a single parameter name.
+                                    // Return an error if a disabled cluster parameter is explicitly
+                                    // requested.
+                                    makeBSON(clusterParameters->get(strParameterName), false);
+                                }
+                            },
+                            [&](const std::vector<std::string>& listParameterNames) {
+                                uassert(ErrorCodes::BadValue,
+                                        "Must supply at least one cluster server parameter name to "
+                                        "getClusterParameter",
+                                        listParameterNames.size() > 0);
+                                parameterValues.reserve(listParameterNames.size());
+                                parameterNames.reserve(listParameterNames.size());
+                                for (const auto& requestedParameterName : listParameterNames) {
+                                    makeBSON(clusterParameters->get(requestedParameterName), false);
+                                }
+                            }},
+          cmdBody);
 
     return {std::move(parameterNames), std::move(parameterValues)};
 }
@@ -129,13 +140,14 @@ GetClusterParameterInvocation::retrieveRequestedParameters(
 GetClusterParameterInvocation::Reply GetClusterParameterInvocation::getCachedParameters(
     OperationContext* opCtx, const GetClusterParameter& request) {
     const CmdBody& cmdBody = request.getCommandParameter();
+    bool shouldOmitInFTDC = request.getOmitInFTDC();
 
     auto* repl = repl::ReplicationCoordinator::get(opCtx);
     bool isStandalone = repl && !repl->getSettings().isReplSet() &&
         serverGlobalParams.clusterRole.has(ClusterRole::None);
 
-    auto [parameterNames, parameterValues] =
-        retrieveRequestedParameters(opCtx, cmdBody, request.getDbName().tenantId(), isStandalone);
+    auto [parameterNames, parameterValues] = retrieveRequestedParameters(
+        opCtx, cmdBody, shouldOmitInFTDC, request.getDbName().tenantId(), isStandalone);
 
     LOGV2_DEBUG(6226100,
                 2,

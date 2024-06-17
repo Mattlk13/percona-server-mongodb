@@ -50,7 +50,6 @@
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/matcher/expression.h"
@@ -71,6 +70,7 @@
 #include "mongo/db/timeseries/timeseries_gen.h"
 #include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
 #include "mongo/db/transaction/transaction_participant.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -280,7 +280,7 @@ void IndexCatalogEntryImpl::forceSetMultikey(OperationContext* const opCtx,
                                              const CollectionPtr& coll,
                                              bool isMultikey,
                                              const MultikeyPaths& multikeyPaths) const {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(coll->ns(), MODE_X));
+    invariant(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(coll->ns(), MODE_X));
 
     // Don't check _indexTracksMultikeyPathsInCatalog because the caller may be intentionally trying
     // to bypass this check. That is, pre-3.4 indexes may be 'stuck' in a state where they are not
@@ -347,7 +347,7 @@ Status IndexCatalogEntryImpl::_setMultikeyInMultiDocumentTransaction(
                 // document that enables multikey hasn't enabled it yet but is present in the
                 // collection. In other words, the index is not set for multikey but there is
                 // already data present that relies on it.
-                auto status = opCtx->recoveryUnit()->setTimestamp(std::max(
+                auto status = shard_role_details::getRecoveryUnit(opCtx)->setTimestamp(std::max(
                     {recoveryPrepareOpTime.getTimestamp(),
                      opCtx->getServiceContext()->getStorageEngine()->getOldestTimestamp(),
                      opCtx->getServiceContext()->getStorageEngine()->getStableTimestamp() + 1}));

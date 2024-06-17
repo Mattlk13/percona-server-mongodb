@@ -12,7 +12,7 @@
  * ]
  */
 // Include helpers for analyzing explain output.
-import {getWinningPlan, isIndexOnly} from "jstests/libs/analyze_plan.js";
+import {getOptimizer, getWinningPlan, isIndexOnly} from "jstests/libs/analyze_plan.js";
 
 const coll = db["jstests_coveredIndex1"];
 coll.drop();
@@ -23,6 +23,7 @@ assert.commandWorked(coll.insert({order: 2, fn: "john", ln: "smith"}));
 assert.commandWorked(coll.insert({order: 3, fn: "jack", ln: "black"}));
 assert.commandWorked(coll.insert({order: 4, fn: "bob", ln: "murray"}));
 assert.commandWorked(coll.insert({order: 5, fn: "aaa", ln: "bbb", obj: {a: 1, b: "blah"}}));
+assert.commandWorked(coll.insert({order: 6, fn: "ccc", ln: "ddd", arr: [1, 2, 3, 4, 5, 6]}));
 
 /**
  * Asserts that running the find command with query 'query' and projection 'projection' is
@@ -42,9 +43,17 @@ function assertIfQueryIsCovered(query, projection, isCovered, hint) {
     assert(explain.queryPlanner.hasOwnProperty("winningPlan"), tojson(explain));
     const winningPlan = getWinningPlan(explain.queryPlanner);
     if (isCovered) {
-        assert(isIndexOnly(db, winningPlan),
-               "Query " + tojson(query) + " with projection " + tojson(projection) +
-                   " should have been covered, but got this plan: " + tojson(winningPlan));
+        switch (getOptimizer(explain)) {
+            case "classic":
+                assert(isIndexOnly(db, winningPlan),
+                       "Query " + tojson(query) + " with projection " + tojson(projection) +
+                           " should have been covered, but got this plan: " + tojson(winningPlan));
+                break;
+            case "CQF":
+                // TODO SERVER-77719: Ensure that the decision for using the scan lines up with CQF
+                // optimizer. M2: allow only collscans, M4: check bonsai behavior for index scan.
+                break;
+        }
     } else {
         assert(!isIndexOnly(db, winningPlan),
                "Query " + tojson(query) + " with projection " + tojson(projection) +
@@ -87,3 +96,9 @@ assertIfQueryIsCovered({obj: {a: 1, b: "blah"}}, {obj: 1, _id: 0}, true);
 assert.commandWorked(coll.dropIndex({obj: 1}));
 assert.commandWorked(coll.createIndex({"obj.a": 1, "obj.b": 1}));
 assertIfQueryIsCovered({"obj.a": 1}, {obj: 1}, false);
+
+// Create indexes on single array elements.
+assert.commandWorked(coll.dropIndex({"obj.a": 1, "obj.b": 1}));
+assert.commandWorked(coll.createIndex({"arr.0": 1}));
+assertIfQueryIsCovered({"arr.0": 1}, {}, false);
+assertIfQueryIsCovered({"arr.0": {$mod: [7, 6]}}, {}, false);

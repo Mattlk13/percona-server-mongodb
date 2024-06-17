@@ -2,7 +2,12 @@
  * Tests that listSampledQueries correctly returns sampled queries for both sharded clusters and
  * replica sets.
  *
- * @tags: [requires_fcv_70]
+ * @tags: [
+ *   requires_fcv_70,
+ *   requires_fcv_80,
+ *   # TODO (SERVER-85629): Re-enable this test once redness is resolved in multiversion suites.
+ *   DISABLED_TEMPORARILY_DUE_TO_FCV_UPGRADE
+ * ]
  */
 
 import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
@@ -179,20 +184,37 @@ function runTest(conn, {rst, st}) {
 
     // TODO (SERVER-67711): Remove feature flag for bulkWrite command.
     if (FeatureFlagUtil.isPresentAndEnabled(testDb, "BulkWriteCommand")) {
-        const bulkWriteCmdObj = {
-            bulkWrite: 1,
-            ops: [{update: 0, filter: {x: 7}, updateMods: {$set: {y: 7}}}],
-            nsInfo: [{ns: ns1}],
-            let : {sampleNum: ++sampleNum}
+        // The bulkWrite feature is not FCV gated and is available (but incomplete) in server
+        // version older than 7.3. In order to not run this portion of the test in multiversion
+        // suites, we check the FCV version here and only do this test against cluster with FCV 7.3
+        // or above (with binary version 7.3 or above implied).
+        const getFCVDoc = () => {
+            if (st) {
+                return assert.commandWorked(
+                    st.shard0.adminCommand({getParameter: 1, featureCompatibilityVersion: 1}));
+            } else {
+                return assert.commandWorked(
+                    testDb.adminCommand({getParameter: 1, featureCompatibilityVersion: 1}));
+            }
         };
-        assert.commandWorked(testDb.adminCommand(bulkWriteCmdObj));
-        expectedSamples[sampleNum] = {
-            ns: ns1,
-            collectionUuid: collUuid1,
-            cmdName: "bulkWrite",
-            cmd: Object.assign({}, bulkWriteCmdObj, {$db: "admin"})
-        };
-        numSamplesColl1++;
+        if (MongoRunner.compareBinVersions(getFCVDoc().featureCompatibilityVersion.version,
+                                           '7.3') >= 0) {
+            jsTestLog("Test bulkWrite command for sampling");
+            const bulkWriteCmdObj = {
+                bulkWrite: 1,
+                ops: [{update: 0, filter: {x: 7}, updateMods: {$set: {y: 7}}}],
+                nsInfo: [{ns: ns1}],
+                let : {sampleNum: ++sampleNum}
+            };
+            assert.commandWorked(testDb.adminCommand(bulkWriteCmdObj));
+            expectedSamples[sampleNum] = {
+                ns: ns1,
+                collectionUuid: collUuid1,
+                cmdName: "bulkWrite",
+                cmd: Object.assign({}, bulkWriteCmdObj, {$db: "admin"})
+            };
+            numSamplesColl1++;
+        }
     }
 
     jsTest.log("Test running a $listSampledQueries aggregate command that doesn't involve " +

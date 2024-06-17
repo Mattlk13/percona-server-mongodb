@@ -97,6 +97,20 @@ def mongod_program(logger, job_num, executable, process_kwargs, mongod_options):
             "wiredTigerCacheSizeGB": "1",
         })
 
+    if config.TLS_MODE:
+        mongod_options["tlsMode"] = config.TLS_MODE
+        if config.TLS_MODE != "disabled":
+            # Note: "tlsAllowInvalidCertificates" is enabled to avoid
+            # hostname conflicts with our testing certificates.
+            # The ssl and ssl_special suites handle hostname validation testing.
+            mongod_options["tlsAllowInvalidHostnames"] = ""
+
+    if config.MONGOD_TLS_CERTIFICATE_KEY_FILE:
+        mongod_options["tlsCertificateKeyFile"] = config.MONGOD_TLS_CERTIFICATE_KEY_FILE
+
+    if config.TLS_CA_FILE:
+        mongod_options["tlsCAFile"] = config.TLS_CA_FILE
+
     if "port" not in mongod_options:
         mongod_options["port"] = network.PortAllocator.next_fixture_port(job_num)
 
@@ -105,6 +119,22 @@ def mongod_program(logger, job_num, executable, process_kwargs, mongod_options):
         suite_set_parameters, "queryAnalysisSamplerConfigurationRefreshSecs", bin_version, "7.0.0")
     remove_set_parameter_if_before_version(suite_set_parameters, "queryAnalysisWriterIntervalSecs",
                                            bin_version, "7.0.0")
+    remove_set_parameter_if_before_version(suite_set_parameters, "defaultConfigCommandTimeoutMS",
+                                           bin_version, "7.3.0")
+
+    if "grpcPort" not in mongod_options and suite_set_parameters.get("featureFlagGRPC"):
+        mongod_options["grpcPort"] = network.PortAllocator.next_fixture_port(job_num)
+
+    remove_set_parameter_if_before_version(suite_set_parameters, "internalQueryStatsRateLimit",
+                                           bin_version, "7.3.0")
+    remove_set_parameter_if_before_version(
+        suite_set_parameters, "internalQueryStatsErrorsAreCommandFatal", bin_version, "7.3.0")
+    remove_set_parameter_if_before_version(suite_set_parameters, "enableAutoCompaction",
+                                           bin_version, "7.3.0")
+
+    if "grpcPort" not in mongod_options and suite_set_parameters.get("featureFlagGRPC"):
+        mongod_options["grpcPort"] = network.PortAllocator.next_fixture_port(job_num)
+
     _apply_set_parameters(args, suite_set_parameters)
     final_mongod_options = mongod_options.copy()
     mongod_options.pop("set_parameters")
@@ -135,12 +165,37 @@ def mongos_program(logger, job_num, executable=None, process_kwargs=None, mongos
         mongos_options["set_parameters"]["fassertOnLockTimeoutForStepUpDown"] = 0
         mongos_options.update({"logpath": "/var/log/mongodb/mongodb.log", "bind_ip": "0.0.0.0"})
 
+    if config.TLS_MODE:
+        mongos_options["tlsMode"] = config.TLS_MODE
+        if config.TLS_MODE != "disabled":
+            mongos_options["tlsAllowInvalidHostnames"] = ""
+
+    if config.MONGOS_TLS_CERTIFICATE_KEY_FILE:
+        mongos_options["tlsCertificateKeyFile"] = config.MONGOS_TLS_CERTIFICATE_KEY_FILE
+
+    if config.TLS_CA_FILE:
+        mongos_options["tlsCAFile"] = config.TLS_CA_FILE
+
     if "port" not in mongos_options:
         mongos_options["port"] = network.PortAllocator.next_fixture_port(job_num)
 
     suite_set_parameters = mongos_options.get("set_parameters", {})
     remove_set_parameter_if_before_version(
         suite_set_parameters, "queryAnalysisSamplerConfigurationRefreshSecs", bin_version, "7.0.0")
+    remove_set_parameter_if_before_version(suite_set_parameters, "defaultConfigCommandTimeoutMS",
+                                           bin_version, "7.3.0")
+
+    if "grpcPort" not in mongos_options and suite_set_parameters.get("featureFlagGRPC"):
+        mongos_options["grpcPort"] = network.PortAllocator.next_fixture_port(job_num)
+
+    remove_set_parameter_if_before_version(suite_set_parameters, "internalQueryStatsRateLimit",
+                                           bin_version, "7.3.0")
+    remove_set_parameter_if_before_version(
+        suite_set_parameters, "internalQueryStatsErrorsAreCommandFatal", bin_version, "7.3.0")
+
+    if "grpcPort" not in mongos_options and suite_set_parameters.get("featureFlagGRPC"):
+        mongos_options["grpcPort"] = network.PortAllocator.next_fixture_port(job_num)
+
     _apply_set_parameters(args, suite_set_parameters)
     final_mongos_options = mongos_options.copy()
     mongos_options.pop("set_parameters")
@@ -153,6 +208,17 @@ def mongos_program(logger, job_num, executable=None, process_kwargs=None, mongos
     process_kwargs = make_historic(utils.default_if_none(process_kwargs, {}))
 
     return make_process(logger, args, **process_kwargs), final_mongos_options
+
+
+def mongot_program(logger, job_num, executable=None, process_kwargs=None, mongot_options=None):
+    """Return a Process instance that starts a mongot."""
+    args = [executable]
+    mongot_options = mongot_options.copy()
+    final_mongot_options = mongot_options.copy()
+    # Apply the rest of the command line arguments.
+    _apply_kwargs(args, mongot_options)
+    process_kwargs = make_historic(utils.default_if_none(process_kwargs, {}))
+    return make_process(logger, args, **process_kwargs), final_mongot_options
 
 
 def mongo_shell_program(logger, executable=None, connection_string=None, filename=None,
@@ -208,6 +274,27 @@ def mongo_shell_program(logger, executable=None, connection_string=None, filenam
         elif opt_name not in test_data:
             # Only use 'opt_default' if the property wasn't set in the YAML configuration.
             test_data[opt_name] = opt_default
+
+    if config.SHELL_TLS_ENABLED:
+        test_data["shellTlsEnabled"] = True
+
+        if config.SHELL_TLS_CERTIFICATE_KEY_FILE:
+            test_data["shellTlsCertificateKeyFile"] = config.SHELL_TLS_CERTIFICATE_KEY_FILE
+
+    if config.SHELL_GRPC:
+        test_data["shellGRPC"] = True
+
+    if config.TLS_CA_FILE:
+        test_data["tlsCAFile"] = config.TLS_CA_FILE
+
+    if config.TLS_MODE:
+        test_data["tlsMode"] = config.TLS_MODE
+
+    if config.MONGOD_TLS_CERTIFICATE_KEY_FILE:
+        test_data["mongodTlsCertificateKeyFile"] = config.MONGOD_TLS_CERTIFICATE_KEY_FILE
+
+    if config.MONGOS_TLS_CERTIFICATE_KEY_FILE:
+        test_data["mongosTlsCertificateKeyFile"] = config.MONGOS_TLS_CERTIFICATE_KEY_FILE
 
     global_vars["TestData"] = test_data
 
@@ -274,6 +361,9 @@ def mongo_shell_program(logger, executable=None, connection_string=None, filenam
 
     if "configShard" not in test_data and config.CONFIG_SHARD is not None:
         test_data["configShard"] = True
+
+    if "embeddedRouter" not in test_data and config.EMBEDDED_ROUTER is not None:
+        test_data["embeddedRouter"] = True
 
     # There's a periodic background thread that checks for and aborts expired transactions.
     # "transactionLifetimeLimitSeconds" specifies for how long a transaction can run before expiring
@@ -343,6 +433,16 @@ def mongo_shell_program(logger, executable=None, connection_string=None, filenam
     eval_str = "; ".join(eval_sb)
     args.append("--eval")
     args.append(eval_str)
+
+    if config.SHELL_TLS_ENABLED:
+        args.extend(["--tls", "--tlsAllowInvalidHostnames"])
+        if config.TLS_CA_FILE:
+            kwargs["tlsCAFile"] = config.TLS_CA_FILE
+        if config.SHELL_TLS_CERTIFICATE_KEY_FILE:
+            kwargs["tlsCertificateKeyFile"] = config.SHELL_TLS_CERTIFICATE_KEY_FILE
+
+    if config.SHELL_GRPC:
+        args.append("--gRPC")
 
     if connection_string is not None:
         # The --host and --port options are ignored by the mongo shell when an explicit connection

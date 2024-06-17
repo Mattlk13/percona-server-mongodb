@@ -2,7 +2,7 @@
 //
 // @tags: [
 //   # The test runs commands that are not allowed with security token: mapReduce.
-//   not_allowed_with_security_token,
+//   not_allowed_with_signed_security_token,
 //   does_not_support_stepdowns,
 //   requires_getmore,
 //   requires_non_retryable_writes,
@@ -13,7 +13,7 @@
 // ]
 
 import "jstests/libs/sbe_assert_error_override.js";
-import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {getExecutionStats} from "jstests/libs/analyze_plan.js";
 
 const coll = db.expr;
 
@@ -120,12 +120,9 @@ assert.throws(function() {
 // $expr which causes a runtime error should be caught be explain and reported as an error in the
 // 'executionSuccess' field.
 let explain = coll.find({$expr: {$divide: [1, "$a"]}}).explain("executionStats");
-// Accommodate format differences between explain via mongos and explain directly on a mongod.
-if (!FixtureHelpers.isMongos(db)) {
-    assert(explain.hasOwnProperty("executionStats"), explain);
-    assert.eq(explain.executionStats.executionSuccess, false, explain);
-    assert.errorCodeEq(explain.executionStats.errorCode, [16609, ErrorCodes.TypeMismatch], explain);
-}
+let executionStats = getExecutionStats(explain).filter(stats => !stats.executionSuccess)[0];
+assert.eq(executionStats.executionSuccess, false, explain);
+assert.errorCodeEq(executionStats.errorCode, [16609, ErrorCodes.TypeMismatch], explain);
 
 // $expr is not allowed in $elemMatch projection.
 coll.drop();

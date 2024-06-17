@@ -4,7 +4,7 @@
  *
  * @tags: [
  *   # The test runs commands that are not allowed with security token: endSession.
- *   not_allowed_with_security_token,
+ *   not_allowed_with_signed_security_token,
  *   uses_transactions
  * ]
  */
@@ -19,7 +19,7 @@ mydb.createCollection("foo", {writeConcern: {w: "majority"}});
 var session = db.getMongo().startSession();
 var sessionDb = session.getDatabase(dbName);
 
-if (FixtureHelpers.isMongos(db)) {
+if (FixtureHelpers.isMongos(db) || TestData.testingReplicaSetEndpoint) {
     // Before starting the transaction below, access the collection so it can be implicitly
     // sharded and force all shards to refresh their database versions because the refresh
     // requires an exclusive lock and would block behind the transaction.

@@ -258,6 +258,7 @@ public:
      *  'info': The result object the database returns. Typically has { ok : ..., errmsg : ... }
      *          fields set.
      *  'options': See enum QueryOptions - normally not needed to run a command.
+     *  'vts': optional validated tenancy scope used to include tenancy information on a command
      *
      *  Returns true if the command returned "ok".
      */
@@ -274,16 +275,6 @@ public:
                                                          BSONObj cmd,
                                                          BSONObj& info,
                                                          int options = 0);
-
-    /**
-     * See the opMsg overload comment for why this function takes a shared_ptr ostensibly to this.
-     */
-    std::tuple<bool, std::shared_ptr<DBClientBase>> runCommandWithTarget(
-        const DatabaseName& dbName,
-        BSONObj cmd,
-        BSONObj& info,
-        std::shared_ptr<DBClientBase> me,
-        int options = 0);
 
     /**
      * Authenticates to another cluster member using appropriate authentication data.
@@ -686,17 +677,25 @@ public:
     }
 #endif
 
+    virtual bool isGRPC() {
+        return false;
+    }
+
     const ClientAPIVersionParameters& getApiParameters() const {
         return _apiParameters;
     }
 
-    void setAlwaysAppendDollarTenant_forTest() {
-        _alwaysAppendDollarTenant = true;
+    void setShouldThrowOnStaleConfigError(bool value) {
+        _shouldThrowOnStaleConfigError = value;
     }
 
-    bool isAlwaysAppendDollarTenant_forTest() const {
-        return _alwaysAppendDollarTenant;
-    }
+protected:
+    /**
+     * Generates the validated tenancy scope for internal requests utilized within the server or
+     * across servers.
+     */
+    virtual auth::ValidatedTenancyScope _createInnerRequestVTS(
+        const boost::optional<TenantId>& tenantId) const;
 
 protected:
     /**
@@ -728,6 +727,11 @@ protected:
 
     std::vector<std::string> _saslMechsForAuth;
 
+    // Unless explicitly opted out, a DBClientBase should throw on a StaleConfig error so that the
+    // error can be handled internally if applicable rather than propagated to the external client
+    // right away.
+    bool _shouldThrowOnStaleConfigError = true;
+
 private:
     virtual Message _call(Message& toSend, std::string* actualServer) = 0;
 
@@ -739,12 +743,6 @@ private:
                                       int options);
 
     auth::RunCommandHook _makeAuthRunCommandHook();
-
-    OpMsgRequest _upconvertRequest(const DatabaseName& dbName,
-                                   BSONObj legacyCmdObj,
-                                   int queryFlags = 0);
-
-    bool _alwaysAppendDollarTenant = false;
 
     rpc::RequestMetadataWriter _metadataWriter;
     rpc::ReplyMetadataReader _metadataReader;

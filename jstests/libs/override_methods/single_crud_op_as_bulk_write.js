@@ -6,6 +6,10 @@
 import {BulkWriteUtils} from "jstests/libs/crud_ops_to_bulk_write_lib.js";
 import {OverrideHelpers} from "jstests/libs/override_methods/override_helpers.js";
 
+const errorsOnly = Math.random() < 0.5;
+
+jsTestLog("Running single op bulkWrite override with `errorsOnly:" + errorsOnly + "`");
+
 function getAdditionalParameters(cmdObj) {
     // Deep copy of original command to modify.
     let cmdCopy = {};
@@ -41,11 +45,13 @@ function runCommandSingleOpBulkWriteOverride(
         BulkWriteUtils.processCRUDOp(dbName, cmdNameLower, cmdObj);
         let additionalParameters = getAdditionalParameters(cmdObj);
         try {
-            let response = BulkWriteUtils.flushCurrentBulkWriteBatch(conn,
-                                                                     null /* lsid */,
-                                                                     originalRunCommand,
-                                                                     makeRunCommandArgs,
-                                                                     additionalParameters);
+            let response = BulkWriteUtils.flushCurrentBulkWriteBatch(
+                conn,
+                null /* lsid */,
+                originalRunCommand,
+                makeRunCommandArgs,
+                false /* isMultiOp */,
+                {...{"errorsOnly": errorsOnly}, ...additionalParameters});
             assert.eq(response.length, 1);
             BulkWriteUtils.resetBulkWriteBatch();
             return response[0];
@@ -53,6 +59,24 @@ function runCommandSingleOpBulkWriteOverride(
             // In case of error reset the batch.
             BulkWriteUtils.resetBulkWriteBatch();
             throw error;
+        }
+    }
+
+    if (cmdNameLower == "explain") {
+        if (BulkWriteUtils.canProcessAsBulkWrite(Object.keys(cmdObj[cmdNameLower])[0])) {
+            let letVar = null;
+            if (cmdObj[cmdNameLower]["let"]) {
+                letVar = cmdObj[cmdNameLower]["let"];
+            }
+            let key = Object.keys(cmdObj[cmdNameLower])[0];
+            BulkWriteUtils.processCRUDOp(dbName, key, cmdObj[cmdNameLower]);
+            cmdObj[cmdNameLower] = BulkWriteUtils.getBulkWriteCmd();
+            if (letVar) {
+                cmdObj[cmdNameLower]["let"] = letVar;
+            }
+            BulkWriteUtils.resetBulkWriteBatch();
+
+            jsTestLog("New explain: " + tojson(cmdObj));
         }
     }
 

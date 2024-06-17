@@ -168,10 +168,10 @@ public:
      *
      * Note that this method assumes ownership of the SBE Array being passed in.
      */
-    std::pair<value::SlotId, std::unique_ptr<PlanStage>> generateVirtualScan(value::TypeTags arrTag,
-                                                                             value::Value arrVal) {
+    std::pair<value::SlotId, std::unique_ptr<PlanStage>> generateVirtualScan(
+        value::TypeTags arrTag, value::Value arrVal, PlanNodeId planNodeId = kEmptyPlanNodeId) {
         return stage_builder::generateVirtualScan(
-            _slotIdGenerator.get(), arrTag, arrVal, _yieldPolicy.get());
+            _slotIdGenerator.get(), arrTag, arrVal, _yieldPolicy.get(), planNodeId);
     };
 
     /**
@@ -262,6 +262,12 @@ public:
                  value::Value expectedVal,
                  const MakeStageFn<value::SlotId>& makeStage);
 
+    // Same method as above, but requires providing your own expression context.
+    std::pair<value::TypeTags, value::Value> runTest(CompileCtx* ctx,
+                                                     value::TypeTags inputTag,
+                                                     value::Value inputVal,
+                                                     const MakeStageFn<value::SlotId>& makeStage);
+
     /**
      * This method is similar to runTest(), but it allows for streaming input via multiple slots as
      * well as testing against multiple output slots. The caller passes in an integer indicating the
@@ -278,6 +284,13 @@ public:
                       value::TypeTags expectedTag,
                       value::Value expectedVal,
                       const MakeStageFn<value::SlotVector>& makeStageMulti);
+
+    // Similar to above method but returns the result instead of comparing to an expected.
+    std::pair<value::TypeTags, value::Value> runTestMulti(
+        size_t numInputSlots,
+        value::TypeTags inputTag,
+        value::Value inputVal,
+        const MakeStageFn<value::SlotVector>& makeStageMulti);
 
     value::SlotIdGenerator* getSlotIdGenerator() {
         return _slotIdGenerator.get();

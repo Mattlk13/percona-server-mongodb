@@ -47,7 +47,6 @@
 #include "mongo/db/repl/repl_set_config_test.h"
 #include "mongo/db/server_options.h"
 #include "mongo/idl/server_parameter_test_util.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/unittest/bson_test_util.h"
 #include "mongo/unittest/framework.h"
@@ -108,8 +107,8 @@ TEST(ReplSetConfig, ParseMinimalConfigAndCheckDefaults) {
     ASSERT_EQUALS(1, config.getConfigTerm());
     ASSERT_EQUALS(1, config.getNumMembers());
     ASSERT_EQUALS(MemberId(0), config.membersBegin()->getId());
-    ASSERT(stdx::holds_alternative<int64_t>(config.getDefaultWriteConcern().w));
-    ASSERT_EQUALS(1, stdx::get<int64_t>(config.getDefaultWriteConcern().w));
+    ASSERT(holds_alternative<int64_t>(config.getDefaultWriteConcern().w));
+    ASSERT_EQUALS(1, get<int64_t>(config.getDefaultWriteConcern().w));
     ASSERT_EQUALS(ReplSetConfig::kDefaultHeartbeatInterval, config.getHeartbeatInterval());
     ASSERT_EQUALS(ReplSetConfig::kDefaultHeartbeatTimeoutPeriod,
                   config.getHeartbeatTimeoutPeriod());
@@ -899,17 +898,6 @@ TEST(ReplSetConfig, ConfigServerField) {
     // When the field is false it should not be serialized.
     configBSON = config2.toBSON();
     ASSERT_FALSE(configBSON.hasField("configsvr"));
-
-    // Configs in which configsvr is not the same as the --configsvr flag are invalid.
-    serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::ConfigServer};
-    ON_BLOCK_EXIT([&] { serverGlobalParams.clusterRole = ClusterRole::None; });
-
-    ASSERT_OK(config.validate());
-    ASSERT_EQUALS(ErrorCodes::BadValue, config2.validate());
-
-    serverGlobalParams.clusterRole = ClusterRole::None;
-    ASSERT_EQUALS(ErrorCodes::BadValue, config.validate());
-    ASSERT_OK(config2.validate());
 }
 
 TEST(ReplSetConfig, SetNewlyAddedFieldForMemberConfig) {
@@ -1108,7 +1096,8 @@ TEST(ReplSetConfig, ConfigServerFieldDefaults) {
                                         OID::gen()));
     ASSERT_FALSE(config2.getConfigServer_deprecated());
 
-    serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::ConfigServer};
+    serverGlobalParams.clusterRole = {
+        ClusterRole::ShardServer, ClusterRole::ConfigServer, ClusterRole::RouterServer};
     ON_BLOCK_EXIT([&] { serverGlobalParams.clusterRole = ClusterRole::None; });
 
     ReplSetConfig config3;
@@ -1479,7 +1468,8 @@ TEST(ReplSetConfig, CheckConfigServerCantHaveSecondaryDelaySecs) {
 }
 
 TEST(ReplSetConfig, CheckConfigServerMustHaveTrueForWriteConcernMajorityJournalDefault) {
-    serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::ConfigServer};
+    serverGlobalParams.clusterRole = {
+        ClusterRole::ShardServer, ClusterRole::ConfigServer, ClusterRole::RouterServer};
     ON_BLOCK_EXIT([&] { serverGlobalParams.clusterRole = ClusterRole::None; });
     ReplSetConfig configA;
     configA = ReplSetConfig::parse(BSON("_id"

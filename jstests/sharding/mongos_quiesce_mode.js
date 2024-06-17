@@ -3,6 +3,11 @@
  * During quiesce mode, existing operations are allowed to continue and new operations are
  * accepted. However, hello requests return a ShutdownInProgress error, so that clients can
  * begin re-routing operations.
+ * @tags: [
+ *   # This test requires shutting down mongos alone.
+ *   # TODO (SERVER-88401): adapt this test for embedded router or create a new one supporting it.
+ *   embedded_router_incompatible,
+ * ]
  */
 
 import {configureFailPoint} from "jstests/libs/fail_point_util.js";

@@ -29,6 +29,7 @@ executor:
       encryptionCipherMode: AES256-GCM
       encryptionKeyFile: src/mongo/db/modules/enterprise/jstests/encryptdb/libs/ekf2
       set_parameters:
+        enableAutoCompaction: 1
         enableTestCommands: 1
   hooks:
   - class: ValidateCollections
@@ -43,9 +44,11 @@ selector:
   exclude_files:
   - jstests/core/txns/**/*.js
   - jstests/core/queryable_encryption/**/*.js
+  - jstests/core/query/query_settings/**/*.js
   - jstests/core/**/profile1.js
   - jstests/core/**/profile2.js
   - jstests/core/**/find9.js
+  - jstests/core/**/express.js
   exclude_with_any_tags:
   - does_not_support_encrypted_storage_engine
   - does_not_support_repeated_reads

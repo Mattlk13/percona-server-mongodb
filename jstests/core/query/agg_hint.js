@@ -1,17 +1,16 @@
-// Cannot implicitly shard accessed collections because of collection existing when none
-// expected.
+// Confirms correct behavior for hinted aggregation execution. This includes tests for scenarios
+// where agg execution differs from query. It also includes confirmation that hint works for find
+// command against views, which is converted to a hinted aggregation on execution.
+//
 // @tags: [
-//   assumes_no_implicit_collection_creation_after_drop,
 //   does_not_support_stepdowns,
 //   # Explain of a resolved view must be executed by mongos.
 //   directly_against_shardsvrs_incompatible,
 // ]
+import {getAggPlanStages, getOptimizer, getPlanStages} from "jstests/libs/analyze_plan.js";
+import {assertDropCollection} from "jstests/libs/collection_drop_recreate.js";
 
-// Confirms correct behavior for hinted aggregation execution. This includes tests for scenarios
-// where agg execution differs from query. It also includes confirmation that hint works for find
-// command against views, which is converted to a hinted aggregation on execution.
-
-import {getAggPlanStage, getPlanStage} from "jstests/libs/analyze_plan.js";
+const isHintsToQuerySettingsSuite = TestData.isHintsToQuerySettingsSuite || false;
 
 const testDB = db.getSiblingDB("agg_hint");
 assert.commandWorked(testDB.dropDatabase());
@@ -22,11 +21,30 @@ const view = testDB.getCollection(viewName);
 
 function confirmWinningPlanUsesExpectedIndex(
     explainResult, expectedKeyPattern, stageName, pipelineOptimizedAway) {
-    const planStage = pipelineOptimizedAway ? getPlanStage(explainResult, stageName)
-                                            : getAggPlanStage(explainResult, stageName);
-    assert.neq(null, planStage);
+    const optimizer = getOptimizer(explainResult);
 
-    assert.eq(planStage.keyPattern, expectedKeyPattern, tojson(planStage));
+    if (!(optimizer in stageName) || stageName[optimizer] === "") {
+        // TODO SERVER-77719: Ensure that the expected operator is defined for all optimizers. There
+        // should be an exception here.
+        return;
+    }
+
+    const planStages = pipelineOptimizedAway
+        ? getPlanStages(explainResult, stageName[optimizer])
+        : getAggPlanStages(explainResult, stageName[optimizer]);
+
+    switch (optimizer) {
+        case "classic":
+            assert.neq(null, planStages, tojson(explainResult));
+            planStages.forEach(planStage => {
+                assert.eq(planStage.keyPattern, expectedKeyPattern, tojson(planStage));
+            });
+            break;
+        case "CQF":
+            // TODO SERVER-77719: Ensure that the decision for using the scan lines up with CQF
+            // optimizer. M2: allow only collscans, M4: check bonsai behavior for index scan.
+            break;
+    }
 }
 
 // Runs explain on 'command', with the hint specified by 'hintKeyPattern' when not null.
@@ -37,7 +55,10 @@ function confirmCommandUsesIndex({
     command = null,
     hintKeyPattern = null,
     expectedKeyPattern = null,
-    stageName = "IXSCAN",
+    stageName = {
+        "classic": "IXSCAN",
+        "CQF": "IndexScan"
+    },
     pipelineOptimizedAway = false
 } = {}) {
     if (hintKeyPattern) {
@@ -60,7 +81,10 @@ function confirmAggUsesIndex({
     aggPipeline = [],
     hintKeyPattern = null,
     expectedKeyPattern = null,
-    stageName = "IXSCAN",
+    stageName = {
+        "classic": "IXSCAN",
+        "CQF": "IndexScan"
+    },
     pipelineOptimizedAway = false
 } = {}) {
     let options = {};
@@ -69,7 +93,7 @@ function confirmAggUsesIndex({
         options = {hint: hintKeyPattern};
     }
     const res = assert.commandWorked(
-        testDB.getCollection(collName).explain().aggregate(aggPipeline, options));
+        testDB.getCollection(collName).explain("executionStats").aggregate(aggPipeline, options));
     confirmWinningPlanUsesExpectedIndex(res, expectedKeyPattern, stageName, pipelineOptimizedAway);
 }
 
@@ -95,7 +119,7 @@ confirmAggUsesIndex({
 //
 
 // Hint on poor index choice should force use of the hinted index over one more optimal.
-coll.drop();
+assertDropCollection(testDB, collName);
 assert.commandWorked(coll.createIndex({x: 1}));
 for (let i = 0; i < 5; ++i) {
     assert.commandWorked(coll.insert({x: i}));
@@ -114,18 +138,22 @@ confirmAggUsesIndex({
     expectedKeyPattern: {x: 1},
     pipelineOptimizedAway: true
 });
-confirmAggUsesIndex({
-    collName: coll.getName(),
-    aggPipeline: [{$match: {x: 3}}],
-    hintKeyPattern: {_id: 1},
-    expectedKeyPattern: {_id: 1},
-    pipelineOptimizedAway: true
-});
+
+// Query settings do not force indexes and therefore '_id' index is not used when filtering on 'x'.
+if (!isHintsToQuerySettingsSuite) {
+    confirmAggUsesIndex({
+        collName: coll.getName(),
+        aggPipeline: [{$match: {x: 3}}],
+        hintKeyPattern: {_id: 1},
+        expectedKeyPattern: {_id: 1},
+        pipelineOptimizedAway: true
+    });
+}
 
 // With no hint specified, aggregation will always prefer an index that provides sort order over
 // one that requires a blocking sort. A hinted aggregation should allow for choice of an index
 // that provides blocking sort.
-coll.drop();
+assertDropCollection(testDB, collName);
 assert.commandWorked(coll.createIndex({x: 1}));
 assert.commandWorked(coll.createIndex({y: 1}));
 for (let i = 0; i < 5; ++i) {
@@ -149,13 +177,14 @@ confirmAggUsesIndex({
     collName: coll.getName(),
     aggPipeline: [{$match: {x: {$gte: 0}}}, {$sort: {y: 1}}],
     hintKeyPattern: {x: 1},
-    expectedKeyPattern: {x: 1}
+    expectedKeyPattern: {x: 1},
+    pipelineOptimizedAway: true
 });
 
 // With no hint specified, aggregation will always prefer an index that provides a covered
 // projection over one that does not. A hinted aggregation should allow for choice of an index
 // that does not cover.
-coll.drop();
+assertDropCollection(testDB, collName);
 assert.commandWorked(coll.createIndex({x: 1}));
 assert.commandWorked(coll.createIndex({x: 1, y: 1}));
 for (let i = 0; i < 5; ++i) {
@@ -179,12 +208,13 @@ confirmAggUsesIndex({
     collName: coll.getName(),
     aggPipeline: [{$match: {x: {$gte: 0}}}, {$project: {x: 1, y: 1, _id: 0}}],
     hintKeyPattern: {x: 1},
-    expectedKeyPattern: {x: 1}
+    expectedKeyPattern: {x: 1},
+    pipelineOptimizedAway: true
 });
 
 // Confirm that a hinted agg can be executed against a view.
-coll.drop();
-view.drop();
+assertDropCollection(testDB, collName);
+assertDropCollection(testDB, viewName);
 assert.commandWorked(coll.createIndex({x: 1}));
 for (let i = 0; i < 5; ++i) {
     assert.commandWorked(coll.insert({x: i}));
@@ -204,17 +234,21 @@ confirmAggUsesIndex({
     expectedKeyPattern: {x: 1},
     pipelineOptimizedAway: true
 });
-confirmAggUsesIndex({
-    collName: view.getName(),
-    aggPipeline: [{$match: {x: 3}}],
-    hintKeyPattern: {_id: 1},
-    expectedKeyPattern: {_id: 1},
-    pipelineOptimizedAway: true
-});
+
+// Query settings do not force indexes and therefore '_id' index is not used when filtering on 'x'.
+if (!isHintsToQuerySettingsSuite) {
+    confirmAggUsesIndex({
+        collName: view.getName(),
+        aggPipeline: [{$match: {x: 3}}],
+        hintKeyPattern: {_id: 1},
+        expectedKeyPattern: {_id: 1},
+        pipelineOptimizedAway: true
+    });
+}
 
 // Confirm that a hinted find can be executed against a view.
-coll.drop();
-view.drop();
+assertDropCollection(testDB, collName);
+assertDropCollection(testDB, viewName);
 assert.commandWorked(coll.createIndex({x: 1}));
 for (let i = 0; i < 5; ++i) {
     assert.commandWorked(coll.insert({x: i}));
@@ -232,35 +266,45 @@ confirmCommandUsesIndex({
     expectedKeyPattern: {x: 1},
     pipelineOptimizedAway: true
 });
-confirmCommandUsesIndex({
-    command: {find: view.getName(), filter: {x: 3}},
-    hintKeyPattern: {_id: 1},
-    expectedKeyPattern: {_id: 1},
-    pipelineOptimizedAway: true
-});
+
+// Query settings do not force indexes and therefore '_id' index is not used when filtering on 'x'.
+if (!isHintsToQuerySettingsSuite) {
+    confirmCommandUsesIndex({
+        command: {find: view.getName(), filter: {x: 3}},
+        hintKeyPattern: {_id: 1},
+        expectedKeyPattern: {_id: 1},
+        pipelineOptimizedAway: true
+    });
+}
 
 // Confirm that a hinted count can be executed against a view.
-coll.drop();
-view.drop();
+assertDropCollection(testDB, collName);
+assertDropCollection(testDB, viewName);
 assert.commandWorked(coll.createIndex({x: 1}));
 for (let i = 0; i < 5; ++i) {
     assert.commandWorked(coll.insert({x: i}));
 }
 assert.commandWorked(testDB.createView(viewName, collName, []));
 
+// TODO SERVER-77719: Ensure that the decision for using the scan lines up with CQF
+// optimizer. M2: allow only collscans, M4: check bonsai behavior for index scan.
 confirmCommandUsesIndex({
     command: {count: view.getName(), query: {x: 3}},
     expectedKeyPattern: {x: 1},
-    stageName: "COUNT_SCAN"
+    stageName: {"classic": "COUNT_SCAN", "CQF": ""},
 });
 confirmCommandUsesIndex({
     command: {count: view.getName(), query: {x: 3}},
     hintKeyPattern: {x: 1},
     expectedKeyPattern: {x: 1},
-    stageName: "COUNT_SCAN"
+    stageName: {"classic": "COUNT_SCAN", "CQF": ""},
 });
-confirmCommandUsesIndex({
-    command: {count: view.getName(), query: {x: 3}},
-    hintKeyPattern: {_id: 1},
-    expectedKeyPattern: {_id: 1}
-});
+
+// Query settings do not force indexes and therefore '_id' index is not used when filtering on 'x'.
+if (!isHintsToQuerySettingsSuite) {
+    confirmCommandUsesIndex({
+        command: {count: view.getName(), query: {x: 3}},
+        hintKeyPattern: {_id: 1},
+        expectedKeyPattern: {_id: 1},
+    });
+}

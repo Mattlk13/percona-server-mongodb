@@ -39,7 +39,6 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog/capped_visibility.h"
 #include "mongo/db/catalog/catalog_control.h"
 #include "mongo/db/catalog/collection.h"
@@ -49,7 +48,6 @@
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/concurrency/locker.h"
-#include "mongo/db/concurrency/locker_impl.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
@@ -66,8 +64,8 @@
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/unittest/assert.h"
-#include "mongo/unittest/barrier.h"
 #include "mongo/unittest/framework.h"
 
 namespace mongo {
@@ -119,7 +117,6 @@ protected:
     ClientAndCtx makeClientAndCtx(const std::string& clientName) {
         auto client = getServiceContext()->getService()->makeClient(clientName);
         auto opCtx = client->makeOperationContext();
-        client->swapLockState(std::make_unique<LockerImpl>(getServiceContext()));
         return std::make_pair(std::move(client), std::move(opCtx));
     }
 
@@ -142,7 +139,7 @@ Status insertBSON(OperationContext* opCtx, const NamespaceString& nss, RecordId 
     WriteUnitOfWork wuow(opCtx);
 
     auto cappedObserver = coll->getCappedVisibilityObserver();
-    cappedObserver->registerWriter(opCtx->recoveryUnit());
+    cappedObserver->registerWriter(shard_role_details::getRecoveryUnit(opCtx));
 
     coll->registerCappedInsert(opCtx, id);
     auto status =
@@ -157,160 +154,14 @@ Status insertBSON(OperationContext* opCtx, const NamespaceString& nss, RecordId 
 Status _insertBSON(OperationContext* opCtx, const CollectionPtr& coll, RecordId id) {
     BSONObj obj = BSON("a" << 1);
     auto cappedObserver = coll->getCappedVisibilityObserver();
-    cappedObserver->registerWriter(opCtx->recoveryUnit());
+    cappedObserver->registerWriter(shard_role_details::getRecoveryUnit(opCtx));
     coll->registerCappedInsert(opCtx, id);
     return collection_internal::insertDocument(opCtx, coll, InsertStatement(obj, id), nullptr);
 }
 
-TEST_F(CappedCollectionTest, SeekNear) {
-    NamespaceString nss = NamespaceString::createNamespaceString_forTest("local.non.oplog");
-    makeCapped(nss);
-
-    {
-        auto opCtx = newOperationContext();
-        ASSERT_OK(insertBSON(opCtx.get(), nss, RecordId(1)));
-        ASSERT_OK(insertBSON(opCtx.get(), nss, RecordId(2)));
-        ASSERT_OK(insertBSON(opCtx.get(), nss, RecordId(3)));
-        ASSERT_OK(insertBSON(opCtx.get(), nss, RecordId(4)));
-    }
-
-    {
-        // Delete the first and third so that we have some gaps to use for inexact seeks.
-        auto opCtx(newOperationContext());
-        AutoGetCollection ac(opCtx.get(), nss, MODE_IX);
-        const CollectionPtr& coll = ac.getCollection();
-        WriteUnitOfWork wuow(opCtx.get());
-        collection_internal::deleteDocument(
-            opCtx.get(), coll, kUninitializedStmtId, RecordId(1), nullptr);
-        collection_internal::deleteDocument(
-            opCtx.get(), coll, kUninitializedStmtId, RecordId(3), nullptr);
-        wuow.commit();
-    }
-
-    // Forward cursor seeks
-    {
-        // Seek to a non-existent record and expect to land on the first record because no previous
-        // record exists.
-        auto opCtx(newOperationContext());
-        AutoGetCollection ac(opCtx.get(), nss, MODE_IX);
-        const CollectionPtr& coll = ac.getCollection();
-        WriteUnitOfWork wuow(opCtx.get());
-        auto cur = coll->getCursor(opCtx.get());
-        auto rec = cur->seekNear(RecordId(1));
-        ASSERT(rec);
-        ASSERT_EQ(rec->id, RecordId(2));
-    }
-
-    {
-        // Seek to a non-existent record and expect to land on the logically previous record.
-        auto opCtx(newOperationContext());
-        AutoGetCollection ac(opCtx.get(), nss, MODE_IX);
-        const CollectionPtr& coll = ac.getCollection();
-        WriteUnitOfWork wuow(opCtx.get());
-        auto cur = coll->getCursor(opCtx.get());
-        auto rec = cur->seekNear(RecordId(3));
-        ASSERT(rec);
-        ASSERT_EQ(rec->id, RecordId(2));
-    }
-
-    {
-        // Seek exactly.
-        auto opCtx(newOperationContext());
-        AutoGetCollection ac(opCtx.get(), nss, MODE_IX);
-        const CollectionPtr& coll = ac.getCollection();
-        WriteUnitOfWork wuow(opCtx.get());
-        auto cur = coll->getCursor(opCtx.get());
-        auto rec = cur->seekNear(RecordId(4));
-        ASSERT(rec);
-        ASSERT_EQ(rec->id, RecordId(4));
-    }
-
-    {
-        // Seek to a non-existent record and expect to land on the logically-previous record, which
-        // is the last record.
-        auto opCtx(newOperationContext());
-        AutoGetCollection ac(opCtx.get(), nss, MODE_IX);
-        const CollectionPtr& coll = ac.getCollection();
-        WriteUnitOfWork wuow(opCtx.get());
-        auto cur = coll->getCursor(opCtx.get());
-        auto rec = cur->seekNear(RecordId(5));
-        ASSERT(rec);
-        ASSERT_EQ(rec->id, RecordId(4));
-    }
-
-    // Reverse cursor seeks
-    {
-        // Seek to a non-existent record and expect to land on the logically-previous record, which
-        // is the first record.
-        auto opCtx(newOperationContext());
-        AutoGetCollection ac(opCtx.get(), nss, MODE_IX);
-        const CollectionPtr& coll = ac.getCollection();
-        WriteUnitOfWork wuow(opCtx.get());
-        auto cur = coll->getCursor(opCtx.get(), false /* forward */);
-        auto rec = cur->seekNear(RecordId(1));
-        ASSERT(rec);
-        ASSERT_EQ(rec->id, RecordId(2));
-    }
-
-    {
-        // Seek exactly.
-        auto opCtx(newOperationContext());
-        AutoGetCollection ac(opCtx.get(), nss, MODE_IX);
-        const CollectionPtr& coll = ac.getCollection();
-        WriteUnitOfWork wuow(opCtx.get());
-        auto cur = coll->getCursor(opCtx.get(), false /* forward */);
-        auto rec = cur->seekNear(RecordId(2));
-        ASSERT(rec);
-        ASSERT_EQ(rec->id, RecordId(2));
-    }
-
-    {
-        // Seek to a non-existent record and expect to land on the logically previous record.
-        auto opCtx(newOperationContext());
-        AutoGetCollection ac(opCtx.get(), nss, MODE_IX);
-        const CollectionPtr& coll = ac.getCollection();
-        WriteUnitOfWork wuow(opCtx.get());
-        auto cur = coll->getCursor(opCtx.get(), false /* forward */);
-        auto rec = cur->seekNear(RecordId(3));
-        ASSERT(rec);
-        ASSERT_EQ(rec->id, RecordId(4));
-    }
-
-    {
-        auto opCtx(newOperationContext());
-        AutoGetCollection ac(opCtx.get(), nss, MODE_IX);
-        const CollectionPtr& coll = ac.getCollection();
-        WriteUnitOfWork wuow(opCtx.get());
-        auto cur = coll->getCursor(opCtx.get(), false /* forward */);
-        auto rec = cur->seekNear(RecordId(5));
-        ASSERT(rec);
-        ASSERT_EQ(rec->id, RecordId(4));
-    }
-
-
-    {
-        // Delete the remaining records.
-        auto opCtx(newOperationContext());
-        AutoGetCollection ac(opCtx.get(), nss, MODE_IX);
-        const CollectionPtr& coll = ac.getCollection();
-        WriteUnitOfWork wuow(opCtx.get());
-        collection_internal::deleteDocument(
-            opCtx.get(), coll, kUninitializedStmtId, RecordId(2), nullptr);
-        collection_internal::deleteDocument(
-            opCtx.get(), coll, kUninitializedStmtId, RecordId(4), nullptr);
-        wuow.commit();
-    }
-
-    {
-        auto opCtx(newOperationContext());
-        AutoGetCollection ac(opCtx.get(), nss, MODE_IX);
-        const CollectionPtr& coll = ac.getCollection();
-        auto cur = coll->getCursor(opCtx.get());
-        auto rec = cur->seekNear(RecordId(2));
-        ASSERT_FALSE(rec);
-        rec = cur->seekNear(RecordId(4));
-        ASSERT_FALSE(rec);
-    }
+Status _insertOplogBSON(OperationContext* opCtx, const CollectionPtr& coll, RecordId id) {
+    BSONObj obj = BSON("ts" << Timestamp(id.getLong()));
+    return collection_internal::insertDocument(opCtx, coll, InsertStatement(obj, id), nullptr);
 }
 
 TEST_F(CappedCollectionTest, InsertOutOfOrder) {
@@ -363,10 +214,9 @@ TEST_F(CappedCollectionTest, OplogOrder) {
         AutoGetCollectionForRead ac(opCtx.get(), nss);
         const CollectionPtr& coll = ac.getCollection();
         auto cursor = coll->getCursor(opCtx.get());
-        auto record = cursor->seekNear(RecordId(id1.getLong() + 1));
-        ASSERT(record);
-        ASSERT_EQ(id1, record->id);
-        ASSERT(!cursor->next());
+        auto record = cursor->seek(RecordId(id1.getLong() + 1),
+                                   SeekableRecordCursor::BoundInclusion::kInclude);
+        ASSERT_FALSE(record);
     }
 
     {
@@ -380,7 +230,7 @@ TEST_F(CappedCollectionTest, OplogOrder) {
         ASSERT_EQ(earlyCursor->seekExact(id1)->id, id1);
         coll.yield();
         earlyCursor->save();
-        earlyCtx->recoveryUnit()->abandonSnapshot();
+        shard_role_details::getRecoveryUnit(earlyCtx.get())->abandonSnapshot();
 
         auto [c1, t1] = makeClientAndCtx("t1");
         AutoGetCollection ac1(t1.get(), nss, MODE_IX);
@@ -420,20 +270,16 @@ TEST_F(CappedCollectionTest, OplogOrder) {
             auto [c2, t2] = makeClientAndCtx("t2");
             AutoGetCollectionForRead ac2(t2.get(), nss);
             auto cursor = coll->getCursor(t2.get());
-            auto record = cursor->seekNear(id2);
-            ASSERT(record);
-            ASSERT_EQ(id1, record->id);
-            ASSERT(!cursor->next());
+            auto record = cursor->seek(id2, SeekableRecordCursor::BoundInclusion::kInclude);
+            ASSERT_FALSE(record);
         }
 
         {
             auto [c2, t2] = makeClientAndCtx("t2");
             AutoGetCollectionForRead ac2(t2.get(), nss);
             auto cursor = coll->getCursor(t2.get());
-            auto record = cursor->seekNear(id3);
-            ASSERT(record);
-            ASSERT_EQ(id1, record->id);
-            ASSERT(!cursor->next());
+            auto record = cursor->seek(id3, SeekableRecordCursor::BoundInclusion::kInclude);
+            ASSERT_FALSE(record);
         }
 
         w1.commit();
@@ -471,7 +317,7 @@ TEST_F(CappedCollectionTest, OplogOrder) {
         ASSERT_EQ(earlyCursor->seekExact(id1)->id, id1);
         coll.yield();
         earlyCursor->save();
-        earlyCtx->recoveryUnit()->abandonSnapshot();
+        shard_role_details::getRecoveryUnit(earlyCtx.get())->abandonSnapshot();
 
         auto [c1, t1] = makeClientAndCtx("t1");
         AutoGetCollection ac1(t1.get(), nss, MODE_IX);
@@ -510,20 +356,16 @@ TEST_F(CappedCollectionTest, OplogOrder) {
             auto [c2, t2] = makeClientAndCtx("t2");
             AutoGetCollectionForRead ac2(t2.get(), nss);
             auto cursor = coll->getCursor(t2.get());
-            auto record = cursor->seekNear(id2);
-            ASSERT(record);
-            ASSERT_EQ(id1, record->id);
-            ASSERT(!cursor->next());
+            auto record = cursor->seek(id2, SeekableRecordCursor::BoundInclusion::kInclude);
+            ASSERT_FALSE(record);
         }
 
         {
             auto [c2, t2] = makeClientAndCtx("t2");
             AutoGetCollectionForRead ac2(t2.get(), nss);
             auto cursor = coll->getCursor(t2.get());
-            auto record = cursor->seekNear(id3);
-            ASSERT(record);
-            ASSERT_EQ(id1, record->id);
-            ASSERT(!cursor->next());
+            auto record = cursor->seek(id3, SeekableRecordCursor::BoundInclusion::kInclude);
+            ASSERT_FALSE(record);
         }
 
         w1.commit();
@@ -624,5 +466,109 @@ TEST_F(CappedCollectionTest, VisibilityAfterRestart) {
         ASSERT_EQ(pastHoleId, next->id);
     }
 }
+
+TEST_F(CappedCollectionTest, SeekOplogWithReadTimestamp) {
+    NamespaceString nss = NamespaceString::kRsOplogNamespace;
+    const auto oneSec = Timestamp(1, 0).asULL();
+    {
+        auto [c1, t1] = makeClientAndCtx("t1");
+        WriteUnitOfWork wuow(t1.get());
+        AutoGetCollection ac(t1.get(), nss, MODE_IX);
+        const CollectionPtr& oplog = ac.getCollection();
+        ASSERT_OK(_insertOplogBSON(t1.get(), oplog, RecordId(oneSec + 2)));
+        ASSERT_OK(_insertOplogBSON(t1.get(), oplog, RecordId(oneSec + 4)));
+        ASSERT_OK(_insertOplogBSON(t1.get(), oplog, RecordId(oneSec + 6)));
+        ASSERT_OK(_insertOplogBSON(t1.get(), oplog, RecordId(oneSec + 8)));
+        wuow.commit();
+    }
+
+#define checkSeek(cursor, recordNum, expectedInclusiveNum, expectedExclusiveNum)    \
+    do {                                                                            \
+        auto record = cursor->seek(RecordId(oneSec + recordNum),                    \
+                                   SeekableRecordCursor::BoundInclusion::kInclude); \
+        if (expectedInclusiveNum > 0) {                                             \
+            ASSERT(record);                                                         \
+            ASSERT_EQ(expectedInclusiveNum, record->id.getLong() - oneSec);         \
+        } else {                                                                    \
+            ASSERT(!record);                                                        \
+        }                                                                           \
+        record = cursor->seek(RecordId(oneSec + recordNum),                         \
+                              SeekableRecordCursor::BoundInclusion::kExclude);      \
+        if (expectedExclusiveNum > 0) {                                             \
+            ASSERT(record);                                                         \
+            ASSERT_EQ(expectedExclusiveNum, record->id.getLong() - oneSec);         \
+        } else {                                                                    \
+            ASSERT(!record);                                                        \
+        }                                                                           \
+    } while (0);
+
+    // Forward, no read timestamp.
+    {
+        auto [c2, t2] = makeClientAndCtx("t2");
+        AutoGetCollectionForReadLockFree acr(t2.get(), nss);
+        shard_role_details::getRecoveryUnit(t2.get())->setOplogVisibilityTs(boost::none);
+        auto cursor = acr.getCollection()->getCursor(t2.get());
+        checkSeek(cursor, 1, 2, 2);
+        checkSeek(cursor, 2, 2, 4);
+        checkSeek(cursor, 3, 4, 4);
+        checkSeek(cursor, 4, 4, 6);
+        checkSeek(cursor, 5, 6, 6);
+        checkSeek(cursor, 6, 6, 8);
+        checkSeek(cursor, 7, 8, 8);
+        checkSeek(cursor, 8, 8, -1);
+        checkSeek(cursor, 9, -1, -1);
+    }
+    // Backward, no read timestamp.
+    {
+        auto [c2, t2] = makeClientAndCtx("t2");
+        AutoGetCollectionForReadLockFree acr(t2.get(), nss);
+        auto cursor = acr.getCollection()->getCursor(t2.get(), false);
+        checkSeek(cursor, 1, -1, -1);
+        checkSeek(cursor, 2, 2, -1);
+        checkSeek(cursor, 3, 2, 2);
+        checkSeek(cursor, 4, 4, 2);
+        checkSeek(cursor, 5, 4, 4);
+        checkSeek(cursor, 6, 6, 4);
+        checkSeek(cursor, 7, 6, 6);
+        checkSeek(cursor, 8, 8, 6);
+        checkSeek(cursor, 9, 8, 8);
+    }
+    // Forward, with read timestamp.
+    {
+        auto [c2, t2] = makeClientAndCtx("t2");
+        shard_role_details::getRecoveryUnit(t2.get())->setTimestampReadSource(
+            RecoveryUnit::ReadSource::kProvided, Timestamp(1, 6));
+        AutoGetCollectionForReadLockFree acr(t2.get(), nss);
+        shard_role_details::getRecoveryUnit(t2.get())->setOplogVisibilityTs(boost::none);
+        auto cursor = acr.getCollection()->getCursor(t2.get());
+        checkSeek(cursor, 1, 2, 2);
+        checkSeek(cursor, 2, 2, 4);
+        checkSeek(cursor, 3, 4, 4);
+        checkSeek(cursor, 4, 4, 6);
+        checkSeek(cursor, 5, 6, 6);
+        checkSeek(cursor, 6, 6, -1);
+        checkSeek(cursor, 7, -1, -1);
+        checkSeek(cursor, 8, -1, -1);
+        checkSeek(cursor, 9, -1, -1);
+    }
+    // Backward, with read timestamp.
+    {
+        auto [c2, t2] = makeClientAndCtx("t2");
+        shard_role_details::getRecoveryUnit(t2.get())->setTimestampReadSource(
+            RecoveryUnit::ReadSource::kProvided, Timestamp(1, 6));
+        AutoGetCollectionForReadLockFree acr(t2.get(), nss);
+        auto cursor = acr.getCollection()->getCursor(t2.get(), false);
+        checkSeek(cursor, 1, -1, -1);
+        checkSeek(cursor, 2, 2, -1);
+        checkSeek(cursor, 3, 2, 2);
+        checkSeek(cursor, 4, 4, 2);
+        checkSeek(cursor, 5, 4, 4);
+        checkSeek(cursor, 6, 6, 4);
+        checkSeek(cursor, 7, 6, 6);
+        checkSeek(cursor, 8, 6, 6);
+        checkSeek(cursor, 9, 6, 6);
+    }
+}
+
 }  // namespace
 }  // namespace mongo

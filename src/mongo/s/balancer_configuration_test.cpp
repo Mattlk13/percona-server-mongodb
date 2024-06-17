@@ -54,10 +54,9 @@
 #include "mongo/executor/network_test_env.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
-#include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/s/balancer_configuration.h"
-#include "mongo/s/sharding_router_test_fixture.h"
+#include "mongo/s/sharding_mongos_test_fixture.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/unittest/bson_test_util.h"
 #include "mongo/unittest/framework.h"
@@ -91,10 +90,9 @@ protected:
      */
     void expectSettingsQuery(StringData key, StatusWith<boost::optional<BSONObj>> result) {
         onFindCommand([&](const RemoteCommandRequest& request) {
-            ASSERT_BSONOBJ_EQ(getReplSecondaryOkMetadata(),
-                              rpc::TrackingMetadata::removeTrackingData(request.metadata));
+            ASSERT_BSONOBJ_EQ(getReplSecondaryOkMetadata(), request.metadata);
 
-            auto opMsg = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+            auto opMsg = static_cast<OpMsgRequest>(request);
             auto findCommand = query_request_helper::makeFromFindCommandForTests(opMsg.body);
 
             ASSERT_EQ(findCommand->getNamespaceOrUUID().nss(),

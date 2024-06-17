@@ -99,6 +99,9 @@ OS_DOCKER_LOOKUP = {
     'rhel72': ('centos:7', "yum",
                frozenset(["rh-python38.x86_64", "wget", "pkgconfig", "systemd", "procps", "file"]),
                "/opt/rh/rh-python38/root/usr/bin/python3"),
+    'rhel79': ('centos:7', "yum",
+               frozenset(["rh-python38.x86_64", "wget", "pkgconfig", "systemd", "procps", "file"]),
+               "/opt/rh/rh-python38/root/usr/bin/python3"),
     'rhel80': ('almalinux:8', "yum",
                frozenset(["python3", "wget", "pkgconfig", "systemd", "procps", "file"]), "python3"),
     'rhel81': ('almalinux:8', "yum",
@@ -407,6 +410,10 @@ release_test_parser.add_argument("-e", "--edition", help="Server edition to run 
 release_test_parser.add_argument("-v", "--server-version", type=str,
                                  help="Version of MongoDB to run tests for",
                                  choices=["all"] + list(versions), default="all")
+release_test_parser.add_argument(
+    "--evg-project", type=str, help=
+    "The evergreen project this is intended to run under (master only). Note that this interface is primarly for evergreen to set, and so the script will check if its is appropriate to run the tests.",
+    default="")
 branch_test_parser = subparsers.add_parser("branch")
 branch_test_parser.add_argument(
     "-t", "--test", type=str, help=
@@ -417,6 +424,19 @@ branch_test_parser.add_argument("-e", "--edition", type=str, help="Server editio
 branch_test_parser.add_argument("-v", "--server-version", type=str,
                                 help="Server version being tested", required=True)
 args = parser.parse_args()
+
+if args.command == "release":
+    evg_project = args.evg_project
+    if not evg_project:
+        logging.error(
+            "Missing '--evg-project' command line option. If trying to run this locally, you will need to set the environment so that --evg-project=mongodb-mongo-master."
+        )
+        sys.exit(1)
+    if re.fullmatch(r"mongodb-mongo-v\d\.\d", evg_project):
+        logging.info(
+            "Non-master evergreen project detected: '%s', skipping release package testing which is expected to only be run from master branches.",
+            evg_project)
+        sys.exit(0)
 
 arch: str = args.arch
 if arch == "auto":

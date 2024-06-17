@@ -65,7 +65,7 @@ public:
     TypeSignature typeCheck(optimizer::ABT& node);
 
     // Retrieve the type of a variable from the information collected so far.
-    TypeSignature getInferredType(optimizer::ProjectionName variable);
+    boost::optional<TypeSignature> getInferredType(optimizer::ProjectionName variable);
 
     // Associate a type to a variable. If the new type is not a subset of the existing one, throw an
     // error.
@@ -93,6 +93,10 @@ public:
 
     TypeSignature operator()(optimizer::ABT& node, optimizer::Constant& value, bool saveInference);
     TypeSignature operator()(optimizer::ABT& n, optimizer::Variable& var, bool saveInference);
+
+    TypeSignature operator()(optimizer::ABT& n,
+                             optimizer::LambdaAbstraction& lambda,
+                             bool saveInference);
 
     TypeSignature operator()(optimizer::ABT& n, optimizer::Let& let, bool saveInference);
 

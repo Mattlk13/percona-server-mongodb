@@ -36,23 +36,23 @@
 namespace mongo {
 namespace sbe {
 AggProjectStage::AggProjectStage(std::unique_ptr<PlanStage> input,
-                                 value::SlotMap<AggExprPair> aggExprPairs,
+                                 AggExprVector aggExprPairs,
                                  PlanNodeId nodeId,
                                  bool participateInTrialRunTracking)
-    : PlanStage("agg_project"_sd, nodeId, participateInTrialRunTracking),
+    : PlanStage("agg_project"_sd, nullptr /* yieldPolicy */, nodeId, participateInTrialRunTracking),
       _projects(std::move(aggExprPairs)) {
     _children.emplace_back(std::move(input));
 }
 
 std::unique_ptr<PlanStage> AggProjectStage::clone() const {
-    value::SlotMap<AggExprPair> projects;
+    AggExprVector projects;
     for (auto& [k, v] : _projects) {
-        projects.emplace(k, AggExprPair{v.init ? v.init->clone() : nullptr, v.acc->clone()});
+        projects.emplace_back(k, AggExprPair{v.init ? v.init->clone() : nullptr, v.agg->clone()});
     }
     return std::make_unique<AggProjectStage>(_children[0]->clone(),
                                              std::move(projects),
                                              _commonStats.nodeId,
-                                             _participateInTrialRunTracking);
+                                             participateInTrialRunTracking());
 }
 
 void AggProjectStage::prepare(CompileCtx& ctx) {
@@ -64,7 +64,7 @@ void AggProjectStage::prepare(CompileCtx& ctx) {
         ctx.root = this;
         ctx.aggExpression = true;
         ctx.accumulator = outAccessor.get();
-        auto aggCode = aggExprPair.acc->compile(ctx);
+        auto aggCode = aggExprPair.agg->compile(ctx);
         auto initCode = aggExprPair.init ? aggExprPair.init->compile(ctx) : nullptr;
         _slots.emplace_back(slot);
         _initCodes.emplace_back(std::move(initCode));
@@ -130,15 +130,15 @@ std::unique_ptr<PlanStageStats> AggProjectStage::getStats(bool includeDebugInfo)
     if (includeDebugInfo) {
         DebugPrinter printer;
         BSONObjBuilder bob;
-        value::orderedSlotMapTraverse(_projects, [&](auto slot, auto&& expr) {
-            auto printBlock = expr.acc->debugPrint();
+        for (const auto& [slot, expr] : _projects) {
+            auto printBlock = expr.agg->debugPrint();
             if (expr.init) {
                 printBlock.emplace_back(DebugPrinter::Block("init{`"));
                 DebugPrinter::addBlocks(printBlock, expr.init->debugPrint());
                 printBlock.emplace_back(DebugPrinter::Block("`}"));
             }
             bob.append(str::stream() << slot, printer.print(printBlock));
-        });
+        }
         ret->debugInfo = BSON("projections" << bob.obj());
     }
 
@@ -155,21 +155,21 @@ std::vector<DebugPrinter::Block> AggProjectStage::debugPrint() const {
 
     ret.emplace_back("[`");
     bool first = true;
-    value::orderedSlotMapTraverse(_projects, [&](auto slot, auto&& expr) {
+    for (const auto& [slot, expr] : _projects) {
         if (!first) {
             ret.emplace_back(DebugPrinter::Block("`,"));
         }
 
         DebugPrinter::addIdentifier(ret, slot);
         ret.emplace_back("=");
-        DebugPrinter::addBlocks(ret, expr.acc->debugPrint());
+        DebugPrinter::addBlocks(ret, expr.agg->debugPrint());
         if (expr.init) {
             ret.emplace_back(DebugPrinter::Block("init{`"));
             DebugPrinter::addBlocks(ret, expr.init->debugPrint());
             ret.emplace_back(DebugPrinter::Block("`}"));
         }
         first = false;
-    });
+    }
     ret.emplace_back("`]");
 
     DebugPrinter::addNewLine(ret);

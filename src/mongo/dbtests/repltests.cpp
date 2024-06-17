@@ -64,9 +64,10 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/op_observer/op_observer_impl.h"
-#include "mongo/db/op_observer/oplog_writer_impl.h"
+#include "mongo/db/op_observer/operation_logger_impl.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/find_command.h"
+#include "mongo/db/query/query_settings/query_settings_manager.h"
 #include "mongo/db/repl/apply_ops_command_info.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/oplog.h"
@@ -180,7 +181,8 @@ public:
         // to avoid the invariant in ReplClientInfo::setLastOp that the optime only goes forward.
         repl::ReplClientInfo::forClient(_opCtx.getClient()).clearLastOp();
 
-        sc->setOpObserver(std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterImpl>()));
+        sc->setOpObserver(
+            std::make_unique<OpObserverImpl>(std::make_unique<OperationLoggerImpl>()));
 
         createOplog(&_opCtx);
 
@@ -198,10 +200,13 @@ public:
         ASSERT(c->getIndexCatalog()->haveIdIndex(&_opCtx));
         wuow.commit();
 
-        _opCtx.getServiceContext()->getStorageEngine()->setOldestTimestamp(Timestamp(1, 1));
+        _opCtx.getServiceContext()->getStorageEngine()->setOldestTimestamp(Timestamp(1, 1),
+                                                                           false /*force*/);
 
         // Start with a fresh oplog.
         deleteAll(cllNS());
+
+        query_settings::QuerySettingsManager::create(_opCtx.getServiceContext(), {});
     }
 
     ~Base() {
@@ -287,15 +292,6 @@ protected:
             }
         }
 
-        if (!serverGlobalParams.enableMajorityReadConcern) {
-            if (ops.size() > 0) {
-                if (auto tsElem = ops.front()["ts"]) {
-                    _opCtx.getServiceContext()->getStorageEngine()->setOldestTimestamp(
-                        tsElem.timestamp());
-                }
-            }
-        }
-
         OldClientContext ctx(&_opCtx, nss());
         for (std::vector<BSONObj>::iterator i = ops.begin(); i != ops.end(); ++i) {
             repl::UnreplicatedWritesBlock uwb(&_opCtx);
@@ -308,7 +304,7 @@ protected:
                 for (auto& stmt : stmts) {
                     ops.push_back(ApplierOperation(&stmt));
                 }
-                _opCtx.releaseAndReplaceRecoveryUnit();
+                shard_role_details::releaseAndReplaceRecoveryUnit(&_opCtx);
                 uassertStatusOK(
                     OplogApplierUtils::applyOplogBatchCommon(&_opCtx,
                                                              &ops,
@@ -324,7 +320,8 @@ protected:
                                        ->getMyLastAppliedOpTime()
                                        .getTimestamp();
                 auto nextTimestamp = std::max(lastApplied + 1, Timestamp(1, 1));
-                ASSERT_OK(_opCtx.recoveryUnit()->setTimestamp(nextTimestamp));
+                ASSERT_OK(
+                    shard_role_details::getRecoveryUnit(&_opCtx)->setTimestamp(nextTimestamp));
                 const bool dataIsConsistent = true;
                 uassertStatusOK(applyOperation_inlock(&_opCtx,
                                                       coll,
@@ -357,7 +354,7 @@ protected:
             auto nextTimestamp = std::max(lastApplied + 1, Timestamp(1, 1));
 
             repl::UnreplicatedWritesBlock uwb(&_opCtx);
-            ASSERT_OK(_opCtx.recoveryUnit()->setTimestamp(nextTimestamp));
+            ASSERT_OK(shard_role_details::getRecoveryUnit(&_opCtx)->setTimestamp(nextTimestamp));
             ASSERT_OK(coll->truncate(&_opCtx));
             wunit.commit();
         });
@@ -389,7 +386,7 @@ protected:
             collection_internal::insertDocument(
                 &_opCtx, coll, InsertStatement(o), nullOpDebug, true)
                 .transitional_ignore();
-            ASSERT_OK(_opCtx.recoveryUnit()->setTimestamp(nextTimestamp));
+            ASSERT_OK(shard_role_details::getRecoveryUnit(&_opCtx)->setTimestamp(nextTimestamp));
             wunit.commit();
             return;
         }
@@ -403,7 +400,7 @@ protected:
         collection_internal::insertDocument(
             &_opCtx, coll, InsertStatement(b.obj()), nullOpDebug, true)
             .transitional_ignore();
-        ASSERT_OK(_opCtx.recoveryUnit()->setTimestamp(nextTimestamp));
+        ASSERT_OK(shard_role_details::getRecoveryUnit(&_opCtx)->setTimestamp(nextTimestamp));
         wunit.commit();
     }
     static BSONObj wid(const char* json) {
@@ -459,26 +456,26 @@ protected:
 // SECONDARY.  This includes duplicate inserts and deletes.
 class Recovering : public Base {
 protected:
-    virtual OplogApplication::Mode getOplogApplicationMode() {
+    OplogApplication::Mode getOplogApplicationMode() override {
         return OplogApplication::Mode::kUnstableRecovering;
     }
 };
 
 class InsertTimestamp : public Recovering {
 public:
-    void doIt() const {
+    void doIt() const override {
         BSONObjBuilder b;
         b.append("a", 1);
         b.appendTimestamp("t");
         _client.insert(nss(), b.done());
         date_ = _client.findOne(nss(), BSON("a" << 1)).getField("t").date();
     }
-    void check() const {
+    void check() const override {
         BSONObj o = _client.findOne(nss(), BSON("a" << 1));
         ASSERT(Date_t{} != o.getField("t").date());
         ASSERT_EQUALS(date_, o.getField("t").date());
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
     }
 
@@ -489,13 +486,13 @@ private:
 class InsertAutoId : public Recovering {
 public:
     InsertAutoId() : o_(fromjson("{\"a\":\"b\"}")) {}
-    void doIt() const {
+    void doIt() const override {
         _client.insert(nss(), o_);
     }
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
     }
 
@@ -508,7 +505,7 @@ public:
     InsertWithId() {
         o_ = fromjson("{\"_id\":ObjectId(\"0f0f0f0f0f0f0f0f0f0f0f0f\"),\"a\":\"b\"}");
     }
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         checkOne(o_);
     }
@@ -517,18 +514,18 @@ public:
 class InsertTwo : public Recovering {
 public:
     InsertTwo() : o_(fromjson("{'_id':1,a:'b'}")), t_(fromjson("{'_id':2,c:'d'}")) {}
-    void doIt() const {
+    void doIt() const override {
         std::vector<BSONObj> v;
         v.push_back(o_);
         v.push_back(t_);
         _client.insert(nss(), v);
     }
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(2, count());
         checkOne(o_);
         checkOne(t_);
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
     }
 
@@ -540,14 +537,14 @@ private:
 class InsertTwoIdentical : public Recovering {
 public:
     InsertTwoIdentical() : o_(fromjson("{\"a\":\"b\"}")) {}
-    void doIt() const {
+    void doIt() const override {
         _client.insert(nss(), o_);
         _client.insert(nss(), o_);
     }
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(2, count());
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
     }
 
@@ -557,19 +554,19 @@ private:
 
 class UpdateTimestamp : public Base {
 public:
-    void doIt() const {
+    void doIt() const override {
         BSONObjBuilder b;
         b.append("_id", 1);
         b.appendTimestamp("t");
         _client.update(nss(), BSON("_id" << 1), b.done());
         date_ = _client.findOne(nss(), BSON("_id" << 1)).getField("t").date();
     }
-    void check() const {
+    void check() const override {
         BSONObj o = _client.findOne(nss(), BSON("_id" << 1));
         ASSERT(Date_t{} != o.getField("t").date());
         ASSERT_EQUALS(date_, o.getField("t").date());
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(BSON("_id" << 1));
     }
@@ -585,15 +582,15 @@ public:
           o1_(wid("{a:'b'}")),
           o2_(wid("{a:'b'}")),
           u_(fromjson("{a:'c'}")) {}
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), q_, u_);
     }
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(2, count());
         ASSERT(!_client.findOne(nss(), q_).isEmpty());
         ASSERT(!_client.findOne(nss(), u_).isEmpty());
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(o1_);
         insert(o2_);
@@ -609,15 +606,15 @@ public:
         : o_(fromjson("{'_id':1,a:'b'}")),
           q_(fromjson("{a:'b'}")),
           u_(fromjson("{'_id':1,a:'c'}")) {}
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), q_, u_);
     }
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(2, count());
         ASSERT(!_client.findOne(nss(), q_).isEmpty());
         ASSERT(!_client.findOne(nss(), u_).isEmpty());
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(o_);
         insert(fromjson("{'_id':2,a:'b'}"));
@@ -631,14 +628,14 @@ class UpdateSameFieldExplicitId : public Base {
 public:
     UpdateSameFieldExplicitId()
         : o_(fromjson("{'_id':1,a:'b'}")), u_(fromjson("{'_id':1,a:'c'}")) {}
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), o_, u_);
     }
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         checkOne(u_);
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(o_);
     }
@@ -653,14 +650,14 @@ public:
         : o_(fromjson("{'_id':1,a:'b'}")),
           q_(fromjson("{'_id':1}")),
           u_(fromjson("{'_id':1,a:'c'}")) {}
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), q_, u_);
     }
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         checkOne(u_);
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(o_);
     }
@@ -670,13 +667,13 @@ protected:
 };
 
 class UpsertUpdateNoMods : public UpdateDifferentFieldExplicitId {
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), q_, u_, true);
     }
 };
 
 class UpsertInsertNoMods : public InsertAutoId {
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), fromjson("{a:'c'}"), o_, true);
     }
 };
@@ -688,14 +685,14 @@ public:
           q_(fromjson("{a:5}")),
           u_(fromjson("{$set:{a:7}}")),
           ou_(fromjson("{'_id':1,a:7}")) {}
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), q_, u_);
     }
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         checkOne(ou_);
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(o_);
     }
@@ -711,14 +708,14 @@ public:
           q_(fromjson("{a:5}")),
           u_(fromjson("{$inc:{a:3}}")),
           ou_(fromjson("{'_id':1,a:8}")) {}
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), q_, u_);
     }
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         checkOne(ou_);
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(o_);
     }
@@ -734,14 +731,14 @@ public:
           q_(fromjson("{a:5}")),
           u_(fromjson("{$inc:{a:3},$set:{x:5}}")),
           ou_(fromjson("{'_id':1,a:8,x:5}")) {}
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), q_, u_);
     }
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         checkOne(ou_);
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(o_);
     }
@@ -757,14 +754,14 @@ public:
           q_(fromjson("{'_id':1}")),
           u_(fromjson("{$inc:{'a.b':1,'b.b':1}}")),
           ou_(fromjson("{'_id':1,a:{b:4},b:{b:2}}")) {}
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), q_, u_);
     }
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         checkOne(ou_);
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(o_);
     }
@@ -780,14 +777,14 @@ public:
           q_(fromjson("{'_id':1}")),
           u_(fromjson("{$inc:{'a':1}}")),
           ou_(fromjson("{'_id':1,a:1}")) {}
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), q_, u_);
     }
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         checkOne(ou_);
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(o_);
     }
@@ -803,14 +800,14 @@ public:
         : q_(fromjson("{'_id':5,a:4}")),
           u_(fromjson("{$inc:{a:3}}")),
           ou_(fromjson("{'_id':5,a:7}")) {}
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), q_, u_, true);
     }
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         checkOne(ou_);
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
     }
 
@@ -822,14 +819,14 @@ class UpsertInsertSet : public Recovering {
 public:
     UpsertInsertSet()
         : q_(fromjson("{a:5}")), u_(fromjson("{$set:{a:7}}")), ou_(fromjson("{a:7}")) {}
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), q_, u_, true);
     }
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(2, count());
         ASSERT(!_client.findOne(nss(), ou_).isEmpty());
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(fromjson("{'_id':7,a:7}"));
     }
@@ -842,14 +839,14 @@ class UpsertInsertInc : public Recovering {
 public:
     UpsertInsertInc()
         : q_(fromjson("{a:5}")), u_(fromjson("{$inc:{a:3}}")), ou_(fromjson("{a:8}")) {}
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), q_, u_, true);
     }
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         ASSERT(!_client.findOne(nss(), ou_).isEmpty());
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
     }
 
@@ -877,7 +874,7 @@ public:
         return ss.str();
     }
 
-    void doIt() const {
+    void doIt() const override {
         _client.insert(nss(), BSON("_id" << 1 << "x" << 1));
         _client.insert(nss(), BSON("_id" << 2 << "x" << 5));
 
@@ -893,11 +890,11 @@ public:
         check();
     }
 
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS("4,6", s());
     }
 
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
     }
 };
@@ -906,15 +903,15 @@ class UpdateWithoutPreexistingId : public Base {
 public:
     UpdateWithoutPreexistingId()
         : o_(fromjson("{a:5}")), u_(fromjson("{a:5}")), ot_(fromjson("{b:4}")) {}
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), o_, u_);
     }
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(2, count());
         checkOne(u_);
         checkOne(ot_);
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(ot_);
         insert(o_);
@@ -930,13 +927,13 @@ public:
         : o1_(f("{\"_id\":\"010101010101010101010101\",\"a\":\"b\"}")),
           o2_(f("{\"_id\":\"010101010101010101010102\",\"a\":\"b\"}")),
           q_(f("{\"a\":\"b\"}")) {}
-    void doIt() const {
+    void doIt() const override {
         _client.remove(nss(), q_);
     }
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(0, count());
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(o1_);
         insert(o2_);
@@ -947,10 +944,10 @@ protected:
 };
 
 class RemoveOne : public Remove {
-    void doIt() const {
+    void doIt() const override {
         _client.remove(nss(), q_, false /*removeMany*/);
     }
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
     }
 };
@@ -958,15 +955,15 @@ class RemoveOne : public Remove {
 class FailingUpdate : public Recovering {
 public:
     FailingUpdate() : o_(fromjson("{'_id':1,a:'b'}")), u_(fromjson("{'_id':1,c:'d'}")) {}
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), o_, u_);
         _client.insert(nss(), o_);
     }
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         checkOne(o_);
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
     }
 
@@ -976,18 +973,18 @@ protected:
 
 class SetNumToStr : public Base {
 public:
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(),
                        BSON("_id" << 0),
                        BSON("$set" << BSON("a"
                                            << "bcd")));
     }
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         checkOne(BSON("_id" << 0 << "a"
                             << "bcd"));
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(BSON("_id" << 0 << "a" << 4.0));
     }
@@ -995,15 +992,15 @@ public:
 
 class Push : public Base {
 public:
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), BSON("_id" << 0), BSON("$push" << BSON("a" << 5.0)));
     }
     using ReplTests::Base::check;
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         check(fromjson("{'_id':0,a:[4,5]}"), one(fromjson("{'_id':0}")));
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(fromjson("{'_id':0,a:[4]}"));
     }
@@ -1011,15 +1008,15 @@ public:
 
 class PushUpsert : public Base {
 public:
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), BSON("_id" << 0), BSON("$push" << BSON("a" << 5.0)), true);
     }
     using ReplTests::Base::check;
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         check(fromjson("{'_id':0,a:[4,5]}"), one(fromjson("{'_id':0}")));
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(fromjson("{'_id':0,a:[4]}"));
     }
@@ -1027,17 +1024,17 @@ public:
 
 class MultiPush : public Base {
 public:
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(),
                        BSON("_id" << 0),
                        BSON("$push" << BSON("a" << 5.0) << "$push" << BSON("b.c" << 6.0)));
     }
     using ReplTests::Base::check;
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         check(fromjson("{'_id':0,a:[4,5],b:{c:[6]}}"), one(fromjson("{'_id':0}")));
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(fromjson("{'_id':0,a:[4]}"));
     }
@@ -1045,69 +1042,69 @@ public:
 
 class EmptyPush : public Base {
 public:
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), BSON("_id" << 0), BSON("$push" << BSON("a" << 5.0)));
     }
     using ReplTests::Base::check;
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         check(fromjson("{'_id':0,a:[5]}"), one(fromjson("{'_id':0}")));
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(fromjson("{'_id':0}"));
     }
 };
 
 class PushSlice : public Base {
-    void doIt() const {
+    void doIt() const override {
         _client.update(
             nss(),
             BSON("_id" << 0),
             BSON("$push" << BSON("a" << BSON("$each" << BSON_ARRAY(3) << "$slice" << -2))));
     }
     using ReplTests::Base::check;
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         check(fromjson("{'_id':0, a:[2,3]}"), one(fromjson("{'_id':0}")));
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(BSON("_id" << 0 << "a" << BSON_ARRAY(1 << 2)));
     }
 };
 
 class PushSliceInitiallyInexistent : public Base {
-    void doIt() const {
+    void doIt() const override {
         _client.update(
             nss(),
             BSON("_id" << 0),
             BSON("$push" << BSON("a" << BSON("$each" << BSON_ARRAY(1 << 2) << "$slice" << -2))));
     }
     using ReplTests::Base::check;
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         check(fromjson("{'_id':0, a:[1,2] }"), one(fromjson("{'_id':0}")));
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(BSON("_id" << 0));
     }
 };
 
 class PushSliceToZero : public Base {
-    void doIt() const {
+    void doIt() const override {
         _client.update(
             nss(),
             BSON("_id" << 0),
             BSON("$push" << BSON("a" << BSON("$each" << BSON_ARRAY(3) << "$slice" << 0))));
     }
     using ReplTests::Base::check;
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         check(fromjson("{'_id':0, a:[]}"), one(fromjson("{'_id':0}")));
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(BSON("_id" << 0));
     }
@@ -1115,15 +1112,15 @@ class PushSliceToZero : public Base {
 
 class Pull : public Base {
 public:
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), BSON("_id" << 0), BSON("$pull" << BSON("a" << 4.0)));
     }
     using ReplTests::Base::check;
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         check(fromjson("{'_id':0,a:[5]}"), one(fromjson("{'_id':0}")));
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(fromjson("{'_id':0,a:[4,5]}"));
     }
@@ -1131,15 +1128,15 @@ public:
 
 class PullNothing : public Base {
 public:
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), BSON("_id" << 0), BSON("$pull" << BSON("a" << 6.0)));
     }
     using ReplTests::Base::check;
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         check(fromjson("{'_id':0,a:[4,5]}"), one(fromjson("{'_id':0}")));
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(fromjson("{'_id':0,a:[4,5]}"));
     }
@@ -1147,15 +1144,15 @@ public:
 
 class PullAll : public Base {
 public:
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), BSON("_id" << 0), fromjson("{$pullAll:{a:[4,5]}}"));
     }
     using ReplTests::Base::check;
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         check(fromjson("{'_id':0,a:[6]}"), one(fromjson("{'_id':0}")));
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(fromjson("{'_id':0,a:[4,5,6]}"));
     }
@@ -1163,15 +1160,15 @@ public:
 
 class Pop : public Base {
 public:
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), BSON("_id" << 0), fromjson("{$pop:{a:1}}"));
     }
     using ReplTests::Base::check;
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         check(fromjson("{'_id':0,a:[4,5]}"), one(fromjson("{'_id':0}")));
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(fromjson("{'_id':0,a:[4,5,6]}"));
     }
@@ -1179,15 +1176,15 @@ public:
 
 class PopReverse : public Base {
 public:
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), BSON("_id" << 0), fromjson("{$pop:{a:-1}}"));
     }
     using ReplTests::Base::check;
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         check(fromjson("{'_id':0,a:[5,6]}"), one(fromjson("{'_id':0}")));
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(fromjson("{'_id':0,a:[4,5,6]}"));
     }
@@ -1195,15 +1192,15 @@ public:
 
 class BitOp : public Base {
 public:
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), BSON("_id" << 0), fromjson("{$bit:{a:{and:2,or:8}}}"));
     }
     using ReplTests::Base::check;
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         check(BSON("_id" << 0 << "a" << ((3 & 2) | 8)), one(fromjson("{'_id':0}")));
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(fromjson("{'_id':0,a:3}"));
     }
@@ -1211,17 +1208,17 @@ public:
 
 class Rename : public Base {
 public:
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), BSON("_id" << 0), fromjson("{$rename:{a:'b'}}"));
         _client.update(nss(), BSON("_id" << 0), fromjson("{$set:{a:50}}"));
     }
     using ReplTests::Base::check;
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         ASSERT_EQUALS(mutablebson::unordered(BSON("_id" << 0 << "a" << 50 << "b" << 3)),
                       mutablebson::unordered(one(fromjson("{'_id':0}"))));
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(fromjson("{'_id':0,a:3}"));
     }
@@ -1229,17 +1226,17 @@ public:
 
 class RenameReplace : public Base {
 public:
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), BSON("_id" << 0), fromjson("{$rename:{a:'b'}}"));
         _client.update(nss(), BSON("_id" << 0), fromjson("{$set:{a:50}}"));
     }
     using ReplTests::Base::check;
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         ASSERT_EQUALS(mutablebson::unordered(BSON("_id" << 0 << "a" << 50 << "b" << 3)),
                       mutablebson::unordered(one(fromjson("{'_id':0}"))));
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(fromjson("{'_id':0,a:3,b:100}"));
     }
@@ -1247,16 +1244,16 @@ public:
 
 class RenameOverwrite : public Base {
 public:
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), BSON("_id" << 0), fromjson("{$rename:{a:'b'}}"));
     }
     using ReplTests::Base::check;
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         ASSERT_EQUALS(mutablebson::unordered(BSON("_id" << 0 << "b" << 3 << "z" << 1)),
                       mutablebson::unordered(one(fromjson("{'_id':0}"))));
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(fromjson("{'_id':0,z:1,a:3}"));
     }
@@ -1264,15 +1261,15 @@ public:
 
 class NoRename : public Base {
 public:
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), BSON("_id" << 0), fromjson("{$rename:{c:'b'},$set:{z:1}}"));
     }
     using ReplTests::Base::check;
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         check(BSON("_id" << 0 << "a" << 3 << "z" << 1), one(fromjson("{'_id':0}")));
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(fromjson("{'_id':0,a:3}"));
     }
@@ -1280,15 +1277,15 @@ public:
 
 class NestedNoRename : public Base {
 public:
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), BSON("_id" << 0), fromjson("{$rename:{'a.b':'c.d'},$set:{z:1}}"));
     }
     using ReplTests::Base::check;
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         check(BSON("_id" << 0 << "z" << 1), one(fromjson("{'_id':0}")));
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(fromjson("{'_id':0}"));
     }
@@ -1296,15 +1293,15 @@ public:
 
 class SingletonNoRename : public Base {
 public:
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), BSONObj(), fromjson("{$rename:{a:'b'}}"));
     }
     using ReplTests::Base::check;
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         check(fromjson("{_id:0,z:1}"), one(fromjson("{'_id':0}")));
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(fromjson("{'_id':0,z:1}"));
     }
@@ -1312,15 +1309,15 @@ public:
 
 class IndexedSingletonNoRename : public Base {
 public:
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), BSONObj(), fromjson("{$rename:{a:'b'}}"));
     }
     using ReplTests::Base::check;
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         check(fromjson("{_id:0,z:1}"), one(fromjson("{'_id':0}")));
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         // Add an index on 'a'.  This prevents the update from running 'in place'.
         ASSERT_OK(dbtests::createIndex(&_opCtx, ns(), BSON("a" << 1)));
@@ -1330,15 +1327,15 @@ public:
 
 class AddToSetEmptyMissing : public Base {
 public:
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), BSON("_id" << 0), fromjson("{$addToSet:{a:{$each:[]}}}"));
     }
     using ReplTests::Base::check;
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         check(fromjson("{_id:0,a:[]}"), one(fromjson("{'_id':0}")));
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(fromjson("{'_id':0}"));
     }
@@ -1350,7 +1347,7 @@ public:
 
 class ReplaySetPreexistingNoOpPull : public Base {
 public:
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), BSONObj(), fromjson("{$unset:{z:1}}"));
 
         // This is logged as {$set:{'a.b':[]},$set:{z:1}}, which might not be
@@ -1362,11 +1359,11 @@ public:
         _client.update(nss(), BSONObj(), fromjson("{$set:{a:1}}"));
     }
     using ReplTests::Base::check;
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         check(fromjson("{_id:0,a:1,z:1}"), one(fromjson("{'_id':0}")));
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(fromjson("{'_id':0,a:{b:[]},z:1}"));
     }
@@ -1374,16 +1371,16 @@ public:
 
 class ReplayArrayFieldNotAppended : public Base {
 public:
-    void doIt() const {
+    void doIt() const override {
         _client.update(nss(), BSONObj(), fromjson("{$push:{'a.0.b':2}}"));
         _client.update(nss(), BSONObj(), fromjson("{$set:{'a.0':1}}"));
     }
     using ReplTests::Base::check;
-    void check() const {
+    void check() const override {
         ASSERT_EQUALS(1, count());
         check(fromjson("{_id:0,a:[1,{b:[1]}]}"), one(fromjson("{'_id':0}")));
     }
-    void reset() const {
+    void reset() const override {
         deleteAll(ns());
         insert(fromjson("{'_id':0,a:[{b:[0]},{b:[1]}]}"));
     }
@@ -1412,11 +1409,11 @@ public:
     }
 };
 
-class All : public OldStyleSuiteSpecification {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("repl") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<LogBasic>();
         add<Idempotence::InsertTimestamp>();
         add<Idempotence::InsertAutoId>();
@@ -1472,7 +1469,7 @@ public:
     }
 };
 
-OldStyleSuiteInitializer<All> myall;
+unittest::OldStyleSuiteInitializer<All> myall;
 
 }  // namespace ReplTests
 }  // namespace repl

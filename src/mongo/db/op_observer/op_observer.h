@@ -141,6 +141,9 @@ struct OplogDeleteEntryArgs : Decorable<OplogDeleteEntryArgs> {
     RetryableFindAndModifyLocation retryableFindAndModifyLocation =
         RetryableFindAndModifyLocation::kNone;
 
+    // Non-null when the RecordId for the delete is / needs to be replicated.
+    RecordId replicatedRecordId;
+
     // Set if OpTimes were reserved for the delete ahead of time for this retryable
     // "findAndModify" operation.
     // Implies 'retryableFindAndModifyLocation' is set to kSideCollection but the
@@ -262,6 +265,9 @@ public:
                                    bool fromMigrate) = 0;
 
     /**
+     * 'recordIds' is a vector of recordIds corresponding to the inserted documents.
+     * The presence of a non-empty vector of recordIds indicates that the recordIds should
+     * be added to the oplog.
      * 'fromMigrate' array contains settings for each insert operation and takes into
      * account orphan documents.
      * 'defaultFromMigrate' is the initial 'fromMigrate' value for the 'fromMigrate' array
@@ -269,11 +275,15 @@ public:
      * 'fromMigrate' to describe the entire set of inserts.
      * Examples: ShardServerOpObserver, UserWriteBlockModeOpObserver, and
      * MigrationChunkClonerSourceOpObserver::onInserts().
+     *
+     * The 'defaultFromMigrate' value must be consistent with the 'fromMigrate' array; that is,
+     * if 'defaultFromMigrate' is true, all entries in the 'fromMigrate' array must be true.
      */
     virtual void onInserts(OperationContext* opCtx,
                            const CollectionPtr& coll,
                            std::vector<InsertStatement>::const_iterator begin,
                            std::vector<InsertStatement>::const_iterator end,
+                           const std::vector<RecordId>& recordIds,
                            std::vector<bool> fromMigrate,
                            bool defaultFromMigrate,
                            OpStateAccumulator* opAccumulator = nullptr) = 0;
@@ -535,7 +545,9 @@ public:
      * are gathered in a single applyOps oplog entry, similar to multi-doc transactions, and written
      * to the oplog.
      */
-    virtual void onBatchedWriteCommit(OperationContext* opCtx) = 0;
+    virtual void onBatchedWriteCommit(OperationContext* opCtx,
+                                      WriteUnitOfWork::OplogEntryGroupType oplogGroupingFormat,
+                                      OpStateAccumulator* opStateAccumulator = nullptr) = 0;
 
     /**
      * Clears the accumulated write operations. No further writes is allowed in this storage
@@ -647,6 +659,9 @@ public:
 
         // Set of all namespaces from ops being rolled back.
         std::set<NamespaceString> rollbackNamespaces = {};
+
+        // Set of all collection UUIDs from ops being rolled back.
+        std::set<UUID> rollbackUUIDs = {};
 
         // Set of all session ids from ops being rolled back.
         std::set<UUID> rollbackSessionIds = {};

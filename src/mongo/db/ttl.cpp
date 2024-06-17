@@ -53,6 +53,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/oid.h"
+#include "mongo/db/admission/execution_admission_context.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/coll_mod.h"
 #include "mongo/db/catalog/collection.h"
@@ -66,7 +67,6 @@
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/batched_delete_stage.h"
 #include "mongo/db/exec/collection_scan_common.h"
@@ -116,14 +116,13 @@
 #include "mongo/s/shard_version_factory.h"
 #include "mongo/s/sharding_index_catalog_cache.h"
 #include "mongo/s/stale_exception.h"
+#include "mongo/stdx/thread.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/admission_context.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/decorable.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/future.h"
-#include "mongo/util/future_impl.h"
 #include "mongo/util/log_with_sampling.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
@@ -336,12 +335,12 @@ private:
             // Some test fixtures might not install the TTLMonitor.
             return;
         }
-        ttlMonitor->onStepUp(opCtx);
+        ttlMonitor->onStepUp();
     }
     void onStepDown() override {}
     void onRollback() override {}
     void onBecomeArbiter() override {}
-    inline std::string getServiceName() const override final {
+    inline std::string getServiceName() const final {
         return "TTLMonitorService";
     }
 };
@@ -365,13 +364,14 @@ MONGO_FAIL_POINT_DEFINE(hangTTLMonitorBetweenPasses);
 // consist of multiple sub-passes. Each sub-pass deletes all the expired documents it can up to
 // 'ttlSubPassTargetSecs'. It is possible for a sub-pass to complete before all expired documents
 // have been removed.
-CounterMetric ttlPasses("ttl.passes");
-CounterMetric ttlSubPasses("ttl.subPasses");
-CounterMetric ttlDeletedDocuments("ttl.deletedDocuments");
+auto& ttlPasses = *MetricBuilder<Counter64>{"ttl.passes"};
+auto& ttlSubPasses = *MetricBuilder<Counter64>{"ttl.subPasses"};
+auto& ttlDeletedDocuments = *MetricBuilder<Counter64>{"ttl.deletedDocuments"};
 
 // Counts the subpasses over TTL collections where the deletes on a collection are increased from
 // 'low' to 'normal' priority.
-CounterMetric ttlCollSubpassesIncreasedPriority("ttl.collSubpassesIncreasedPriority");
+auto& ttlCollSubpassesIncreasedPriority =
+    *MetricBuilder<Counter64>{"ttl.collSubpassesIncreasedPriority"};
 
 using MtabType = TenantMigrationAccessBlocker::BlockerType;
 
@@ -546,7 +546,7 @@ bool TTLMonitor::_doTTLSubPass(
             // 'AdmissionContext::Priority::kNormal' for one index means the priority will be
             // 'normal' for all indexes.
             AdmissionContext::Priority priority = getTTLPriority(uuid, ttlPriorityMap);
-            ScopedAdmissionPriorityForLock priorityGuard(opCtx->lockState(), priority);
+            ScopedAdmissionPriority<ExecutionAdmissionContext> priorityGuard(opCtx, priority);
 
             for (const auto& info : infos) {
                 bool moreToDelete = _doTTLIndexDelete(opCtx, &ttlCollectionCache, uuid, info);
@@ -616,11 +616,6 @@ bool TTLMonitor::_doTTLIndexDelete(OperationContext* opCtx,
             return false;
 
         const auto& collectionPtr = coll.getCollectionPtr();
-        if (!feature_flags::gFeatureFlagTTLIndexesOnCappedCollections.isEnabled(
-                serverGlobalParams.featureCompatibility) &&
-            collectionPtr->isCapped() && !collectionPtr->isClustered()) {
-            return false;
-        }
 
         if (MONGO_unlikely(hangTTLMonitorWithLock.shouldFail())) {
             LOGV2(22534,
@@ -644,6 +639,10 @@ bool TTLMonitor::_doTTLIndexDelete(OperationContext* opCtx,
                         "Postpone TTL of DB because of active tenant migration",
                         "tenantMigrationAccessBlocker"_attr = mtab->getDebugInfo().jsonString(),
                         "database"_attr = coll.nss().dbName());
+            return false;
+        }
+
+        if (collectionPtr->getRequiresTimeseriesExtendedRangeSupport()) {
             return false;
         }
 
@@ -831,7 +830,7 @@ bool TTLMonitor::_deleteExpiredWithCollscan(OperationContext* opCtx,
 
     LOGV2_DEBUG(5400704, 1, "running TTL job for clustered collection", logAttrs(collection.nss()));
 
-    const auto startId = makeCollScanStartBound(collectionPtr, Date_t::min());
+    const auto startId = makeCollScanStartBound(collectionPtr, Date_t{});
 
     const auto expirationDate = safeExpirationDate(opCtx, collectionPtr, *expireAfterSeconds);
     const auto endId = makeCollScanEndBound(collectionPtr, expirationDate);
@@ -902,79 +901,110 @@ void shutdownTTLMonitor(ServiceContext* serviceContext) {
     }
 }
 
-void TTLMonitor::onStepUp(OperationContext* opCtx) {
-    auto&& ttlCollectionCache = TTLCollectionCache::get(opCtx->getServiceContext());
-    auto ttlInfos = ttlCollectionCache.getTTLInfos();
-    for (const auto& [uuid, infos] : ttlInfos) {
-        auto collectionCatalog = CollectionCatalog::get(opCtx);
+void TTLMonitor::onStepUp() {
+    stdx::thread([]() mutable {
+        ThreadClient tc("InvalidTTLIndexFixer",
+                        getGlobalServiceContext()->getService(ClusterRole::ShardServer));
+        AuthorizationSession::get(cc())->grantInternalAuthorization(&cc());
+        const auto opCtxCtr = cc().makeOperationContext();
+        auto opCtx = opCtxCtr.get();
+        auto&& ttlCollectionCache = TTLCollectionCache::get(opCtx->getServiceContext());
+        auto ttlInfos = ttlCollectionCache.getTTLInfos();
+        for (const auto& [uuid, infos] : ttlInfos) {
+            auto collectionCatalog = CollectionCatalog::get(opCtx);
 
-        // The collection was dropped.
-        auto nss = collectionCatalog->lookupNSSByUUID(opCtx, uuid);
-        if (!nss) {
-            continue;
-        }
-
-        if (nss->isTemporaryReshardingCollection() || nss->isDropPendingNamespace()) {
-            continue;
-        }
-
-        try {
-            uassertStatusOK(userAllowedWriteNS(opCtx, *nss));
-
-            for (const auto& info : infos) {
-                // Skip clustered indexes with TTL. This includes time-series collections.
-                if (info.isClustered()) {
-                    continue;
-                }
-
-                if (!info.isExpireAfterSecondsInvalid()) {
-                    continue;
-                }
-
-                auto indexName = info.getIndexName();
-                LOGV2(6847700,
-                      "Running collMod to fix TTL index with invalid 'expireAfterSeconds'.",
-                      "ns"_attr = *nss,
-                      "uuid"_attr = uuid,
-                      "name"_attr = indexName,
-                      "expireAfterSecondsNew"_attr =
-                          index_key_validate::kExpireAfterSecondsForInactiveTTLIndex);
-
-                // Compose collMod command to amend 'expireAfterSeconds' to same value that
-                // would be used by listIndexes() to convert a NaN value in the catalog.
-                CollModIndex collModIndex;
-                collModIndex.setName(StringData{indexName});
-                collModIndex.setExpireAfterSeconds(mongo::durationCount<Seconds>(
-                    index_key_validate::kExpireAfterSecondsForInactiveTTLIndex));
-                CollMod collModCmd{*nss};
-                collModCmd.getCollModRequest().setIndex(collModIndex);
-
-                // processCollModCommand() will acquire MODE_X access to the collection.
-                BSONObjBuilder builder;
-                uassertStatusOK(
-                    processCollModCommand(opCtx, {nss->dbName(), uuid}, collModCmd, &builder));
-                auto result = builder.obj();
-                LOGV2(
-                    6847701,
-                    "Successfully fixed TTL index with invalid 'expireAfterSeconds' using collMod",
-                    "ns"_attr = *nss,
-                    "uuid"_attr = uuid,
-                    "name"_attr = indexName,
-                    "result"_attr = result);
+            // The collection was dropped.
+            auto nss = collectionCatalog->lookupNSSByUUID(opCtx, uuid);
+            if (!nss) {
+                continue;
             }
-        } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
-            // The exception is relevant to the entire TTL monitoring process, not just the specific
-            // TTL index. Let the exception escape so it can be addressed at the higher monitoring
-            // layer.
-            throw;
-        } catch (const DBException& ex) {
-            LOGV2_ERROR(6835901,
-                        "Error checking TTL job on collection during step up",
-                        logAttrs(*nss),
-                        "error"_attr = ex);
-            continue;
+
+            if (nss->isTemporaryReshardingCollection() || nss->isDropPendingNamespace()) {
+                continue;
+            }
+
+            try {
+                uassertStatusOK(userAllowedWriteNS(opCtx, *nss));
+
+                for (const auto& info : infos) {
+                    // Skip clustered indexes with TTL. This includes time-series collections.
+                    if (info.isClustered()) {
+                        continue;
+                    }
+
+                    if (!info.isExpireAfterSecondsInvalid() && !info.isExpireAfterSecondsNonInt()) {
+                        continue;
+                    }
+
+                    // A prepared transaction, which has a write to a collection "foo",  will
+                    // reacquire an IX lock on "foo" prior to running this function. Thus
+                    // processCollModCommand(), which will acquire MODE_X access to the collection,
+                    // can't run synchronously here. Spawn and detach a thread to run it in
+                    // background.
+                    auto indexName = info.getIndexName();
+                    LOGV2(6847700,
+                          "Running collMod to fix TTL index with invalid 'expireAfterSeconds'.",
+                          "ns"_attr = *nss,
+                          "uuid"_attr = uuid,
+                          "name"_attr = indexName,
+                          "expireAfterSecondsNew"_attr =
+                              index_key_validate::kExpireAfterSecondsForInactiveTTLIndex);
+
+                    // Compose collMod command to amend 'expireAfterSeconds' to same value that
+                    // would be used by listIndexes() to convert a NaN value in the catalog.
+                    CollModIndex collModIndex;
+                    collModIndex.setName(StringData{indexName});
+                    if (info.isExpireAfterSecondsInvalid()) {
+                        collModIndex.setExpireAfterSeconds(mongo::durationCount<Seconds>(
+                            index_key_validate::kExpireAfterSecondsForInactiveTTLIndex));
+                    } else if (info.isExpireAfterSecondsNonInt()) {
+                        const auto coll = acquireCollection(
+                            opCtx,
+                            CollectionAcquisitionRequest::fromOpCtx(
+                                opCtx, *nss, AcquisitionPrerequisites::OperationType::kWrite),
+                            MODE_X);
+
+                        if (!coll.exists() || coll.uuid() != uuid) {
+                            continue;
+                        }
+                        const auto& collectionPtr = coll.getCollectionPtr();
+
+                        if (!collectionPtr->isIndexPresent(indexName)) {
+                            ttlCollectionCache.deregisterTTLIndexByName(uuid, indexName);
+                            continue;
+                        }
+
+                        BSONObj spec = collectionPtr->getIndexSpec(indexName);
+                        auto expireAfterSeconds =
+                            spec[IndexDescriptor::kExpireAfterSecondsFieldName].safeNumberInt();
+
+                        collModIndex.setExpireAfterSeconds(expireAfterSeconds);
+                    }
+                    CollMod collModCmd{*nss};
+                    collModCmd.getCollModRequest().setIndex(collModIndex);
+
+                    // processCollModCommand() will acquire MODE_X access to the collection.
+                    BSONObjBuilder builder;
+                    uassertStatusOK(
+                        processCollModCommand(opCtx, {nss->dbName(), uuid}, collModCmd, &builder));
+                    auto result = builder.obj();
+                    LOGV2(6847701,
+                          "Successfully fixed TTL index with invalid 'expireAfterSeconds' using "
+                          "collMod",
+                          "ns"_attr = *nss,
+                          "uuid"_attr = uuid,
+                          "name"_attr = indexName,
+                          "result"_attr = result);
+                }
+            } catch (const DBException& ex) {
+                LOGV2_ERROR(6835901,
+                            "Error checking TTL job on collection during step up",
+                            logAttrs(*nss),
+                            "error"_attr = ex);
+                continue;
+            }
         }
-    }
+    }).detach();
 }
 
 long long TTLMonitor::getTTLPasses_forTest() {

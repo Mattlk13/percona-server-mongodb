@@ -165,7 +165,10 @@ OpMsg runCommandInLocalTxn(OperationContext* opCtx,
     return OpMsg::parseOwned(
         opCtx->getService()
             ->getServiceEntryPoint()
-            ->handleRequest(opCtx, OpMsgRequest::fromDBAndBody(db, bob.obj()).serialize())
+            ->handleRequest(
+                opCtx,
+                OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::get(opCtx), db, bob.obj())
+                    .serialize())
             .get()
             .response);
 }
@@ -237,7 +240,10 @@ BSONObj commitOrAbortTransaction(OperationContext* opCtx,
         newOpCtx->getService()
             ->getServiceEntryPoint()
             ->handleRequest(newOpCtx.get(),
-                            OpMsgRequest::fromDBAndBody(DatabaseName::kAdmin, cmdObj).serialize())
+                            OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::kNotRequired,
+                                                        DatabaseName::kAdmin,
+                                                        cmdObj)
+                                .serialize())
             .get()
             .response);
     return replyOpMsg.body;
@@ -675,6 +681,7 @@ ShardingCatalogManager::ShardingCatalogManager(
       _localConfigShard(std::move(localConfigShard)),
       _localCatalogClient(std::move(localCatalogClient)),
       _kShardMembershipLock("shardMembershipLock"),
+      _kClusterCardinalityParameterLock("clusterCardinalityParameterLock"),
       _kChunkOpLock("chunkOpLock"),
       _kZoneOpLock("zoneOpLock"),
       _kPlacementHistoryInitializationLock("placementHistoryInitializationOpLock") {
@@ -782,6 +789,12 @@ Status ShardingCatalogManager::_initConfigIndexes(OperationContext* opCtx) {
     }
 
     result = createIndexOnConfigCollection(
+        opCtx, NamespaceString::kConfigDatabasesNamespace, BSON("_id" << 1), unique);
+    if (!result.isOK()) {
+        return result.withContext("couldn't create _id_ index on config db");
+    }
+
+    result = createIndexOnConfigCollection(
         opCtx, NamespaceString::kConfigsvrShardsNamespace, BSON(ShardType::host() << 1), unique);
     if (!result.isOK()) {
         return result.withContext("couldn't create host_1 index on config db");
@@ -800,7 +813,7 @@ Status ShardingCatalogManager::_initConfigIndexes(OperationContext* opCtx) {
     }
 
     if (feature_flags::gGlobalIndexesShardingCatalog.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
         result = sharding_util::createShardingIndexCatalogIndexes(
             opCtx, NamespaceString::kConfigsvrIndexCatalogNamespace);
         if (!result.isOK()) {
@@ -844,39 +857,42 @@ Status ShardingCatalogManager::_initConfigCollections(OperationContext* opCtx) {
     return Status::OK();
 }
 
+// TODO (SERVER-83264): Move new validator to _initConfigSettings and remove old validator once 8.0
+// becomes last LTS.
+BSONObj createConfigSettingsValidator() {
+    // (Generic FCV reference): on versions where the balancerSettingsSchema feature flag is
+    // enabled, install an extended validator. This must be the case even for transitional FCV
+    // states, as the validator is installed during FCV upgrade.
+    auto fcvSnapshot = serverGlobalParams.featureCompatibility.acquireFCVSnapshot();
+    auto targetVersion = fcvSnapshot.isUpgradingOrDowngrading()
+        ? getTransitionFCVFromAndTo(fcvSnapshot.getVersion()).second
+        : fcvSnapshot.getVersion();
+
+    if (feature_flags::gBalancerSettingsSchema.isEnabledOnVersion(targetVersion)) {
+        const auto noopValidator = BSON(
+            "properties" << BSON(
+                "_id" << BSON("enum" << BSON_ARRAY(AutoMergeSettingsType::kKey
+                                                   << ReadWriteConcernDefaults::kPersistedDocumentId
+                                                   << "audit"))));
+        return BSON("$jsonSchema" << BSON("oneOf" << BSON_ARRAY(BalancerSettingsType::kSchema
+                                                                << ChunkSizeSettingsType::kSchema
+                                                                << noopValidator)));
+    } else {
+        const auto noopValidator = BSON(
+            "properties" << BSON(
+                "_id" << BSON("enum" << BSON_ARRAY(BalancerSettingsType::kKey
+                                                   << AutoMergeSettingsType::kKey
+                                                   << ReadWriteConcernDefaults::kPersistedDocumentId
+                                                   << "audit"))));
+        return BSON("$jsonSchema" << BSON(
+                        "oneOf" << BSON_ARRAY(ChunkSizeSettingsType::kSchema << noopValidator)));
+    }
+}
+
 Status ShardingCatalogManager::_initConfigSettings(OperationContext* opCtx) {
     DBDirectClient client(opCtx);
 
-    /**
-     * $jsonSchema: {
-     *   oneOf: [
-     *       {"properties": {_id: {enum: ["chunksize"]}},
-     *                      {value: {bsonType: "number", minimum: 1, maximum: 1024}}},
-     *       {"properties": {_id: {enum: ["balancer", "automerge" "ReadWriteConcernDefaults",
-     * "audit"]}}}
-     *   ]
-     * }
-     *
-     * Note: the schema uses "number" for the chunksize instead of "int" because "int" requires the
-     * user to pass NumberInt(x) as the value rather than x (as all of our docs recommend). Non-
-     * integer values will be handled as they were before the schema, by the balancer failing until
-     * a new value is set.
-     */
-    const auto chunkSizeValidator =
-        BSON("properties" << BSON("_id" << BSON("enum" << BSON_ARRAY(ChunkSizeSettingsType::kKey))
-                                        << "value"
-                                        << BSON("bsonType"
-                                                << "number"
-                                                << "minimum" << 1 << "maximum" << 1024))
-                          << "additionalProperties" << false);
-    const auto noopValidator =
-        BSON("properties" << BSON(
-                 "_id" << BSON("enum" << BSON_ARRAY(
-                                   BalancerSettingsType::kKey
-                                   << AutoMergeSettingsType::kKey
-                                   << ReadWriteConcernDefaults::kPersistedDocumentId << "audit"))));
-    const auto fullValidator =
-        BSON("$jsonSchema" << BSON("oneOf" << BSON_ARRAY(chunkSizeValidator << noopValidator)));
+    const auto fullValidator = createConfigSettingsValidator();
 
     BSONObj cmd = BSON("create" << NamespaceString::kConfigSettingsNamespace.coll());
     BSONObj result;
@@ -1335,8 +1351,26 @@ void ShardingCatalogManager::initializePlacementHistory(OperationContext* opCtx)
 
     // Delete any existing document that has been already majority committed.
     {
-        repl::ReadConcernArgs::get(opCtx) =
-            repl::ReadConcernArgs(repl::ReadConcernLevel::kMajorityReadConcern);
+        // Set the needed read concern for the operation; since its execution through
+        // _localConfigShard involves the DBDirectClient, RecoveryUnit::ReadSource also needs to
+        // be restored upon exit.
+        auto originalReadConcern =
+            std::exchange(repl::ReadConcernArgs::get(opCtx),
+                          repl::ReadConcernArgs(repl::ReadConcernLevel::kMajorityReadConcern));
+
+        auto originalReadSource =
+            shard_role_details::getRecoveryUnit(opCtx)->getTimestampReadSource();
+        boost::optional<Timestamp> originalReadTimestamp;
+        if (originalReadSource == RecoveryUnit::ReadSource::kProvided) {
+            originalReadTimestamp =
+                shard_role_details::getRecoveryUnit(opCtx)->getPointInTimeReadTimestamp(opCtx);
+        }
+
+        ScopeGuard resetopCtxStateGuard([&] {
+            repl::ReadConcernArgs::get(opCtx) = std::move(originalReadConcern);
+            shard_role_details::getRecoveryUnit(opCtx)->setTimestampReadSource(
+                originalReadSource, originalReadTimestamp);
+        });
 
         write_ops::DeleteCommandRequest deleteOp(
             NamespaceString::kConfigsvrPlacementHistoryNamespace);
@@ -1567,5 +1601,10 @@ int ShardingCatalogManager::deleteMaxSizeMbFromShardEntries(OperationContext* op
     write_ops::checkWriteErrors(updateReply);
     return updateReply.getN();
 }
+
+Status ShardingCatalogManager::upgradeDowngradeConfigSettings(OperationContext* opCtx) {
+    return _initConfigSettings(opCtx);
+}
+
 
 }  // namespace mongo

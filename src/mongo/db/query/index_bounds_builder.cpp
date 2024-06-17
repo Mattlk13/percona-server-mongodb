@@ -133,7 +133,8 @@ Interval makeNullPointInterval(bool isHashed) {
  * This helper updates the query bounds tightness for the limited set of conditions where we see a
  * null query that can be covered.
  */
-void updateTightnessForNullQuery(const IndexEntry& index,
+void updateTightnessForNullQuery(const PathMatchExpression* matchExpr,
+                                 const IndexEntry& index,
                                  IndexBoundsBuilder::BoundsTightness* tightnessOut) {
     if (index.sparse || index.type == IndexType::INDEX_HASHED) {
         // Sparse indexes and hashed indexes require a FETCH stage with a filter for null queries.
@@ -141,11 +142,10 @@ void updateTightnessForNullQuery(const IndexEntry& index,
         return;
     }
 
-    if (index.multikey) {
-        // If we have a simple equality null query and our index is multikey, we cannot cover the
-        // query. This is because null intervals are translated into the null and undefined point
-        // intervals, and the undefined point interval includes entries for []. In the case of a
-        // single null interval, [] should not match.
+    if (index.multikey && matchExpr->fieldRef() && matchExpr->fieldRef()->numParts() > 1) {
+        // Documents {"a.b": null} and {a: [1,2,3]} will generate null index keys for index {"a.b":
+        // 1}. However, a query like {"a.b": {$eq: null}} should not match {a: [1, 2, 3]}. So, we
+        // have inexact bounds, because we will need a residual filter after the fetch.
         *tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
         return;
     }
@@ -156,18 +156,14 @@ void updateTightnessForNullQuery(const IndexEntry& index,
     *tightnessOut = IndexBoundsBuilder::EXACT_MAYBE_COVERED;
 }
 
-void makeNullEqualityBounds(const IndexEntry& index,
+void makeNullEqualityBounds(const PathMatchExpression* matchExpr,
+                            const IndexEntry& index,
                             bool isHashed,
                             OrderedIntervalList* oil,
                             IndexBoundsBuilder::BoundsTightness* tightnessOut) {
-    updateTightnessForNullQuery(index, tightnessOut);
+    updateTightnessForNullQuery(matchExpr, index, tightnessOut);
 
-    // There are two values that could possibly be equal to null in an index: undefined and null.
-    oil->intervals.push_back(makeUndefinedPointInterval(isHashed));
     oil->intervals.push_back(makeNullPointInterval(isHashed));
-
-    // Just to be sure, make sure the bounds are in the right order if the hash values are opposite.
-    IndexBoundsBuilder::unionize(oil);
 }
 
 bool isEqualityOrInNull(MatchExpression* me) {
@@ -353,7 +349,8 @@ IndexBoundsBuilder::BoundsTightness computeTightnessForTypeSet(const MatcherType
         return IndexBoundsBuilder::INEXACT_FETCH;
     }
 
-    // Null and Undefined Types always require an inexact fetch.
+    // Mark both null and undefined as inexact. Null and undefined must be differentiated, and
+    // undefined and [] must be differentiated.
     if (typeSet.hasType(BSONType::jstNULL) || typeSet.hasType(BSONType::Undefined)) {
         return IndexBoundsBuilder::INEXACT_FETCH;
     }
@@ -486,11 +483,11 @@ bool detectIfEntireNullIntervalMatchesPredicate(const InMatchExpression* ime,
             return false;
         }
 
-        // We must have an equality to an empty array for this null query to be covered, otherwise,
-        // because we generate both null and undefined point intervals for a null query, and because
-        // a multikey index reuses the same entry for [] and undefined, we will not be able to cover
-        // the query.
-        if (!ime->hasEmptyArray()) {
+        // When the in-list contains an empty array, the index bounds will include a point interval
+        // for undefined values. Since a multikey index reuses the same entry for [] and undefined,
+        // we will need a fetch to distinguish these two values (there cannot be an undefined value
+        // in an in-list, so we are not matching undefined here).
+        if (ime->hasEmptyArray()) {
             return false;
         }
     }
@@ -576,7 +573,7 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
         if (MatchExpression::MATCH_IN == child->matchType()) {
             auto ime = static_cast<const InMatchExpression*>(child);
             if (QueryPlannerIXSelect::canUseIndexForNin(ime)) {
-                makeNullEqualityBounds(index, isHashed, oilOut, tightnessOut);
+                makeNullEqualityBounds(ime, index, isHashed, oilOut, tightnessOut);
                 oilOut->intervals.push_back(IndexBoundsBuilder::kEmptyArrayPointInterval);
                 oilOut->complement();
                 unionize(oilOut);
@@ -666,7 +663,8 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
         const auto* node = static_cast<const ComparisonMatchExpressionBase*>(expr);
         // There is no need to sort intervals or merge overlapping intervals here since the output
         // is from one element.
-        translateEquality(node->getData(), index, isHashed, oilOut, tightnessOut);
+
+        translateEquality(node, node->getData(), nullptr, index, isHashed, oilOut, tightnessOut);
         if (ietBuilder != nullptr) {
             switch (expr->matchType()) {
                 case MatchExpression::EQ:
@@ -790,9 +788,8 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
         }
 
         if (BSONType::jstNULL == dataElt.type()) {
-            // Because of type-bracketing, $lte null is equivalent to $eq null. An equality to null
-            // query is special. It should return both undefined and null values.
-            makeNullEqualityBounds(index, isHashed, oilOut, tightnessOut);
+            // Because of type-bracketing, $lte null is equivalent to $eq null.
+            makeNullEqualityBounds(node, index, isHashed, oilOut, tightnessOut);
             return;
         }
 
@@ -952,9 +949,8 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
         }
 
         if (BSONType::jstNULL == dataElt.type()) {
-            // Because of type-bracketing, $lte null is equivalent to $eq null. An equality to null
-            // query is special. It should return both undefined and null values.
-            makeNullEqualityBounds(index, isHashed, oilOut, tightnessOut);
+            // Because of type-bracketing, $gte null is equivalent to $eq null.
+            makeNullEqualityBounds(node, index, isHashed, oilOut, tightnessOut);
             return;
         }
         BSONObjBuilder bob;
@@ -1094,19 +1090,36 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
         // basis of indexes, null intervals, and array intervals.
         const bool entireNullIntervalMatchesPredicate =
             detectIfEntireNullIntervalMatchesPredicate(ime, index);
+
+        // Ensure that we own the BSON buffer containing the $in array. This will allow us to create
+        // Interval objects which point to this BSON without having to make copies just to strip out
+        // the field name as is usually done in IndexBoundsBuilder::translateEquality.
+        // If the InList has already been prepared, as will be the case if we reach this codepath
+        // from IntervalEvalutionTree evaluation (SBE plan was retrieved from the cache and
+        // parameters are being bound), then we cannot make a copy of the BSON buffer. In this case,
+        // we clone() the InList, which will share the underlying BSON but the copy will not be in
+        // the prepared state, allowing us to make a copy of the BSON.
+        auto inList = ime->getInList();
+        if (!inList->isBSONOwned()) {
+            if (inList->isPrepared()) {
+                inList = inList->clone();
+            }
+            inList->makeBSONOwned();
+        }
+
         for (auto&& equality : ime->getEqualities()) {
             // First, we generate the bounds the same way that we would do for an individual
             // equality. This will set tightness to the value it should be if this equality is being
             // considered in isolation.
-            IndexBoundsBuilder::translateEquality(equality, index, isHashed, oilOut, &tightness);
-            if (entireNullIntervalMatchesPredicate &&
-                (BSONType::jstNULL == equality.type() ||
-                 (BSONType::Array == equality.type() && equality.Obj().isEmpty()))) {
-                // We may have a covered null query. In this case, we update both empty array and
-                // null interval tightness to EXACT_MAYBE_COVERED, as individually they would have a
-                // tightness of INEXACT_FETCH. However, we already know we will be able to cover
-                // these intervals together if we have appropriate projections. Note that any other
-                // intervals that cannot be covered may still require the query to use a FETCH.
+            IndexBoundsBuilder::translateEquality(
+                ime, equality, &inList->getOwnedBSONStorage(), index, isHashed, oilOut, &tightness);
+
+            if (entireNullIntervalMatchesPredicate && BSONType::jstNULL == equality.type()) {
+                // We may have a covered null query. In this case, we update null interval
+                // tightness to EXACT_MAYBE_COVERED, as individually it would have a tightness of
+                // INEXACT_FETCH. However, we already know we will be able to cover this interval
+                // if we have appropriate projections. Note that any other intervals that
+                // cannot be covered may still require the query to use a FETCH.
                 tightness = IndexBoundsBuilder::EXACT_MAYBE_COVERED;
             }
             IndexBoundsBuilder::_mergeTightness(tightness, *tightnessOut);
@@ -1375,20 +1388,27 @@ void IndexBoundsBuilder::translateRegex(const RegexMatchExpression* rme,
 }
 
 // static
-void IndexBoundsBuilder::translateEquality(const BSONElement& data,
+void IndexBoundsBuilder::translateEquality(const PathMatchExpression* matchExpr,
+                                           const BSONElement& data,
+                                           const BSONObj* holder,
                                            const IndexEntry& index,
                                            bool isHashed,
                                            OrderedIntervalList* oil,
                                            BoundsTightness* tightnessOut) {
     if (BSONType::jstNULL == data.type()) {
-        // An equality to null query is special. It should return both undefined and null values, so
-        // is not a point query.
-        return makeNullEqualityBounds(index, isHashed, oil, tightnessOut);
+        // An equality to null query is special. It has different tightness constraints.
+        return makeNullEqualityBounds(matchExpr, index, isHashed, oil, tightnessOut);
     }
 
-    // We have to copy the data out of the parse tree and stuff it into the index
-    // bounds.  BSONValue will be useful here.
     if (BSONType::Array != data.type()) {
+        // Reuse the BSON from the parse tree if possible to avoid allocating a BSONObj.
+        // A hashed index or collation means we have to create a copy to construct the bounds.
+        if (!isHashed && index.collator == nullptr && holder != nullptr) {
+            oil->intervals.emplace_back(*holder, data, true, data, true);
+            *tightnessOut = IndexBoundsBuilder::EXACT;
+            return;
+        }
+
         BSONObj dataObj = objFromElement(data, index.collator);
         if (isHashed) {
             dataObj = ExpressionMapping::hash(dataObj.firstElement());
@@ -1478,13 +1498,15 @@ void IndexBoundsBuilder::alignBounds(IndexBounds* bounds,
         ++oilIdx;
     }
 
-    if (!bounds->isValidFor(kp, scanDir)) {
-        LOGV2(20933,
-              "Invalid bounds",
-              "bounds"_attr = redact(bounds->toString(hasNonSimpleCollation)),
-              "keyPattern"_attr = redact(kp),
-              "scanDirection"_attr = scanDir);
-        MONGO_UNREACHABLE_TASSERT(6349900);
+    if constexpr (kDebugBuild) {
+        if (!bounds->isValidFor(kp, scanDir)) {
+            LOGV2(20933,
+                  "Invalid bounds",
+                  "bounds"_attr = redact(bounds->toString(hasNonSimpleCollation)),
+                  "keyPattern"_attr = redact(kp),
+                  "scanDirection"_attr = scanDir);
+            MONGO_UNREACHABLE_TASSERT(6349900);
+        }
     }
 }
 
@@ -1613,23 +1635,6 @@ bool IndexBoundsBuilder::isSingleInterval(const IndexBounds& bounds,
     } else {
         return false;
     }
-}
-
-// static
-bool IndexBoundsBuilder::isNullInterval(const OrderedIntervalList& oil) {
-    // Checks if the the intervals are [undefined, undefined] and [null, null].
-    // Note: the order is always the same (see makeNullEqualityBounds()).
-    return 2 == oil.intervals.size() && oil.intervals[0].equals(kUndefinedPointInterval) &&
-        oil.intervals[1].equals(kNullPointInterval);
-}
-
-// static
-bool IndexBoundsBuilder::isNullAndEmptyArrayInterval(const OrderedIntervalList& oil) {
-    // Checks if the the intervals are [undefined, undefined], [null, null], and [[], []]. These
-    // will always be sorted in the above order during IndexBoundsBuilder::_translatePredicate().
-    return 3 == oil.intervals.size() && oil.intervals[0].equals(kUndefinedPointInterval) &&
-        oil.intervals[1].equals(kNullPointInterval) &&
-        oil.intervals[2].equals(kEmptyArrayPointInterval);
 }
 
 }  // namespace mongo

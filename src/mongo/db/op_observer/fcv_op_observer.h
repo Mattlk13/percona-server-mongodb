@@ -59,7 +59,7 @@ class FcvOpObserver final : public OpObserverNoop {
 
 public:
     FcvOpObserver() = default;
-    ~FcvOpObserver() = default;
+    ~FcvOpObserver() override = default;
 
     // FcvOpObserver overrides.
 
@@ -71,6 +71,7 @@ public:
                    const CollectionPtr& coll,
                    std::vector<InsertStatement>::const_iterator first,
                    std::vector<InsertStatement>::const_iterator last,
+                   const std::vector<RecordId>& recordIds,
                    std::vector<bool> fromMigrate,
                    bool defaultFromMigrate,
                    OpStateAccumulator* opAccumulator = nullptr) final;

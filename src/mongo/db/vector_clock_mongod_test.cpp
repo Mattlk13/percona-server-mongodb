@@ -48,7 +48,9 @@
 #include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/op_observer/op_observer_impl.h"
 #include "mongo/db/op_observer/op_observer_registry.h"
-#include "mongo/db/op_observer/oplog_writer_mock.h"
+#include "mongo/db/op_observer/operation_logger_mock.h"
+#include "mongo/db/repl/replica_set_aware_service.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/sharding_mongod_test_fixture.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
@@ -67,16 +69,19 @@ namespace {
 
 /**
  * Even though these tests are to exercise logic for plain replica set members, it uses
- * ShardingMongodTestFixture as a convenient way to get the necessary support infrastructure (such
+ * ShardingMongoDTestFixture as a convenient way to get the necessary support infrastructure (such
  * as a TaskExecutor with pool), while still being neither "config server" nor "shard server".
  */
-class VectorClockMongoDTest : public ShardingMongodTestFixture {
+class VectorClockMongoDTest : public ShardingMongoDTestFixture {
 protected:
     VectorClockMongoDTest()
-        : ShardingMongodTestFixture(Options{}.useMockClock(true), false /* setUpMajorityReads */) {}
+        : ShardingMongoDTestFixture(Options{}.useMockClock(true), false /* setUpMajorityReads */) {}
 
     void setUp() override {
-        ShardingMongodTestFixture::setUp();
+        // Ensure that this node is neither "config server" nor "shard server".
+        serverGlobalParams.clusterRole = ClusterRole::None;
+
+        ShardingMongoDTestFixture::setUp();
 
         auto keysCollectionClient = std::make_unique<KeysCollectionClientDirect>(
             !getServiceContext()->getStorageEngine()->supportsReadConcernMajority());
@@ -89,15 +94,12 @@ protected:
         auto validator = std::make_unique<LogicalTimeValidator>(_keyManager);
         validator->init(getServiceContext());
         LogicalTimeValidator::set(getServiceContext(), std::move(validator));
-
-        // Ensure that this node is neither "config server" nor "shard server".
-        serverGlobalParams.clusterRole = ClusterRole::None;
     }
 
     void tearDown() override {
         LogicalTimeValidator::get(getServiceContext())->shutDown();
 
-        ShardingMongodTestFixture::tearDown();
+        ShardingMongoDTestFixture::tearDown();
     }
 
     /**
@@ -111,7 +113,7 @@ protected:
         auto opObserverRegistry =
             checked_cast<OpObserverRegistry*>(getServiceContext()->getOpObserver());
         opObserverRegistry->addObserver(
-            std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterMock>()));
+            std::make_unique<OpObserverImpl>(std::make_unique<OperationLoggerMock>()));
     }
 
 private:
@@ -231,12 +233,12 @@ TEST_F(VectorClockMongoDTest, GossipInInternal) {
     auto dummySignature =
         BSON("hash" << BSONBinData("\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1", 20, BinDataGeneral)
                     << "keyId" << 0);
-    vc->gossipIn(nullptr,
-                 BSON("$clusterTime"
-                      << BSON("clusterTime" << Timestamp(2, 2) << "signature" << dummySignature)
-                      << "$configTime" << Timestamp(2, 2) << "$topologyTime" << Timestamp(2, 2)),
-                 false,
-                 true);
+    auto timepointsObj = BSON(
+        "$clusterTime" << BSON("clusterTime" << Timestamp(2, 2) << "signature" << dummySignature)
+                       << "$configTime" << Timestamp(2, 2) << "$topologyTime" << Timestamp(2, 2));
+    auto timepoints = GossipedVectorClockComponents::parse(
+        IDLParserContext("VectorClockComponents"), timepointsObj);
+    vc->gossipIn(nullptr, timepoints, false, true);
 
     // On plain replset servers, gossip in from internal clients should update $clusterTime, but not
     // $configTime or $topologyTime.
@@ -245,24 +247,24 @@ TEST_F(VectorClockMongoDTest, GossipInInternal) {
     ASSERT_EQ(afterTime.configTime(), VectorClock::kInitialComponentTime);
     ASSERT_EQ(afterTime.topologyTime(), VectorClock::kInitialComponentTime);
 
-    vc->gossipIn(nullptr,
-                 BSON("$clusterTime"
-                      << BSON("clusterTime" << Timestamp(1, 1) << "signature" << dummySignature)
-                      << "$configTime" << Timestamp(1, 1) << "$topologyTime" << Timestamp(1, 1)),
-                 false,
-                 true);
+    timepointsObj = BSON("$clusterTime"
+                         << BSON("clusterTime" << Timestamp(1, 1) << "signature" << dummySignature)
+                         << "$configTime" << Timestamp(1, 1) << "$topologyTime" << Timestamp(1, 1));
+    timepoints = GossipedVectorClockComponents::parse(IDLParserContext("VectorClockComponents"),
+                                                      timepointsObj);
+    vc->gossipIn(nullptr, timepoints, false, true);
 
     auto afterTime2 = vc->getTime();
     ASSERT_EQ(afterTime2.clusterTime().asTimestamp(), Timestamp(2, 2));
     ASSERT_EQ(afterTime2.configTime(), VectorClock::kInitialComponentTime);
     ASSERT_EQ(afterTime2.topologyTime(), VectorClock::kInitialComponentTime);
 
-    vc->gossipIn(nullptr,
-                 BSON("$clusterTime"
-                      << BSON("clusterTime" << Timestamp(3, 3) << "signature" << dummySignature)
-                      << "$configTime" << Timestamp(3, 3) << "$topologyTime" << Timestamp(3, 3)),
-                 false,
-                 true);
+    timepointsObj = BSON("$clusterTime"
+                         << BSON("clusterTime" << Timestamp(3, 3) << "signature" << dummySignature)
+                         << "$configTime" << Timestamp(3, 3) << "$topologyTime" << Timestamp(3, 3));
+    timepoints = GossipedVectorClockComponents::parse(IDLParserContext("VectorClockComponents"),
+                                                      timepointsObj);
+    vc->gossipIn(nullptr, timepoints, false, true);
 
     auto afterTime3 = vc->getTime();
     ASSERT_EQ(afterTime3.clusterTime().asTimestamp(), Timestamp(3, 3));
@@ -279,11 +281,12 @@ TEST_F(VectorClockMongoDTest, GossipInExternal) {
     auto dummySignature =
         BSON("hash" << BSONBinData("\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1", 20, BinDataGeneral)
                     << "keyId" << 0);
-    vc->gossipIn(nullptr,
-                 BSON("$clusterTime"
-                      << BSON("clusterTime" << Timestamp(2, 2) << "signature" << dummySignature)
-                      << "$configTime" << Timestamp(2, 2) << "$topologyTime" << Timestamp(2, 2)),
-                 false);
+    auto timepointsObj = BSON(
+        "$clusterTime" << BSON("clusterTime" << Timestamp(2, 2) << "signature" << dummySignature)
+                       << "$configTime" << Timestamp(2, 2) << "$topologyTime" << Timestamp(2, 2));
+    auto timepoints = GossipedVectorClockComponents::parse(
+        IDLParserContext("VectorClockComponents"), timepointsObj);
+    vc->gossipIn(nullptr, timepoints, false);
 
     // On plain replset servers, gossip in from external clients should update $clusterTime, but not
     // $configTime or $topologyTime.
@@ -292,27 +295,47 @@ TEST_F(VectorClockMongoDTest, GossipInExternal) {
     ASSERT_EQ(afterTime.configTime(), VectorClock::kInitialComponentTime);
     ASSERT_EQ(afterTime.topologyTime(), VectorClock::kInitialComponentTime);
 
-    vc->gossipIn(nullptr,
-                 BSON("$clusterTime"
-                      << BSON("clusterTime" << Timestamp(1, 1) << "signature" << dummySignature)
-                      << "$configTime" << Timestamp(1, 1) << "$topologyTime" << Timestamp(1, 1)),
-                 false);
+    timepointsObj = BSON("$clusterTime"
+                         << BSON("clusterTime" << Timestamp(1, 1) << "signature" << dummySignature)
+                         << "$configTime" << Timestamp(1, 1) << "$topologyTime" << Timestamp(1, 1));
+    timepoints = GossipedVectorClockComponents::parse(IDLParserContext("VectorClockComponents"),
+                                                      timepointsObj);
+    vc->gossipIn(nullptr, timepoints, false);
 
     auto afterTime2 = vc->getTime();
     ASSERT_EQ(afterTime2.clusterTime().asTimestamp(), Timestamp(2, 2));
     ASSERT_EQ(afterTime2.configTime(), VectorClock::kInitialComponentTime);
     ASSERT_EQ(afterTime2.topologyTime(), VectorClock::kInitialComponentTime);
 
-    vc->gossipIn(nullptr,
-                 BSON("$clusterTime"
-                      << BSON("clusterTime" << Timestamp(3, 3) << "signature" << dummySignature)
-                      << "$configTime" << Timestamp(3, 3) << "$topologyTime" << Timestamp(3, 3)),
-                 false);
+    timepointsObj = BSON("$clusterTime"
+                         << BSON("clusterTime" << Timestamp(3, 3) << "signature" << dummySignature)
+                         << "$configTime" << Timestamp(3, 3) << "$topologyTime" << Timestamp(3, 3));
+    timepoints = GossipedVectorClockComponents::parse(IDLParserContext("VectorClockComponents"),
+                                                      timepointsObj);
+    vc->gossipIn(nullptr, timepoints, false);
 
     auto afterTime3 = vc->getTime();
     ASSERT_EQ(afterTime3.clusterTime().asTimestamp(), Timestamp(3, 3));
     ASSERT_EQ(afterTime2.configTime(), VectorClock::kInitialComponentTime);
     ASSERT_EQ(afterTime3.topologyTime(), VectorClock::kInitialComponentTime);
+}
+
+class VectorClockMongoDDurableTest : public ShardServerTestFixture {
+protected:
+    VectorClockMongoDDurableTest()
+        : ShardServerTestFixture(Options{}.useMockClock(true), false /* setUpMajorityReads */) {}
+};
+
+TEST_F(VectorClockMongoDDurableTest, DurableTimeDoesNotHangAfterShutdown) {
+    auto sc = getServiceContext();
+    auto vc = VectorClockMutable::get(sc);
+    auto opCtx = Client::getCurrent()->getOperationContext();
+
+    ReplicaSetAwareServiceRegistry::get(sc).onShutdown();
+    shutdownExecutorPool();
+
+    ASSERT_THROWS_CODE(
+        vc->waitForDurable().get(opCtx), DBException, ErrorCodes::ShutdownInProgress);
 }
 
 }  // namespace

@@ -67,7 +67,7 @@
 #include "mongo/rpc/op_msg.h"
 #include "mongo/s/query/async_results_merger.h"
 #include "mongo/s/query/async_results_merger_params_gen.h"
-#include "mongo/s/sharding_router_test_fixture.h"
+#include "mongo/s/sharding_mongos_test_fixture.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/util/assert_util_core.h"
 #include "mongo/util/clock_source.h"
@@ -113,7 +113,11 @@ protected:
 
         if (findCmd) {
             // If there is no '$db', append it.
-            auto cmd = OpMsgRequest::fromDBAndBody(kTestNss.dbName(), *findCmd).body;
+            auto cmd =
+                OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::get(operationContext()),
+                                            kTestNss.dbName(),
+                                            *findCmd)
+                    .body;
             const auto findCommand =
                 query_request_helper::makeFromFindCommandForTests(cmd, kTestNss);
             if (!findCommand->getSort().isEmpty()) {

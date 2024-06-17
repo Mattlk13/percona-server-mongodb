@@ -238,8 +238,13 @@ void setSocketKeepAliveParams(int sock,
 #endif  // _WIN32
 }
 
-std::string makeUnixSockPath(int port) {
-    return str::stream() << serverGlobalParams.socket << "/mongodb-" << port << ".sock";
+std::string makeUnixSockPath(int port, StringData label) {
+    str::stream stream;
+    stream << serverGlobalParams.socket << "/mongodb-";
+    if (!label.empty()) {
+        stream << label << "-";
+    }
+    return stream << port << ".sock";
 }
 
 #ifndef _WIN32
@@ -295,14 +300,13 @@ std::string getHostNameCached() {
     return temp;
 }
 
-std::string getHostNameCachedAndPort() {
-    return str::stream() << getHostNameCached() << ':' << serverGlobalParams.port;
+std::string prettyHostNameAndPort(int port) {
+    return str::stream() << getHostNameCached() << ':' << port;
 }
 
-std::string prettyHostName() {
-    return (serverGlobalParams.port == ServerGlobalParams::DefaultDBPort
-                ? getHostNameCached()
-                : getHostNameCachedAndPort());
+std::string prettyHostName(int port) {
+    return port == ServerGlobalParams::DefaultDBPort ? getHostNameCached()
+                                                     : prettyHostNameAndPort(port);
 }
 
 }  // namespace mongo

@@ -1,10 +1,12 @@
-/*
+/**
  * Tests that during an upgrade from a replica set to a sharded cluster the CRUD and DDL command
  * works. This implies testing those commands on a replica set directly when it is in a sharded
  * cluster.
  * @tags: [
+ *   multiversion_incompatible,
  *   requires_persistence,
- *   multiversion_incompatible
+ *   # Test doesn't start enough mongods to have num_mongos routers
+ *   temp_disabled_embedded_router_num_routers,
  * ]
  */
 
@@ -322,7 +324,7 @@ rst0.awaitReplication();
 
 // TODO SERVER-82316: currently we don't have full compatibility for direct connections.
 if (!FeatureFlagUtil.isPresentAndEnabled(rst0.getPrimary(),
-                                         "TrackUnshardedCollectionsOnShardingCatalog")) {
+                                         "TrackUnshardedCollectionsUponCreation")) {
     checkCRUDCommands(rst0.getPrimary().getDB(dbName));
     checkDDLCommands(rst0.getPrimary().getDB(DDLDbName));
 

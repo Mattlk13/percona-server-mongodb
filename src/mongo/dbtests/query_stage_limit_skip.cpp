@@ -61,8 +61,7 @@
 #include "mongo/unittest/framework.h"
 #include "mongo/util/intrusive_counter.h"
 
-using namespace mongo;
-
+namespace mongo {
 namespace {
 
 using std::max;
@@ -136,15 +135,16 @@ protected:
     OperationContext* const _opCtx = _uniqOpCtx.get();
 };
 
-class All : public OldStyleSuiteSpecification {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("query_stage_limit_skip") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<QueryStageLimitSkipBasicTest>();
     }
 };
 
-OldStyleSuiteInitializer<All> queryStageLimitSkipAll;
+unittest::OldStyleSuiteInitializer<All> queryStageLimitSkipAll;
 
 }  // namespace
+}  // namespace mongo

@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#pragma once
+
 #include <absl/base/config.h>
 #include <absl/numeric/int128.h>
 #include <array>
@@ -54,13 +56,13 @@ public:
     // store as an unsigned integer
     // the most significant bit position to the least significant bit and call simple8b as an
     // unsigned integer.
-    static uint64_t encodeInt64(int64_t val) {
+    static constexpr uint64_t encodeInt64(int64_t val) {
         return (static_cast<uint64_t>(val) << 1) ^ (val >> 63);
     }
-    static int64_t decodeInt64(uint64_t val) {
+    static constexpr int64_t decodeInt64(uint64_t val) {
         return (val >> 1) ^ (~(val & 1) + 1);
     }
-    static uint128_t encodeInt128(int128_t val) {
+    static constexpr uint128_t encodeInt128(int128_t val) {
         // The Abseil right shift implementation on signed int128 is not correct as an arithmetic
         // shift in their non-intrinsic implementation. When we detect this case we replace the
         // right arithmetic shift of 127 positions that needs to produce 0xFF..FF or 0x00..00
@@ -77,9 +79,12 @@ public:
 #endif
     }
 
-    static int128_t decodeInt128(uint128_t val) {
+    static constexpr int128_t decodeInt128(uint128_t val) {
         return static_cast<int128_t>((val >> 1) ^ (~(val & 1) + 1));
     }
+
+    template <typename T>
+    static constexpr auto decodeInt(T val);
 
     // These methods are for encoding OID with simple8b. The unique identifier is not part of
     // the encoded integer and must thus be provided when decoding.
@@ -129,4 +134,14 @@ public:
     static constexpr std::array<double, kMemoryAsInteger> kScaleMultiplier = {
         1, 10, 100, 10000, 100000000};
 };
+
+template <>
+inline auto Simple8bTypeUtil::decodeInt(uint64_t val) {
+    return decodeInt64(val);
+}
+
+template <>
+inline auto Simple8bTypeUtil::decodeInt(uint128_t val) {
+    return decodeInt128(val);
+}
 }  // namespace mongo

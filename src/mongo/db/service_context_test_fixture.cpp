@@ -32,6 +32,8 @@
 #include <utility>
 
 #include "mongo/client/replica_set_monitor_manager.h"
+#include "mongo/db/auth/authorization_manager_factory_mock.h"
+#include "mongo/db/query/query_settings/query_settings_manager.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/util/clock_source_mock.h"
 
@@ -47,6 +49,11 @@ ScopedGlobalServiceContextForTest::ScopedGlobalServiceContextForTest() {
     auto serviceContext = ServiceContext::make();
     WireSpec::getWireSpec(serviceContext.get()).initialize(WireSpec::Specification{});
     setGlobalServiceContext(std::move(serviceContext));
+
+    auto globalAuthzManagerFactory = std::make_unique<AuthorizationManagerFactoryMock>();
+    AuthorizationManager::set(getService(), globalAuthzManagerFactory->createShard(getService()));
+
+    query_settings::QuerySettingsManager::create(getServiceContext(), {});
 }
 
 ScopedGlobalServiceContextForTest::~ScopedGlobalServiceContextForTest() {
@@ -58,11 +65,11 @@ ScopedGlobalServiceContextForTest::~ScopedGlobalServiceContextForTest() {
     setGlobalServiceContext({});
 }
 
-ServiceContext* ScopedGlobalServiceContextForTest::getServiceContext() {
+ServiceContext* ScopedGlobalServiceContextForTest::getServiceContext() const {
     return getGlobalServiceContext();
 }
 
-Service* ScopedGlobalServiceContextForTest::getService() {
+Service* ScopedGlobalServiceContextForTest::getService() const {
     auto sc = getServiceContext();
     // Just pick any service. Giving priority to Shard.
     if (auto srv = sc->getService(ClusterRole::ShardServer))

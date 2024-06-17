@@ -6,10 +6,11 @@
 //   requires_multi_updates,
 //   requires_non_retryable_writes,
 //   requires_scripting,
+//   requires_system_dot_js_stored_functions,
 // ]
 const testDB = db.getSiblingDB("where_system_js");
 const testColl = testDB.where_system_js;
-const systemJsColl = testDB.system.js;
+const systemJsColl = testDB.getCollection("system.js");
 
 assert.commandWorked(testDB.dropDatabase());
 

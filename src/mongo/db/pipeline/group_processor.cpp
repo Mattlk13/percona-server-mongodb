@@ -118,12 +118,13 @@ boost::optional<Document> GroupProcessor::getNextSpilled() {
 
 boost::optional<Document> GroupProcessor::getNextStandard() {
     // Not spilled, and not streaming.
-    if (_groupsIterator == _groups.end())
+    if (!_groupsIterator || _groupsIterator == _groups.end())
         return boost::none;
 
-    Document out =
-        makeDocument(_groupsIterator->first, _groupsIterator->second, _expCtx->needsMerge);
-    ++_groupsIterator;
+    auto& it = *_groupsIterator;
+
+    Document out = makeDocument(it->first, it->second, _expCtx->needsMerge);
+    ++it;
     return out;
 }
 
@@ -279,10 +280,6 @@ void GroupProcessor::spill() {
             }
             break;
     }
-
-    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(_expCtx->opCtx);
-    metricsCollector.incrementKeysSorted(ptrs.size());
-    metricsCollector.incrementSorterSpills(1);
 
     // Zero out the current per-accumulation statement memory consumption, as the memory has been
     // freed by spilling.

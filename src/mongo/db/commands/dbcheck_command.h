@@ -29,6 +29,7 @@
 #pragma once
 
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/throttle_cursor.h"
 #include "mongo/db/repl/dbcheck.h"
 #include "mongo/db/repl/dbcheck_gen.h"
 #include "mongo/db/repl/dbcheck_idl.h"
@@ -49,14 +50,14 @@ struct DbCheckCollectionInfo {
     BSONObj end;
     int64_t maxCount;
     int64_t maxSize;
-    int64_t maxRate;
     int64_t maxDocsPerBatch;
-    int64_t maxBytesPerBatch;
-    int64_t maxDocsPerSec;
-    int64_t maxBytesPerSec;
     int64_t maxBatchTimeMillis;
     WriteConcernOptions writeConcern;
     boost::optional<SecondaryIndexCheckParameters> secondaryIndexCheckParameters;
+    DataThrottle dataThrottle;
+
+    // Returns the BSON representation of this object.
+    BSONObj toBSON() const;
 };
 
 /**
@@ -65,6 +66,7 @@ struct DbCheckCollectionInfo {
 struct DbCheckCollectionBatchStats {
     boost::optional<UUID> batchId;
     int64_t nDocs;
+    int64_t nCount;
     int64_t nBytes;
     BSONObj lastKey;
     std::string md5;
@@ -77,16 +79,39 @@ struct DbCheckCollectionBatchStats {
  * For organizing the results of batches for extra index keys check.
  */
 struct DbCheckExtraIndexKeysBatchStats {
-    int64_t nDocs;
+    boost::optional<UUID> batchId;
+    int64_t nKeys;
     int64_t nBytes;
-    key_string::Value firstIndexKey;
-    key_string::Value lastIndexKey;
-    key_string::Value nextLookupStart;
-    bool finishedIndexBatch;
-    bool finishedIndexCheck;
+
+    // These keystrings should have the recordId appended at the end, since WiredTiger will always
+    // append the recordId when returning a keystring from the index cursor.
+    key_string::Value firstKeyCheckedWithRecordId;
+    key_string::Value lastKeyCheckedWithRecordId;
+    key_string::Value nextKeyToBeCheckedWithRecordId;
+
     std::string md5;
     repl::OpTime time;
+    bool logToHealthLog;
     boost::optional<Timestamp> readTimestamp;
+
+    Date_t deadline;
+
+    // Number of consecutive identical keys at the end of the batch.
+    int64_t nConsecutiveIdenticalKeysAtEnd = 1;
+
+    // Numer of keys and bytes seen by the hasher. This is used only for reporting and not for
+    // tracking rate limiting.
+    int64_t nHasherKeys;
+    int64_t nHasherBytes;
+
+    BSONObj keyPattern;
+    BSONObj firstBson;
+    BSONObj lastBson;
+    BSONObj indexSpec;
+
+
+    bool finishedIndexBatch;
+    bool finishedIndexCheck;
 };
 
 /**
@@ -150,12 +175,7 @@ private:
 
 class DbChecker {
 public:
-    DbChecker(DbCheckCollectionInfo info) : _info(info), _done(false){};
-
-    /**
-     * Returns true if the node has stepped down and dbCheck has stopped.
-     */
-    bool steppedDown();
+    DbChecker(DbCheckCollectionInfo info) : _info(info){};
 
     /**
      * Runs dbCheck on the collection specified in the DbCheckCollectionInfo struct.
@@ -163,55 +183,96 @@ public:
     void doCollection(OperationContext* opCtx);
 
 private:
-    boost::optional<key_string::Value> getExtraIndexKeysCheckLookupStart(OperationContext* opCtx);
+    /**
+     * Helper that takes in a keystring WITH a RecordId appended at the end, and returns a new
+     * keystring that is identical except without the RecordId appended at the end.
+     */
+    key_string::Value _stripRecordIdFromKeyString(const key_string::Value& keyString,
+                                                  const key_string::Version& version,
+                                                  const Collection* collection);
 
+    /**
+     * Runs the secondary extra index keys check
+     */
     void _extraIndexKeysCheck(OperationContext* opCtx);
+
+    /**
+     * Entry point for hashing portion of extra index key check.
+     */
+    Status _hashExtraIndexKeysCheck(OperationContext* opCtx,
+                                    DbCheckExtraIndexKeysBatchStats* batchStats);
 
     /**
      * Sets up a hasher and hashes one batch for extra index keys check.
      * Returns a non-OK Status if we encountered an error and should abandon extra index keys check.
      */
-    Status _hashExtraIndexKeysCheck(OperationContext* opCtx,
-                                    const key_string::Value& batchFirst,
-                                    const key_string::Value& batchLast,
-                                    DbCheckExtraIndexKeysBatchStats* batchStats);
+    Status _runHashExtraKeyCheck(OperationContext* opCtx,
+                                 DbCheckExtraIndexKeysBatchStats* batchStats);
 
     /**
      * Gets batch bounds for extra index keys check and stores the info in batchStats. Runs
      * reverse lookup if skipLookupForExtraKeys is not set.
-     * Returns a non-OK Status if we encountered an error and should abandon extra index keys check.
+     * Returns a non-OK Status if we encountered an error and should abandon extra index keys
+     * check.
      */
-    Status _getExtraIndexKeysBatchAndRunReverseLookup(OperationContext* opCtx,
-                                                      const StringData& indexName,
-                                                      key_string::Value& lookupStart,
-                                                      DbCheckExtraIndexKeysBatchStats& batchStats);
+    Status _getExtraIndexKeysBatchAndRunReverseLookup(
+        OperationContext* opCtx,
+        StringData indexName,
+        const boost::optional<key_string::Value>& nextKeyToSeekWithRecordId,
+        DbCheckExtraIndexKeysBatchStats& batchStats);
 
     /**
      * Acquires a consistent catalog snapshot and iterates through the secondary index in order
      * to get the batch bounds. Runs reverse lookup if skipLookupForExtraKeys is not set.
      *
-     * We release the snapshot by exiting the function. This occurs when we've either finished
-     * the whole extra index keys check, finished one batch, or the number of keys we've looked
-     * at has met or exceeded dbCheckMaxExtraIndexKeysReverseLookupPerSnapshot.
+     * We release the snapshot by exiting the function. This occurs when:
+     *   * we have finished the whole extra index keys check,
+     *   * we have finished one batch
+     *   * The number of keys we've looked at has met or exceeded
+     *     dbCheckMaxTotalIndexKeysPerSnapshot
+     *   * if we have identical keys at the end of the batch, one of the above conditions is met
+     *     and the number of consecutive identical keys we've looked at has met or exceeded
+     *     dbCheckMaxConsecutiveIdenticalIndexKeysPerSnapshot
      *
-     * Returns a non-OK Status if we encountered an error and should abandon extra index keys check.
+     * Returns a non-OK Status if we encountered an error and should abandon extra index keys
+     * check.
      */
-    Status _getCatalogSnapshotAndRunReverseLookup(OperationContext* opCtx,
-                                                  const StringData& indexName,
-                                                  const key_string::Value& lookupStart,
-                                                  DbCheckExtraIndexKeysBatchStats& batchStats);
+    Status _getCatalogSnapshotAndRunReverseLookup(
+        OperationContext* opCtx,
+        StringData indexName,
+        const boost::optional<key_string::Value>& snapshotFirstKeyWithRecordId,
+        DbCheckExtraIndexKeysBatchStats& batchStats);
 
     /**
-     * Iterates through an index table and fetches the corresponding document for each index entry.
+     * Returns if we should end the current catalog snapshot based on meeting snapshot/batch
+     * limits. Also updates batchStats accordingly with the next batch's starting key, and
+     * whether the batch and/or index check has finished.
+     */
+    bool _shouldEndCatalogSnapshotOrBatch(
+        OperationContext* opCtx,
+        const CollectionPtr& collection,
+        StringData indexName,
+        const key_string::Value& currKeyStringWithoutRecordId,
+        const BSONObj& currKeyStringBson,
+        int64_t numKeysInSnapshot,
+        const SortedDataIndexAccessMethod* iam,
+        const std::unique_ptr<SortedDataInterfaceThrottleCursor>& indexCursor,
+        DbCheckExtraIndexKeysBatchStats& batchStats,
+        const boost::optional<KeyStringEntry>& nextIndexKey);
+
+    /**
+     * Iterates through an index table and fetches the corresponding document for each index
+     * entry.
      */
     void _reverseLookup(OperationContext* opCtx,
-                        const StringData& indexName,
+                        StringData indexName,
                         DbCheckExtraIndexKeysBatchStats& batchStats,
                         const CollectionPtr& collection,
-                        const key_string::Value& keyString,
+                        const KeyStringEntry& keyStringEntryWithRecordId,
                         const BSONObj& keyStringBson,
                         const SortedDataIndexAccessMethod* iam,
-                        const IndexCatalogEntry* indexCatalogEntry);
+                        const IndexCatalogEntry* indexCatalogEntry,
+                        const BSONObj& indexSpec);
 
     /**
      * Runs the data consistency and missing index key check.
@@ -222,15 +283,14 @@ private:
                                                       const BSONObj& first);
 
     /**
-     * Return `true` iff the primary the check is running on has stepped down.
+     * Acquire the required locks for dbcheck to run on the given namespace.
      */
-    bool _stepdownHasOccurred(OperationContext* opCtx, const NamespaceString& nss);
+    std::unique_ptr<DbCheckAcquisition> _acquireDBCheckLocks(OperationContext* opCtx,
+                                                             const NamespaceString& nss);
 
-    bool _shouldLogBatch(DbCheckOplogBatch& batch);
+    std::pair<bool, boost::optional<UUID>> _shouldLogBatch(DbCheckOplogBatch& batch);
 
     DbCheckCollectionInfo _info;
-
-    bool _done;  // Set if the job cannot proceed.
 
     // Cumulative number of batches processed. Can wrap around; it's not guaranteed to be in
     // lockstep with other replica set members.

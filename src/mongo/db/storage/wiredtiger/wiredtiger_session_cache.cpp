@@ -47,6 +47,7 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_parameters_gen.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_session_data.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
@@ -65,6 +66,7 @@ WiredTigerSession::WiredTigerSession(WT_CONNECTION* conn, uint64_t epoch, uint64
       _session(nullptr),
       _cursorGen(0),
       _cursorsOut(0),
+      _compiled(nullptr),
       _idleExpireTime(Date_t::min()) {
     invariantWTOK(conn->open_session(conn, nullptr, "isolation=snapshot", &_session), nullptr);
 }
@@ -74,12 +76,14 @@ WiredTigerSession::WiredTigerSession(WT_CONNECTION* conn,
                                      uint64_t epoch,
                                      uint64_t cursorEpoch)
     : _epoch(epoch),
-      _cache(cache),
       _session(nullptr),
       _cursorGen(0),
       _cursorsOut(0),
+      _cache(cache),
+      _compiled(nullptr),
       _idleExpireTime(Date_t::min()) {
     invariantWTOK(conn->open_session(conn, nullptr, "isolation=snapshot", &_session), nullptr);
+    setCompiledConfigurationsPerConnection(cache->getCompiledConfigurations());
 }
 
 WiredTigerSession::~WiredTigerSession() {
@@ -145,7 +149,7 @@ WT_CURSOR* WiredTigerSession::getNewCursor(const std::string& uri, const char* c
     return cursor;
 }
 
-void WiredTigerSession::releaseCursor(uint64_t id, WT_CURSOR* cursor, const std::string& config) {
+void WiredTigerSession::releaseCursor(uint64_t id, WT_CURSOR* cursor, std::string config) {
     // When releasing the cursor, we would want to check if the session cache is already in shutdown
     // and prevent the race condition that the shutdown starts after the check.
     WiredTigerSessionCache::BlockShutdown blockShutdown(_cache);
@@ -162,7 +166,7 @@ void WiredTigerSession::releaseCursor(uint64_t id, WT_CURSOR* cursor, const std:
     invariantWTOK(cursor->reset(cursor), _session);
 
     // Cursors are pushed to the front of the list and removed from the back
-    _cursors.push_front(WiredTigerCachedCursor(id, _cursorGen++, cursor, config));
+    _cursors.push_front(WiredTigerCachedCursor(id, _cursorGen++, cursor, std::move(config)));
 
     // A negative value for wiredTigercursorCacheSize means to use hybrid caching.
     std::uint32_t cacheSize = abs(gWiredTigerCursorCacheSize.load());
@@ -207,18 +211,14 @@ uint64_t WiredTigerSession::genTableId() {
 // -----------------------
 
 WiredTigerSessionCache::WiredTigerSessionCache(WiredTigerKVEngine* engine)
-    : _engine(engine),
-      _conn(engine->getConnection()),
-      _clockSource(_engine->getClockSource()),
-      _shuttingDown(0),
-      _prepareCommitOrAbortCounter(0) {}
+    : WiredTigerSessionCache(engine->getConnection(), engine->getClockSource(), engine) {}
 
-WiredTigerSessionCache::WiredTigerSessionCache(WT_CONNECTION* conn, ClockSource* cs)
-    : _engine(nullptr),
-      _conn(conn),
-      _clockSource(cs),
-      _shuttingDown(0),
-      _prepareCommitOrAbortCounter(0) {}
+WiredTigerSessionCache::WiredTigerSessionCache(WT_CONNECTION* conn,
+                                               ClockSource* cs,
+                                               WiredTigerKVEngine* engine)
+    : _conn(conn), _clockSource(cs), _engine(engine) {
+    uassertStatusOK(_compiledConfigurations.compileAll(_conn));
+}
 
 WiredTigerSessionCache::~WiredTigerSessionCache() {
     shuttingDown();
@@ -235,6 +235,10 @@ void WiredTigerSessionCache::shuttingDown() {
     }
 
     closeAll();
+}
+
+void WiredTigerSessionCache::restart() {
+    _shuttingDown.fetchAndBitAnd(~kShuttingDownMask);
 }
 
 bool WiredTigerSessionCache::isShuttingDown() {
@@ -368,10 +372,8 @@ void WiredTigerSessionCache::waitUntilDurable(OperationContext* opCtx,
     }
 }
 
-void WiredTigerSessionCache::waitUntilPreparedUnitOfWorkCommitsOrAborts(OperationContext* opCtx,
-                                                                        std::uint64_t lastCount) {
-    invariant(opCtx);
-
+void WiredTigerSessionCache::waitUntilPreparedUnitOfWorkCommitsOrAborts(
+    Interruptible& interruptible, std::uint64_t lastCount) {
     // It is possible for a prepared transaction to block on bonus eviction inside WiredTiger after
     // it commits or rolls-back, but this delays it from signalling us to wake up. In the very
     // worst case that the only evictable page is the one pinned by our cursor, AND there are no
@@ -381,9 +383,10 @@ void WiredTigerSessionCache::waitUntilPreparedUnitOfWorkCommitsOrAborts(Operatio
     const auto deadline = Date_t::now() + Seconds(1);
     stdx::unique_lock<Latch> lk(_prepareCommittedOrAbortedMutex);
     if (lastCount == _prepareCommitOrAbortCounter.loadRelaxed()) {
-        opCtx->waitForConditionOrInterruptUntil(_prepareCommittedOrAbortedCond, lk, deadline, [&] {
-            return _prepareCommitOrAbortCounter.loadRelaxed() > lastCount;
-        });
+        interruptible.waitForConditionOrInterruptUntil(
+            _prepareCommittedOrAbortedCond, lk, deadline, [&] {
+                return _prepareCommitOrAbortCounter.loadRelaxed() > lastCount;
+            });
     }
 }
 

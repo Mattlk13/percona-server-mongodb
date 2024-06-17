@@ -125,7 +125,6 @@ public:
      * the sort order that each scan provides.
      */
     static bool explodeForSort(const CanonicalQuery& query,
-                               const QueryPlannerParams& params,
                                std::unique_ptr<QuerySolutionNode>* solnRoot);
 
     /**
@@ -147,6 +146,13 @@ public:
     static void removeUselessColumnScanRowStoreExpression(QuerySolutionNode& root);
 
     /**
+     * Walk the solution tree, and trim out useless imprecise filters that are guaranteed to be
+     * applied again by a later filter.
+     */
+    static void removeImpreciseInternalExprFilters(const QueryPlannerParams& params,
+                                                   QuerySolutionNode& root);
+
+    /**
      * For the provided 'foreignCollName' and 'foreignFieldName' corresponding to an EqLookupNode,
      * returns what join algorithm should be used to execute it. In particular:
      * - An empty array is produced for each document if the foreign collection does not exist.
@@ -158,18 +164,17 @@ public:
      * - A nested loop join is chosen in all other cases.
      */
     static std::pair<EqLookupNode::LookupStrategy, boost::optional<IndexEntry>>
-    determineLookupStrategy(
-        const NamespaceString& foreignCollName,
-        const std::string& foreignField,
-        const std::map<NamespaceString, SecondaryCollectionInfo>& collectionsInfo,
-        bool allowDiskUse,
-        const CollatorInterface* collator);
+    determineLookupStrategy(const NamespaceString& foreignCollName,
+                            const std::string& foreignField,
+                            const std::map<NamespaceString, CollectionInfo>& collectionsInfo,
+                            bool allowDiskUse,
+                            const CollatorInterface* collator);
 
     /**
      * Checks if the foreign collection is eligible for the hash join algorithm. We conservatively
      * choose the hash join algorithm for cases when the hash table is unlikely to spill to disk.
      */
-    static bool isEligibleForHashJoin(const SecondaryCollectionInfo& foreignCollInfo);
+    static bool isEligibleForHashJoin(const CollectionInfo& foreignCollInfo);
 };
 
 }  // namespace mongo

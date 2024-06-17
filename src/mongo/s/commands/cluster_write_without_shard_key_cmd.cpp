@@ -158,7 +158,8 @@ std::pair<DatabaseName, BSONObj> makeTargetWriteRequest(OperationContext* opCtx,
 
     // Parse into OpMsgRequest to append the $db field, which is required for command
     // parsing.
-    const auto opMsgRequest = OpMsgRequest::fromDBAndBody(dbName, writeCmd);
+    const auto opMsgRequest =
+        OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::get(opCtx), dbName, writeCmd);
 
     DatabaseName requestDbName = dbName;
     boost::optional<BulkWriteCommandRequest> bulkWriteRequest;
@@ -394,10 +395,6 @@ public:
 
         Response typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::IllegalOperation,
-                    "_clusterWriteWithoutShardKey can only be run on Mongos",
-                    serverGlobalParams.clusterRole.hasExclusively(ClusterRole::RouterServer));
-
-            uassert(ErrorCodes::IllegalOperation,
                     "_clusterWriteWithoutShardKey must be run in a transaction.",
                     opCtx->inMultiDocumentTransaction());
 
@@ -434,7 +431,7 @@ public:
             // transaction api to use in case of a retry.
             uassertStatusOK(getStatusFromWriteCommandReply(response.data));
             if (cmdObj.firstElementFieldNameStringData() == BulkWriteCommandRequest::kCommandName &&
-                response.data[BulkWriteCommandReply::kNumErrorsFieldName].Int() != 0) {
+                response.data[BulkWriteCommandReply::kNErrorsFieldName].Int() != 0) {
                 // It was a bulkWrite, extract the first and only reply item and uassert on error so
                 // that we can fail the internal transaction correctly.
                 auto bulkWriteResponse = BulkWriteCommandReply::parse(
@@ -460,10 +457,11 @@ public:
                      ExplainOptions::Verbosity verbosity,
                      rpc::ReplyBuilderInterface* result) override {
             const auto shardId = ShardId(request().getShardId().toString());
+            auto vts = auth::ValidatedTenancyScope::get(opCtx);
             const auto writeCmdObj = [&] {
                 const auto explainCmdObj = request().getWriteCmd();
                 const auto opMsgRequestExplainCmd =
-                    OpMsgRequest::fromDBAndBody(ns().dbName(), explainCmdObj);
+                    OpMsgRequestBuilder::create(vts, ns().dbName(), explainCmdObj);
                 auto explainRequest = ExplainCommandRequest::parse(
                     IDLParserContext("_clusterWriteWithoutShardKeyExplain"),
                     opMsgRequestExplainCmd.body);
@@ -493,12 +491,13 @@ public:
             const auto millisElapsed = timer.millis();
 
             auto bodyBuilder = result->getBodyBuilder();
-            uassertStatusOK(ClusterExplain::buildExplainResult(opCtx,
-                                                               {response},
-                                                               ClusterExplain::kWriteOnShards,
-                                                               millisElapsed,
-                                                               writeCmdObj,
-                                                               &bodyBuilder));
+            uassertStatusOK(ClusterExplain::buildExplainResult(
+                ExpressionContext::makeBlankExpressionContext(opCtx, ns()),
+                {response},
+                ClusterExplain::kWriteOnShards,
+                millisElapsed,
+                writeCmdObj,
+                &bodyBuilder));
         }
 
         NamespaceString ns() const override {
@@ -536,7 +535,7 @@ public:
     // compliant, when they technically should not be. To satisfy this requirement, this command is
     // marked as part of the Stable API, but is not truly a part of it, since it is an internal-only
     // command.
-    const std::set<std::string>& apiVersions() const {
+    const std::set<std::string>& apiVersions() const override {
         return kApiVersions1;
     }
 };

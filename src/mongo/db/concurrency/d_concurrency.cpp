@@ -37,9 +37,11 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/concurrency/resource_catalog.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
@@ -61,13 +63,13 @@ bool Lock::ResourceMutex::isAtLeastReadLocked(Locker* locker) {
 
 void Lock::ResourceLock::_lock(LockMode mode, Date_t deadline) {
     invariant(_result == LOCK_INVALID);
-    _opCtx->lockState()->lock(_opCtx, _rid, mode, deadline);
+    shard_role_details::getLocker(_opCtx)->lock(_opCtx, _rid, mode, deadline);
     _result = LOCK_OK;
 }
 
 void Lock::ResourceLock::_unlock() {
     if (_isLocked()) {
-        _opCtx->lockState()->unlock(_rid);
+        shard_role_details::getLocker(_opCtx)->unlock(_rid);
         _result = LOCK_INVALID;
     }
 }
@@ -76,7 +78,7 @@ void Lock::ExclusiveLock::lock() {
     // The contract of the condition_variable-like utilities is that that the lock is returned in
     // the locked state so the acquisition below must be guaranteed to always succeed.
     invariant(_opCtx);
-    UninterruptibleLockGuard ulg(_opCtx->lockState());  // NOLINT.
+    UninterruptibleLockGuard ulg(shard_role_details::getLocker(_opCtx));  // NOLINT.
     _lock(MODE_X);
 }
 
@@ -94,23 +96,24 @@ Lock::GlobalLock::GlobalLock(OperationContext* opCtx,
     : _opCtx(opCtx),
       _interruptBehavior(behavior),
       _skipRSTLLock(options.skipRSTLLock),
-      _isOutermostLock(!opCtx->lockState()->isLocked()) {
+      _isOutermostLock(!shard_role_details::getLocker(opCtx)->isLocked()) {
     if (!options.skipFlowControlTicket) {
-        _opCtx->lockState()->getFlowControlTicket(_opCtx, lockMode);
+        shard_role_details::getLocker(_opCtx)->getFlowControlTicket(_opCtx, lockMode);
     }
 
     try {
-        if (_opCtx->lockState()->shouldConflictWithSetFeatureCompatibilityVersion()) {
-            _fcvLock.emplace(_opCtx,
-                             resourceIdFeatureCompatibilityVersion,
-                             isSharedLockMode(lockMode) ? MODE_IS : MODE_IX,
-                             deadline);
-        }
-        ScopeGuard unlockFCVLock([this] {
-            if (_opCtx->lockState()->shouldConflictWithSetFeatureCompatibilityVersion()) {
-                _fcvLock.reset();
+        const bool acquireMultiDocumentTxnBarrier = [&] {
+            if (opCtx->inMultiDocumentTransaction()) {
+                invariant(lockMode == MODE_IS || lockMode == MODE_IX);
+                return true;
             }
-        });
+            return lockMode == MODE_S || lockMode == MODE_X;
+        }();
+        if (acquireMultiDocumentTxnBarrier) {
+            _multiDocTxnBarrier.emplace(
+                _opCtx, resourceIdMultiDocumentTransactionsBarrier, lockMode, deadline);
+        }
+        ScopeGuard unlockMultiDocTxnBarrier([this] { _multiDocTxnBarrier.reset(); });
 
         _result = LOCK_INVALID;
         if (options.skipRSTLLock) {
@@ -120,7 +123,7 @@ Lock::GlobalLock::GlobalLock(OperationContext* opCtx,
         }
         _result = LOCK_OK;
 
-        unlockFCVLock.dismiss();
+        unlockMultiDocTxnBarrier.dismiss();
     } catch (const DBException& ex) {
         // If our opCtx is interrupted or we got a LockTimeout or MaxTimeMSExpired, either throw or
         // suppress the exception depending on the specified interrupt behavior. For any other
@@ -131,20 +134,22 @@ Lock::GlobalLock::GlobalLock(OperationContext* opCtx,
             throw;
         }
     }
-    auto acquiredLockMode = _opCtx->lockState()->getLockMode(resourceIdGlobal);
-    _opCtx->lockState()->setGlobalLockTakenInMode(acquiredLockMode);
+    auto acquiredLockMode = shard_role_details::getLocker(_opCtx)->getLockMode(resourceIdGlobal);
+    shard_role_details::getLocker(_opCtx)->setGlobalLockTakenInMode(acquiredLockMode);
 }
 
 void Lock::GlobalLock::_takeGlobalLockOnly(LockMode lockMode, Date_t deadline) {
-    _opCtx->lockState()->lockGlobal(_opCtx, lockMode, deadline);
+    shard_role_details::getLocker(_opCtx)->lockGlobal(_opCtx, lockMode, deadline);
 }
 
 void Lock::GlobalLock::_takeGlobalAndRSTLLocks(LockMode lockMode, Date_t deadline) {
-    _opCtx->lockState()->lock(_opCtx, resourceIdReplicationStateTransitionLock, MODE_IX, deadline);
-    ScopeGuard unlockRSTL(
-        [this] { _opCtx->lockState()->unlock(resourceIdReplicationStateTransitionLock); });
+    shard_role_details::getLocker(_opCtx)->lock(
+        _opCtx, resourceIdReplicationStateTransitionLock, MODE_IX, deadline);
+    ScopeGuard unlockRSTL([this] {
+        shard_role_details::getLocker(_opCtx)->unlock(resourceIdReplicationStateTransitionLock);
+    });
 
-    _opCtx->lockState()->lockGlobal(_opCtx, lockMode, deadline);
+    shard_role_details::getLocker(_opCtx)->lockGlobal(_opCtx, lockMode, deadline);
 
     unlockRSTL.dismiss();
 }
@@ -152,7 +157,7 @@ void Lock::GlobalLock::_takeGlobalAndRSTLLocks(LockMode lockMode, Date_t deadlin
 Lock::GlobalLock::GlobalLock(GlobalLock&& otherLock)
     : _opCtx(otherLock._opCtx),
       _result(otherLock._result),
-      _fcvLock(std::move(otherLock._fcvLock)),
+      _multiDocTxnBarrier(std::move(otherLock._multiDocTxnBarrier)),
       _interruptBehavior(otherLock._interruptBehavior),
       _skipRSTLLock(otherLock._skipRSTLLock),
       _isOutermostLock(otherLock._isOutermostLock) {
@@ -163,7 +168,7 @@ Lock::GlobalLock::GlobalLock(GlobalLock&& otherLock)
 Lock::GlobalLock::~GlobalLock() {
     // Preserve the original lock result which will be overridden by unlock().
     auto lockResult = _result;
-    auto* locker = _opCtx->lockState();
+    auto* locker = shard_role_details::getLocker(_opCtx);
 
     if (isLocked()) {
         // Abandon our snapshot if destruction of the GlobalLock object results in actually
@@ -171,7 +176,7 @@ Lock::GlobalLock::~GlobalLock() {
         // prevent lock release.
         const bool willReleaseLock = _isOutermostLock && !locker->inAWriteUnitOfWork();
         if (willReleaseLock) {
-            _opCtx->recoveryUnit()->abandonSnapshot();
+            shard_role_details::getRecoveryUnit(_opCtx)->abandonSnapshot();
         }
         _unlock();
     }
@@ -182,7 +187,7 @@ Lock::GlobalLock::~GlobalLock() {
 }
 
 void Lock::GlobalLock::_unlock() {
-    _opCtx->lockState()->unlockGlobal();
+    shard_role_details::getLocker(_opCtx)->unlockGlobal();
     _result = LOCK_INVALID;
 }
 
@@ -191,9 +196,9 @@ Lock::TenantLock::TenantLock(OperationContext* opCtx,
                              LockMode mode,
                              Date_t deadline)
     : _id{RESOURCE_TENANT, tenantId}, _opCtx{opCtx} {
-    dassert(_opCtx->lockState()->isLockHeldForMode(resourceIdGlobal,
-                                                   isSharedLockMode(mode) ? MODE_IS : MODE_IX));
-    _opCtx->lockState()->lock(_opCtx, _id, mode, deadline);
+    dassert(shard_role_details::getLocker(_opCtx)->isLockHeldForMode(
+        resourceIdGlobal, isSharedLockMode(mode) ? MODE_IS : MODE_IX));
+    shard_role_details::getLocker(_opCtx)->lock(_opCtx, _id, mode, deadline);
 }
 
 Lock::TenantLock::TenantLock(TenantLock&& otherLock)
@@ -203,7 +208,7 @@ Lock::TenantLock::TenantLock(TenantLock&& otherLock)
 
 Lock::TenantLock::~TenantLock() {
     if (_opCtx) {
-        _opCtx->lockState()->unlock(_id);
+        shard_role_details::getLocker(_opCtx)->unlock(_id);
     }
 }
 
@@ -256,7 +261,7 @@ Lock::DBLock::DBLock(OperationContext* opCtx,
         _tenantLock.emplace(opCtx, *dbName.tenantId(), effectiveTenantLockMode, deadline);
     }
 
-    _opCtx->lockState()->lock(_opCtx, _id, _mode, deadline);
+    shard_role_details::getLocker(_opCtx)->lock(_opCtx, _id, _mode, deadline);
     _result = LOCK_OK;
 }
 
@@ -273,7 +278,7 @@ Lock::DBLock::DBLock(DBLock&& otherLock)
 
 Lock::DBLock::~DBLock() {
     if (isLocked()) {
-        _opCtx->lockState()->unlock(_id);
+        shard_role_details::getLocker(_opCtx)->unlock(_id);
     }
 }
 
@@ -283,10 +288,10 @@ Lock::CollectionLock::CollectionLock(OperationContext* opCtx,
                                      Date_t deadline)
     : _id(RESOURCE_COLLECTION, ns), _opCtx(opCtx) {
     invariant(!ns.coll().empty());
-    dassert(_opCtx->lockState()->isDbLockedForMode(ns.dbName(),
-                                                   isSharedLockMode(mode) ? MODE_IS : MODE_IX));
+    dassert(shard_role_details::getLocker(_opCtx)->isDbLockedForMode(
+        ns.dbName(), isSharedLockMode(mode) ? MODE_IS : MODE_IX));
 
-    _opCtx->lockState()->lock(_opCtx, _id, mode, deadline);
+    shard_role_details::getLocker(_opCtx)->lock(_opCtx, _id, mode, deadline);
 }
 
 Lock::CollectionLock::CollectionLock(CollectionLock&& otherLock)
@@ -294,9 +299,16 @@ Lock::CollectionLock::CollectionLock(CollectionLock&& otherLock)
     otherLock._opCtx = nullptr;
 }
 
+Lock::CollectionLock& Lock::CollectionLock::operator=(CollectionLock&& other) {
+    _id = other._id;
+    _opCtx = other._opCtx;
+    other._opCtx = nullptr;
+    return *this;
+}
+
 Lock::CollectionLock::~CollectionLock() {
     if (_opCtx)
-        _opCtx->lockState()->unlock(_id);
+        shard_role_details::getLocker(_opCtx)->unlock(_id);
 }
 
 }  // namespace mongo

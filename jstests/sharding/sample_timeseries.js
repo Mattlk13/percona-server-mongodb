@@ -2,15 +2,14 @@
  * Tests $sample pushdown on sharded time-series collections for a small collection size.
  *
  * @tags: [
- *   # The validation hook in this suite enforces that all time-series buckets are compressed. This
- *   # will not be the case in multiversion suites.
- *   requires_fcv_71,
- *   # TODO (SERVER-80521): Re-enable this test once redness is resolve in multiversion suites.
- *   DISABLED_TEMPORARILY_DUE_TO_FCV_UPGRADE,
+ *   # TODO (SERVER-70605): Remove this tag once the time-series always compressed buckets feature
+ *   # flag can be removed.
+ *   multiversion_incompatible,
  * ]
  */
 import {documentEq} from "jstests/aggregation/extras/utils.js";
 import {planHasStage} from "jstests/libs/analyze_plan.js";
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
 
 // Test deliberately inserts orphans.
 TestData.skipCheckOrphans = true;

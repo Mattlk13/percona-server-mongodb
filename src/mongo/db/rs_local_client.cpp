@@ -40,7 +40,6 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/client/dbclient_cursor.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/query/find_command.h"
 #include "mongo/db/read_concern.h"
@@ -49,6 +48,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/rs_local_client.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/reply_interface.h"
@@ -96,8 +96,8 @@ StatusWith<Shard::CommandResponse> RSLocalClient::runCommandOnce(OperationContex
     try {
         DBDirectClient client(opCtx);
 
-        rpc::UniqueReply commandResponse =
-            client.runCommand(OpMsgRequest::fromDBAndBody(dbName, cmdObj));
+        rpc::UniqueReply commandResponse = client.runCommand(
+            OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::get(opCtx), dbName, cmdObj));
 
         auto result = commandResponse->getCommandReply().getOwned();
         return Shard::CommandResponse(boost::none,
@@ -121,43 +121,58 @@ StatusWith<Shard::QueryResponse> RSLocalClient::queryOnce(
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     boost::optional<ScopeGuard<std::function<void()>>> readSourceGuard;
 
-    if (readConcernLevel == repl::ReadConcernLevel::kMajorityReadConcern) {
-        invariant(!opCtx->lockState()->isLocked());
-        invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+    if (readConcernLevel == repl::ReadConcernLevel::kMajorityReadConcern ||
+        readConcernLevel == repl::ReadConcernLevel::kSnapshotReadConcern) {
+        invariant(!shard_role_details::getLocker(opCtx)->isLocked());
+        invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
         // Resets to the original read source at the end of this operation.
-        auto originalReadSource = opCtx->recoveryUnit()->getTimestampReadSource();
+        auto originalReadSource =
+            shard_role_details::getRecoveryUnit(opCtx)->getTimestampReadSource();
         boost::optional<Timestamp> originalReadTimestamp;
         if (originalReadSource == RecoveryUnit::ReadSource::kProvided) {
-            originalReadTimestamp = opCtx->recoveryUnit()->getPointInTimeReadTimestamp(opCtx);
+            originalReadTimestamp =
+                shard_role_details::getRecoveryUnit(opCtx)->getPointInTimeReadTimestamp(opCtx);
         }
         readSourceGuard.emplace([opCtx, originalReadSource, originalReadTimestamp] {
             if (originalReadSource == RecoveryUnit::ReadSource::kProvided) {
-                opCtx->recoveryUnit()->setTimestampReadSource(originalReadSource,
-                                                              originalReadTimestamp);
+                shard_role_details::getRecoveryUnit(opCtx)->setTimestampReadSource(
+                    originalReadSource, originalReadTimestamp);
             } else {
-                opCtx->recoveryUnit()->setTimestampReadSource(originalReadSource);
+                shard_role_details::getRecoveryUnit(opCtx)->setTimestampReadSource(
+                    originalReadSource);
             }
         });
-        // Sets up operation context with majority read snapshot so correct optime can be retrieved.
-        opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kMajorityCommitted);
-        Status status = opCtx->recoveryUnit()->majorityCommittedSnapshotAvailable();
+        // Sets up operation context with majority read snapshot so correct optime can be
+        // retrieved.
+        shard_role_details::getRecoveryUnit(opCtx)->setTimestampReadSource(
+            RecoveryUnit::ReadSource::kMajorityCommitted);
+        Status status =
+            shard_role_details::getRecoveryUnit(opCtx)->majorityCommittedSnapshotAvailable();
         if (!status.isOK()) {
             return status;
         }
 
-        // Waits for any writes performed by this ShardLocal instance to be committed and visible.
+        // Waits for any writes performed by this ShardLocal instance to be committed and
+        // visible. We hardcode majority here even if using snaphsot as both operations will do the
+        // initial snapshot at the majority timestamp.
         Status readConcernStatus = replCoord->waitUntilOpTimeForRead(
-            opCtx, repl::ReadConcernArgs{_getLastOpTime(), readConcernLevel});
+            opCtx,
+            repl::ReadConcernArgs{_getLastOpTime(), repl::ReadConcernLevel::kMajorityReadConcern});
         if (!readConcernStatus.isOK()) {
             return readConcernStatus;
         }
 
-        // Informs the storage engine to read from the committed snapshot for the rest of this
-        // operation.
-        status = opCtx->recoveryUnit()->majorityCommittedSnapshotAvailable();
+        status = shard_role_details::getRecoveryUnit(opCtx)->majorityCommittedSnapshotAvailable();
         if (!status.isOK()) {
             return status;
+        }
+        if (readConcernLevel == repl::ReadConcernLevel::kSnapshotReadConcern) {
+            // Snapshot readConcern starts a snapshot at the majority timestamp, acquire the
+            // timestamp now and overwrite the majority readConcern used above.
+            auto opTime = replCoord->getCurrentCommittedSnapshotOpTime();
+            shard_role_details::getRecoveryUnit(opCtx)->setTimestampReadSource(
+                RecoveryUnit::ReadSource::kProvided, opTime.getTimestamp());
         }
     } else {
         invariant(readConcernLevel == repl::ReadConcernLevel::kLocalReadConcern);
@@ -208,8 +223,8 @@ Status RSLocalClient::runAggregation(
      * consistent with any remote client. We extract the readConcern from the request and apply
      * it to the opCtx's readSource/readTimestamp. Leave as it was originally before returning*/
 
-    invariant(!opCtx->lockState()->isLocked());
-    invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(!shard_role_details::getLocker(opCtx)->isLocked());
+    invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
     // extracting readConcern
     repl::ReadConcernArgs requestReadConcernArgs;
@@ -233,18 +248,19 @@ Status RSLocalClient::runAggregation(
     }
     // saving original read source and read concern
     auto originalRCA = repl::ReadConcernArgs::get(opCtx);
-    auto originalReadSource = opCtx->recoveryUnit()->getTimestampReadSource();
+    auto originalReadSource = shard_role_details::getRecoveryUnit(opCtx)->getTimestampReadSource();
     boost::optional<Timestamp> originalReadTimestamp;
     if (originalReadSource == RecoveryUnit::ReadSource::kProvided)
-        originalReadTimestamp = opCtx->recoveryUnit()->getPointInTimeReadTimestamp(opCtx);
+        originalReadTimestamp =
+            shard_role_details::getRecoveryUnit(opCtx)->getPointInTimeReadTimestamp(opCtx);
 
     ON_BLOCK_EXIT([&]() {
         repl::ReadConcernArgs::get(opCtx) = originalRCA;
         if (originalReadSource == RecoveryUnit::ReadSource::kProvided) {
-            opCtx->recoveryUnit()->setTimestampReadSource(originalReadSource,
-                                                          originalReadTimestamp);
+            shard_role_details::getRecoveryUnit(opCtx)->setTimestampReadSource(
+                originalReadSource, originalReadTimestamp);
         } else {
-            opCtx->recoveryUnit()->setTimestampReadSource(originalReadSource);
+            shard_role_details::getRecoveryUnit(opCtx)->setTimestampReadSource(originalReadSource);
         }
     });
 

@@ -75,6 +75,20 @@ public:
      * Recovers the data on disk from the oplog up to and including the given timestamp.
      */
     virtual void recoverFromOplogUpTo(OperationContext* opCtx, Timestamp endPoint) = 0;
+
+    /**
+     * Truncates the oplog after the entry with the 'truncateAfterTimestamp'.
+     */
+    virtual void truncateOplogToTimestamp(OperationContext* opCtx,
+                                          Timestamp truncateAfterTimestamp) = 0;
+
+    /**
+     * Performs oplog application for magic restore. This function expects the caller to correctly
+     * truncate oplog the oplog application start point. Callers must be using a storage engine that
+     * supports recover to stable timestamp.
+     */
+    virtual void applyOplogEntriesForRestore(OperationContext* opCtx,
+                                             Timestamp stableTimestamp) = 0;
 };
 
 class ReplicationRecoveryImpl : public ReplicationRecovery {
@@ -92,6 +106,11 @@ public:
                                       bool duringInitialSync = false) override;
 
     void recoverFromOplogUpTo(OperationContext* opCtx, Timestamp endPoint) override;
+
+    void truncateOplogToTimestamp(OperationContext* opCtx,
+                                  Timestamp truncateAfterTimestamp) override;
+
+    void applyOplogEntriesForRestore(OperationContext* opCtx, Timestamp stableTimestamp) override;
 
 private:
     enum class RecoveryMode {

@@ -60,10 +60,11 @@ class CardinalityEstimator {
 public:
     virtual ~CardinalityEstimator() = default;
 
-    virtual CEType deriveCE(const Metadata& metadata,
-                            const Memo& memo,
-                            const properties::LogicalProps& logicalProps,
-                            ABT::reference_type logicalNodeRef) const = 0;
+    virtual CERecord deriveCE(const Metadata& metadata,
+                              const Memo& memo,
+                              const properties::LogicalProps& logicalProps,
+                              const QueryParameterMap& queryParameters,
+                              ABT::reference_type logicalNodeRef) const = 0;
 };
 
 /**

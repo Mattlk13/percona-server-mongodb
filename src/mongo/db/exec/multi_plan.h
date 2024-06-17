@@ -45,7 +45,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/canonical_query.h"
-#include "mongo/db/query/plan_enumerator_explain_info.h"
+#include "mongo/db/query/plan_enumerator/plan_enumerator_explain_info.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_ranker.h"
 #include "mongo/db/query/plan_yield_policy.h"
@@ -65,6 +65,8 @@ namespace mongo {
  */
 class MultiPlanStage final : public RequiresCollectionStage {
 public:
+    static const char* kStageType;
+
     /**
      * Takes no ownership.
      *
@@ -74,7 +76,8 @@ public:
     MultiPlanStage(ExpressionContext* expCtx,
                    VariantCollectionPtrOrAcquisition collection,
                    CanonicalQuery* cq,
-                   PlanCachingMode cachingMode = PlanCachingMode::AlwaysCache);
+                   PlanCachingMode cachingMode = PlanCachingMode::AlwaysCache,
+                   boost::optional<std::string> replanReason = boost::none);
 
     bool isEOF() final;
 
@@ -88,6 +91,7 @@ public:
 
     const SpecificStats* getSpecificStats() const final;
 
+    const plan_ranker::CandidatePlan& getCandidate(size_t candidateIdx) const;
     boost::optional<double> getCandidateScore(size_t candidateIdx) const;
 
     /**
@@ -130,7 +134,34 @@ public:
      * The MultiPlanStage does not retain ownership of the winning QuerySolution and returns
      * a unique pointer.
      */
-    std::unique_ptr<QuerySolution> bestSolution();
+    std::unique_ptr<QuerySolution> extractBestSolution();
+
+    /**
+     * Returns true if the winning plan reached EOF during its trial period and false otherwise.
+     * Illegal to call if the best plan has not yet been selected.
+     */
+    bool bestSolutionEof() const;
+
+    /**
+     * Returns the PlanRankingDecision which captures scoring information from the trial period.
+     * Requires caching mode to be NeverCache and calling pickBestPlan() beforehand.
+     */
+    const plan_ranker::PlanRankingDecision& planRankingDecision() const {
+        tassert(8524800,
+                "The caching mode must be NeverCache to ensure planRankingDecision() is invoked by "
+                "Classic runtime planner for SBE",
+                _cachingMode == PlanCachingMode::NeverCache);
+        tassert(8524801, "Ranking decision must be determined by calling pickBestPlan()", _ranking);
+        return *_ranking;
+    }
+
+    /**
+     * Returns the candidate plans. Each candidate plan includes a child PlanStage tree and
+     * QuerySolution.
+     */
+    const std::vector<plan_ranker::CandidatePlan>& candidates() const {
+        return _candidates;
+    }
 
     /**
      * Returns true if a backup plan was picked.
@@ -138,12 +169,6 @@ public:
      * Exposed for testing.
      */
     bool hasBackupPlan() const;
-
-    //
-    // Used by explain.
-    //
-
-    static const char* kStageType;
 
 protected:
     void doSaveStateRequiresCollection() final {}
@@ -201,12 +226,19 @@ private:
     // one-to-one with _candidates.
     std::vector<plan_ranker::CandidatePlan> _candidates;
 
+    // Captures scoring information from the trial period. Nullptr until 'pickBestPlan()' returns
+    // with an OK status. Requires '_cachingMode' to be NeverCache to retain the ownership.
+    std::unique_ptr<plan_ranker::PlanRankingDecision> _ranking;
+
     // Rejected plans in saved and detached state.
     std::vector<std::unique_ptr<PlanStage>> _rejected;
 
     // index into _candidates, of the winner of the plan competition
     // uses -1 / kNoSuchPlan when best plan is not (yet) known
     int _bestPlanIdx;
+
+    // Because best solution may be "extracted", we need to cache best plan score for explain.
+    boost::optional<double> _bestPlanScore;
 
     // index into _candidates, of the backup plan for sort
     // uses -1 / kNoSuchPlan when best plan is not (yet) known

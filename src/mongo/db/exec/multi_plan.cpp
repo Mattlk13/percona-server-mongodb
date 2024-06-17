@@ -93,50 +93,56 @@ void markShouldCollectTimingInfoOnSubtree(PlanStage* root) {
 /**
  * Aggregation of the total number of microseconds spent (in the classic multiplanner).
  */
-CounterMetric classicMicrosTotal("query.multiPlanner.classicMicros");
+auto& classicMicrosTotal = *MetricBuilder<Counter64>{"query.multiPlanner.classicMicros"};
 
 /**
  * Aggregation of the total number of "works" performed (in the classic multiplanner).
  */
-CounterMetric classicWorksTotal("query.multiPlanner.classicWorks");
+auto& classicWorksTotal = *MetricBuilder<Counter64>{"query.multiPlanner.classicWorks"};
 
 /**
  * Aggregation of the total number of invocations (of the classic multiplanner).
  */
-CounterMetric classicCount("query.multiPlanner.classicCount");
+auto& classicCount = *MetricBuilder<Counter64>{"query.multiPlanner.classicCount"};
 
 /**
  * An element in this histogram is the number of microseconds spent in an invocation (of the
  * classic multiplanner).
  */
-HistogramServerStatusMetric classicMicrosHistogram("query.multiPlanner.histograms.classicMicros",
-                                                   HistogramServerStatusMetric::pow(11, 1024, 4));
+auto& classicMicrosHistogram =
+    *MetricBuilder<HistogramServerStatusMetric>{"query.multiPlanner.histograms.classicMicros"}.bind(
+        HistogramServerStatusMetric::pow(11, 1024, 4));
 
 /**
  * An element in this histogram is the number of "works" performed during an invocation (of the
  * classic multiplanner).
  */
-HistogramServerStatusMetric classicWorksHistogram("query.multiPlanner.histograms.classicWorks",
-                                                  HistogramServerStatusMetric::pow(9, 128, 2));
+auto& classicWorksHistogram =
+    *MetricBuilder<HistogramServerStatusMetric>{"query.multiPlanner.histograms.classicWorks"}.bind(
+        HistogramServerStatusMetric::pow(9, 128, 2));
 
 /**
  * An element in this histogram is the number of plans in the candidate set of an invocation (of the
  * classic multiplanner).
  */
-HistogramServerStatusMetric classicNumPlansHistogram(
-    "query.multiPlanner.histograms.classicNumPlans", HistogramServerStatusMetric::pow(5, 2, 2));
+auto& classicNumPlansHistogram =
+    *MetricBuilder<HistogramServerStatusMetric>{"query.multiPlanner.histograms.classicNumPlans"}
+         .bind(HistogramServerStatusMetric::pow(5, 2, 2));
 
 }  // namespace
 
 MultiPlanStage::MultiPlanStage(ExpressionContext* expCtx,
                                VariantCollectionPtrOrAcquisition collection,
                                CanonicalQuery* cq,
-                               PlanCachingMode cachingMode)
+                               PlanCachingMode cachingMode,
+                               boost::optional<std::string> replanReason)
     : RequiresCollectionStage(kStageType, expCtx, collection),
       _cachingMode(cachingMode),
       _query(cq),
       _bestPlanIdx(kNoSuchPlan),
-      _backupPlanIdx(kNoSuchPlan) {}
+      _backupPlanIdx(kNoSuchPlan) {
+    _specificStats.replanReason = replanReason;
+}
 
 void MultiPlanStage::addPlan(std::unique_ptr<QuerySolution> solution,
                              std::unique_ptr<PlanStage> root,
@@ -214,6 +220,10 @@ void MultiPlanStage::tryYield(PlanYieldPolicy* yieldPolicy) {
 }
 
 Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
+    if (bestPlanChosen()) {
+        return Status::OK();
+    }
+
     // Adds the amount of time taken by pickBestPlan() to executionTime. There's lots of execution
     // work that happens here, so this is needed for the time accounting to make sense.
     auto optTimer = getOptTimer();
@@ -259,11 +269,11 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
         return statusWithRanking.getStatus();
     }
 
-    auto ranking = std::move(statusWithRanking.getValue());
+    _ranking = std::move(statusWithRanking.getValue());
     // Since the status was ok there should be a ranking containing at least one successfully ranked
     // plan.
-    invariant(ranking);
-    _bestPlanIdx = ranking->candidateOrder[0];
+    invariant(_ranking);
+    _bestPlanIdx = _ranking->candidateOrder[0];
 
     MONGO_verify(_bestPlanIdx >= 0 && _bestPlanIdx < static_cast<int>(_candidates.size()));
 
@@ -271,8 +281,11 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
     const auto& alreadyProduced = bestCandidate.results;
     const auto& bestSolution = bestCandidate.solution;
 
-    LOGV2_DEBUG(
-        20590, 5, "Winning solution", "bestSolution"_attr = redact(bestSolution->toString()));
+    LOGV2_DEBUG(20590,
+                5,
+                "Winning solution",
+                "bestSolution"_attr = redact(bestSolution->toString()),
+                "bestSolutionHash"_attr = bestSolution->hash());
 
     auto explainer =
         plan_explainer_factory::make(bestCandidate.root, bestSolution->_enumeratorExplainInfo);
@@ -281,7 +294,7 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
     _backupPlanIdx = kNoSuchPlan;
     if (bestSolution->hasBlockingStage && (0 == alreadyProduced.size())) {
         LOGV2_DEBUG(20592, 5, "Winner has blocking stage, looking for backup plan...");
-        for (auto&& ix : ranking->candidateOrder) {
+        for (auto&& ix : _ranking->candidateOrder) {
             if (!_candidates[ix].solution->hasBlockingStage) {
                 LOGV2_DEBUG(20593, 5, "Backup child", "ix"_attr = ix);
                 _backupPlanIdx = ix;
@@ -295,12 +308,15 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
         ? MultipleCollectionAccessor{coll.getAcquisition()}
         : MultipleCollectionAccessor{coll.getCollectionPtr()};
 
-    plan_cache_util::updatePlanCacheFromCandidates(expCtx()->opCtx,
-                                                   multipleCollection,
-                                                   _cachingMode,
-                                                   *_query,
-                                                   std::move(ranking),
-                                                   _candidates);
+    if (_cachingMode != PlanCachingMode::NeverCache) {
+        plan_cache_util::updateClassicPlanCacheFromClassicCandidates(expCtx()->opCtx,
+                                                                     multipleCollection,
+                                                                     _cachingMode,
+                                                                     *_query,
+                                                                     std::move(_ranking),
+                                                                     _candidates);
+    }
+
     removeRejectedPlans();
 
     return Status::OK();
@@ -444,11 +460,18 @@ const QuerySolution* MultiPlanStage::bestSolution() const {
     return _candidates[_bestPlanIdx].solution.get();
 }
 
-std::unique_ptr<QuerySolution> MultiPlanStage::bestSolution() {
+std::unique_ptr<QuerySolution> MultiPlanStage::extractBestSolution() {
     if (_bestPlanIdx == kNoSuchPlan)
         return nullptr;
 
+    _bestPlanScore = _candidates[_bestPlanIdx].solution->score;
     return std::move(_candidates[_bestPlanIdx].solution);
+}
+
+bool MultiPlanStage::bestSolutionEof() const {
+    tassert(8523500, "The best plan is not chosen by the multi-planner", bestPlanChosen());
+    auto& bestPlan = _candidates[_bestPlanIdx];
+    return bestPlan.root->isEOF();
 }
 
 unique_ptr<PlanStageStats> MultiPlanStage::getStats() {
@@ -469,11 +492,22 @@ const SpecificStats* MultiPlanStage::getSpecificStats() const {
     return &_specificStats;
 }
 
+const plan_ranker::CandidatePlan& MultiPlanStage::getCandidate(size_t candidateIdx) const {
+    tassert(8223800,
+            str::stream() << "Invalid candidate plan index: " << candidateIdx
+                          << ", size: " << _candidates.size(),
+            candidateIdx < _candidates.size());
+    return _candidates[candidateIdx];
+}
+
 boost::optional<double> MultiPlanStage::getCandidateScore(size_t candidateIdx) const {
     tassert(5408301,
             str::stream() << "Invalid candidate plan index: " << candidateIdx
                           << ", size: " << _candidates.size(),
             candidateIdx < _candidates.size());
+    if (candidateIdx == static_cast<size_t>(_bestPlanIdx) && !_candidates[candidateIdx].solution) {
+        return _bestPlanScore;
+    }
     return _candidates[candidateIdx].solution->score;
 }
 

@@ -150,8 +150,10 @@ void SessionsCollectionSharded::checkSessionsCollectionExists(OperationContext* 
 void SessionsCollectionSharded::refreshSessions(OperationContext* opCtx,
                                                 const LogicalSessionRecordSet& sessions) {
     auto send = [&](BSONObj toSend) {
-        auto opMsg = OpMsgRequest::fromDBAndBody(
-            NamespaceString::kLogicalSessionsNamespace.dbName(), toSend);
+        auto opMsg =
+            OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::get(opCtx),
+                                        NamespaceString::kLogicalSessionsNamespace.dbName(),
+                                        toSend);
         auto request = BatchedCommandRequest::parseUpdate(opMsg);
 
         BatchedCommandResponse response;
@@ -169,8 +171,10 @@ void SessionsCollectionSharded::refreshSessions(OperationContext* opCtx,
 void SessionsCollectionSharded::removeRecords(OperationContext* opCtx,
                                               const LogicalSessionIdSet& sessions) {
     auto send = [&](BSONObj toSend) {
-        auto opMsg = OpMsgRequest::fromDBAndBody(
-            NamespaceString::kLogicalSessionsNamespace.dbName(), toSend);
+        auto opMsg =
+            OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::get(opCtx),
+                                        NamespaceString::kLogicalSessionsNamespace.dbName(),
+                                        toSend);
         auto request = BatchedCommandRequest::parseDelete(opMsg);
 
         BatchedCommandResponse response;
@@ -191,14 +195,16 @@ LogicalSessionIdSet SessionsCollectionSharded::findRemovedSessions(
     bool apiStrict = APIParameters::get(opCtx).getAPIStrict().value_or(false);
     auto send = [&](BSONObj toSend) -> BSONObj {
         // If there is no '$db', append it.
-        toSend =
-            OpMsgRequest::fromDBAndBody(NamespaceString::kLogicalSessionsNamespace.dbName(), toSend)
-                .body;
-        auto findCommand = query_request_helper::makeFromFindCommand(
-            toSend,
-            static_cast<const NamespaceString&>(NamespaceString::kLogicalSessionsNamespace),
-            SerializationContext::stateDefault(),
-            apiStrict);
+        toSend = OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::get(opCtx),
+                                             NamespaceString::kLogicalSessionsNamespace.dbName(),
+                                             toSend)
+                     .body;
+        auto findCommand =
+            query_request_helper::makeFromFindCommand(toSend,
+                                                      auth::ValidatedTenancyScope::get(opCtx),
+                                                      boost::none,
+                                                      SerializationContext::stateDefault(),
+                                                      apiStrict);
         auto cq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
             .expCtx = makeExpressionContext(opCtx, *findCommand),
             .parsedFind = ParsedFindCommandParams{

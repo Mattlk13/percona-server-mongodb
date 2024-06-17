@@ -8,6 +8,11 @@
  *
  * This workload was designed to reproduce an issue similar to SERVER-18304 for update operations
  * using the findAndModify command where the old version of the document is returned.
+ *
+ * @tags: [
+ *   # PM-1632 was delivered in 7.1.
+ *   requires_fcv_71,
+ * ]
  */
 import {extendWorkload} from "jstests/concurrency/fsm_libs/extend_workload.js";
 import {isMongod} from "jstests/concurrency/fsm_workload_helpers/server_types.js";
@@ -18,7 +23,7 @@ import {
 export const $config = extendWorkload($baseConfig, function($config, $super) {
     // Use the workload name as the database name, since the workload name is assumed to be
     // unique.
-    $config.data.uniqueDBName = 'findAndModify_update_queue';
+    $config.data.uniqueDBName = jsTestName();
 
     $config.data.newDocForInsert = function newDocForInsert(i) {
         return {_id: i, rand: Random.rand(), counter: 0};

@@ -60,9 +60,9 @@ public:
     static ShardingReady* get(OperationContext* opCtx);
 
     void scheduleTransitionToConfigShard(OperationContext* opCtx);
-    void transitionToConfigShard(ServiceContext* serviceContext);
     void waitUntilReady(OperationContext* opCtx);
     bool isReady();
+    SharedSemiFuture<void> isReadyFuture() const;
 
     /**
      * Sets a value for the _isReady promise indicating that the sharding system is ready to start
@@ -79,6 +79,8 @@ public:
     void setIsReadyIfShardExists(OperationContext* opCtx);
 
 private:
+    void _transitionToConfigShard(ServiceContext* serviceContext);
+
     // Protects _isReady.
     mutable Mutex _mutex = MONGO_MAKE_LATCH("ShardingReady::_mutex");
     SharedPromise<void> _isReady;

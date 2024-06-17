@@ -86,9 +86,9 @@
 #include "mongo/s/client/shard.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/move_range_request_gen.h"
+#include "mongo/s/routing_information_cache.h"
 #include "mongo/s/shard_version.h"
 #include "mongo/s/stale_exception.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/decorable.h"
 #include "mongo/util/fail_point.h"
@@ -118,7 +118,7 @@ static constexpr int64_t kBigChunkMarker = std::numeric_limits<int64_t>::max();
 ShardVersion getShardVersion(OperationContext* opCtx,
                              const ShardId& shardId,
                              const NamespaceString& nss) {
-    auto cri = Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfo(opCtx, nss);
+    auto cri = RoutingInformationCache::get(opCtx)->getShardedCollectionRoutingInfo(opCtx, nss);
     return cri.getShardVersion(shardId);
 }
 
@@ -180,8 +180,7 @@ void handleActionResult(OperationContext* opCtx,
 
     if (status == ErrorCodes::StaleConfig) {
         if (auto staleInfo = status.extraInfo<StaleConfigInfo>()) {
-            Grid::get(opCtx)
-                ->catalogCache()
+            RoutingInformationCache::get(opCtx)
                 ->invalidateShardOrEntireCollectionEntryForShardedCollection(
                     nss, staleInfo->getVersionWanted(), staleInfo->getShardId());
         }
@@ -211,8 +210,8 @@ bool areMergeable(const ChunkType& firstChunk,
                   const ChunkType& secondChunk,
                   const ZoneInfo& collectionZones) {
     return firstChunk.getShard() == secondChunk.getShard() &&
-        collectionZones.getZoneForChunk(firstChunk.getRange()) ==
-        collectionZones.getZoneForChunk(secondChunk.getRange()) &&
+        collectionZones.getZoneForRange(firstChunk.getRange()) ==
+        collectionZones.getZoneForRange(secondChunk.getRange()) &&
         SimpleBSONObjComparator::kInstance.evaluate(firstChunk.getMax() == secondChunk.getMin());
 }
 
@@ -273,7 +272,9 @@ public:
             auto it = _shardToProcess ? _pendingActionsByShards.find(*_shardToProcess)
                                       : _pendingActionsByShards.begin();
 
-            invariant(it != _pendingActionsByShards.end());
+            tassert(8245212,
+                    "Shard to process not found in pending actions",
+                    it != _pendingActionsByShards.end());
 
             auto& [shardId, pendingActions] = *it;
             auto shardVersion = getShardVersion(opCtx, shardId, _nss);
@@ -326,70 +327,68 @@ public:
         if (_aborted) {
             return;
         }
-        stdx::visit(OverloadedVisitor{
-                        [&](const MergeInfo& mergeAction) {
-                            auto& mergeResponse = stdx::get<Status>(response);
-                            auto& shardingPendingActions =
-                                _pendingActionsByShards[mergeAction.shardId];
-                            handleActionResult(
-                                opCtx,
-                                _nss,
-                                _uuid,
-                                getType(),
-                                mergeResponse,
-                                [&]() {
-                                    shardingPendingActions.rangesWithoutDataSize.emplace_back(
-                                        mergeAction.chunkRange);
-                                },
-                                [&]() {
-                                    shardingPendingActions.rangesToMerge.emplace_back(
-                                        mergeAction.chunkRange);
-                                },
-                                [&]() { _abort(getType()); });
-                        },
-                        [&](const DataSizeInfo& dataSizeAction) {
-                            auto& dataSizeResponse =
-                                stdx::get<StatusWith<DataSizeResponse>>(response);
-                            handleActionResult(
-                                opCtx,
-                                _nss,
-                                _uuid,
-                                getType(),
-                                dataSizeResponse.getStatus(),
-                                [&]() {
-                                    ChunkType chunk(dataSizeAction.uuid,
-                                                    dataSizeAction.chunkRange,
-                                                    dataSizeAction.version.placementVersion(),
-                                                    dataSizeAction.shardId);
-                                    auto catalogManager = ShardingCatalogManager::get(opCtx);
-                                    // Max out the chunk size if it has has been estimated as bigger
-                                    // than _smallChunkSizeThresholdBytes; this will exlude the
-                                    // chunk from the list of candidates considered by
-                                    // MoveAndMergeChunksPhase
-                                    auto estimatedSize = dataSizeResponse.getValue().maxSizeReached
-                                        ? kBigChunkMarker
-                                        : dataSizeResponse.getValue().sizeBytes;
-                                    catalogManager->setChunkEstimatedSize(
-                                        opCtx,
-                                        chunk,
-                                        estimatedSize,
-                                        ShardingCatalogClient::kMajorityWriteConcern);
-                                },
-                                [&]() {
-                                    auto& shardingPendingActions =
-                                        _pendingActionsByShards[dataSizeAction.shardId];
-                                    shardingPendingActions.rangesWithoutDataSize.emplace_back(
-                                        dataSizeAction.chunkRange);
-                                },
-                                [&]() { _abort(getType()); });
-                        },
-                        [](const MigrateInfo& _) {
-                            uasserted(ErrorCodes::BadValue, "Unexpected action type");
-                        },
-                        [](const MergeAllChunksOnShardInfo& _) {
-                            uasserted(ErrorCodes::BadValue, "Unexpected action type");
-                        }},
-                    action);
+        visit(OverloadedVisitor{
+                  [&](const MergeInfo& mergeAction) {
+                      auto& mergeResponse = get<Status>(response);
+                      auto& shardingPendingActions = _pendingActionsByShards[mergeAction.shardId];
+                      handleActionResult(
+                          opCtx,
+                          _nss,
+                          _uuid,
+                          getType(),
+                          mergeResponse,
+                          [&]() {
+                              shardingPendingActions.rangesWithoutDataSize.emplace_back(
+                                  mergeAction.chunkRange);
+                          },
+                          [&]() {
+                              shardingPendingActions.rangesToMerge.emplace_back(
+                                  mergeAction.chunkRange);
+                          },
+                          [&]() { _abort(getType()); });
+                  },
+                  [&](const DataSizeInfo& dataSizeAction) {
+                      auto& dataSizeResponse = get<StatusWith<DataSizeResponse>>(response);
+                      handleActionResult(
+                          opCtx,
+                          _nss,
+                          _uuid,
+                          getType(),
+                          dataSizeResponse.getStatus(),
+                          [&]() {
+                              ChunkType chunk(dataSizeAction.uuid,
+                                              dataSizeAction.chunkRange,
+                                              dataSizeAction.version.placementVersion(),
+                                              dataSizeAction.shardId);
+                              auto catalogManager = ShardingCatalogManager::get(opCtx);
+                              // Max out the chunk size if it has has been estimated as bigger
+                              // than _smallChunkSizeThresholdBytes; this will exlude the
+                              // chunk from the list of candidates considered by
+                              // MoveAndMergeChunksPhase
+                              auto estimatedSize = dataSizeResponse.getValue().maxSizeReached
+                                  ? kBigChunkMarker
+                                  : dataSizeResponse.getValue().sizeBytes;
+                              catalogManager->setChunkEstimatedSize(
+                                  opCtx,
+                                  chunk,
+                                  estimatedSize,
+                                  ShardingCatalogClient::kMajorityWriteConcern);
+                          },
+                          [&]() {
+                              auto& shardingPendingActions =
+                                  _pendingActionsByShards[dataSizeAction.shardId];
+                              shardingPendingActions.rangesWithoutDataSize.emplace_back(
+                                  dataSizeAction.chunkRange);
+                          },
+                          [&]() { _abort(getType()); });
+                  },
+                  [](const MigrateInfo& _) {
+                      uasserted(ErrorCodes::BadValue, "Unexpected action type");
+                  },
+                  [](const MergeAllChunksOnShardInfo& _) {
+                      uasserted(ErrorCodes::BadValue, "Unexpected action type");
+                  }},
+              action);
     }
 
     bool isComplete() const override {
@@ -516,7 +515,7 @@ public:
             }
 
             // We have a chunk that can be moved&merged with at least one sibling. Choose one...
-            invariant(candidateSiblings.size() <= 2);
+            tassert(8245213, "Chunk has too many siblings", candidateSiblings.size() <= 2);
             auto targetSibling = candidateSiblings.front();
             if (auto challenger = candidateSiblings.back(); targetSibling != challenger) {
                 auto targetScore = _rankMergeableSibling(*nextSmallChunk, *targetSibling);
@@ -546,172 +545,174 @@ public:
     void applyActionResult(OperationContext* opCtx,
                            const BalancerStreamAction& action,
                            const BalancerStreamActionResponse& response) override {
-        stdx::visit(
-            OverloadedVisitor{
-                [&](const MigrateInfo& migrationAction) {
-                    auto& migrationResponse = stdx::get<Status>(response);
-                    auto match =
-                        std::find_if(_outstandingMigrations.begin(),
-                                     _outstandingMigrations.end(),
-                                     [&migrationAction](const MoveAndMergeRequest& request) {
-                                         return (migrationAction.minKey.woCompare(
-                                                     request.getMigrationMinKey()) == 0);
-                                     });
-                    invariant(match != _outstandingMigrations.end());
-                    MoveAndMergeRequest moveRequest(std::move(*match));
-                    _outstandingMigrations.erase(match);
+        visit(OverloadedVisitor{
+                  [&](const MigrateInfo& migrationAction) {
+                      auto& migrationResponse = get<Status>(response);
+                      auto match =
+                          std::find_if(_outstandingMigrations.begin(),
+                                       _outstandingMigrations.end(),
+                                       [&migrationAction](const MoveAndMergeRequest& request) {
+                                           return (migrationAction.minKey.woCompare(
+                                                       request.getMigrationMinKey()) == 0);
+                                       });
+                      tassert(8245214,
+                              "MigrationAction not found",
+                              match != _outstandingMigrations.end());
+                      MoveAndMergeRequest moveRequest(std::move(*match));
+                      _outstandingMigrations.erase(match);
 
-                    if (_aborted) {
-                        return;
-                    }
+                      if (_aborted) {
+                          return;
+                      }
 
-                    if (migrationResponse.isOK()) {
-                        Grid::get(opCtx)
-                            ->catalogCache()
-                            ->invalidateShardOrEntireCollectionEntryForShardedCollection(
-                                _nss, boost::none, moveRequest.getDestinationShard());
+                      if (migrationResponse.isOK()) {
+                          RoutingInformationCache::get(opCtx)
+                              ->invalidateShardOrEntireCollectionEntryForShardedCollection(
+                                  _nss, boost::none, moveRequest.getDestinationShard());
 
-                        auto transferredAmount = moveRequest.getMovedDataSizeBytes();
-                        invariant(transferredAmount <= _smallChunkSizeThresholdBytes);
-                        _shardInfos.at(moveRequest.getSourceShard()).currentSizeBytes -=
-                            transferredAmount;
-                        _shardInfos.at(moveRequest.getDestinationShard()).currentSizeBytes +=
-                            transferredAmount;
-                        _shardProcessingOrder.sort([this](const ShardId& lhs, const ShardId& rhs) {
-                            return _shardInfos.at(lhs).currentSizeBytes >
-                                _shardInfos.at(rhs).currentSizeBytes;
-                        });
-                        _actionableMerges.push_back(std::move(moveRequest));
-                        return;
-                    }
+                          auto transferredAmount = moveRequest.getMovedDataSizeBytes();
+                          tassert(8245215,
+                                  "Unexpected amount of transferred data during chunk migration",
+                                  transferredAmount <= _smallChunkSizeThresholdBytes);
+                          _shardInfos.at(moveRequest.getSourceShard()).currentSizeBytes -=
+                              transferredAmount;
+                          _shardInfos.at(moveRequest.getDestinationShard()).currentSizeBytes +=
+                              transferredAmount;
+                          _shardProcessingOrder.sort(
+                              [this](const ShardId& lhs, const ShardId& rhs) {
+                                  return _shardInfos.at(lhs).currentSizeBytes >
+                                      _shardInfos.at(rhs).currentSizeBytes;
+                              });
+                          _actionableMerges.push_back(std::move(moveRequest));
+                          return;
+                      }
 
-                    LOGV2_DEBUG(6290000,
-                                1,
-                                "Migration failed during collection defragmentation",
-                                logAttrs(_nss),
-                                "uuid"_attr = _uuid,
-                                "currentPhase"_attr = getType(),
-                                "error"_attr = redact(migrationResponse));
+                      LOGV2_DEBUG(6290000,
+                                  1,
+                                  "Migration failed during collection defragmentation",
+                                  logAttrs(_nss),
+                                  "uuid"_attr = _uuid,
+                                  "currentPhase"_attr = getType(),
+                                  "error"_attr = redact(migrationResponse));
 
-                    moveRequest.chunkToMove->busyInOperation = false;
-                    moveRequest.chunkToMergeWith->busyInOperation = false;
+                      moveRequest.chunkToMove->busyInOperation = false;
+                      moveRequest.chunkToMergeWith->busyInOperation = false;
 
-                    if (migrationResponse.code() == ErrorCodes::ChunkTooBig ||
-                        migrationResponse.code() == ErrorCodes::ExceededMemoryLimit) {
-                        // Never try moving this chunk again, it isn't actually small
-                        _removeIteratorFromSmallChunks(moveRequest.chunkToMove,
-                                                       moveRequest.chunkToMove->shard);
-                        return;
-                    }
+                      if (migrationResponse.code() == ErrorCodes::ChunkTooBig ||
+                          migrationResponse.code() == ErrorCodes::ExceededMemoryLimit) {
+                          // Never try moving this chunk again, it isn't actually small
+                          _removeIteratorFromSmallChunks(moveRequest.chunkToMove,
+                                                         moveRequest.chunkToMove->shard);
+                          return;
+                      }
 
-                    if (isRetriableForDefragmentation(migrationResponse)) {
-                        // The migration will be eventually retried
-                        return;
-                    }
+                      if (isRetriableForDefragmentation(migrationResponse)) {
+                          // The migration will be eventually retried
+                          return;
+                      }
 
-                    const auto exceededTimeLimit = [&] {
-                        // All errors thrown by the migration destination shard are converted
-                        // into OperationFailed. Thus we need to inspect the error message to
-                        // match the real error code.
+                      const auto exceededTimeLimit = [&] {
+                          // All errors thrown by the migration destination shard are converted
+                          // into OperationFailed. Thus we need to inspect the error message to
+                          // match the real error code.
 
-                        // TODO SERVER-62990 introduce and propagate specific error code for
-                        // migration failed due to range deletion pending
-                        return migrationResponse == ErrorCodes::OperationFailed &&
-                            migrationResponse.reason().find(ErrorCodes::errorString(
-                                ErrorCodes::ExceededTimeLimit)) != std::string::npos;
-                    };
+                          // TODO SERVER-62990 introduce and propagate specific error code for
+                          // migration failed due to range deletion pending
+                          return migrationResponse == ErrorCodes::OperationFailed &&
+                              migrationResponse.reason().find(ErrorCodes::errorString(
+                                  ErrorCodes::ExceededTimeLimit)) != std::string::npos;
+                      };
 
-                    if (exceededTimeLimit()) {
-                        // The migration failed because there is still a range deletion
-                        // pending on the recipient.
-                        moveRequest.chunkToMove->shardsToAvoid.emplace(
-                            moveRequest.getDestinationShard());
-                        return;
-                    }
+                      if (exceededTimeLimit()) {
+                          // The migration failed because there is still a range deletion
+                          // pending on the recipient.
+                          moveRequest.chunkToMove->shardsToAvoid.emplace(
+                              moveRequest.getDestinationShard());
+                          return;
+                      }
 
-                    LOGV2_ERROR(6290001,
-                                "Encountered non-retriable error on migration during "
-                                "collection defragmentation",
-                                logAttrs(_nss),
-                                "uuid"_attr = _uuid,
-                                "currentPhase"_attr = getType(),
-                                "error"_attr = redact(migrationResponse));
-                    _abort(DefragmentationPhaseEnum::kMergeAndMeasureChunks);
-                },
-                [&](const MergeInfo& mergeAction) {
-                    auto& mergeResponse = stdx::get<Status>(response);
-                    auto match = std::find_if(_outstandingMerges.begin(),
-                                              _outstandingMerges.end(),
-                                              [&mergeAction](const MoveAndMergeRequest& request) {
-                                                  return mergeAction.chunkRange.containsKey(
-                                                      request.getMigrationMinKey());
-                                              });
-                    invariant(match != _outstandingMerges.end());
-                    MoveAndMergeRequest mergeRequest(std::move(*match));
-                    _outstandingMerges.erase(match);
+                      LOGV2_ERROR(6290001,
+                                  "Encountered non-retriable error on migration during "
+                                  "collection defragmentation",
+                                  logAttrs(_nss),
+                                  "uuid"_attr = _uuid,
+                                  "currentPhase"_attr = getType(),
+                                  "error"_attr = redact(migrationResponse));
+                      _abort(DefragmentationPhaseEnum::kMergeAndMeasureChunks);
+                  },
+                  [&](const MergeInfo& mergeAction) {
+                      auto& mergeResponse = get<Status>(response);
+                      auto match = std::find_if(_outstandingMerges.begin(),
+                                                _outstandingMerges.end(),
+                                                [&mergeAction](const MoveAndMergeRequest& request) {
+                                                    return mergeAction.chunkRange.containsKey(
+                                                        request.getMigrationMinKey());
+                                                });
+                      tassert(8245216, "MergeAction not found", match != _outstandingMerges.end());
+                      MoveAndMergeRequest mergeRequest(std::move(*match));
+                      _outstandingMerges.erase(match);
 
-                    auto onSuccess = [&] {
-                        // The sequence is complete; update the state of the merged chunk...
-                        auto& mergedChunk = mergeRequest.chunkToMergeWith;
+                      auto onSuccess = [&] {
+                          // The sequence is complete; update the state of the merged chunk...
+                          auto& mergedChunk = mergeRequest.chunkToMergeWith;
 
-                        Grid::get(opCtx)
-                            ->catalogCache()
-                            ->invalidateShardOrEntireCollectionEntryForShardedCollection(
-                                _nss, boost::none, mergedChunk->shard);
+                          RoutingInformationCache::get(opCtx)
+                              ->invalidateShardOrEntireCollectionEntryForShardedCollection(
+                                  _nss, boost::none, mergedChunk->shard);
 
-                        auto& chunkToDelete = mergeRequest.chunkToMove;
-                        mergedChunk->range = mergeRequest.asMergedRange();
-                        if (mergedChunk->estimatedSizeBytes != kBigChunkMarker &&
-                            chunkToDelete->estimatedSizeBytes != kBigChunkMarker) {
-                            mergedChunk->estimatedSizeBytes += chunkToDelete->estimatedSizeBytes;
-                        } else {
-                            mergedChunk->estimatedSizeBytes = kBigChunkMarker;
-                        }
+                          auto& chunkToDelete = mergeRequest.chunkToMove;
+                          mergedChunk->range = mergeRequest.asMergedRange();
+                          if (mergedChunk->estimatedSizeBytes != kBigChunkMarker &&
+                              chunkToDelete->estimatedSizeBytes != kBigChunkMarker) {
+                              mergedChunk->estimatedSizeBytes += chunkToDelete->estimatedSizeBytes;
+                          } else {
+                              mergedChunk->estimatedSizeBytes = kBigChunkMarker;
+                          }
 
-                        mergedChunk->busyInOperation = false;
-                        auto deletedChunkShard = chunkToDelete->shard;
-                        // the lookup data structures...
-                        _removeIteratorFromSmallChunks(chunkToDelete, deletedChunkShard);
-                        if (mergedChunk->estimatedSizeBytes > _smallChunkSizeThresholdBytes) {
-                            _removeIteratorFromSmallChunks(mergedChunk, mergedChunk->shard);
-                        } else {
-                            // Keep the list of small chunk iterators in the recipient sorted
-                            auto match = _smallChunksByShard.find(mergedChunk->shard);
-                            if (match != _smallChunksByShard.end()) {
-                                auto& [_, smallChunksInRecipient] = *match;
-                                smallChunksInRecipient.sort(compareChunkRangeInfoIterators);
-                            }
-                        }
-                        //... and the collection
-                        _collectionChunks.erase(chunkToDelete);
-                    };
+                          mergedChunk->busyInOperation = false;
+                          auto deletedChunkShard = chunkToDelete->shard;
+                          // the lookup data structures...
+                          _removeIteratorFromSmallChunks(chunkToDelete, deletedChunkShard);
+                          if (mergedChunk->estimatedSizeBytes > _smallChunkSizeThresholdBytes) {
+                              _removeIteratorFromSmallChunks(mergedChunk, mergedChunk->shard);
+                          } else {
+                              // Keep the list of small chunk iterators in the recipient sorted
+                              auto match = _smallChunksByShard.find(mergedChunk->shard);
+                              if (match != _smallChunksByShard.end()) {
+                                  auto& [_, smallChunksInRecipient] = *match;
+                                  smallChunksInRecipient.sort(compareChunkRangeInfoIterators);
+                              }
+                          }
+                          //... and the collection
+                          _collectionChunks.erase(chunkToDelete);
+                      };
 
-                    auto onRetriableError = [&] {
-                        _actionableMerges.push_back(std::move(mergeRequest));
-                    };
+                      auto onRetriableError = [&] {
+                          _actionableMerges.push_back(std::move(mergeRequest));
+                      };
 
-                    auto onNonRetriableError = [&]() {
-                        _abort(DefragmentationPhaseEnum::kMergeAndMeasureChunks);
-                    };
+                      auto onNonRetriableError = [&]() {
+                          _abort(DefragmentationPhaseEnum::kMergeAndMeasureChunks);
+                      };
 
-                    if (!_aborted) {
-                        handleActionResult(opCtx,
-                                           _nss,
-                                           _uuid,
-                                           getType(),
-                                           mergeResponse,
-                                           onSuccess,
-                                           onRetriableError,
-                                           onNonRetriableError);
-                    }
-                },
-                [](const DataSizeInfo& dataSizeAction) {
-                    uasserted(ErrorCodes::BadValue, "Unexpected action type");
-                },
-                [](const MergeAllChunksOnShardInfo& _) {
-                    uasserted(ErrorCodes::BadValue, "Unexpected action type");
-                }},
-            action);
+                      if (!_aborted) {
+                          handleActionResult(opCtx,
+                                             _nss,
+                                             _uuid,
+                                             getType(),
+                                             mergeResponse,
+                                             onSuccess,
+                                             onRetriableError,
+                                             onNonRetriableError);
+                      }
+                  },
+                  [](const DataSizeInfo& dataSizeAction) {
+                      uasserted(ErrorCodes::BadValue, "Unexpected action type");
+                  },
+                  [](const MergeAllChunksOnShardInfo& _) {
+                      uasserted(ErrorCodes::BadValue, "Unexpected action type");
+                  }},
+              action);
     }
 
     bool isComplete() const override {
@@ -940,8 +941,8 @@ private:
         std::list<ChunkRangeInfoIterator> siblings;
         auto canBeMoveAndMerged = [this](const ChunkRangeInfoIterator& chunkIt,
                                          const ChunkRangeInfoIterator& siblingIt) {
-            auto onSameZone = _zoneInfo.getZoneForChunk(chunkIt->range) ==
-                _zoneInfo.getZoneForChunk(siblingIt->range);
+            auto onSameZone = _zoneInfo.getZoneForRange(chunkIt->range) ==
+                _zoneInfo.getZoneForRange(siblingIt->range);
             auto destinationAvailable = chunkIt->shard == siblingIt->shard ||
                 !_shardInfos.at(siblingIt->shard).isDraining();
             return (onSameZone && destinationAvailable);
@@ -1141,10 +1142,15 @@ public:
         auto it = _shardToProcess ? _unmergedRangesByShard.find(*_shardToProcess)
                                   : _unmergedRangesByShard.begin();
 
-        invariant(it != _unmergedRangesByShard.end());
+        tassert(8245217,
+                str::stream() << "Shard to process not found in unmerged ranges. ShardId: "
+                              << *_shardToProcess,
+                it != _unmergedRangesByShard.end());
 
         auto& [shardId, unmergedRanges] = *it;
-        invariant(!unmergedRanges.empty());
+        tassert(8245218,
+                str::stream() << "Unmerged ranges is empty. ShardId: " << *_shardToProcess,
+                !unmergedRanges.empty());
         auto shardVersion = getShardVersion(opCtx, shardId, _nss);
         const auto& rangeToMerge = unmergedRanges.back();
         boost::optional<BalancerStreamAction> nextAction = boost::optional<BalancerStreamAction>(
@@ -1177,37 +1183,36 @@ public:
         if (_aborted) {
             return;
         }
-        stdx::visit(
-            OverloadedVisitor{[&](const MergeInfo& mergeAction) {
-                                  auto& mergeResponse = stdx::get<Status>(response);
-                                  auto onSuccess = [] {
-                                  };
-                                  auto onRetriableError = [&] {
-                                      _unmergedRangesByShard[mergeAction.shardId].emplace_back(
-                                          mergeAction.chunkRange);
-                                  };
-                                  auto onNonretriableError = [this] {
-                                      _abort(getType());
-                                  };
-                                  handleActionResult(opCtx,
-                                                     _nss,
-                                                     _uuid,
-                                                     getType(),
-                                                     mergeResponse,
-                                                     onSuccess,
-                                                     onRetriableError,
-                                                     onNonretriableError);
-                              },
-                              [](const DataSizeInfo& _) {
-                                  uasserted(ErrorCodes::BadValue, "Unexpected action type");
-                              },
-                              [](const MigrateInfo& _) {
-                                  uasserted(ErrorCodes::BadValue, "Unexpected action type");
-                              },
-                              [](const MergeAllChunksOnShardInfo& _) {
-                                  uasserted(ErrorCodes::BadValue, "Unexpected action type");
-                              }},
-            action);
+        visit(OverloadedVisitor{[&](const MergeInfo& mergeAction) {
+                                    auto& mergeResponse = get<Status>(response);
+                                    auto onSuccess = [] {
+                                    };
+                                    auto onRetriableError = [&] {
+                                        _unmergedRangesByShard[mergeAction.shardId].emplace_back(
+                                            mergeAction.chunkRange);
+                                    };
+                                    auto onNonretriableError = [this] {
+                                        _abort(getType());
+                                    };
+                                    handleActionResult(opCtx,
+                                                       _nss,
+                                                       _uuid,
+                                                       getType(),
+                                                       mergeResponse,
+                                                       onSuccess,
+                                                       onRetriableError,
+                                                       onNonretriableError);
+                                },
+                                [](const DataSizeInfo& _) {
+                                    uasserted(ErrorCodes::BadValue, "Unexpected action type");
+                                },
+                                [](const MigrateInfo& _) {
+                                    uasserted(ErrorCodes::BadValue, "Unexpected action type");
+                                },
+                                [](const MergeAllChunksOnShardInfo& _) {
+                                    uasserted(ErrorCodes::BadValue, "Unexpected action type");
+                                }},
+              action);
     }
 
     bool isComplete() const override {
@@ -1474,26 +1479,25 @@ void BalancerDefragmentationPolicy::applyActionResult(
     {
         stdx::lock_guard<Latch> lk(_stateMutex);
         DefragmentationPhase* targetState = nullptr;
-        stdx::visit(
-            OverloadedVisitor{[&](const MergeInfo& act) {
-                                  if (_defragmentationStates.contains(act.uuid)) {
-                                      targetState = _defragmentationStates.at(act.uuid).get();
-                                  }
-                              },
-                              [&](const DataSizeInfo& act) {
-                                  if (_defragmentationStates.contains(act.uuid)) {
-                                      targetState = _defragmentationStates.at(act.uuid).get();
-                                  }
-                              },
-                              [&](const MigrateInfo& act) {
-                                  if (_defragmentationStates.contains(act.uuid)) {
-                                      targetState = _defragmentationStates.at(act.uuid).get();
-                                  }
-                              },
-                              [](const MergeAllChunksOnShardInfo& _) {
-                                  uasserted(ErrorCodes::BadValue, "Unexpected action type");
-                              }},
-            action);
+        visit(OverloadedVisitor{[&](const MergeInfo& act) {
+                                    if (_defragmentationStates.contains(act.uuid)) {
+                                        targetState = _defragmentationStates.at(act.uuid).get();
+                                    }
+                                },
+                                [&](const DataSizeInfo& act) {
+                                    if (_defragmentationStates.contains(act.uuid)) {
+                                        targetState = _defragmentationStates.at(act.uuid).get();
+                                    }
+                                },
+                                [&](const MigrateInfo& act) {
+                                    if (_defragmentationStates.contains(act.uuid)) {
+                                        targetState = _defragmentationStates.at(act.uuid).get();
+                                    }
+                                },
+                                [](const MergeAllChunksOnShardInfo& _) {
+                                    uasserted(ErrorCodes::BadValue, "Unexpected action type");
+                                }},
+              action);
 
         if (targetState) {
             targetState->applyActionResult(opCtx, action, response);

@@ -98,10 +98,28 @@ private:
 };
 
 /**
+ * Class which contains logic common to routers which target one or more collections.
+ */
+class CollectionRouterCommon : public RouterBase {
+protected:
+    CollectionRouterCommon(ServiceContext* service,
+                           const std::vector<NamespaceString>& routingNamespaces);
+
+    static void appendCRUDRoutingTokenToCommand(const ShardId& shardId,
+                                                const CollectionRoutingInfo& cri,
+                                                BSONObjBuilder* builder);
+
+    void _onException(RouteContext* context, Status s);
+    CollectionRoutingInfo _getRoutingInfo(OperationContext* opCtx, const NamespaceString& nss);
+
+    const std::vector<NamespaceString> _targetedNamespaces;
+};
+
+/**
  * This class should mostly be used for routing CRUD operations which need to have a view of the
  * entire routing table for a collection.
  */
-class CollectionRouter : public RouterBase {
+class CollectionRouter : public CollectionRouterCommon {
 public:
     CollectionRouter(ServiceContext* service, NamespaceString nss);
 
@@ -109,7 +127,7 @@ public:
     auto route(OperationContext* opCtx, StringData comment, F&& callbackFn) {
         RouteContext context{comment.toString()};
         while (true) {
-            auto cri = _getRoutingInfo(opCtx);
+            auto cri = _getRoutingInfo(opCtx, _targetedNamespaces.front());
             try {
                 return callbackFn(opCtx, cri);
             } catch (const DBException& ex) {
@@ -117,16 +135,37 @@ public:
             }
         }
     }
+};
 
-    static void appendCRUDRoutingTokenToCommand(const ShardId& shardId,
-                                                const CollectionRoutingInfo& cri,
-                                                BSONObjBuilder* builder);
+class MultiCollectionRouter : public CollectionRouterCommon {
+public:
+    MultiCollectionRouter(ServiceContext* service, const std::vector<NamespaceString>& nssList);
 
-private:
-    CollectionRoutingInfo _getRoutingInfo(OperationContext* opCtx) const;
-    void _onException(RouteContext* context, Status s);
+    /**
+     * Member function which discerns whether any of the namespaces in 'routingNamespaces' are not
+     * local.
+     */
+    bool isAnyCollectionNotLocal(
+        OperationContext* opCtx,
+        const stdx::unordered_map<NamespaceString, CollectionRoutingInfo>& criMap);
 
-    NamespaceString _nss;
+
+    template <typename F>
+    auto route(OperationContext* opCtx, StringData comment, F&& callbackFn) {
+        RouteContext context{comment.toString()};
+        while (true) {
+            stdx::unordered_map<NamespaceString, CollectionRoutingInfo> criMap;
+            for (const auto& nss : _targetedNamespaces) {
+                criMap.emplace(nss, _getRoutingInfo(opCtx, nss));
+            }
+
+            try {
+                return callbackFn(opCtx, criMap);
+            } catch (const DBException& ex) {
+                _onException(&context, ex.toStatus());
+            }
+        }
+    }
 };
 
 }  // namespace router

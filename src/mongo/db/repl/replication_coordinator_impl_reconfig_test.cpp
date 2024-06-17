@@ -124,8 +124,8 @@ TEST_F(ReplCoordTest, NodeReturnsNotWritablePrimaryWhenReconfigReceivedWhileSeco
                        HostAndPort("node1", 12345));
 
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
 
     BSONObjBuilder result;
     ReplSetReconfigArgs args;
@@ -148,8 +148,8 @@ TEST_F(ReplCoordTest, NodeReturnsNotWritablePrimaryWhenRunningSafeReconfigWhileI
                                                         << "test2:1234"))
                             << "protocolVersion" << 1),
                        HostAndPort("test1", 1234));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
     ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
 
@@ -181,8 +181,8 @@ TEST_F(ReplCoordTest, NodeReturnsNotPrimaryErrorWhenReconfigCmdReceivedWhileInDr
                                                         << "test2:1234"))
                             << "protocolVersion" << 1),
                        HostAndPort("test1", 1234));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
     ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
 
@@ -212,8 +212,8 @@ TEST_F(ReplCoordTest,
                                                         << "test2:1234"))
                             << "protocolVersion" << 1),
                        HostAndPort("test1", 1234));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
     ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
 
@@ -243,8 +243,8 @@ TEST_F(ReplCoordTest, NodeReturnsInvalidReplicaSetConfigWhenReconfigReceivedWith
                                                         << "node2:12345"))),
                        HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
     simulateSuccessfulV1Election();
 
     BSONObjBuilder result;
@@ -278,8 +278,8 @@ TEST_F(ReplCoordTest, NodeReturnsInvalidReplicaSetConfigWhenReconfigReceivedWith
                                                         << "node2:12345"))),
                        HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
     simulateSuccessfulV1Election();
 
     BSONObjBuilder result;
@@ -311,8 +311,8 @@ TEST_F(ReplCoordTest, NodeReturnsInvalidReplicaSetConfigWhenReconfigReceivedWith
                             << "settings" << BSON("replicaSetId" << OID::gen())),
                        HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
     simulateSuccessfulV1Election();
 
     BSONObjBuilder result;
@@ -345,8 +345,8 @@ TEST_F(ReplCoordTest,
                                                         << "node2:12345"))),
                        HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
     simulateSuccessfulV1Election();
 
     BSONObjBuilder result;
@@ -412,7 +412,7 @@ TEST_F(ReplCoordTest, QuorumCheckSucceedsWhenOtherNodesHaveHigherTerm) {
     OpTime opTime{Timestamp(100, 1), 1};
     assertStartSuccess(configObj, HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedAndDurableOpTime(opTime, getNet()->now());
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(opTime, getNet()->now());
     simulateSuccessfulV1Election();
 
     Status status(ErrorCodes::InternalError, "Not Set");
@@ -437,6 +437,7 @@ TEST_F(ReplCoordTest, QuorumCheckSucceedsWhenOtherNodesHaveHigherTerm) {
     hbResp.setConfigVersion(2);
     hbResp.setConfigTerm(getReplCoord()->getTerm() + 1);
     hbResp.setAppliedOpTimeAndWallTime({opTime, net->now()});
+    hbResp.setWrittenOpTimeAndWallTime({opTime, net->now()});
     hbResp.setDurableOpTimeAndWallTime({opTime, net->now()});
     net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
     net->runReadyNetworkOperations();
@@ -453,7 +454,7 @@ TEST_F(ReplCoordTest, QuorumCheckSucceedsWhenOtherNodesHaveLowerTerm) {
     OpTime opTime{Timestamp(100, 1), 1};
     assertStartSuccess(configObj, HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedAndDurableOpTime(opTime, getNet()->now());
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(opTime, getNet()->now());
     simulateSuccessfulV1Election();
 
     Status status(ErrorCodes::InternalError, "Not Set");
@@ -478,6 +479,7 @@ TEST_F(ReplCoordTest, QuorumCheckSucceedsWhenOtherNodesHaveLowerTerm) {
     hbResp.setConfigVersion(4);
     hbResp.setConfigTerm(getReplCoord()->getTerm() - 1);
     hbResp.setAppliedOpTimeAndWallTime({opTime, net->now()});
+    hbResp.setWrittenOpTimeAndWallTime({opTime, net->now()});
     hbResp.setDurableOpTimeAndWallTime({opTime, net->now()});
     net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
     net->runReadyNetworkOperations();
@@ -498,16 +500,16 @@ TEST_F(ReplCoordTest, NodeReturnsOutOfDiskSpaceWhenSavingANewConfigFailsDuringRe
                                                         << "node2:12345"))),
                        HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
     simulateSuccessfulV1Election();
 
     auto newOpTime = OpTime(Timestamp(101, 1), 1);
-    replCoordSetMyLastAppliedOpTime(newOpTime, Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(newOpTime, Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(newOpTime, Date_t() + Seconds(100));
 
     // Advance optimes of secondary so we pass the config oplog commitment check.
     ASSERT_OK(getReplCoord()->setLastAppliedOptime_forTest(2, 2, newOpTime));
+    ASSERT_OK(getReplCoord()->setLastWrittenOptime_forTest(2, 2, newOpTime));
     ASSERT_OK(getReplCoord()->setLastDurableOptime_forTest(2, 2, newOpTime));
 
     Status status(ErrorCodes::InternalError, "Not Set");
@@ -533,8 +535,8 @@ TEST_F(ReplCoordTest,
                                                         << "node2:12345"))),
                        HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
     simulateSuccessfulV1Election();
 
     Status status(ErrorCodes::InternalError, "Not Set");
@@ -569,8 +571,8 @@ TEST_F(ReplCoordTest, NodeReturnsConfigurationInProgressWhenReceivingAReconfigWh
     init();
     start(HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
 
     // initiate
     Status status(ErrorCodes::InternalError, "Not Set");
@@ -611,16 +613,16 @@ TEST_F(ReplCoordTest, PrimaryNodeAcceptsNewConfigWhenReceivingAReconfigWithAComp
                             << "settings" << BSON("replicaSetId" << OID::gen())),
                        HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
     simulateSuccessfulV1Election();
 
     auto newOpTime = OpTime(Timestamp(101, 1), 1);
-    replCoordSetMyLastAppliedOpTime(newOpTime, Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(newOpTime, Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(newOpTime, Date_t() + Seconds(100));
 
     // Advance optimes of secondary so we pass the config oplog commitment check.
     ASSERT_OK(getReplCoord()->setLastAppliedOptime_forTest(2, 2, newOpTime));
+    ASSERT_OK(getReplCoord()->setLastWrittenOptime_forTest(2, 2, newOpTime));
     ASSERT_OK(getReplCoord()->setLastDurableOptime_forTest(2, 2, newOpTime));
 
     Status status(ErrorCodes::InternalError, "Not Set");
@@ -645,6 +647,7 @@ TEST_F(ReplCoordTest, PrimaryNodeAcceptsNewConfigWhenReceivingAReconfigWithAComp
     hbResp.setConfigVersion(3);
     hbResp.setConfigTerm(1);
     hbResp.setAppliedOpTimeAndWallTime({OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100)});
+    hbResp.setWrittenOpTimeAndWallTime({OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100)});
     hbResp.setDurableOpTimeAndWallTime({OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100)});
     BSONObjBuilder respObj;
     respObj << "ok" << 1;
@@ -668,13 +671,12 @@ TEST_F(ReplCoordTest, OverrideReconfigBsonTermSoReconfigSucceeds) {
                             << "settings" << BSON("replicaSetId" << OID::gen())),
                        HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
     simulateSuccessfulV1Election();  // Since we have simulated one election, term should be 1.
 
     auto newOpTime = OpTime(Timestamp(101, 1), 1);
-    replCoordSetMyLastAppliedOpTime(newOpTime, Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(newOpTime, Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(newOpTime, Date_t() + Seconds(100));
 
     // Advance optimes of secondary so we pass the config oplog commitment check.
     ASSERT_OK(getReplCoord()->setLastAppliedOptime_forTest(2, 2, newOpTime));
@@ -703,6 +705,7 @@ TEST_F(ReplCoordTest, OverrideReconfigBsonTermSoReconfigSucceeds) {
     hbResp.setConfigTerm(1);
     BSONObjBuilder respObj;
     hbResp.setAppliedOpTimeAndWallTime({OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100)});
+    hbResp.setWrittenOpTimeAndWallTime({OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100)});
     hbResp.setDurableOpTimeAndWallTime({OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100)});
     respObj << "ok" << 1;
     hbResp.addToBSON(&respObj);
@@ -731,8 +734,8 @@ TEST_F(
                                                         << "node2:12345"))),
                        HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
     simulateSuccessfulV1Election();
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
 
@@ -754,6 +757,7 @@ TEST_F(
     hbResp2.setSetName("mySet");
     hbResp2.setState(MemberState::RS_SECONDARY);
     hbResp2.setAppliedOpTimeAndWallTime({OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100)});
+    hbResp2.setWrittenOpTimeAndWallTime({OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100)});
     hbResp2.setDurableOpTimeAndWallTime({OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100)});
     BSONObjBuilder respObj2;
     respObj2 << "ok" << 1;
@@ -787,8 +791,8 @@ TEST_F(ReplCoordTest, NodeDoesNotAcceptHeartbeatReconfigWhileInTheMidstOfReconfi
                                                         << "node2:12345"))),
                        HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
     simulateSuccessfulV1Election();
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
 
@@ -819,6 +823,7 @@ TEST_F(ReplCoordTest, NodeDoesNotAcceptHeartbeatReconfigWhileInTheMidstOfReconfi
     hbResp.setSetName("mySet");
     hbResp.setState(MemberState::RS_SECONDARY);
     hbResp.setAppliedOpTimeAndWallTime({OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100)});
+    hbResp.setWrittenOpTimeAndWallTime({OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100)});
     hbResp.setDurableOpTimeAndWallTime({OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100)});
     BSONObjBuilder respObj2;
     respObj2 << "ok" << 1;
@@ -853,8 +858,8 @@ TEST_F(ReplCoordTest, NodeAcceptsConfigFromAReconfigWithForceTrueWhileNotPrimary
                                                         << "node2:12345"))),
                        HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
 
     // fail before forced
     BSONObjBuilder result;
@@ -890,8 +895,8 @@ TEST_F(ReplCoordTest, ReconfigThatChangesIDWCFromWMajToW1WithoutCWWCSetFails) {
                                                         << "node2:12345"))),
                        HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
     simulateSuccessfulV1Election();
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
 
@@ -928,8 +933,8 @@ TEST_F(ReplCoordTest, ReconfigThatChangesIDWCFromW1toWMajWithoutCWWCSetFails) {
                                                         << "arbiterOnly" << true))),
                        HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
     simulateSuccessfulV1Election();
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
 
@@ -967,8 +972,8 @@ TEST_F(ReplCoordTest, ReconfigThatChangesIDWCWMajToW1WithCWWCSetPasses) {
                                                         << "node2:12345"))),
                        HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
     simulateSuccessfulV1Election();
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
 
@@ -1031,8 +1036,8 @@ TEST_F(ReplCoordTest, ReconfigThatChangesIDWCW1ToWMajWithCWWCSetPasses) {
                                                         << "arbiterOnly" << true))),
                        HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
     simulateSuccessfulV1Election();
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
 
@@ -1087,8 +1092,8 @@ TEST_F(ReplCoordTest, ReconfigThatKeepsIDWCAtW1WithoutCWWCSetPasses) {
                                                         << "arbiterOnly" << true))),
                        HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
     simulateSuccessfulV1Election();
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
 
@@ -1149,8 +1154,8 @@ TEST_F(ReplCoordTest, ReconfigThatKeepsIDWCAtWMajWithoutCWWCSetPasses) {
                                                         << "node2:12345"))),
                        HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
     simulateSuccessfulV1Election();
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
 
@@ -1227,6 +1232,7 @@ public:
         hbResp.setConfigTerm(getReplCoord()->getConfigTerm());
         BSONObjBuilder respObj;
         hbResp.setAppliedOpTimeAndWallTime({OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100)});
+        hbResp.setWrittenOpTimeAndWallTime({OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100)});
         hbResp.setDurableOpTimeAndWallTime({OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100)});
         respObj << "ok" << 1;
         hbResp.addToBSON(&respObj);
@@ -1255,7 +1261,7 @@ public:
         ASSERT_FALSE(rsConfig.findMemberByID(2)->isNewlyAdded());
 
         // Simulate application of one oplog entry.
-        replCoordSetMyLastAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
+        replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
 
         // Get elected primary.
         simulateSuccessfulV1Election();
@@ -1263,7 +1269,7 @@ public:
         ASSERT_EQ(getReplCoord()->getTerm(), 1);
 
         // Advance your optime.
-        replCoordSetMyLastAppliedAndDurableOpTime(OpTime(Timestamp(2, 1), 1));
+        replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(2, 1), 1));
         respondToAllHeartbeats();
     }
 
@@ -1384,7 +1390,7 @@ TEST_F(ReplCoordReconfigTest, MustFindSelfAndBeElectableInNewConfig) {
 
     assertStartSuccess(oldConfigObj, HostAndPort("h1", 1));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
     simulateSuccessfulV1Election();
     ASSERT_EQ(getReplCoord()->getMemberState(), MemberState::RS_PRIMARY);
 
@@ -1451,7 +1457,7 @@ TEST_F(ReplCoordReconfigTest, MustSendHeartbeatToSplitConfigRecipients) {
 
     assertStartSuccess(oldConfigObj, HostAndPort("h1", 1));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
     simulateSuccessfulV1Election();
     ASSERT_EQ(getReplCoord()->getMemberState(), MemberState::RS_PRIMARY);
 
@@ -1511,7 +1517,7 @@ TEST_F(ReplCoordReconfigTest,
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
     // Simulate application of one oplog entry.
-    replCoordSetMyLastAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
 
     // Get elected primary.
     simulateSuccessfulV1Election();
@@ -1521,7 +1527,7 @@ TEST_F(ReplCoordReconfigTest,
     // Advance the commit point by simulating optime reports from nodes.
     auto commitPoint = OpTime(Timestamp(2, 1), 1);
     auto configVersion = 2;
-    replCoordSetMyLastAppliedAndDurableOpTime(commitPoint);
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(commitPoint);
     ASSERT_OK(getReplCoord()->setLastAppliedOptime_forTest(configVersion, 2, commitPoint));
     ASSERT_OK(getReplCoord()->setLastDurableOptime_forTest(configVersion, 2, commitPoint));
     ASSERT_EQ(getReplCoord()->getLastCommittedOpTime(), commitPoint);
@@ -1583,7 +1589,7 @@ TEST_F(ReplCoordReconfigTest,
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
     // Simulate application of one oplog entry.
-    replCoordSetMyLastAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
 
     // Get elected primary.
     simulateSuccessfulV1Election();
@@ -1593,7 +1599,7 @@ TEST_F(ReplCoordReconfigTest,
     // Write one new oplog entry.
     auto commitPoint = OpTime(Timestamp(2, 1), 1);
     configVersion = 3;
-    replCoordSetMyLastAppliedAndDurableOpTime(commitPoint);
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(commitPoint);
 
     // Do a reconfig that should fail the oplog commitment pre-condition check.
     ReplSetReconfigArgs args;
@@ -1649,14 +1655,14 @@ TEST_F(ReplCoordReconfigTest, WaitForConfigCommitmentTimesOutIfConfigIsNotCommit
     // Startup, simulate application of one oplog entry and get elected.
     assertStartSuccess(configWithMembers(configVersion, 0, Ca_members), HostAndPort("n1", 1));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
     simulateSuccessfulV1Election();
     ASSERT_EQ(getReplCoord()->getMemberState(), MemberState::RS_PRIMARY);
     ASSERT_EQ(getReplCoord()->getTerm(), 1);
 
     // Write and commit one new oplog entry, and consume any heartbeats.
     auto commitPoint = OpTime(Timestamp(2, 1), 1);
-    replCoordSetMyLastAppliedAndDurableOpTime(commitPoint);
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(commitPoint);
     ASSERT_EQ(getReplCoord()->getLastCommittedOpTime(), commitPoint);
     respondToAllHeartbeats();
 
@@ -1690,14 +1696,14 @@ TEST_F(ReplCoordReconfigTest, WaitForConfigCommitmentReturnsOKIfConfigIsCommitte
     // Startup, simulate application of one oplog entry and get elected.
     assertStartSuccess(configWithMembers(configVersion, 0, Ca_members), HostAndPort("n1", 1));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
     simulateSuccessfulV1Election();
     ASSERT_EQ(getReplCoord()->getMemberState(), MemberState::RS_PRIMARY);
     ASSERT_EQ(getReplCoord()->getTerm(), 1);
 
     // Write and commit one new oplog entry, and consume any heartbeats.
     auto commitPoint = OpTime(Timestamp(2, 1), 1);
-    replCoordSetMyLastAppliedAndDurableOpTime(commitPoint);
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(commitPoint);
     ASSERT_EQ(getReplCoord()->getLastCommittedOpTime(), commitPoint);
     respondToAllHeartbeats();
 
@@ -1722,7 +1728,7 @@ TEST_F(ReplCoordReconfigTest,
     // Startup, simulate application of one oplog entry and get elected.
     assertStartSuccess(configWithMembers(configVersion, 0, Ca_members), HostAndPort("n1", 1));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
     simulateSuccessfulV1Election();
     ASSERT_EQ(getReplCoord()->getMemberState(), MemberState::RS_PRIMARY);
     ASSERT_EQ(getReplCoord()->getTerm(), 1);
@@ -1730,7 +1736,7 @@ TEST_F(ReplCoordReconfigTest,
     // Write and commit one new oplog entry, and consume any heartbeats.
     const auto opCtx = makeOperationContext();
     auto commitPoint = OpTime(Timestamp(2, 1), 1);
-    replCoordSetMyLastAppliedAndDurableOpTime(commitPoint);
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(commitPoint);
     ASSERT_EQ(getReplCoord()->getLastCommittedOpTime(), commitPoint);
     respondToAllHeartbeats();
 
@@ -1761,7 +1767,7 @@ TEST_F(ReplCoordReconfigTest,
     // Start up, simulate application of one oplog entry and get elected.
     assertStartSuccess(configWithMembers(configVersion, 0, Ca_members), HostAndPort("n1", 1));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
     simulateSuccessfulV1Election();
     ASSERT_EQ(getReplCoord()->getMemberState(), MemberState::RS_PRIMARY);
     ASSERT_EQ(getReplCoord()->getTerm(), 1);
@@ -1769,7 +1775,7 @@ TEST_F(ReplCoordReconfigTest,
     // Write and commit one new oplog entry, and consume any heartbeats.
     const auto opCtx = makeOperationContext();
     auto commitPoint = OpTime(Timestamp(2, 1), 1);
-    replCoordSetMyLastAppliedAndDurableOpTime(commitPoint);
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(commitPoint);
     replicateOpTo(2, commitPoint);
     ASSERT_EQ(getReplCoord()->getLastCommittedOpTime(), commitPoint);
     respondToAllHeartbeats();
@@ -1799,7 +1805,7 @@ TEST_F(ReplCoordReconfigTest,
     // Start up, simulate application of one oplog entry and get elected.
     assertStartSuccess(configWithMembers(configVersion, 0, Ca_members), HostAndPort("n1", 1));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
     simulateSuccessfulV1Election();
     ASSERT_EQ(getReplCoord()->getMemberState(), MemberState::RS_PRIMARY);
     ASSERT_EQ(getReplCoord()->getTerm(), 1);
@@ -1808,7 +1814,7 @@ TEST_F(ReplCoordReconfigTest,
     // 3, which will be removed from the config.
     const auto opCtx = makeOperationContext();
     auto commitPoint = OpTime(Timestamp(2, 1), 1);
-    replCoordSetMyLastAppliedAndDurableOpTime(commitPoint);
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(commitPoint);
     replicateOpTo(3, commitPoint);
     ASSERT_EQ(getReplCoord()->getLastCommittedOpTime(), commitPoint);
     respondToAllHeartbeats();
@@ -1840,7 +1846,7 @@ TEST_F(ReplCoordReconfigTest,
     // Start up, simulate application of one oplog entry and get elected.
     assertStartSuccess(configWithMembers(configVersion, 0, Ca_members), HostAndPort("n1", 1));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
     simulateSuccessfulV1Election();
     ASSERT_EQ(getReplCoord()->getMemberState(), MemberState::RS_PRIMARY);
     ASSERT_EQ(getReplCoord()->getTerm(), 1);
@@ -1849,7 +1855,7 @@ TEST_F(ReplCoordReconfigTest,
     // nodes 4 and 5, one of which will be removed from the config.
     const auto opCtx = makeOperationContext();
     auto commitPoint = OpTime(Timestamp(2, 1), 1);
-    replCoordSetMyLastAppliedAndDurableOpTime(commitPoint);
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(commitPoint);
     replicateOpTo(4, commitPoint);
     replicateOpTo(5, commitPoint);
     ASSERT_EQ(getReplCoord()->getLastCommittedOpTime(), commitPoint);
@@ -1881,7 +1887,7 @@ TEST_F(ReplCoordReconfigTest,
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
     // Simulate application of one oplog entry.
-    replCoordSetMyLastAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
 
     // Get elected primary.
     simulateSuccessfulV1Election();
@@ -1889,7 +1895,7 @@ TEST_F(ReplCoordReconfigTest,
     ASSERT_EQ(getReplCoord()->getTerm(), 1);
 
     // Advance your optime.
-    replCoordSetMyLastAppliedAndDurableOpTime(OpTime(Timestamp(2, 1), 1));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(2, 1), 1));
 
     // Do a force reconfig that should succeed even though oplog commitment pre-condition check is
     // not satisfied.
@@ -1922,7 +1928,7 @@ TEST_F(ReplCoordReconfigTest, StepdownShouldInterruptConfigWrite) {
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
     // Simulate application of one oplog entry.
-    replCoordSetMyLastAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
 
     // Get elected primary.
     simulateSuccessfulV1Election();
@@ -1931,7 +1937,7 @@ TEST_F(ReplCoordReconfigTest, StepdownShouldInterruptConfigWrite) {
 
     // Advance your optime.
     auto commitPoint = OpTime(Timestamp(2, 1), 1);
-    replCoordSetMyLastAppliedAndDurableOpTime(commitPoint);
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(commitPoint);
     replicateOpTo(2, commitPoint);
 
     // Respond to heartbeats before reconfig.
@@ -1994,7 +2000,7 @@ TEST_F(ReplCoordReconfigTest, StartElectionOnReconfigToSingleNode) {
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
     // Simulate application of one oplog entry.
-    replCoordSetMyLastAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
 
     // Construct the new config of single node replset.
     auto configVersion = 2;
@@ -2140,7 +2146,7 @@ TEST_F(ReplCoordReconfigTest, ForceReconfigDoesNotPersistNewlyAddedFieldFromOldN
 
     // Advance the commit point on all nodes.
     const auto commitPoint = OpTime(Timestamp(3, 1), 1);
-    replCoordSetMyLastAppliedAndDurableOpTime(commitPoint);
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(commitPoint);
     replicateOpTo(1, commitPoint);
     replicateOpTo(2, commitPoint);
     replicateOpTo(3, commitPoint);
@@ -2289,7 +2295,7 @@ TEST_F(ReplCoordReconfigTest, ReconfigNeverModifiesExistingNewlyAddedFieldForMem
 
     // Advance the commit point on all nodes.
     const auto commitPoint = OpTime(Timestamp(3, 1), 1);
-    replCoordSetMyLastAppliedAndDurableOpTime(commitPoint);
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(commitPoint);
     replicateOpTo(1, commitPoint);
     replicateOpTo(2, commitPoint);
     replicateOpTo(3, commitPoint);
@@ -2335,7 +2341,7 @@ TEST_F(ReplCoordReconfigTest, ReconfigNeverModifiesExistingNewlyAddedFieldForPre
 
     // Advance the commit point on all nodes.
     const auto commitPoint = OpTime(Timestamp(3, 1), 1);
-    replCoordSetMyLastAppliedAndDurableOpTime(commitPoint);
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(commitPoint);
     replicateOpTo(1, commitPoint);
     replicateOpTo(2, commitPoint);
     replicateOpTo(3, commitPoint);
@@ -2418,7 +2424,7 @@ TEST_F(ReplCoordReconfigTest, NodesWithNewlyAddedFieldSetHavePriorityZero) {
 
     // Advance the commit point on all nodes.
     const auto commitPoint = OpTime(Timestamp(3, 1), 1);
-    replCoordSetMyLastAppliedAndDurableOpTime(commitPoint);
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(commitPoint);
     replicateOpTo(1, commitPoint);
     replicateOpTo(2, commitPoint);
     replicateOpTo(3, commitPoint);
@@ -2532,8 +2538,8 @@ TEST_F(ReplCoordTest, StepUpReconfigConcurrentWithHeartbeatReconfig) {
                        HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
     ASSERT_EQUALS(getReplCoord()->getTerm(), 0);
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
 
     // Win election but don't exit drain mode.
     auto electionTimeoutWhen = getReplCoord()->getElectionTimeout_forTest();
@@ -2603,6 +2609,7 @@ TEST_F(ReplCoordTest, StepUpReconfigConcurrentWithHeartbeatReconfig) {
     hbResp.setConfigVersion(rsConfig.getConfigVersion());
     hbResp.setConfigTerm(rsConfig.getConfigTerm());
     hbResp.setAppliedOpTimeAndWallTime({lastApplied, Date_t() + Seconds(lastApplied.getSecs())});
+    hbResp.setWrittenOpTimeAndWallTime({lastApplied, Date_t() + Seconds(lastApplied.getSecs())});
     hbResp.setDurableOpTimeAndWallTime({lastApplied, Date_t() + Seconds(lastApplied.getSecs())});
     net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
     net->runReadyNetworkOperations();
@@ -2633,8 +2640,8 @@ TEST_F(ReplCoordTest, StepUpReconfigConcurrentWithForceHeartbeatReconfig) {
                        HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
     ASSERT_EQUALS(getReplCoord()->getTerm(), 0);
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
 
     // Win election but don't exit drain mode.
     auto electionTimeoutWhen = getReplCoord()->getElectionTimeout_forTest();
@@ -2682,6 +2689,7 @@ TEST_F(ReplCoordTest, StepUpReconfigConcurrentWithForceHeartbeatReconfig) {
     hbResp.setConfigVersion(rsConfig.getConfigVersion());
     hbResp.setConfigTerm(rsConfig.getConfigTerm());
     hbResp.setAppliedOpTimeAndWallTime({lastApplied, Date_t() + Seconds(lastApplied.getSecs())});
+    hbResp.setWrittenOpTimeAndWallTime({lastApplied, Date_t() + Seconds(lastApplied.getSecs())});
     hbResp.setDurableOpTimeAndWallTime({lastApplied, Date_t() + Seconds(lastApplied.getSecs())});
     net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
     net->exitNetwork();
@@ -2726,8 +2734,8 @@ TEST_F(ReplCoordReconfigTest, FindOwnHostForCommandReconfigQuick) {
                                           << BSON("_id" << 2 << "host"
                                                         << "node2:12345"))),
                        HostAndPort("node1", 12345));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
     simulateSuccessfulV1Election();
 
@@ -2779,8 +2787,8 @@ TEST_F(ReplCoordReconfigTest, FindOwnHostForCommandReconfigQuickUnelectableError
                                           << BSON("_id" << 2 << "host"
                                                         << "node2:12345"))),
                        HostAndPort("node1", 12345));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
     simulateSuccessfulV1Election();
 
@@ -2813,8 +2821,8 @@ TEST_F(ReplCoordReconfigTest, FindOwnHostForCommandReconfigQuickUnelectableButFo
                                           << BSON("_id" << 2 << "host"
                                                         << "node2:12345"))),
                        HostAndPort("node1", 12345));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 0),
+                                                        Date_t() + Seconds(100));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
     simulateSuccessfulV1Election();
 

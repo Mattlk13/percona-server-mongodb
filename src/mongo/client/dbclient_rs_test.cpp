@@ -98,7 +98,7 @@ public:
     }
 
 protected:
-    void setUp() {
+    void setUp() override {
         auto serviceContext = ServiceContext::make();
         setGlobalServiceContext(std::move(serviceContext));
     }
@@ -116,7 +116,7 @@ private:
  */
 class BasicRS : public DBClientRSTest {
 protected:
-    void setUp() {
+    void setUp() override {
         DBClientRSTest::setUp();
         ReplicaSetMonitor::cleanup();
 
@@ -127,7 +127,7 @@ protected:
         ConnectionString::setConnectionHook(mongo::MockConnRegistry::get()->getConnStrHook());
     }
 
-    void tearDown() {
+    void tearDown() override {
         _replSet.reset();
 
         mongo::ScopedDbConnection::clearPool();
@@ -152,7 +152,8 @@ void assertOneOfNodesSelected(MockReplicaSet* replSet,
     auto tagSet = secondaryOk ? TagSet() : TagSet::primaryOnly();
     // We need the command to be a "SecOk command"
     auto res = replConn.runCommand(
-        OpMsgRequest::fromDBAndBody(DatabaseName::createDatabaseName_forTest(boost::none, "foo"),
+        OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::kNotRequired,
+                                    DatabaseName::createDatabaseName_forTest(boost::none, "foo"),
                                     BSON("dbStats" << 1),
                                     makeMetadata(rp, tagSet)));
     stdx::unordered_set<HostAndPort> hostSet;
@@ -237,7 +238,7 @@ TEST_F(BasicRS, CommandSecondaryPreferred) {
  */
 class AllNodesDown : public DBClientRSTest {
 protected:
-    void setUp() {
+    void setUp() override {
         DBClientRSTest::setUp();
         ReplicaSetMonitor::cleanup();
 
@@ -254,7 +255,7 @@ protected:
         getTopologyManager()->setTopologyDescription(_replSet->getTopologyDescription(clock()));
     }
 
-    void tearDown() {
+    void tearDown() override {
         ReplicaSetMonitor::cleanup();
         _replSet.reset();
 
@@ -275,7 +276,8 @@ void assertRunCommandWithReadPrefThrows(MockReplicaSet* replSet, ReadPreference 
     TagSet ts = isPrimaryOnly ? TagSet::primaryOnly() : TagSet();
 
     DBClientReplicaSet replConn(replSet->getSetName(), replSet->getHosts(), StringData());
-    ASSERT_THROWS(replConn.runCommand(OpMsgRequest::fromDBAndBody(
+    ASSERT_THROWS(replConn.runCommand(OpMsgRequestBuilder::create(
+                      auth::ValidatedTenancyScope::kNotRequired,
                       DatabaseName::createDatabaseName_forTest(boost::none, "foo"),
                       BSON("dbStats" << 1),
                       makeMetadata(rp, ts))),
@@ -356,7 +358,7 @@ TEST_F(AllNodesDown, CommandNearest) {
  */
 class PrimaryDown : public DBClientRSTest {
 protected:
-    void setUp() {
+    void setUp() override {
         DBClientRSTest::setUp();
         ReplicaSetMonitor::cleanup();
 
@@ -368,7 +370,7 @@ protected:
         getTopologyManager()->setTopologyDescription(_replSet->getTopologyDescription(clock()));
     }
 
-    void tearDown() {
+    void tearDown() override {
         ReplicaSetMonitor::cleanup();
         _replSet.reset();
 
@@ -464,7 +466,7 @@ TEST_F(PrimaryDown, Nearest) {
  */
 class SecondaryDown : public DBClientRSTest {
 protected:
-    void setUp() {
+    void setUp() override {
         DBClientRSTest::setUp();
         ReplicaSetMonitor::cleanup();
 
@@ -477,7 +479,7 @@ protected:
         getTopologyManager()->setTopologyDescription(_replSet->getTopologyDescription(clock()));
     }
 
-    void tearDown() {
+    void tearDown() override {
         ReplicaSetMonitor::cleanup();
         _replSet.reset();
 
@@ -574,7 +576,7 @@ TEST_F(SecondaryDown, CommandNearest) {
  */
 class TaggedFiveMemberRS : public DBClientRSTest {
 protected:
-    void setUp() {
+    void setUp() override {
         DBClientRSTest::setUp();
 
         // This shuts down the background RSMWatcher thread and prevents it from running. These
@@ -679,7 +681,7 @@ protected:
         getTopologyManager()->setTopologyDescription(_replSet->getTopologyDescription(clock()));
     }
 
-    void tearDown() {
+    void tearDown() override {
         ConnectionString::setConnectionHook(_originalConnectionHook);
         ReplicaSetMonitor::cleanup();
         _replSet.reset();

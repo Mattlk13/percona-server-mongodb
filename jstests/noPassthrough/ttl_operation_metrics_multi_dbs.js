@@ -59,7 +59,7 @@ const assertMetrics = (conn, assertFn) => {
 assert.commandWorked(primaryDB1[collName].createIndex({x: 1}, {expireAfterSeconds: 0}));
 assert.commandWorked(primaryDB2[collName].createIndex({x: 1}, {expireAfterSeconds: 0}));
 
-const pauseTtl = configureFailPoint(primary, 'hangTTLMonitorWithLock');
+const pauseTtl = configureFailPoint(primary, 'hangTTLMonitorBetweenPasses');
 pauseTtl.wait();
 
 clearMetrics(primary);
@@ -90,6 +90,7 @@ assertMetrics(primary, (metrics) => {
 // Clear metrics and wait for two TTL passes to make sure we both observe the inserts and delete the
 // documents.
 clearMetrics(primary);
+primaryDB1.setLogLevel(1, 'index');
 pauseTtl.off();
 TTLUtil.waitForPass(primaryDB1);
 TTLUtil.waitForPass(primaryDB1);
@@ -117,10 +118,8 @@ assertMetrics(primary, (metrics) => {
     assert.eq(metrics[dbName2].docUnitsWritten, 0);
     assert.eq(metrics[dbName2].totalUnitsWritten, 0);
 
-    // We need to read in a few keys to determine whether there is data to delete. Since we haven't
-    // stopped the TTL monitor, the value can be larger than expected.
-    assert.gte(metrics[dbName2].primaryMetrics.idxEntryBytesRead, 24);
-    assert.gte(metrics[dbName2].primaryMetrics.idxEntryUnitsRead, 2);
+    assert.eq(metrics[dbName2].primaryMetrics.idxEntryBytesRead, 0);
+    assert.eq(metrics[dbName2].primaryMetrics.idxEntryUnitsRead, 0);
     assert.eq(metrics[dbName2].idxEntryUnitsWritten, 0);
     assert.eq(metrics[dbName2].idxEntryBytesWritten, 0);
 });

@@ -81,7 +81,10 @@ namespace mongo::optimizer::cascades {
     F(EvaluationSubstitute)                                       \
     F(SargableSplit)                                              \
     F(FilterRIDIntersectReorder)                                  \
-    F(EvaluationRIDIntersectReorder)
+    F(EvaluationRIDIntersectReorder)                              \
+                                                                  \
+    /* Simplify filter node. */                                   \
+    F(FilterSimplify)
 
 QUERY_UTIL_NAMED_ENUM_DEFINE(LogicalRewriteType, LOGICALREWRITER_NAMES)
 #undef LOGICALREWRITER_NAMES
@@ -106,6 +109,7 @@ QUERY_UTIL_NAMED_ENUM_DEFINE(LogicalRewriteType, LOGICALREWRITER_NAMES)
     F(Exchange)                   \
     F(NLJ)                        \
     F(Filter)                     \
+    F(FilterWithPhysicalScan)     \
     F(RenameProjection)           \
     F(EvaluationPassthrough)      \
     F(SargableIxScanConvert)      \

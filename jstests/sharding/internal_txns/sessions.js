@@ -1,7 +1,11 @@
-/*
+/**
  * Tests basic support for internal sessions.
  *
- * @tags: [requires_fcv_60, uses_transactions]
+ * @tags: [
+ *   requires_fcv_60,
+ *   temp_disabled_embedded_router_known_issues,
+ *   uses_transactions,
+ * ]
  */
 TestData.disableImplicitSessions = true;
 
@@ -13,7 +17,7 @@ const st = new ShardingTest({
     },
     // The config server uses a session for internal operations, so raise the limit by 1 for a
     // config shard.
-    shardOptions: {setParameter: {maxSessions: TestData.configShard ? 2 : 1}}
+    shardOptions: {setParameter: {maxSessions: TestData.configShard ? 3 : 2}}
 });
 const shard0Primary = st.rs0.getPrimary();
 

@@ -39,32 +39,27 @@
 namespace mongo {
 namespace {
 
-long long ll(auto v) {
-    return static_cast<long long>(v);
-}
-
-//
-// ServerStatus metric cursor counts.
-//
-
-class ClusterCursorStats final : public ServerStatusMetric {
-public:
-    void appendTo(BSONObjBuilder& b, StringData leafName) const override {
+/** ServerStatus metric cursor counts. */
+struct CursorStatsMetricPolicy {
+    void appendTo(BSONObjBuilder& b, StringData leafName) const {
+        auto ll = [](auto v) {
+            return static_cast<long long>(v);
+        };
         auto grid = Grid::get(getGlobalServiceContext());
         BSONObjBuilder cursorBob(b.subobjStart(leafName));
         cursorBob.append("timedOut", ll(grid->getCursorManager()->cursorsTimedOut()));
-        auto stats = grid->getCursorManager()->stats();
+        auto stats = grid->getCursorManager()->getOpenCursorStats();
         BSONObjBuilder{cursorBob.subobjStart("open")}
-            .append("multiTarget", ll(stats.cursorsMultiTarget))
-            .append("singleTarget", ll(stats.cursorsSingleTarget))
-            .append("queuedData", ll(stats.cursorsQueuedData))
-            .append("pinned", ll(stats.cursorsPinned))
-            .append("total", ll(stats.cursorsMultiTarget + stats.cursorsSingleTarget));
+            .append("multiTarget", ll(stats.multiTarget))
+            .append("singleTarget", ll(stats.singleTarget))
+            .append("queuedData", ll(stats.queuedData))
+            .append("pinned", ll(stats.pinned))
+            .append("total", ll(stats.multiTarget + stats.singleTarget));
     }
 };
 
-ClusterCursorStats& clusterCursorStats =
-    addMetricToTree("cursor", std::make_unique<ClusterCursorStats>());
+auto& clusterCursorStats =
+    *CustomMetricBuilder<CursorStatsMetricPolicy>{"cursor"}.setRole(ClusterRole::RouterServer);
 
 }  // namespace
 }  // namespace mongo

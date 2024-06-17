@@ -3,7 +3,7 @@
  * but is rejected by the server.
  *
  * @tags: [
- *   assumes_unsharded_collection,
+ *   assumes_no_implicit_collection_creation_on_get_collection,
  * ]
  */
 
@@ -11,7 +11,7 @@ import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
 // TODO SERVER-82107 remove creation of database once
 // find behavior will be the same in both standalone/replicaset and sharded cluster
-if (FixtureHelpers.isMongos(db)) {
+if (FixtureHelpers.isMongos(db) || TestData.testingReplicaSetEndpoint) {
     // Create database
     assert.commandWorked(db.adminCommand({'enableSharding': db.getName()}));
 }

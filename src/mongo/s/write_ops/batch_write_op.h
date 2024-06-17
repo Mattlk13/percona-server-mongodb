@@ -207,6 +207,19 @@ public:
      */
     WriteOp& getWriteOp(int index);
 
+    /**
+     * This method is used for writes of type WithoutShardKeyWithId to clear the deferred WCEs
+     * if a retry of the broadcast is needed. Otherwise they are added to _wcErrors.
+     * See _deferredWCErrors for more details.
+     */
+    void handleDeferredWriteConcernErrors();
+
+    /**
+     * Used by writes of type WithoutShardKeyWithId sent in a batch to clear the responses if a
+     * retry of the broadcast is needed. Otherwise they are used to increment batch stats.
+     */
+    void handleDeferredResponses(bool hasAnyStaleShardResponse);
+
 private:
     /**
      * Maintains the batch execution statistics when a response is received.
@@ -226,6 +239,27 @@ private:
 
     // Write concern responses from all write batches so far
     std::vector<ShardWCError> _wcErrors;
+
+    // Optionally stores a map of write concern errors from all shards encountered during
+    // the current round of execution. This is used only in the specific case where we are
+    // processing writes of type WriteType::WithoutShardKeyWithId, and is necessary because
+    // if we see a staleness error we restart the broadcasting protocol and do not care about
+    // results or WC errors from previous rounds of the protocol. Thus we temporarily save the
+    // errors here, and at the end of each round of execution we check if the operations specified
+    // by the opIdx have reached a terminal state. If so, these errors are final and will be moved
+    // to _wcErrors. If the op is not in a terminal state, we must be restarting the protocol and
+    // therefore we discard the errors.
+    boost::optional<stdx::unordered_map<int /* opIdx */, std::vector<ShardWCError>>>
+        _deferredWCErrors;
+
+    // Optionally stores a vector of TargetedWriteBatch and response pair for writes of type
+    // WithoutShardKeyWithId in a targeted batch to defer updating batch stats until we are sure
+    // that there is no retry of such writes is needed. This is necessary for responses that have
+    // n > 0 in a given round because we do not want to increment the batch stats multiple times for
+    // retried statements.
+    boost::optional<
+        std::vector<std::pair<const TargetedWriteBatch*, const BatchedCommandResponse*>>>
+        _deferredResponses;
 
     // Upserted ids for the whole write batch
     std::vector<std::unique_ptr<BatchedUpsertDetail>> _upsertedIds;
@@ -261,6 +295,8 @@ public:
 
     void addError(ShardError error);
 
+    bool hasError(int errCode) const;
+
     const std::vector<ShardError>& getErrors(int errCode) const;
 
 private:
@@ -275,6 +311,13 @@ typedef std::function<int(const WriteOp& writeOp)> GetWriteSizeFn;
 boost::optional<WriteConcernErrorDetail> mergeWriteConcernErrors(
     const std::vector<ShardWCError>& wcErrors);
 
+// Utility function to add the actualCollection field into a WriteError if it does not already
+// exist, contacting the primary shard if it needs to.
+void populateCollectionUUIDMismatch(OperationContext* opCtx,
+                                    write_ops::WriteError* error,
+                                    boost::optional<std::string>* actualCollection,
+                                    bool* hasContactedPrimaryShard);
+
 // Helper function to target ready writeOps. See BatchWriteOp::targetBatch for details.
 StatusWith<WriteType> targetWriteOps(OperationContext* opCtx,
                                      std::vector<WriteOp>& writeOps,
@@ -284,12 +327,4 @@ StatusWith<WriteType> targetWriteOps(OperationContext* opCtx,
                                      GetWriteSizeFn getWriteSizeFn,
                                      int baseCommandSizeBytes,
                                      TargetedBatchMap& batchMap);
-
-/**
- * Returns a new write concern that has the copy of every field from the original
- * document but with a w set to 1. This is intended for upgrading { w: 0 } write
- * concern to { w: 1 }.
- */
-BSONObj upgradeWriteConcern(const BSONObj& origWriteConcern);
-
 }  // namespace mongo

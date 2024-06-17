@@ -96,7 +96,7 @@ public:
         _fieldSet = std::move(fieldSet);
     }
 
-    void addIncludeExcludeField(const StringData& field) {
+    void addIncludeExcludeField(StringData field) {
         _fieldSet.emplace(field);
     }
 
@@ -116,7 +116,7 @@ public:
         return _behavior;
     }
 
-    void addComputedMetaProjFields(const StringData& field) {
+    void addComputedMetaProjFields(StringData field) {
         _computedMetaProjFields.emplace(field);
     }
 
@@ -124,8 +124,11 @@ public:
         return _computedMetaProjFields;
     }
 
-    void eraseFromComputedMetaProjFields(const std::string& field) {
-        _computedMetaProjFields.erase(field);
+    // Remove fields that the predicate function evaluates to true for.
+    void eraseIfPredTrueFromComputedMetaProjFields(const std::function<bool(std::string)> pred) {
+        std::erase_if(_computedMetaProjFields, [&](const std::string& computedMetaProjField) {
+            return pred(computedMetaProjField);
+        });
     }
 
     void setUsesExtendedRange(bool usesExtendedRange) {

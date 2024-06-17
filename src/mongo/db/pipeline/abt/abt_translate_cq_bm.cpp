@@ -36,8 +36,8 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/bonsai_query_bm_fixture.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/pipeline/abt/abt_translate_bm_fixture.h"
 #include "mongo/db/pipeline/abt/canonical_query_translation.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/cqf_command_utils.h"
@@ -54,19 +54,18 @@ namespace {
 /**
  * Benchmarks translation from CanonicalQuery to ABT.
  */
-class CanonicalQueryABTTranslate : public ABTTranslateBenchmarkFixture {
+class CanonicalQueryABTTranslate : public BonsaiQueryBenchmarkFixture {
 public:
     CanonicalQueryABTTranslate() {}
 
-    void benchmarkABTTranslate(benchmark::State& state,
-                               const std::vector<BSONObj>& pipeline) override final {
-        state.SkipWithError("Find translation fixture cannot translate a pieline");
+    void benchmarkPipeline(benchmark::State& state, const std::vector<BSONObj>& pipeline) final {
+        state.SkipWithError("Find translation fixture cannot translate a pipeline");
         return;
     }
 
-    void benchmarkABTTranslate(benchmark::State& state,
-                               BSONObj matchSpec,
-                               BSONObj projectSpec) override final {
+    void benchmarkQueryMatchProject(benchmark::State& state,
+                                    BSONObj matchSpec,
+                                    BSONObj projectSpec) final {
         QueryTestServiceContext testServiceContext;
         auto opCtx = testServiceContext.makeOperationContext();
         auto nss = NamespaceString::createNamespaceString_forTest("test.bm");
@@ -81,16 +80,22 @@ public:
         auto cq = std::make_unique<CanonicalQuery>(
             CanonicalQueryParams{.expCtx = makeExpressionContext(opCtx.get(), *findCommand),
                                  .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
+        QueryParameterMap qp;
 
-        if (!isEligibleForBonsai_forTesting(*cq)) {
+        if (!isEligibleForBonsai_forTesting(*cq).isFullyEligible()) {
             state.SkipWithError("CanonicalQuery is not supported by CQF");
             return;
         }
 
         // This is where recording starts.
         for (auto keepRunning : state) {
-            benchmark::DoNotOptimize(translateCanonicalQueryToABT(
-                metadata, *cq, scanProjName, make<ScanNode>(scanProjName, "collection"), prefixId));
+            benchmark::DoNotOptimize(
+                translateCanonicalQueryToABT(metadata,
+                                             *cq,
+                                             scanProjName,
+                                             make<ScanNode>(scanProjName, "collection"),
+                                             prefixId,
+                                             qp));
             benchmark::ClobberMemory();
         }
     }

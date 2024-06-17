@@ -2,7 +2,7 @@
 //
 // @tags: [
 //   # The test runs commands that are not allowed with security token: mapreduce.
-//   not_allowed_with_security_token,
+//   not_allowed_with_signed_security_token,
 //   # mapReduce does not support afterClusterTime.
 //   does_not_support_causal_consistency,
 //   does_not_support_stepdowns,
@@ -24,6 +24,13 @@ function getOpCode() {
 
     function isMapReduce(op) {
         if (!op.command) {
+            return false;
+        }
+
+        if (TestData.testingReplicaSetEndpoint && op.role == "ClusterRole{shard}") {
+            // On the replica set endpoint, currentOp reports both router and shard operations. To
+            // interrupt the mapReduce operation, the killOp command must be use the opId of the
+            // router mapReduce operation.
             return false;
         }
 

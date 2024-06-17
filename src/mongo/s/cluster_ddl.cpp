@@ -37,7 +37,6 @@
 #include <boost/optional/optional.hpp>
 
 #include "mongo/base/error_codes.h"
-#include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/client/read_preference.h"
@@ -53,10 +52,13 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/cluster_ddl.h"
-#include "mongo/s/database_version.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/router_role.h"
 #include "mongo/s/shard_version.h"
+#include "mongo/s/transaction_router.h"
+#include "mongo/s/transaction_router_resource_yielder.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/read_through_cache.h"
 #include "mongo/util/str.h"
 
@@ -66,6 +68,8 @@
 namespace mongo {
 namespace cluster {
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(createUnshardedCollectionRandomizeDataShard);
 
 std::vector<AsyncRequestsSender::Request> buildUnshardedRequestsForAllShards(
     OperationContext* opCtx, std::vector<ShardId> shardIds, const BSONObj& cmdObj) {
@@ -117,6 +121,17 @@ CachedDatabaseInfo createDatabase(OperationContext* opCtx,
         if (suggestedPrimaryId)
             request.setPrimaryShardId(*suggestedPrimaryId);
 
+        if (auto txnRouter = TransactionRouter::get(opCtx)) {
+            txnRouter.annotateCreatedDatabase(dbName);
+        }
+
+        // If this is a database creation triggered by a command running inside a transaction, the
+        // _configsvrCreateDatabase command here will also need to run inside that session. Yield
+        // the session here. Otherwise, if this router is also the configsvr primary, the
+        // _configsvrCreateDatabase command would not be able to check out the session.
+        auto txnRouterResourceYielder = std::make_unique<TransactionRouterResourceYielder>();
+        txnRouterResourceYielder->yield(opCtx);
+
         auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
         auto response = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
             opCtx,
@@ -124,6 +139,8 @@ CachedDatabaseInfo createDatabase(OperationContext* opCtx,
             DatabaseName::kAdmin,
             CommandHelpers::appendMajorityWriteConcern(request.toBSON({})),
             Shard::RetryPolicy::kIdempotent));
+
+        uassertStatusOK(txnRouterResourceYielder->unyieldNoThrow(opCtx));
         uassertStatusOK(response.writeConcernStatus);
         uassertStatusOKWithContext(response.commandStatus,
                                    str::stream() << "Database " << dbName.toStringForErrorMsg()
@@ -143,7 +160,35 @@ void createCollection(OperationContext* opCtx, const ShardsvrCreateCollection& r
     const auto& nss = request.getNamespace();
     const auto dbInfo = createDatabase(opCtx, nss.dbName());
 
-    auto cmdObj = request.toBSON({});
+    if (MONGO_unlikely(createUnshardedCollectionRandomizeDataShard.shouldFail()) &&
+        request.getUnsplittable() && !request.getDataShard()) {
+        // Select a random 'dataShard'.
+        const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
+        const auto allShardIds = shardRegistry->getAllShardIds(opCtx);
+        std::random_device random_device;
+        std::mt19937 engine{random_device()};
+        std::uniform_int_distribution<int> dist(0, allShardIds.size() - 1);
+
+        ShardsvrCreateCollection requestWithRandomDataShard(request);
+        requestWithRandomDataShard.setDataShard(allShardIds[dist(engine)]);
+
+        LOGV2_DEBUG(8339600,
+                    2,
+                    "Selected a random data shard for createCollection",
+                    "nss"_attr = nss,
+                    "dataShard"_attr = *requestWithRandomDataShard.getDataShard());
+
+        try {
+            createCollection(opCtx, requestWithRandomDataShard);
+            return;
+        } catch (const ExceptionFor<ErrorCodes::AlreadyInitialized>&) {
+            // If the collection already exists but we randomly selected a dataShard that turns out
+            // to be different than the current one, then createCollection will fail with
+            // AlreadyInitialized error. However, this error can also occur for other reasons. So
+            // let's run createCollection again without selecting a random dataShard.
+        }
+    }
+
     BSONObjBuilder builder;
     request.serialize({}, &builder);
 
@@ -183,7 +228,7 @@ void createCollection(OperationContext* opCtx, const ShardsvrCreateCollection& r
                 ReadPreferenceSetting(ReadPreference::PrimaryOnly),
                 Shard::RetryPolicy::kIdempotent);
         else {
-            return executeCommandAgainstDatabasePrimary(
+            return executeDDLCoordinatorCommandAgainstDatabasePrimary(
                 opCtx,
                 nss.dbName(),
                 dbInfo,
@@ -202,6 +247,30 @@ void createCollection(OperationContext* opCtx, const ShardsvrCreateCollection& r
     auto catalogCache = Grid::get(opCtx)->catalogCache();
     catalogCache->invalidateShardOrEntireCollectionEntryForShardedCollection(
         nss, createCollResp.getCollectionVersion(), dbInfo->getPrimary());
+}
+
+void createCollectionWithRouterLoop(OperationContext* opCtx,
+                                    const ShardsvrCreateCollection& request) {
+    sharding::router::DBPrimaryRouter router(opCtx->getServiceContext(), request.getDbName());
+    router.route(opCtx,
+                 "cluster::createCollectionWithRouterLoop",
+                 [&](OperationContext* opCtx, const CachedDatabaseInfo& cdb) {
+                     cluster::createCollection(opCtx, request);
+                 });
+}
+
+void createCollectionWithRouterLoop(OperationContext* opCtx, const NamespaceString& nss) {
+    auto dbName = nss.dbName();
+
+    ShardsvrCreateCollection shardsvrCollCommand(nss);
+    ShardsvrCreateCollectionRequest request;
+
+    request.setUnsplittable(true);
+
+    shardsvrCollCommand.setShardsvrCreateCollectionRequest(request);
+    shardsvrCollCommand.setDbName(nss.dbName());
+
+    createCollectionWithRouterLoop(opCtx, shardsvrCollCommand);
 }
 
 }  // namespace cluster

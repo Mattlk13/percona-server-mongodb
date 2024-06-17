@@ -1,25 +1,23 @@
 build_variant_large_distro_exceptions:
   - amazon
-  - amazon2
+  - amazon-linux2-arm64-dynamic-compile
   - amazon2023
   - amazon2023-arm64
-  - debian11
   - debian12
-  - enterprise-amazon2
-  - enterprise-amazon2-arm64
+  - enterprise-amazon2-openssl111
+  - enterprise-amazon2-arm64-openssl111
   - enterprise-amazon2023
   - enterprise-amazon2023-lto
   - enterprise-amazon2023-arm64
   - enterprise-amazon2023-arm64-lto
-  - enterprise-debian11-64
   - enterprise-debian12-64
   - enterprise-linux-64-amazon-ami
   - enterprise-macos
   - enterprise-macos-arm64
   - enterprise-rhel-67-s390x
-  - enterprise-rhel-70-64-bit
   - enterprise-rhel-71-ppc64le
   - enterprise-rhel-71-ppc64le-inmem
+  - enterprise-rhel-79-64-bit
   - enterprise-rhel-80-64-bit
   - enterprise-rhel-80-64-bit-coverage
   - enterprise-rhel-81-ppc64le
@@ -27,19 +25,21 @@ build_variant_large_distro_exceptions:
   - enterprise-rhel-83-s390x
   - enterprise-rhel-90-64-bit
   - enterprise-rhel-90-arm64
-  - enterprise-suse12-64
-  - enterprise-suse12-s390x
   - enterprise-suse15-64
   - enterprise-ubuntu1804-arm64
   - enterprise-ubuntu1804-ppc64le
   - enterprise-ubuntu1804-s390x
   - enterprise-ubuntu2004-arm64
   - enterprise-ubuntu2204-arm64
-  - hot_backups-rhel-70-64-bit
+  - hot_backups-rhel-79-64-bit
+  - linux-debug-aubsan-compile-required
+  - linux-x86-dynamic-compile
+  - linux-x86-dynamic-debug-compile-required
   - macos
   - macos-arm64
   - macos-debug-suggested
-  - rhel70
+  - rhel7.9-small
+  - rhel7.9-large
   - rhel80
   - rhel80-debug-asan
   - rhel80-debug-asan-all-feature-flags
@@ -52,8 +52,9 @@ build_variant_large_distro_exceptions:
   - rhel-82-arm64
   - rhel90
   - rhel90-arm64
-  - suse12
   - suse15
   - ubi8
   - ubuntu1604-container
   - ubuntu1804-container
+  - windows-compile-required
+  - windows-debug-suggested

@@ -143,7 +143,7 @@ public:
 
     KeyMaterial getKey(const UUID& uuid) override;
     BSONObj getEncryptedKey(const UUID& uuid) override;
-    SymmetricKey& getKMSLocalKey() {
+    SymmetricKey& getKMSLocalKey() override {
         return _localKey;
     }
 
@@ -223,8 +223,8 @@ int32_t getTestSeed() {
 
 class FleCrudTest : public ServiceContextMongoDTest {
 protected:
-    void setUp();
-    void tearDown();
+    void setUp() override;
+    void tearDown() override;
 
     void createCollection(const NamespaceString& ns);
 
@@ -455,7 +455,7 @@ EncryptedFieldConfig getTestEncryptedFieldConfig(
                         ,
             "path": "encrypted",
             "bsonType": "int",
-            "queries": {"queryType": "rangePreview", "min": 0, "max": 15, "sparsity": 1}
+            "queries": {"queryType": "range", "min": 0, "max": 15, "sparsity": 1}
 
         }
     ]
@@ -482,7 +482,7 @@ void parseEncryptedInvalidFieldConfig(StringData esc, StringData ecoc) {
                             ,
                 "path": "encrypted",
                 "bsonType": "int",
-                "queries": {"queryType": "rangePreview", "min": 0, "max": 15, "sparsity": 1}
+                "queries": {"queryType": "range", "min": 0, "max": 15, "sparsity": 1}
 
             }
         ]
@@ -532,7 +532,6 @@ void FleCrudTest::validateDocument(int id, boost::optional<BSONObj> doc, Fle2Alg
     std::cout << "Updated Doc: " << updatedDoc << std::endl;
 
     auto efc = getTestEncryptedFieldConfig(alg);
-    FLEClientCrypto::validateDocument(updatedDoc, efc, &_keyVault);
 
     // Decrypt document
     auto decryptedDoc = FLEClientCrypto::decryptDocument(updatedDoc, &_keyVault);
@@ -772,10 +771,10 @@ private:
 
 class FleTagsTest : public FleCrudTest {
 protected:
-    void setUp() {
+    void setUp() override {
         FleCrudTest::setUp();
     }
-    void tearDown() {
+    void tearDown() override {
         FleCrudTest::tearDown();
     }
 

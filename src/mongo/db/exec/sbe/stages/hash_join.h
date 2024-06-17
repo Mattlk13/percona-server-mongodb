@@ -43,7 +43,6 @@
 #include "mongo/db/exec/sbe/util/debug_print.h"
 #include "mongo/db/exec/sbe/values/row.h"
 #include "mongo/db/exec/sbe/values/slot.h"
-#include "mongo/db/exec/sbe/vm/vm.h"
 #include "mongo/db/query/stage_types.h"
 
 namespace mongo::sbe {
@@ -78,6 +77,7 @@ public:
                   value::SlotVector innerCond,
                   value::SlotVector innerProjects,
                   boost::optional<value::SlotId> collatorSlot,
+                  PlanYieldPolicy* yieldPolicy,
                   PlanNodeId planNodeId,
                   bool participateInTrialRunTracking = true);
 
@@ -136,9 +136,5 @@ private:
     boost::optional<TableType> _ht;
     TableType::iterator _htIt;
     TableType::iterator _htItEnd;
-
-    vm::ByteCode _bytecode;
-
-    bool _compiled{false};
 };
 }  // namespace mongo::sbe

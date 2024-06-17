@@ -54,7 +54,7 @@ class CatalogCacheMock final : public CatalogCache {
 
 public:
     CatalogCacheMock(ServiceContext* context, CatalogCacheLoaderMock& loader);
-    ~CatalogCacheMock() = default;
+    ~CatalogCacheMock() override = default;
 
     StatusWith<CachedDatabaseInfo> getDatabase(OperationContext* opCtx,
                                                const DatabaseName& dbName) override;
@@ -66,6 +66,9 @@ public:
     void setDatabaseReturnValue(const DatabaseName& dbName, CachedDatabaseInfo databaseInfo);
 
     void setCollectionReturnValue(const NamespaceString& nss, CollectionRoutingInfo chunkManager);
+
+    void advanceCollectionTimeInStore(const NamespaceString& nss,
+                                      const ChunkVersion& newVersionInStore) override;
 
     static std::unique_ptr<CatalogCacheMock> make();
 
@@ -101,6 +104,8 @@ public:
     static CachedDatabaseInfo makeDatabaseInfo(const DatabaseName& dbName,
                                                const ShardId& dbPrimaryShard,
                                                const DatabaseVersion& dbVersion);
+
+    stdx::unordered_map<NamespaceString, ChunkVersion> lastNotifiedTimeInStore;
 
 private:
     stdx::unordered_map<DatabaseName, CachedDatabaseInfo> _dbCache;

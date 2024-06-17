@@ -1,30 +1,26 @@
 // Tests the 'showDebugQueryShape' option for the '$querySettings' aggregation stage.
 // @tags: [
 //   directly_against_shardsvrs_incompatible,
-//   featureFlagQuerySettings,
-//   does_not_support_stepdowns,
-//   simulate_atlas_proxy_incompatible
+//   simulate_atlas_proxy_incompatible,
+//   requires_fcv_80,
 // ]
 //
 
+import {assertDropAndRecreateCollection} from "jstests/libs/collection_drop_recreate.js";
 import {QuerySettingsUtils} from "jstests/libs/query_settings_utils.js";
 
 const collName = jsTestName();
 const qsutils = new QuerySettingsUtils(db, collName);
 
-// Set the 'clusterServerParameterRefreshIntervalSecs' value to 1 second for faster fetching of
-// 'querySettings' cluster parameter on mongos from the configsvr.
-const clusterParamRefreshSecs = qsutils.setClusterParamRefreshSecs(1);
-
 const settings = {
-    queryEngineVersion: "v1"
+    queryFramework: "classic"
 };
 
 // Creating the collection, because some sharding passthrough suites are failing when explain
 // command is issued on the nonexistent database and collection.
-assert.commandWorked(db.createCollection(collName));
+assertDropAndRecreateCollection(db, collName);
 
-function runTest({queryInstance, expectedDebugQueryShape}) {
+function runTest({queryInstance, expectedDebugQueryShape, shouldRunExplain = true}) {
     // Ensure that no query settings are present at the start of the test.
     qsutils.assertQueryShapeConfiguration([]);
 
@@ -33,9 +29,11 @@ function runTest({queryInstance, expectedDebugQueryShape}) {
     assert.commandWorked(
         db.adminCommand({setQuerySettings: queryInstance, settings}),
     );
-    qsutils.assertQueryShapeConfiguration([
-        qsutils.makeQueryShapeConfiguration(settings, queryInstance),
-    ]);
+    qsutils.assertQueryShapeConfiguration(
+        [
+            qsutils.makeQueryShapeConfiguration(settings, queryInstance),
+        ],
+        shouldRunExplain);
 
     // Compare the actual debug query shape against the expected one. Using 'assert.docEq()' has the
     // added bonus of ensuring that the 'tenantId' does not get leaked within the 'cmdNs' property.
@@ -53,7 +51,7 @@ function runTest({queryInstance, expectedDebugQueryShape}) {
 
 // Test the find command case.
 runTest({
-    queryInstance: qsutils.makeFindQueryInstance({evil: true}),
+    queryInstance: qsutils.makeFindQueryInstance({filter: {evil: true}}),
     expectedDebugQueryShape: {
         cmdNs: {db: db.getName(), coll: collName},
         command: "find",
@@ -63,27 +61,29 @@ runTest({
 
 // Test the aggregate command case.
 runTest({
-  queryInstance: qsutils.makeAggregateQueryInstance([
-    {
-      $lookup: {
-        from: "inventory",
-        localField: "item",
-        foreignField: "sku",
-        as: "inventory_docs",
-      },
-    },
-    {
-      $match: {
-        qty: { $lt: 5 },
-        manufacturer: {
-          $in: ["Acme Corporation", "Umbrella Corporation"],
-        },
-      },
-    },
-    {
-      $count: "itemsLowOnStock",
-    },
-  ]),
+  queryInstance: qsutils.makeAggregateQueryInstance({
+      pipeline: [
+          {
+            $lookup: {
+              from: "inventory",
+              localField: "item",
+              foreignField: "sku",
+              as: "inventory_docs",
+            },
+          },
+          {
+            $match: {
+              qty: { $lt: 5 },
+              manufacturer: {
+                $in: ["Acme Corporation", "Umbrella Corporation"],
+              },
+            },
+          },
+          {
+            $count: "itemsLowOnStock",
+          },
+      ],
+  }),
   expectedDebugQueryShape: {
     cmdNs: {db: db.getName(), coll: collName},
     command: "aggregate",
@@ -130,19 +130,17 @@ runTest({
   },
 });
 
-// TODO SERVER-82128 Uncomment this test case once the $querySettings recursion issue has been
-// addressed.
-
 // Test the inception case: setting query settings on '$querySettings'.
-// runTest({
-//     queryInstance: qsutils.makeAggregateQueryInstance(
-//         /* pipeline */[{$querySettings: {showDebugQueryShape: true}}], /* collName */ 1),
-//     expectedDebugQueryShape: {
-//         cmdNs: {db: db.getName(), coll: "$cmd.aggregate"},
-//         command: "aggregate",
-//         pipeline: [{"$queue": "[]"}],
-//     },
-// });
-
-// Reset the 'clusterServerParameterRefreshIntervalSecs' parameter to its initial value.
-clusterParamRefreshSecs.restore();
+runTest({
+    queryInstance: qsutils.makeAggregateQueryInstance({
+        pipeline: [{$querySettings: {showDebugQueryShape: true}}],
+    },
+                                                      /* collectionless */ true),
+    expectedDebugQueryShape: {
+        cmdNs: {db: db.getName(), coll: "$cmd.aggregate"},
+        command: "aggregate",
+        pipeline: [{$querySettings: {showDebugQueryShape: true}}]
+    },
+    // Since it's a collectionless aggregate, the explain does not contain the 'queryPlanner' field.
+    shouldRunExplain: false,
+});

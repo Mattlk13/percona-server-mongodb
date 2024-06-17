@@ -12,29 +12,30 @@
  *   tenant_migration_incompatible,
  *   does_not_support_stepdowns,
  *   does_not_support_transactions,
- *   not_allowed_with_security_token,
+ *   not_allowed_with_signed_security_token,
  * ]
  */
 
-import {getPlanStages, getWinningPlan} from "jstests/libs/analyze_plan.js";
+import {
+    getNumberOfColumnScans,
+    getNumberOfIndexScans,
+    getOptimizer
+} from "jstests/libs/analyze_plan.js";
 import {assertDropAndRecreateCollection} from "jstests/libs/collection_drop_recreate.js";
 import {setUpServerForColumnStoreIndexTest} from "jstests/libs/columnstore_util.js";
 import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 import {IndexCatalogHelpers} from "jstests/libs/index_catalog_helpers.js";
-import {checkSBEEnabled} from "jstests/libs/sbe_util.js";
 
-const columnstoreEnabled =
-    checkSBEEnabled(db, ["featureFlagColumnstoreIndexes"], true /* checkAllNodes */) &&
-    setUpServerForColumnStoreIndexTest(db);
+const columnstoreEnabled = setUpServerForColumnStoreIndexTest(db);
 
 const collName = "hidden_index";
 let coll = assertDropAndRecreateCollection(db, collName);
 
-function numOfUsedIndexes(query, projection) {
-    const explain = assert.commandWorked(coll.find(query, projection).explain());
-    const indexScans = getPlanStages(getWinningPlan(explain.queryPlanner), "IXSCAN");
-    const columnIndexScans = getPlanStages(getWinningPlan(explain.queryPlanner), "COLUMN_SCAN");
-    return indexScans.length + columnIndexScans.length;
+function numOfUsedIndexes(explain) {
+    let numberOfIndexScans = getNumberOfIndexScans(explain);
+    let numberOfColumnScans = getNumberOfColumnScans(explain);
+
+    return numberOfIndexScans + numberOfColumnScans;
 }
 
 function validateHiddenIndexBehaviour(
@@ -56,7 +57,21 @@ function validateHiddenIndexBehaviour(
 
     let idxSpec = IndexCatalogHelpers.findByName(coll.getIndexes(), index_name);
     assert.eq(idxSpec.hidden, undefined);
-    assert.gt(numOfUsedIndexes(query, projection), 0);
+
+    // Assert the plan is using an index scan.
+    let explain = assert.commandWorked(coll.find(query, projection).explain());
+    switch (getOptimizer(explain)) {
+        case "classic":
+            assert.gt(numOfUsedIndexes(explain), 0);
+            break;
+        case "CQF":
+            // TODO SERVER-77719: Ensure that the decision for using the scan lines up with CQF
+            // optimizer. M2: allow only collscans, M4: check bonsai behavior for index scan.
+            assert.eq(numOfUsedIndexes(explain), 0);
+            break;
+        default:
+            break
+    }
 
     assert.commandWorked(coll.hideIndex(index_name));
     idxSpec = IndexCatalogHelpers.findByName(coll.getIndexes(), index_name);
@@ -66,12 +81,29 @@ function validateHiddenIndexBehaviour(
         assert.commandWorked(coll.dropIndexes());
         return;
     }
-    assert.eq(numOfUsedIndexes(query, projection), 0);
+
+    // Assert the plan is not using an index scan.
+    explain = assert.commandWorked(coll.find(query, projection).explain());
+    assert.eq(numOfUsedIndexes(explain), 0);
 
     assert.commandWorked(coll.unhideIndex(index_name));
     idxSpec = IndexCatalogHelpers.findByName(coll.getIndexes(), index_name);
     assert.eq(idxSpec.hidden, undefined);
-    assert.gt(numOfUsedIndexes(query, projection), 0);
+
+    // Assert the plan is using an index scan.
+    explain = assert.commandWorked(coll.find(query, projection).explain());
+    switch (getOptimizer(explain)) {
+        case "classic":
+            assert.gt(numOfUsedIndexes(explain), 0);
+            break;
+        case "CQF":
+            // TODO SERVER-77719: Ensure that the decision for using the scan lines up with CQF
+            // optimizer. M2: allow only collscans, M4: check bonsai behavior for index scan.
+            assert.eq(numOfUsedIndexes(explain), 0);
+            break;
+        default:
+            break
+    }
 
     assert.commandWorked(coll.dropIndex(index_name));
 
@@ -84,7 +116,22 @@ function validateHiddenIndexBehaviour(
 
     idxSpec = IndexCatalogHelpers.findByName(coll.getIndexes(), index_name);
     assert(idxSpec.hidden);
-    assert.eq(numOfUsedIndexes(query, projection), 0);
+    explain = assert.commandWorked(coll.find(query, projection).explain());
+    assert.eq(numOfUsedIndexes(explain), 0);
+
+    if (wildcard)
+        assert.commandFailedWithCode(coll.createIndex({"a.$**": index_type}, {hidden: false}),
+                                     ErrorCodes.IndexOptionsConflict);
+    else if (index_type === 'columnstore')
+        assert.commandFailedWithCode(coll.createIndex({"$**": index_type}, {hidden: false}),
+                                     ErrorCodes.IndexOptionsConflict);
+    else
+        assert.commandFailedWithCode(coll.createIndex({"a": index_type}, {hidden: false}),
+                                     ErrorCodes.IndexOptionsConflict);
+
+    idxSpec = IndexCatalogHelpers.findByName(coll.getIndexes(), index_name);
+    assert(idxSpec.hidden);
+
     assert.commandWorked(coll.dropIndexes());
 }
 
@@ -117,7 +164,7 @@ if (columnstoreEnabled) {
 }
 
 // Hidden index on capped collection.
-if (!FixtureHelpers.isMongos(db)) {
+if (!FixtureHelpers.isMongos(db) && !TestData.testingReplicaSetEndpoint) {
     coll = assertDropAndRecreateCollection(db, collName, {capped: true, size: 100});
     validateHiddenIndexBehaviour({query: {a: 1}, index_type: 1});
     coll = assertDropAndRecreateCollection(db, collName);
@@ -131,10 +178,13 @@ assert.eq(idxSpec.hidden, true);
 // Can't hide any index in a system collection.
 const systemColl = db.getSiblingDB("admin").system.version;
 assert.commandWorked(systemColl.createIndex({a: 1}));
-// The collMod command throws NoShardingEnabled on DDL coordinator implementation and BadValue on
-// old implementation.
-assert.commandFailedWithCode(systemColl.hideIndex("a_1"),
-                             [ErrorCodes.NoShardingEnabled, ErrorCodes.BadValue]);
+// The collMod command throws NoShardingEnabled_OBSOLETE on DDL coordinator implementation and
+// BadValue on old implementation.
+assert.commandFailedWithCode(systemColl.hideIndex("a_1"), [
+    ErrorCodes.ShardingStateNotInitialized,
+    ErrorCodes.BadValue,                    // TODO (SERVER-83326): Remove this code
+    ErrorCodes.NoShardingEnabled_OBSOLETE,  // TODO (SERVER-83326): Remove this code
+]);
 assert.commandFailedWithCode(systemColl.createIndex({a: 1}, {hidden: true}), 2);
 
 // Can't hide the '_id' index.

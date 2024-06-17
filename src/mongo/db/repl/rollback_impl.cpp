@@ -347,7 +347,7 @@ void RollbackImpl::_killAllUserOperations(OperationContext* opCtx) {
     int numOpsRunning = 0;
 
     for (ServiceContext::LockedClientsCursor cursor(serviceCtx); Client* client = cursor.next();) {
-        stdx::lock_guard<Client> lk(*client);
+        ClientLock lk(client);
         if (client->isFromSystemConnection() && !client->canKillSystemOperationInStepdown(lk)) {
             continue;
         }
@@ -446,20 +446,26 @@ void RollbackImpl::_stopAndWaitForIndexBuilds(OperationContext* opCtx) {
     LOGV2(21597, "Finished waiting for background operations to complete before rollback");
 }
 
-StatusWith<std::set<NamespaceString>> RollbackImpl::_namespacesForOp(const OplogEntry& oplogEntry) {
+StatusWith<std::pair<std::set<NamespaceString>, std::set<UUID>>>
+RollbackImpl::_namespacesAndUUIDsForOp(const OplogEntry& oplogEntry) {
     NamespaceString opNss = oplogEntry.getNss();
+
     OpTypeEnum opType = oplogEntry.getOpType();
     std::set<NamespaceString> namespaces;
+    std::set<UUID> uuids;
+    if (auto opUUID = oplogEntry.getUuid()) {
+        uuids.insert(opUUID.get());
+    }
 
     // No namespaces for a no-op.
     if (opType == OpTypeEnum::kNoop) {
-        return std::set<NamespaceString>();
+        return std::make_pair(std::set<NamespaceString>(), std::set<UUID>());
     }
 
     // CRUD ops have the proper namespace in the operation 'ns' field.
     if (opType == OpTypeEnum::kInsert || opType == OpTypeEnum::kUpdate ||
         opType == OpTypeEnum::kDelete) {
-        return std::set<NamespaceString>({opNss});
+        return std::make_pair(std::set<NamespaceString>({opNss}), uuids);
     }
 
     // If the operation is a command, then we need to extract the appropriate namespaces from the
@@ -470,7 +476,7 @@ StatusWith<std::set<NamespaceString>> RollbackImpl::_namespacesForOp(const Oplog
 
         // Does not handle 'applyOps' entries.
         invariant(oplogEntry.getCommandType() != OplogEntry::CommandType::kApplyOps,
-                  "_namespacesForOp does not handle 'applyOps' oplog entries.");
+                  "_namespacesAndUUIDsForOp does not handle 'applyOps' oplog entries.");
 
         switch (oplogEntry.getCommandType()) {
             case OplogEntry::CommandType::kRenameCollection: {
@@ -483,6 +489,9 @@ StatusWith<std::set<NamespaceString>> RollbackImpl::_namespacesForOp(const Oplog
                     NamespaceStringUtil::deserialize(opNss.tenantId(),
                                                      obj.getStringField("to"),
                                                      SerializationContext::stateDefault()));
+                if (auto uuidSW = UUID::parse(obj.getField("dropTarget")); uuidSW.isOK()) {
+                    uuids.insert(uuidSW.getValue());
+                }
                 break;
             }
             case OplogEntry::CommandType::kDropDatabase: {
@@ -507,6 +516,7 @@ StatusWith<std::set<NamespaceString>> RollbackImpl::_namespacesForOp(const Oplog
             case OplogEntry::CommandType::kImportCollection:
             case OplogEntry::CommandType::kCreateIndexes:
             case OplogEntry::CommandType::kDropIndexes:
+            case OplogEntry::CommandType::kDeleteIndexes:
             case OplogEntry::CommandType::kStartIndexBuild:
             case OplogEntry::CommandType::kAbortIndexBuild:
             case OplogEntry::CommandType::kCommitIndexBuild:
@@ -532,7 +542,7 @@ StatusWith<std::set<NamespaceString>> RollbackImpl::_namespacesForOp(const Oplog
         }
     }
 
-    return namespaces;
+    return std::make_pair(namespaces, uuids);
 }
 
 void RollbackImpl::_restoreTxnsTableEntryFromRetryableWrites(OperationContext* opCtx,
@@ -592,7 +602,7 @@ void RollbackImpl::_restoreTxnsTableEntryFromRetryableWrites(OperationContext* o
         }
         const auto nss = NamespaceString::kSessionTransactionsTableNamespace;
         writeConflictRetry(opCtx, "updateSessionTransactionsTableInRollback", nss, [&] {
-            opCtx->recoveryUnit()->allowOneUntimestampedWrite();
+            shard_role_details::getRecoveryUnit(opCtx)->allowOneUntimestampedWrite();
             auto collection =
                 acquireCollection(opCtx,
                                   CollectionAcquisitionRequest(
@@ -614,8 +624,9 @@ void RollbackImpl::_restoreTxnsTableEntryFromRetryableWrites(OperationContext* o
     // persisted to disk before truncating the oplog. If we were to take an unstable checkpoint, we
     // would have to update replication metadata like 'minValid.appliedThrough' to be consistent
     // with the oplog.
-    opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(opCtx,
-                                                             /*stableCheckpoint=*/true);
+    shard_role_details::getRecoveryUnit(opCtx)->waitUntilUnjournaledWritesDurable(
+        opCtx,
+        /*stableCheckpoint=*/true);
 }
 
 void RollbackImpl::_runPhaseFromAbortToReconstructPreparedTxns(
@@ -946,7 +957,8 @@ Status RollbackImpl::_processRollbackOp(OperationContext* opCtx, const OplogEntr
         // Follow chain on applyOps oplog entries to process entire unprepared transaction.
         // The beginning of the applyOps chain may precede the common point.
         auto status = _processRollbackOpForApplyOps(opCtx, oplogEntry);
-        if (const auto prevOpTime = oplogEntry.getPrevWriteOpTimeInTransaction()) {
+        if (oplogEntry.applyOpsIsLinkedTransactionally()) {
+            const auto prevOpTime = oplogEntry.getPrevWriteOpTimeInTransaction();
             for (TransactionHistoryIterator iter(*prevOpTime); status.isOK() && iter.hasNext();) {
                 status = _processRollbackOpForApplyOps(opCtx, iter.next(opCtx));
             }
@@ -959,13 +971,15 @@ Status RollbackImpl::_processRollbackOp(OperationContext* opCtx, const OplogEntr
         return Status::OK();
     }
 
-    // Extract the appropriate namespaces from the oplog operation.
-    auto namespacesSW = _namespacesForOp(oplogEntry);
-    if (!namespacesSW.isOK()) {
-        return namespacesSW.getStatus();
+    // Extract the appropriate namespaces and UUIDs from the oplog operation.
+    auto namespacesAndUUIDsSW = _namespacesAndUUIDsForOp(oplogEntry);
+    if (!namespacesAndUUIDsSW.isOK()) {
+        return namespacesAndUUIDsSW.getStatus();
     } else {
-        _observerInfo.rollbackNamespaces.insert(namespacesSW.getValue().begin(),
-                                                namespacesSW.getValue().end());
+        _observerInfo.rollbackNamespaces.insert(namespacesAndUUIDsSW.getValue().first.begin(),
+                                                namespacesAndUUIDsSW.getValue().first.end());
+        _observerInfo.rollbackUUIDs.insert(namespacesAndUUIDsSW.getValue().second.begin(),
+                                           namespacesAndUUIDsSW.getValue().second.end());
     }
 
     // If the operation being rolled back has a session id, then we add it to the set of
@@ -1488,6 +1502,7 @@ void RollbackImpl::_summarizeRollback(OperationContext* opCtx) const {
               _observerInfo.configServerConfigVersionRolledBack);
     attrs.add("affectedSessions", _observerInfo.rollbackSessionIds);
     attrs.add("affectedNamespaces", _observerInfo.rollbackNamespaces);
+    attrs.add("affectedUUIDs", _observerInfo.rollbackUUIDs);
     attrs.add("rollbackCommandCounts", _observerInfo.rollbackCommandCounts);
     attrs.add("totalEntriesRolledBackIncludingNoops", _observerInfo.numberOfEntriesObserved);
     LOGV2(21612, "Rollback summary", attrs);

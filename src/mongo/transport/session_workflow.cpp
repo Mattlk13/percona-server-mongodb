@@ -75,6 +75,7 @@
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/transport/service_executor.h"
 #include "mongo/transport/session.h"
+#include "mongo/transport/session_manager.h"
 #include "mongo/transport/session_workflow.h"
 #include "mongo/transport/transport_layer_manager.h"
 #include "mongo/util/assert_util.h"
@@ -230,7 +231,7 @@ struct SplitTimerPolicy {
         BSONObjBuilder bob;
         splitTimer->appendIntervals(bob);
 
-        if (!gEnableDetailedConnectionHealthMetricLogLines) {
+        if (!gEnableDetailedConnectionHealthMetricLogLines.load()) {
             return;
         }
 
@@ -361,13 +362,15 @@ bool killExhaust(const Message& in, ServiceEntryPoint* sep, Client* client) {
         const auto& [cmd, firstElement] = body.firstElement();
         if (cmd != "getMore"_sd)
             return false;
-        sep->handleRequest(client->makeOperationContext().get(),
-                           OpMsgRequest::fromDBAndBody(
-                               inRequest.getDbName(),
-                               KillCursorsCommandRequest(
-                                   NamespaceStringUtil::deserialize(inRequest.getDbName(),
-                                                                    body["collection"].String()),
-                                   {CursorId{firstElement.Long()}})
+        auto opCtx = client->makeOperationContext();
+        auto dbName = inRequest.parseDbName();
+        sep->handleRequest(opCtx.get(),
+                           OpMsgRequestBuilder::create(
+                               auth::ValidatedTenancyScope::get(opCtx.get()),
+                               dbName,
+                               KillCursorsCommandRequest(NamespaceStringUtil::deserialize(
+                                                             dbName, body["collection"].String()),
+                                                         {CursorId{firstElement.Long()}})
                                    .toBSON(BSONObj{}))
                                .serialize())
             .get();
@@ -379,7 +382,8 @@ bool killExhaust(const Message& in, ServiceEntryPoint* sep, Client* client) {
 }
 
 // Counts the # of responses to completed operations that we were unable to send back to the client.
-CounterMetric unsendableCompletedResponses("operation.unsendableCompletedResponses");
+auto& unsendableCompletedResponses =
+    *MetricBuilder<Counter64>("operation.unsendableCompletedResponses");
 }  // namespace
 
 class SessionWorkflow::Impl {
@@ -422,10 +426,6 @@ public:
 
     ServiceExecutor* executor() {
         return seCtx()->getServiceExecutor();
-    }
-
-    bool usesDedicatedThread() {
-        return seCtx()->usesDedicatedThread();
     }
 
     std::shared_ptr<ServiceExecutor::TaskRunner> taskRunner() {
@@ -490,21 +490,16 @@ private:
         invariant(!_work);
         if (_nextWork)
             return Future{std::move(_nextWork)};  // Already have one ready.
-        if (usesDedicatedThread()) {
-            // Yield here to avoid pinning the CPU. Give other threads some CPU
-            // time to avoid a spiky latency distribution (BF-27452). Even if
-            // this client can run continuously and receive another command
-            // without blocking, we yield anyway. We WANT context switching, and
-            // we're trying deliberately to make it happen, to reduce long tail
-            // latency.
-            _yieldPointReached();
-            _iterationFrame->metrics.yieldedBeforeReceive();
-            return _receiveRequest();
-        }
-        auto&& [p, f] = makePromiseFuture<void>();
-        taskRunner()->runOnDataAvailable(
-            session(), _captureContext([p = std::move(p)](Status s) mutable { p.setFrom(s); }));
-        return std::move(f).then([this, anchor = shared_from_this()] { return _receiveRequest(); });
+
+        // Yield here to avoid pinning the CPU. Give other threads some CPU
+        // time to avoid a spiky latency distribution (BF-27452). Even if
+        // this client can run continuously and receive another command
+        // without blocking, we yield anyway. We WANT context switching, and
+        // we're trying deliberately to make it happen, to reduce long tail
+        // latency.
+        _yieldPointReached();
+        _iterationFrame->metrics.yieldedBeforeReceive();
+        return _receiveRequest();
     }
 
     /** Receives a message from the session and creates a new WorkItem from it. */
@@ -739,7 +734,10 @@ void SessionWorkflow::Impl::_acceptResponse(DbResponse response) {
     Message& toSink = response.response;
     if (toSink.empty())
         return;
-    invariant(!OpMsg::isFlagSet(work.in(), OpMsg::kMoreToCome));
+
+    tassert(ErrorCodes::InternalError,
+            "Attempted to respond to fire-and-forget request",
+            !OpMsg::isFlagSet(work.in(), OpMsg::kMoreToCome));
     invariant(!OpMsg::isFlagSet(toSink, OpMsg::kChecksumPresent));
 
     // Update the header for the response message.
@@ -802,21 +800,16 @@ void SessionWorkflow::Impl::_scheduleIteration() try {
             _cleanupSession(status);
             return;
         }
-        if (usesDedicatedThread()) {
-            try {
+
+        try {
+            // All available service executors use dedicated threads, so it's okay to
+            // run eager futures in an ordinary loop to bypass scheduler overhead.
+            while (true) {
                 _doOneIteration().get();
-                _scheduleIteration();
-            } catch (const DBException& ex) {
-                _onLoopError(ex.toStatus());
+                _work = nullptr;
             }
-        } else {
-            _doOneIteration().getAsync([this, anchor = shared_from_this()](Status st) {
-                if (!st.isOK()) {
-                    _onLoopError(st);
-                    return;
-                }
-                _scheduleIteration();
-            });
+        } catch (const DBException& ex) {
+            _onLoopError(ex.toStatus());
         }
     }));
 } catch (const DBException& ex) {

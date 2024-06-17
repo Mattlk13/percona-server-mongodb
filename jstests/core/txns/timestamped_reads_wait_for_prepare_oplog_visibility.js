@@ -4,15 +4,12 @@
  *
  * @tags: [
  *  # The test runs commands that are not allowed with security token: prepareTransaction.
- *  not_allowed_with_security_token,
+ *  not_allowed_with_signed_security_token,
  *  uses_transactions,
  *  uses_prepare_transaction,
  *  uses_parallel_shell,
  *  # 'setDefaultRWConcern' is not supposed to be run on shard nodes.
  *  command_not_supported_in_serverless,
- *   # TODO SERVER-70847: Snapshot reads do not succeed on non-conflicting documents while txn is
- *   # in prepare.
- *  cqf_experimental_incompatible,
  * ]
  */
 

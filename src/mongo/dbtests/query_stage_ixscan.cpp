@@ -350,11 +350,11 @@ public:
     }
 };
 
-class All : public OldStyleSuiteSpecification {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("query_stage_ixscan") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<QueryStageIxscanInitializeStats>();
         add<QueryStageIxscanInsertDuringSave>();
         add<QueryStageIxscanInsertDuringSaveExclusive>();
@@ -363,7 +363,7 @@ public:
     }
 };
 
-OldStyleSuiteInitializer<All> aueryStageIxscanAll;
+unittest::OldStyleSuiteInitializer<All> aueryStageIxscanAll;
 
 }  // namespace QueryStageIxscan
 }  // namespace mongo

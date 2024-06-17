@@ -44,6 +44,7 @@
 #include "mongo/db/storage/flow_control.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/vector_clock_mutable.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/decorable.h"
@@ -76,16 +77,16 @@ LocalOplogInfo* LocalOplogInfo::get(OperationContext* opCtx) {
     return get(opCtx->getServiceContext());
 }
 
-const Collection* LocalOplogInfo::getCollection() const {
-    return _oplog;
+RecordStore* LocalOplogInfo::getRecordStore() const {
+    return _rs;
 }
 
-void LocalOplogInfo::setCollection(const Collection* oplog) {
-    _oplog = oplog;
+void LocalOplogInfo::setRecordStore(RecordStore* rs) {
+    _rs = rs;
 }
 
-void LocalOplogInfo::resetCollection() {
-    _oplog = nullptr;
+void LocalOplogInfo::resetRecordStore() {
+    _rs = nullptr;
 }
 
 void LocalOplogInfo::setNewTimestamp(ServiceContext* service, const Timestamp& newTime) {
@@ -112,18 +113,18 @@ std::vector<OplogSlot> LocalOplogInfo::getNextOpTimes(OperationContext* opCtx, s
     });
 
     // Allow the storage engine to start the transaction outside the critical section.
-    opCtx->recoveryUnit()->preallocateSnapshot();
+    shard_role_details::getRecoveryUnit(opCtx)->preallocateSnapshot();
     {
         stdx::lock_guard<Latch> lk(_newOpMutex);
 
         ts = VectorClockMutable::get(opCtx)->tickClusterTime(count).asTimestamp();
         const bool orderedCommit = false;
 
-        // The local oplog collection pointer must already be established by this point.
+        // The local oplog record store pointer must already be established by this point.
         // We can't establish it here because that would require locking the local database, which
         // would be a lock order violation.
-        invariant(_oplog);
-        fassert(28560, _oplog->getRecordStore()->oplogDiskLocRegister(opCtx, ts, orderedCommit));
+        invariant(_rs);
+        fassert(28560, _rs->oplogDiskLocRegister(opCtx, ts, orderedCommit));
     }
 
     Timer oplogSlotDurationTimer;
@@ -135,14 +136,15 @@ std::vector<OplogSlot> LocalOplogInfo::getNextOpTimes(OperationContext* opCtx, s
     // If we abort a transaction that has reserved an optime, we should make sure to update the
     // stable timestamp if necessary, since this oplog hole may have been holding back the stable
     // timestamp.
-    opCtx->recoveryUnit()->onRollback([replCoord, oplogSlotDurationTimer](OperationContext* opCtx) {
-        replCoord->attemptToAdvanceStableTimestamp();
-        // Sum the oplog slot durations. An operation may participate in multiple transactions.
-        CurOp::get(opCtx)->debug().totalOplogSlotDurationMicros +=
-            Microseconds(oplogSlotDurationTimer.elapsed());
-    });
+    shard_role_details::getRecoveryUnit(opCtx)->onRollback(
+        [replCoord, oplogSlotDurationTimer](OperationContext* opCtx) {
+            replCoord->attemptToAdvanceStableTimestamp();
+            // Sum the oplog slot durations. An operation may participate in multiple transactions.
+            CurOp::get(opCtx)->debug().totalOplogSlotDurationMicros +=
+                Microseconds(oplogSlotDurationTimer.elapsed());
+        });
 
-    opCtx->recoveryUnit()->onCommit(
+    shard_role_details::getRecoveryUnit(opCtx)->onCommit(
         [oplogSlotDurationTimer](OperationContext* opCtx, boost::optional<Timestamp>) {
             // Sum the oplog slot durations. An operation may participate in multiple transactions.
             CurOp::get(opCtx)->debug().totalOplogSlotDurationMicros +=

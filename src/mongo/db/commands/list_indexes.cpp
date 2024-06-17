@@ -262,6 +262,10 @@ public:
             return false;
         }
 
+        bool isSubjectToIngressAdmissionControl() const override {
+            return true;
+        }
+
         NamespaceString ns() const final {
             auto nssOrUUID = request().getNamespaceOrUUID();
             if (nssOrUUID.isUUID()) {
@@ -372,6 +376,7 @@ public:
                         IDLParserContext(
                             "ListIndexesReplyItem",
                             false /* apiStrict */,
+                            auth::ValidatedTenancyScope::get(opCtx),
                             nss.tenantId(),
                             SerializationContext::stateCommandReply(serializationContext)),
                         nextDoc));

@@ -43,7 +43,6 @@
 #include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/size_estimator.h"
 #include "mongo/db/exec/sbe/stages/ix_scan.h"
-#include "mongo/db/exec/trial_run_tracker.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
@@ -51,6 +50,7 @@
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/snapshot.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/admission_context.h"
@@ -71,7 +71,11 @@ IndexScanStageBase::IndexScanStageBase(StringData stageType,
                                        PlanNodeId nodeId,
                                        bool lowPriority,
                                        bool participateInTrialRunTracking)
-    : PlanStage(stageType, yieldPolicy, nodeId, participateInTrialRunTracking),
+    : PlanStage(stageType,
+                yieldPolicy,
+                nodeId,
+                participateInTrialRunTracking,
+                TrialRunTrackingType::TrackReads),
       _collUuid(collUuid),
       _indexName(indexName),
       _forward(forward),
@@ -97,13 +101,12 @@ void IndexScanStageBase::prepareImpl(CompileCtx& ctx) {
 
     auto indexCatalog = _coll.getPtr()->getIndexCatalog();
     auto indexDesc = indexCatalog->findIndexByName(_opCtx, _indexName);
-    // uassert here, not tassert, because it is not a programming bug if the index got dropped just
-    // before we looked for it.
-    uassert(4938500,
+    tassert(4938500,
             str::stream() << "could not find index named '" << _indexName << "' in collection '"
                           << _coll.getCollName()->toStringForErrorMsg() << "'",
             indexDesc);
 
+    _uniqueIndex = indexDesc->unique();
     _entry = indexCatalog->getEntry(indexDesc);
     tassert(4938503,
             str::stream() << "expected IndexCatalogEntry for index named: " << _indexName,
@@ -121,7 +124,7 @@ void IndexScanStageBase::prepareImpl(CompileCtx& ctx) {
     }
 
     if (_snapshotIdSlot) {
-        _latestSnapshotId = _opCtx->recoveryUnit()->getSnapshotId().toNumber();
+        _latestSnapshotId = shard_role_details::getRecoveryUnit(_opCtx)->getSnapshotId().toNumber();
     }
 }
 
@@ -213,7 +216,7 @@ void IndexScanStageBase::doRestoreState(bool relinquishCursor) {
     // Yield is the only time during plan execution that the snapshotId can change. As such, we
     // update it accordingly as part of yield recovery.
     if (_snapshotIdSlot) {
-        _latestSnapshotId = _opCtx->recoveryUnit()->getSnapshotId().toNumber();
+        _latestSnapshotId = shard_role_details::getRecoveryUnit(_opCtx)->getSnapshotId().toNumber();
     }
 }
 
@@ -226,22 +229,13 @@ void IndexScanStageBase::doDetachFromOperationContext() {
 
 void IndexScanStageBase::doAttachToOperationContext(OperationContext* opCtx) {
     if (_lowPriority && _open && gDeprioritizeUnboundedUserIndexScans.load() &&
-        _opCtx->getClient()->isFromUserConnection() && _opCtx->lockState()->shouldWaitForTicket()) {
-        _priority.emplace(opCtx->lockState(), AdmissionContext::Priority::kLow);
+        _opCtx->getClient()->isFromUserConnection() &&
+        shard_role_details::getLocker(_opCtx)->shouldWaitForTicket(_opCtx)) {
+        _priority.emplace(opCtx, AdmissionContext::Priority::kLow);
     }
     if (_cursor) {
         _cursor->reattachToOperationContext(opCtx);
     }
-}
-
-void IndexScanStageBase::doDetachFromTrialRunTracker() {
-    _tracker = nullptr;
-}
-
-PlanStage::TrialRunTrackerAttachResultMask IndexScanStageBase::doAttachToTrialRunTracker(
-    TrialRunTracker* tracker, TrialRunTrackerAttachResultMask childrenAttachResult) {
-    _tracker = tracker;
-    return childrenAttachResult | TrialRunTrackerAttachResultFlags::AttachedToStreamingStage;
 }
 
 void IndexScanStageBase::openImpl(bool reOpen) {
@@ -273,25 +267,18 @@ void IndexScanStageBase::openImpl(bool reOpen) {
     _scanState = ScanState::kNeedSeek;
 }
 
-void IndexScanStageBase::trackRead() {
+void IndexScanStageBase::trackIndexRead() {
     ++_specificStats.numReads;
-    if (_tracker && _tracker->trackProgress<TrialRunTracker::kNumReads>(1)) {
-        // If we're collecting execution stats during multi-planning and reached the end of the
-        // trial period because we've performed enough physical reads, bail out from the trial run
-        // by raising a special exception to signal a runtime planner that this candidate plan has
-        // completed its trial run early. Note that a trial period is executed only once per a
-        // PlanStage tree, and once completed never run again on the same tree.
-        _tracker = nullptr;
-        uasserted(ErrorCodes::QueryTrialRunCompleted, "Trial run early exit in ixscan");
-    }
+    trackRead();
 }
 
 PlanState IndexScanStageBase::getNext() {
     auto optTimer(getOptTimer(_opCtx));
 
     if (_lowPriority && !_priority && gDeprioritizeUnboundedUserIndexScans.load() &&
-        _opCtx->getClient()->isFromUserConnection() && _opCtx->lockState()->shouldWaitForTicket()) {
-        _priority.emplace(_opCtx->lockState(), AdmissionContext::Priority::kLow);
+        _opCtx->getClient()->isFromUserConnection() &&
+        shard_role_details::getLocker(_opCtx)->shouldWaitForTicket(_opCtx)) {
+        _priority.emplace(_opCtx, AdmissionContext::Priority::kLow);
     }
 
     // We are about to get next record from a storage cursor so do not bother saving our internal
@@ -304,12 +291,12 @@ PlanState IndexScanStageBase::getNext() {
         switch (_scanState) {
             case ScanState::kNeedSeek:
                 ++_specificStats.seeks;
-                trackRead();
+                trackIndexRead();
                 // Seek for key and establish the cursor position.
                 _nextRecord = seek();
                 break;
             case ScanState::kScanning:
-                trackRead();
+                trackIndexRead();
                 _nextRecord = _cursor->nextKeyString();
                 break;
             case ScanState::kFinished:
@@ -365,6 +352,10 @@ std::unique_ptr<PlanStageStats> IndexScanStageBase::getStats(bool includeDebugIn
         bob.appendNumber("keysExamined", static_cast<long long>(_specificStats.keysExamined));
         bob.appendNumber("seeks", static_cast<long long>(_specificStats.seeks));
         bob.appendNumber("numReads", static_cast<long long>(_specificStats.numReads));
+        if (_specificStats.keyCheckSkipped != 0) {
+            bob.appendNumber("keyCheckSkipped",
+                             static_cast<long long>(_specificStats.keyCheckSkipped));
+        }
         if (_indexKeySlot) {
             bob.appendNumber("indexKeySlot", static_cast<long long>(*_indexKeySlot));
         }
@@ -508,7 +499,7 @@ std::unique_ptr<PlanStage> SimpleIndexScanStage::clone() const {
                                                   _yieldPolicy,
                                                   _commonStats.nodeId,
                                                   _lowPriority,
-                                                  _participateInTrialRunTracking);
+                                                  participateInTrialRunTracking());
 }
 
 void SimpleIndexScanStage::prepare(CompileCtx& ctx) {
@@ -562,6 +553,13 @@ void SimpleIndexScanStage::open(bool reOpen) {
                 tagHi == value::TypeTags::ksValue);
 
         _seekKeyHighHolder.reset(ownedHi, tagHi, valHi);
+
+        // It is a point bound if the lowKey and highKey are same except discriminator.
+        auto& highKey = *getSeekKeyHigh();
+        _pointBound = getSeekKeyLow().compareWithoutDiscriminator(highKey) == 0 &&
+            highKey.computeElementCount(*_ordering) == _entry->descriptor()->getNumFields();
+
+        _cursor->setEndPosition(highKey);
     } else if (_seekKeyLow) {
         auto [ownedLow, tagLow, valLow] = _bytecode.run(_seekKeyLowCode.get());
         const auto msgTagLow = tagLow;
@@ -648,25 +646,12 @@ bool SimpleIndexScanStage::validateKey(const boost::optional<KeyStringEntry>& ke
         return false;
     }
 
-    if (auto seekKeyHigh = getSeekKeyHigh(); seekKeyHigh) {
-        auto cmp = key->keyString.compare(*seekKeyHigh);
-
-        if (_forward) {
-            if (cmp > 0) {
-                _scanState = ScanState::kFinished;
-                return false;
-            }
-        } else {
-            if (cmp < 0) {
-                _scanState = ScanState::kFinished;
-                return false;
-            }
-        }
-    }
     // Note: we may in the future want to bump 'keysExamined' for comparisons to a key that result
     // in the stage returning EOF.
     ++_specificStats.keysExamined;
-    _scanState = ScanState::kScanning;
+
+    // For point bound on unique index, there's only one possible key.
+    _scanState = _pointBound && _uniqueIndex ? ScanState::kFinished : ScanState::kScanning;
     return true;
 }
 
@@ -695,7 +680,8 @@ GenericIndexScanStage::GenericIndexScanStage(UUID collUuid,
                          yieldPolicy,
                          planNodeId,
                          participateInTrialRunTracking),
-      _params{std::move(params)} {}
+      _params{std::move(params)},
+      _endKey{_params.version} {}
 
 std::unique_ptr<PlanStage> GenericIndexScanStage::clone() const {
     sbe::GenericIndexScanStageParams params{_params.indexBounds->clone(),
@@ -714,7 +700,7 @@ std::unique_ptr<PlanStage> GenericIndexScanStage::clone() const {
                                                    _vars,
                                                    _yieldPolicy,
                                                    _commonStats.nodeId,
-                                                   _participateInTrialRunTracking);
+                                                   participateInTrialRunTracking());
 }
 
 void GenericIndexScanStage::prepare(CompileCtx& ctx) {
@@ -769,9 +755,21 @@ boost::optional<KeyStringEntry> GenericIndexScanStage::seek() {
 }
 
 bool GenericIndexScanStage::validateKey(const boost::optional<KeyStringEntry>& key) {
-    if (key && _checker) {
-        ++_specificStats.keysExamined;
+    if (!key) {
+        _scanState = ScanState::kFinished;
+        return false;
+    }
+    ++_specificStats.keysExamined;
 
+    if (!_endKey.isEmpty() &&
+        ((_forward && key->keyString.compare(_endKey) <= 0) ||
+         (!_forward && key->keyString.compare(_endKey) >= 0))) {
+        ++_specificStats.keyCheckSkipped;
+        _scanState = ScanState::kScanning;
+        return true;
+    }
+
+    if (_checker) {
         _keyBuffer.reset();
         BSONObjBuilder keyBuilder(_keyBuffer);
         key_string::toBsonSafe(key->keyString.getBuffer(),
@@ -781,7 +779,8 @@ bool GenericIndexScanStage::validateKey(const boost::optional<KeyStringEntry>& k
                                keyBuilder);
         auto bsonKey = keyBuilder.done();
 
-        switch (_checker->checkKey(bsonKey, &_seekPoint)) {
+        switch (_checker->checkKeyWithEndPosition(
+            bsonKey, &_seekPoint, _endKey, _params.ord, _forward)) {
             case IndexBoundsChecker::VALID:
                 _scanState = ScanState::kScanning;
                 return true;

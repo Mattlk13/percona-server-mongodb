@@ -46,7 +46,6 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/base/init.h"  // IWYU pragma: keep
 #include "mongo/base/initializer.h"
-#include "mongo/base/shim.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/config.h"  // IWYU pragma: keep
@@ -169,15 +168,12 @@ bool loggedCommandOperatesOnAuthzData(const NamespaceString& nss, const BSONObj&
     } else if (cmdName == "dropDatabase") {
         return true;
     } else if (cmdName == "renameCollection") {
-        auto context = SerializationContext::stateAuthPrevalidated();
-        // Mark the context as should expect tenant prefix for auth to signify that the NS string we
-        // are passing in may be prefixed with a tenantId.
-        context.setExpectTenantPrefixForAuth(true);
+        auto context = SerializationContext::stateStorageRequest();
 
         const NamespaceString fromNamespace = NamespaceStringUtil::deserialize(
-            boost::none, cmdObj.firstElement().valueStringDataSafe(), context);
+            nss.tenantId(), cmdObj.firstElement().valueStringDataSafe(), context);
         const NamespaceString toNamespace =
-            NamespaceStringUtil::deserialize(boost::none, cmdObj.getStringField("to"), context);
+            NamespaceStringUtil::deserialize(nss.tenantId(), cmdObj.getStringField("to"), context);
 
         if (fromNamespace.isAdminDB() || toNamespace.isAdminDB()) {
             return isAuthzCollection(fromNamespace.coll()) || isAuthzCollection(toNamespace.coll());
@@ -214,15 +210,6 @@ bool appliesToAuthzData(StringData op, const NamespaceString& nss, const BSONObj
             return true;
     }
 }
-
-std::unique_ptr<AuthorizationManager> authorizationManagerCreateImpl(
-    ServiceContext* serviceContext) {
-    return std::make_unique<AuthorizationManagerImpl>(serviceContext,
-                                                      AuthzManagerExternalState::create());
-}
-
-auto authorizationManagerCreateRegistration =
-    MONGO_WEAK_FUNCTION_REGISTRATION(AuthorizationManager::create, authorizationManagerCreateImpl);
 
 MONGO_FAIL_POINT_DEFINE(waitForUserCacheInvalidation);
 void handleWaitForUserCacheInvalidation(OperationContext* opCtx, const UserHandle& user) {
@@ -284,7 +271,7 @@ public:
                         ldapGlobalParams.ldapUserCacheInvalidationInterval.load()));
 
             if (cv_status == std::cv_status::timeout) {
-                _authzManager->invalidateUsersFromDB(nullptr, DatabaseName::kExternal);
+                _authzManager->invalidateUsersFromDB(DatabaseName::kExternal);
             }
         }
         LOGV2_DEBUG(29058, 1, "stopping thread", "name"_attr = name());
@@ -309,7 +296,7 @@ private:
 };
 
 AuthorizationManagerImpl::AuthorizationManagerImpl(
-    ServiceContext* service, std::unique_ptr<AuthzManagerExternalState> externalState)
+    Service* service, std::unique_ptr<AuthzManagerExternalState> externalState)
     : _externalState(std::move(externalState)),
       _authSchemaVersionCache(service, _threadPool, _externalState.get()),
       _userCache(service,
@@ -566,8 +553,7 @@ void AuthorizationManagerImpl::_updateCacheGeneration() {
     _cacheGeneration = OID::gen();
 }
 
-void AuthorizationManagerImpl::invalidateUserByName(OperationContext* opCtx,
-                                                    const UserName& userName) {
+void AuthorizationManagerImpl::invalidateUserByName(const UserName& userName) {
     LOGV2_DEBUG(20235, 2, "Invalidating user", "user"_attr = userName);
     _updateCacheGeneration();
     _authSchemaVersionCache.invalidateAll();
@@ -576,8 +562,7 @@ void AuthorizationManagerImpl::invalidateUserByName(OperationContext* opCtx,
     _userCache.invalidateKey(UserRequest(userName, boost::none));
 }
 
-void AuthorizationManagerImpl::invalidateUsersFromDB(OperationContext* opCtx,
-                                                     const DatabaseName& dbname) {
+void AuthorizationManagerImpl::invalidateUsersFromDB(const DatabaseName& dbname) {
     LOGV2_DEBUG(20236, 2, "Invalidating all users from database", "database"_attr = dbname);
     _updateCacheGeneration();
     _authSchemaVersionCache.invalidateAll();
@@ -586,10 +571,9 @@ void AuthorizationManagerImpl::invalidateUsersFromDB(OperationContext* opCtx,
     });
 }
 
-void AuthorizationManagerImpl::invalidateUsersByTenant(OperationContext* opCtx,
-                                                       const boost::optional<TenantId>& tenant) {
+void AuthorizationManagerImpl::invalidateUsersByTenant(const boost::optional<TenantId>& tenant) {
     if (!tenant) {
-        invalidateUserCache(opCtx);
+        invalidateUserCache();
         return;
     }
 
@@ -600,7 +584,7 @@ void AuthorizationManagerImpl::invalidateUsersByTenant(OperationContext* opCtx,
         [&](const UserRequest& userRequest) { return userRequest.name.getTenant() == tenant; });
 }
 
-void AuthorizationManagerImpl::invalidateUserCache(OperationContext* opCtx) {
+void AuthorizationManagerImpl::invalidateUserCache() {
     LOGV2_DEBUG(20237, 2, "Invalidating user cache");
     _updateCacheGeneration();
     _authSchemaVersionCache.invalidateAll();
@@ -654,7 +638,7 @@ Status AuthorizationManagerImpl::initialize(OperationContext* opCtx) {
         return status;
     }
 
-    invalidateUserCache(opCtx);
+    invalidateUserCache();
     if (!ldapGlobalParams.ldapServers->empty()) {
         _ldapUserCacheInvalidator = std::make_unique<LDAPUserCacheInvalidator>(this);
         _ldapUserCacheInvalidator->go();
@@ -686,9 +670,7 @@ std::vector<AuthorizationManager::CachedUserInfo> AuthorizationManagerImpl::getU
 }
 
 AuthorizationManagerImpl::AuthSchemaVersionCache::AuthSchemaVersionCache(
-    ServiceContext* service,
-    ThreadPoolInterface& threadPool,
-    AuthzManagerExternalState* externalState)
+    Service* service, ThreadPoolInterface& threadPool, AuthzManagerExternalState* externalState)
     : ReadThroughCache(
           _mutex,
           service,
@@ -712,7 +694,7 @@ AuthorizationManagerImpl::AuthSchemaVersionCache::_lookup(OperationContext* opCt
 }
 
 AuthorizationManagerImpl::UserCacheImpl::UserCacheImpl(
-    ServiceContext* service,
+    Service* service,
     ThreadPoolInterface& threadPool,
     int cacheSize,
     AuthSchemaVersionCache* authSchemaVersionCache,

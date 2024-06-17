@@ -50,6 +50,10 @@ namespace mongo {
 
 class ProcessInfo {
 public:
+    static auto constexpr kTranparentHugepageDirectory = "/sys/kernel/mm/transparent_hugepage";
+    static auto constexpr kGlibcTunableEnvVar = "GLIBC_TUNABLES";
+    static auto constexpr kRseqKey = "glibc.pthread.rseq";
+
     ProcessInfo(ProcessId pid = ProcessId::getCurrent());
     ~ProcessInfo();
 
@@ -108,7 +112,7 @@ public:
     /**
      * Get the number of (logical) CPUs
      */
-    static unsigned getNumCores() {
+    static unsigned getNumLogicalCores() {
         return sysInfo().numCores;
     }
 
@@ -131,7 +135,14 @@ public:
      * If that information is not available, get the total number of CPUs.
      */
     static unsigned long getNumAvailableCores() {
-        return ProcessInfo::getNumCoresForProcess().value_or(ProcessInfo::getNumCores());
+        return ProcessInfo::getNumCoresForProcess().value_or(ProcessInfo::getNumLogicalCores());
+    }
+
+    /**
+     * Get the number of cores available for process or return the errorValue.
+     */
+    static long getNumCoresAvailableToProcess(long errorValue = -1) {
+        return ProcessInfo::getNumCoresForProcess().value_or(errorValue);
     }
 
     /**
@@ -171,6 +182,20 @@ public:
     static bool preferMsyncOverFSync() {
         return sysInfo().preferMsyncOverFSync;
     }
+
+    /**
+     * Transparent hugepage files display settings like so, with the selected setting in brackets:
+     *      always defer [defer+madvise] madvise never
+     *
+     * This function parses out the selected setting from this file format.
+     */
+    static StatusWith<std::string> readTransparentHugePagesParameter(
+        StringData parameter, StringData directory = kTranparentHugepageDirectory);
+
+    /**
+     * Check whether the environment variable GLIBC_TUNABLES=glibc.pthread.rseq=0 is correctly set.
+     */
+    static bool checkGlibcRseqTunable();
 
     /**
      * Get extra system stats

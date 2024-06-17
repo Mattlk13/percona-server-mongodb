@@ -21,6 +21,7 @@ selector:
 
   # Skip any tests that run with auth explicitly.
   - jstests/multiVersion/genericBinVersion/load_keys_on_upgrade.js
+  - jstests/multiVersion/targetedTestsLastLtsFeatures/oidc_multipurpose_idp.js
 
   exclude_with_any_tags:
   - featureFlagToaster
@@ -32,6 +33,8 @@ executor:
     shell_options:
       global_vars:
         TestData:
+          setParameters:
+            bsonTestValidationVersion: 1
           auth: true
 #          authMechanism: SCRAM-SHA-256
           keyFile: *keyFile

@@ -40,8 +40,8 @@ structs:
       is_command_reply: true
       fields:
         historicalPlacement: HistoricalPlacement
-commands:
 
+commands:
     clusterResetPlacementHistory:
         command_name: resetPlacementHistory
         cpp_name: ClusterResetPlacementHistory
@@ -60,7 +60,6 @@ commands:
         api_version: ""
         strict: false
 
-    # TODO (SERVER-73029): remove the _configsvrGetHistoricalPlacement and the code supporting it.
     _configsvrGetHistoricalPlacement:
         command_name: _configsvrGetHistoricalPlacement
         cpp_name: ConfigsvrGetHistoricalPlacement

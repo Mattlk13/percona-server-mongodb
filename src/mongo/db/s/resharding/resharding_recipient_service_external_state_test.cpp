@@ -64,7 +64,6 @@
 #include "mongo/db/transaction/session_catalog_mongod_transaction_interface_impl.h"
 #include "mongo/executor/network_test_env.h"
 #include "mongo/executor/remote_command_request.h"
-#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog_cache_test_fixture.h"
@@ -87,26 +86,7 @@ namespace {
 
 class RecipientServiceExternalStateTest : public ShardCatalogCacheTestFixture,
                                           public ServiceContextMongoDTest {
-public:
-    const ShardKeyPattern kShardKey = ShardKeyPattern(BSON("_id" << 1));
-
-    const NamespaceString kOrigNss = NamespaceString::createNamespaceString_forTest("db.foo");
-    const OID kOrigEpoch = OID::gen();
-    const Timestamp kOrigTimestamp = Timestamp(1);
-    const UUID kOrigUUID = UUID::gen();
-
-    const NamespaceString kReshardingNss = NamespaceString::createNamespaceString_forTest(
-        str::stream() << "db." << NamespaceString::kTemporaryReshardingCollectionPrefix
-                      << kOrigUUID);
-    const ShardKeyPattern kReshardingKey = ShardKeyPattern(BSON("newKey" << 1));
-    const OID kReshardingEpoch = OID::gen();
-    const Timestamp kReshardingTimestamp = Timestamp(2);
-    const UUID kReshardingUUID = UUID::gen();
-
-    const CommonReshardingMetadata kMetadata{
-        kReshardingUUID, kOrigNss, kOrigUUID, kReshardingNss, kReshardingKey.getKeyPattern()};
-    const Timestamp kDefaultFetchTimestamp = Timestamp(200, 1);
-
+protected:
     void setUp() override {
         ShardCatalogCacheTestFixture::setUp();
 
@@ -164,7 +144,7 @@ public:
             ASSERT_EQ(request.cmdObj.firstElementFieldName(), "listIndexes"_sd);
             ASSERT_EQUALS(nss.dbName(), request.dbname);
             ASSERT_EQUALS(expectedHost, request.target);
-            ASSERT_EQ(unittest::assertGet(UUID::parse(request.cmdObj.firstElement())), uuid);
+            ASSERT_EQ(request.cmdObj.firstElement().checkAndGetStringData(), nss.coll());
             ASSERT(request.cmdObj.hasField("shardVersion"));
             ASSERT_BSONOBJ_EQ(request.cmdObj["readConcern"].Obj(),
                               BSON("level"
@@ -297,9 +277,31 @@ public:
         RecipientStateMachineExternalStateImpl externalState;
         externalState.ensureTempReshardingCollectionExistsWithIndexes(
             operationContext(), kMetadata, kDefaultFetchTimestamp);
-        CollectionShardingRuntime csr(getServiceContext(), kOrigNss);
-        ASSERT(csr.getCurrentMetadataIfKnown() == boost::none);
+
+        AutoGetCollection autoColl(operationContext(), kReshardingNss, MODE_IX);
+        auto scopedCsr = CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(
+            operationContext(), kReshardingNss);
+        ASSERT(scopedCsr->getCurrentMetadataIfKnown() == boost::none);
     }
+
+    const ShardKeyPattern kShardKey = ShardKeyPattern(BSON("_id" << 1));
+
+    const NamespaceString kOrigNss = NamespaceString::createNamespaceString_forTest("db.foo");
+    const OID kOrigEpoch = OID::gen();
+    const Timestamp kOrigTimestamp = Timestamp(1);
+    const UUID kOrigUUID = UUID::gen();
+
+    const NamespaceString kReshardingNss = NamespaceString::createNamespaceString_forTest(
+        str::stream() << "db." << NamespaceString::kTemporaryReshardingCollectionPrefix
+                      << kOrigUUID);
+    const ShardKeyPattern kReshardingKey = ShardKeyPattern(BSON("newKey" << 1));
+    const OID kReshardingEpoch = OID::gen();
+    const Timestamp kReshardingTimestamp = Timestamp(2);
+    const UUID kReshardingUUID = UUID::gen();
+
+    const CommonReshardingMetadata kMetadata{
+        kReshardingUUID, kOrigNss, kOrigUUID, kReshardingNss, kReshardingKey.getKeyPattern()};
+    const Timestamp kDefaultFetchTimestamp = Timestamp(200, 1);
 };
 
 TEST_F(RecipientServiceExternalStateTest, ReshardingConfigServerUpdatesHaveNoTimeout) {
@@ -322,9 +324,6 @@ TEST_F(RecipientServiceExternalStateTest, ReshardingConfigServerUpdatesHaveNoTim
 }
 
 TEST_F(RecipientServiceExternalStateTest, CreateLocalReshardingCollectionBasic) {
-    // TODO(SERVER-80519): Turn feature flag on and fix test.
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagReshardingImprovements",
-                                                               false);
     auto shards = setupNShards(2);
 
     // Shard kOrigNss by _id with chunks [minKey, 0), [0, maxKey] on shards "0" and "1"
@@ -357,6 +356,10 @@ TEST_F(RecipientServiceExternalStateTest, CreateLocalReshardingCollectionBasic) 
                                                                << "hashed")
                                                    << "name"
                                                    << "indexOne")};
+    // When creating collection, only _id index should be created.
+    const std::vector<BSONObj> expectedIndexes = {BSON("v" << 2 << "key" << BSON("_id" << 1)
+                                                           << "name"
+                                                           << "_id_")};
     auto future = launchAsync([&] {
         expectRefreshReturnForOriginalColl(
             kOrigNss, kShardKey, kOrigUUID, kOrigEpoch, kOrigTimestamp);
@@ -382,14 +385,11 @@ TEST_F(RecipientServiceExternalStateTest, CreateLocalReshardingCollectionBasic) 
 
     future.default_timed_get();
 
-    verifyCollectionAndIndexes(kReshardingNss, kReshardingUUID, indexes);
+    verifyCollectionAndIndexes(kReshardingNss, kReshardingUUID, expectedIndexes);
 }
 
 TEST_F(RecipientServiceExternalStateTest,
        CreatingLocalReshardingCollectionRetriesOnStaleVersionErrors) {
-    // TODO(SERVER-80519): Turn feature flag on and fix test.
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagReshardingImprovements",
-                                                               false);
     auto shards = setupNShards(2);
 
     // Shard kOrigNss by _id with chunks [minKey, 0), [0, maxKey] on shards "0" and "1"
@@ -422,6 +422,11 @@ TEST_F(RecipientServiceExternalStateTest,
                                                                << "hashed")
                                                    << "name"
                                                    << "indexOne")};
+    // When creating collection, only _id index should be created.
+    const std::vector<BSONObj> expectedIndexes = {BSON("v" << 2 << "key" << BSON("_id" << 1)
+                                                           << "name"
+                                                           << "_id_")};
+
     auto future = launchAsync([&] {
         expectRefreshReturnForOriginalColl(
             kOrigNss, kShardKey, kOrigUUID, kOrigEpoch, kOrigTimestamp);
@@ -453,14 +458,11 @@ TEST_F(RecipientServiceExternalStateTest,
 
     future.default_timed_get();
 
-    verifyCollectionAndIndexes(kReshardingNss, kReshardingUUID, indexes);
+    verifyCollectionAndIndexes(kReshardingNss, kReshardingUUID, expectedIndexes);
 }
 
 TEST_F(RecipientServiceExternalStateTest,
        CreateLocalReshardingCollectionCollectionAlreadyExistsWithNoIndexes) {
-    // TODO(SERVER-80519): Turn feature flag on and fix test.
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagReshardingImprovements",
-                                                               false);
     auto shards = setupNShards(2);
 
     // Shard kOrigNss by _id with chunks [minKey, 0), [0, maxKey] on shards "0" and "1"
@@ -493,6 +495,10 @@ TEST_F(RecipientServiceExternalStateTest,
                                                                << "hashed")
                                                    << "name"
                                                    << "indexOne")};
+    // When creating collection, only _id index should be created.
+    const std::vector<BSONObj> expectedIndexes = {BSON("v" << 2 << "key" << BSON("_id" << 1)
+                                                           << "name"
+                                                           << "_id_")};
     // Create the collection and indexes to simulate retrying after a failover. Only include the id
     // index, because it is needed to create the collection.
     CollectionOptionsAndIndexes optionsAndIndexes = {
@@ -532,14 +538,11 @@ TEST_F(RecipientServiceExternalStateTest,
 
     future.default_timed_get();
 
-    verifyCollectionAndIndexes(kReshardingNss, kReshardingUUID, indexes);
+    verifyCollectionAndIndexes(kReshardingNss, kReshardingUUID, expectedIndexes);
 }
 
 TEST_F(RecipientServiceExternalStateTest,
        CreateLocalReshardingCollectionCollectionAlreadyExistsWithSomeIndexes) {
-    // TODO(SERVER-80519): Turn feature flag on and fix test.
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagReshardingImprovements",
-                                                               false);
     auto shards = setupNShards(2);
 
     // Shard kOrigNss by _id with chunks [minKey, 0), [0, maxKey] on shards "0" and "1"
@@ -574,6 +577,13 @@ TEST_F(RecipientServiceExternalStateTest,
                                                    << "indexOne"),
                                           BSON("v" << 2 << "key" << BSON("c.d" << 1) << "name"
                                                    << "nested")};
+    // When creating collection, only _id index should be created, the other index is cloned
+    // manually.
+    const std::vector<BSONObj> expectedIndexes = {
+        BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
+                 << "_id_"),
+        BSON("v" << 2 << "key" << BSON("c.d" << 1) << "name"
+                 << "nested")};
 
     // Create the collection and indexes to simulate retrying after a failover. Only include the id
     // index, because it is needed to create the collection.
@@ -614,7 +624,7 @@ TEST_F(RecipientServiceExternalStateTest,
 
     future.default_timed_get();
 
-    verifyCollectionAndIndexes(kReshardingNss, kReshardingUUID, indexes);
+    verifyCollectionAndIndexes(kReshardingNss, kReshardingUUID, expectedIndexes);
 }
 
 TEST_F(RecipientServiceExternalStateTest,

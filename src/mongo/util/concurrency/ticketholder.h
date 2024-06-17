@@ -31,19 +31,14 @@
 #include <boost/move/utility_core.hpp>
 #include <boost/optional/optional.hpp>
 #include <cstdint>
-#include <utility>
 
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
-#include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/future.h"
 #include "mongo/util/assert_util_core.h"
 #include "mongo/util/concurrency/admission_context.h"
-#include "mongo/util/concurrency/mutex.h"
-#include "mongo/util/hierarchical_acquisition.h"
+#include "mongo/util/tick_source.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -61,14 +56,17 @@ class TicketHolder {
     friend class Ticket;
 
 public:
-    TicketHolder(int32_t numTickets, ServiceContext* svcCtx);
+    TicketHolder(ServiceContext* svcCtx, int32_t numTickets, bool trackPeakUsed);
 
-    virtual ~TicketHolder(){};
+    virtual ~TicketHolder() {}
 
     /**
      * Adjusts the total number of tickets allocated for the ticket pool to 'newSize'.
+     *
+     * Returns 'true' if the resize completed without reaching the 'deadline', and 'false'
+     * otherwise.
      */
-    virtual void resize(int32_t newSize) noexcept;
+    bool resize(int32_t newSize, Date_t deadline = Date_t::max()) noexcept;
 
     /**
      * Attempts to acquire a ticket without blocking.
@@ -77,58 +75,41 @@ public:
     virtual boost::optional<Ticket> tryAcquire(AdmissionContext* admCtx);
 
     /**
-     * Attempts to acquire a ticket. Blocks until a ticket is acquired or the OperationContext
-     * 'opCtx' is killed, throwing an AssertionException. If no OperationContext is provided, then
-     * the operation is uninterruptible.
+     * Attempts to acquire a ticket. Blocks until a ticket is acquired or the Interruptible is
+     * interrupted, throwing an AssertionException. Outputs 'timeQueuedForTicketMicros' with time
+     * spent waiting for a ticket.
      */
-    virtual Ticket waitForTicket(OperationContext* opCtx, AdmissionContext* admCtx);
+    virtual Ticket waitForTicket(Interruptible& interruptible, AdmissionContext* admCtx);
 
     /**
      * Attempts to acquire a ticket within a deadline, 'until'. Returns 'true' if a ticket is
      * acquired and 'false' if the deadline is reached, but the operation is retryable. Throws an
-     * AssertionException if the OperationContext 'opCtx' is killed and no waits for tickets can
-     * proceed. If no OperationContext is provided, then the operation is uninterruptible.
+     * AssertionException if the Interruptible is interrupted. Outputs 'timeQueuedForTicketMicros'
+     * with time spent waiting for a ticket.
      */
-    virtual boost::optional<Ticket> waitForTicketUntil(OperationContext* opCtx,
+    virtual boost::optional<Ticket> waitForTicketUntil(Interruptible& interruptible,
                                                        AdmissionContext* admCtx,
                                                        Date_t until);
 
     /**
      * The total number of tickets allotted to the ticket pool.
      */
-    virtual int32_t outof() const {
+    int32_t outof() const {
         return _outof.loadRelaxed();
     }
 
     /**
      * Instantaneous number of tickets that are checked out by an operation.
      */
-    virtual int32_t used() const {
+    int32_t used() const {
         return outof() - available();
     }
 
     /**
      * Peak number of tickets checked out at once since the previous time this function was called.
+     * Invariants that 'trackPeakUsed' has been passed to the TicketHolder,
      */
-    virtual int32_t getAndResetPeakUsed();
-
-    /**
-     * 'Immediate' admissions don't need to acquire or wait for a ticket. However, they should
-     * report to the TicketHolder for tracking purposes.
-     *
-     * Increments the count of 'immediate' priority admissions reported.
-     */
-    virtual void reportImmediatePriorityAdmission() {
-        _immediatePriorityAdmissionsCount.fetchAndAdd(1);
-    }
-
-    /**
-     * Returns the number of 'immediate' priority admissions, which always bypass ticket
-     * acquisition.
-     */
-    int64_t getImmediatePriorityAdmissionsCount() const {
-        return _immediatePriorityAdmissionsCount.loadRelaxed();
-    }
+    int32_t getAndResetPeakUsed();
 
     virtual void appendStats(BSONObjBuilder& b) const;
 
@@ -172,34 +153,35 @@ private:
     /**
      * Releases a ticket back into the ticketing pool.
      */
-    virtual void _releaseToTicketPool(AdmissionContext* admCtx) noexcept;
+    virtual void _releaseToTicketPool(Ticket& ticket) noexcept;
 
     virtual void _releaseToTicketPoolImpl(AdmissionContext* admCtx) noexcept = 0;
 
     virtual boost::optional<Ticket> _tryAcquireImpl(AdmissionContext* admCtx) = 0;
 
-    virtual boost::optional<Ticket> _waitForTicketUntilImpl(OperationContext* opCtx,
+    virtual boost::optional<Ticket> _waitForTicketUntilImpl(Interruptible& interruptible,
                                                             AdmissionContext* admCtx,
                                                             Date_t until) = 0;
 
     virtual void _appendImplStats(BSONObjBuilder& b) const {}
 
-    virtual void _resize(int32_t newSize, int32_t oldSize) noexcept {}
-
     /**
-     * Fetches the queueing statistics corresponding to the 'admCtx'. All statistics that are queue
+     * Fetches the queueing statistics for the given priority. All statistics that are queue
      * specific should be updated through the resulting 'QueueStats'.
      */
-    virtual QueueStats& _getQueueStatsToUse(const AdmissionContext* admCtx) noexcept = 0;
+    virtual QueueStats& _getQueueStatsToUse(AdmissionContext::Priority priority) noexcept = 0;
 
     void _updatePeakUsed();
 
+    const bool _trackPeakUsed;
+
+    void _updateQueueStatsOnRelease(TicketHolder::QueueStats& queueStats, const Ticket& ticket);
+    void _updateQueueStatsOnTicketAcquisition(AdmissionContext* admCtx,
+                                              TicketHolder::QueueStats& queueStats);
+
     Mutex _resizeMutex =
         MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(2), "TicketHolder::_resizeMutex");
-    AtomicWord<int32_t> _outof;
-    AtomicWord<int32_t> _peakUsed;
-    AtomicWord<std::int64_t> _immediatePriorityAdmissionsCount;
-    bool _usingDynamicConcurrencyAdjustment;
+    QueueStats _exemptQueueStats;
 
 protected:
     /**
@@ -207,47 +189,36 @@ protected:
      */
     void _appendCommonQueueImplStats(BSONObjBuilder& b, const QueueStats& stats) const;
 
+    AtomicWord<int32_t> _outof;
+    AtomicWord<int32_t> _peakUsed;
+
     ServiceContext* _serviceContext;
 };
 
 class MockTicketHolder : public TicketHolder {
 public:
-    MockTicketHolder() : TicketHolder(0, nullptr) {}
+    MockTicketHolder(ServiceContext* svcCtx) : TicketHolder(svcCtx, 0, true) {}
 
-    void resize(int32_t newSize) noexcept override {
-        _outof = newSize;
-    }
+    boost::optional<Ticket> tryAcquire(AdmissionContext* admCtx) override;
 
-    boost::optional<Ticket> tryAcquire(AdmissionContext*) override;
+    Ticket waitForTicket(Interruptible& interruptible, AdmissionContext* admCtx) override;
 
-    Ticket waitForTicket(OperationContext*, AdmissionContext*) override;
+    boost::optional<Ticket> waitForTicketUntil(Interruptible& interruptible,
+                                               AdmissionContext* admCtx,
+                                               Date_t until) override;
 
-    boost::optional<Ticket> waitForTicketUntil(OperationContext*,
-                                               AdmissionContext*,
-                                               Date_t) override;
-
-    void appendStats(BSONObjBuilder&) const override {}
-
-    void reportImmediatePriorityAdmission() override {}
+    void appendStats(BSONObjBuilder& b) const override {}
 
     int32_t available() const override {
-        return _outof - _used;
+        return _available;
     }
 
-    int32_t used() const override {
-        return _used;
-    }
-    void setUsed(int32_t used);
-
-    int32_t getAndResetPeakUsed() override {
-        return std::exchange(_peakUsed, 0);
+    void setPeakUsed(int32_t used) {
+        _peakUsed.store(used);
     }
 
-    int32_t outof() const override {
-        return _outof;
-    }
-    void setOutof(int32_t outof) {
-        _outof = outof;
+    void setAvailable(int32_t available) {
+        _available = available;
     }
 
     int64_t queued() const override {
@@ -263,23 +234,21 @@ public:
     }
 
 private:
-    void _releaseToTicketPoolImpl(AdmissionContext* admCtx) noexcept override {}
+    void _releaseToTicketPoolImpl(AdmissionContext* admCtx) noexcept override;
 
     boost::optional<Ticket> _tryAcquireImpl(AdmissionContext* admCtx) override;
 
-    boost::optional<Ticket> _waitForTicketUntilImpl(OperationContext* opCtx,
+    boost::optional<Ticket> _waitForTicketUntilImpl(Interruptible& interruptible,
                                                     AdmissionContext* admCtx,
                                                     Date_t until) override;
 
-    QueueStats& _getQueueStatsToUse(const AdmissionContext* admCtx) noexcept override {
+    QueueStats& _getQueueStatsToUse(AdmissionContext::Priority priority) noexcept override {
         return _stats;
     }
 
     QueueStats _stats;
 
-    int32_t _used = 0;
-    int32_t _peakUsed = 0;
-    int32_t _outof = 0;
+    int32_t _available = 0;
     int32_t _numFinishedProcessing = 0;
 };
 
@@ -294,7 +263,11 @@ class Ticket {
     friend class MockTicketHolder;
 
 public:
-    Ticket(Ticket&& t) : _ticketholder(t._ticketholder), _admissionContext(t._admissionContext) {
+    Ticket(Ticket&& t)
+        : _ticketholder(t._ticketholder),
+          _admissionContext(t._admissionContext),
+          _priority(t._priority),
+          _acquisitionTime(t._acquisitionTime) {
         t._ticketholder = nullptr;
         t._admissionContext = nullptr;
     }
@@ -306,6 +279,8 @@ public:
         invariant(!valid(), "Attempting to overwrite a valid ticket with another one");
         _ticketholder = t._ticketholder;
         _admissionContext = t._admissionContext;
+        _priority = t._priority;
+        _acquisitionTime = t._acquisitionTime;
         t._ticketholder = nullptr;
         t._admissionContext = nullptr;
         return *this;
@@ -313,7 +288,7 @@ public:
 
     ~Ticket() {
         if (_ticketholder) {
-            _ticketholder->_releaseToTicketPool(_admissionContext);
+            _ticketholder->_releaseToTicketPool(*this);
         }
     }
 
@@ -324,9 +299,19 @@ public:
         return _ticketholder != nullptr;
     }
 
+    /**
+     * Returns the ticket priority.
+     */
+    AdmissionContext::Priority getPriority() const {
+        return _priority;
+    }
+
 private:
     Ticket(TicketHolder* ticketHolder, AdmissionContext* admissionContext)
-        : _ticketholder(ticketHolder), _admissionContext(admissionContext) {}
+        : _ticketholder(ticketHolder), _admissionContext(admissionContext) {
+        _priority = admissionContext->getPriority();
+        _acquisitionTime = ticketHolder->_serviceContext->getTickSource()->getTicks();
+    }
 
     /**
      * Discards the ticket without releasing it back to the ticketholder.
@@ -342,5 +327,7 @@ private:
 
     TicketHolder* _ticketholder;
     AdmissionContext* _admissionContext;
+    AdmissionContext::Priority _priority;
+    TickSource::Tick _acquisitionTime;
 };
 }  // namespace mongo

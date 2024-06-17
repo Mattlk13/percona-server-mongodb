@@ -308,7 +308,8 @@ SemiFuture<void> ShardSplitDonorService::DonorStateMachine::run(
 
         // We must abort the migration if we try to start or resume while upgrading or downgrading.
         // (Generic FCV reference): This FCV check should exist across LTS binary versions.
-        if (serverGlobalParams.featureCompatibility.isUpgradingOrDowngrading()) {
+        if (serverGlobalParams.featureCompatibility.acquireFCVSnapshot()
+                .isUpgradingOrDowngrading()) {
             LOGV2(8423360, "Aborting shard split since donor is upgrading or downgrading.");
             _abortSource->cancel();
         }
@@ -983,7 +984,7 @@ ExecutorFuture<repl::OpTime> ShardSplitDonorService::DonorStateMachine::_updateS
                            invariant(mtab);
                            mtab->startBlockingWrites();
 
-                           opCtx->recoveryUnit()->onRollback(
+                           shard_role_details::getRecoveryUnit(opCtx)->onRollback(
                                [mtab](OperationContext*) { mtab->rollBackStartBlocking(); });
                        }
                    }
@@ -1045,7 +1046,8 @@ ExecutorFuture<repl::OpTime> ShardSplitDonorService::DonorStateMachine::_updateS
                                             collection.getCollectionPtr(),
                                             BSON("_id" << originalStateDocBson["_id"]));
                        const auto originalSnapshot = Snapshotted<BSONObj>(
-                           opCtx->recoveryUnit()->getSnapshotId(), originalStateDocBson);
+                           shard_role_details::getRecoveryUnit(opCtx)->getSnapshotId(),
+                           originalStateDocBson);
                        invariant(!originalRecordId.isNull());
 
                        CollectionUpdateArgs args{originalSnapshot.value()};

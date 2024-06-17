@@ -62,6 +62,7 @@
 #include "mongo/unittest/assert.h"
 #include "mongo/unittest/assert_that.h"
 #include "mongo/unittest/death_test.h"
+#include "mongo/unittest/thread_assertion_monitor.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/notification.h"
@@ -341,6 +342,16 @@ TEST(AsioTransportLayer, TCPResetAfterConnectionIsSilentlySwallowed) {
     ASSERT_EQ(sessionsCreated.load(), 0);
 }
 
+TEST(AsioTransportLayer, StopAcceptingSessionsBeforeStart) {
+    auto sm = std::make_unique<test::MockSessionManager>();
+    auto tla = std::make_unique<AsioTransportLayer>(defaultTLAOptions(), std::move(sm));
+    ON_BLOCK_EXIT([&] { tla->shutdown(); });
+
+    ASSERT_OK(tla->setup());
+    tla->stopAcceptingSessions();
+    ASSERT_OK(tla->start());
+}
+
 #ifdef __linux__
 /**
  * Test that the server successfully captures the TCP socket queue depth, and places the value both
@@ -406,7 +417,7 @@ TEST(AsioTransportLayer, ThrowOnNetworkErrorInEnsureSync) {
 
     // We set the timeout to ensure that the setsockopt calls are actually made in ensureSync()
     auto& st = *mockSessionCreated.get();
-    st.session().setTimeout(Milliseconds{500});
+    st.session()->setTimeout(Milliseconds{500});
 
     // Synchronize with the connection thread to ensure the connection is closed only after the
     // connection thread returns from calling `setsockopt`.
@@ -418,7 +429,7 @@ TEST(AsioTransportLayer, ThrowOnNetworkErrorInEnsureSync) {
     // We allow for either exception here.
     using namespace unittest::match;
     ASSERT_THAT(
-        st.session().sourceMessage().getStatus(),
+        st.session()->sourceMessage().getStatus(),
         StatusIs(AnyOf(Eq(ErrorCodes::HostUnreachable), Eq(ErrorCodes::SocketException)), Any()));
 }
 
@@ -427,7 +438,7 @@ TEST(AsioTransportLayer, SourceSyncTimeoutTimesOut) {
     TestFixture tf;
     Notification<StatusWith<Message>> received;
     tf.sessionManager().setOnStartSession([&](test::SessionThread& st) {
-        st.session().setTimeout(Milliseconds{500});
+        st.session()->setTimeout(Milliseconds{500});
         st.schedule([&](auto& session) { received.set(session.sourceMessage()); });
     });
     SyncClient conn(tf.tla().listenerPort());
@@ -439,7 +450,7 @@ TEST(AsioTransportLayer, SourceSyncTimeoutSucceeds) {
     TestFixture tf;
     Notification<StatusWith<Message>> received;
     tf.sessionManager().setOnStartSession([&](test::SessionThread& st) {
-        st.session().setTimeout(Milliseconds{500});
+        st.session()->setTimeout(Milliseconds{500});
         st.schedule([&](auto& session) { received.set(session.sourceMessage()); });
     });
     SyncClient conn(tf.tla().listenerPort());
@@ -582,7 +593,9 @@ void runTfoScenario(bool serverOn, bool clientOn, bool expectTfo) {
     auto extractTfoAccepted = [] {
         BSONObjBuilder bob;
         networkCounter.append(bob);
-        return bob.done()["tcpFastOpen"]["accepted"].numberInt();
+        auto obj = bob.obj();
+        auto accepted = obj["tcpFastOpen"]["accepted"].numberInt();
+        return std::pair{accepted, obj};
     };
 
     TestFixture tf;
@@ -602,12 +615,23 @@ void runTfoScenario(bool serverOn, bool clientOn, bool expectTfo) {
 
     // Make one throwaway connection just to allow establishment of a TFO cookie.
     connectOnce();
-
-    int tfos = extractTfoAccepted();
+    auto rec0 = extractTfoAccepted();
     connectOnce();
-    int newTfos = extractTfoAccepted();
+    auto rec1 = extractTfoAccepted();
 
-    ASSERT_EQ(newTfos, tfos + expectTfo);
+    auto newTfos = rec1.first - rec0.first;
+    if (newTfos != static_cast<int>(expectTfo)) {
+        LOGV2_WARNING(8397800,
+                      "In practice we sometimes do not get TFO when we expect to. "
+                      "We are logging these events but not failing the test (See SERVER-83978)",
+                      "serverOn"_attr = serverOn,
+                      "clientOn"_attr = clientOn,
+                      "expectTfo"_attr = expectTfo,
+                      "rec0"_attr = rec0.second,
+                      "rec1"_attr = rec1.second);
+        // Only really asserting that we do not unexpectedly get TFO.
+        ASSERT_LTE(newTfos, static_cast<int>(expectTfo));
+    }
 }
 
 TEST(AsioTransportLayer, TcpFastOpenWithServerOffClientOff) {
@@ -719,6 +743,36 @@ TEST(AsioTransportLayer, ConfirmSocketSetOptionOnResetConnections) {
     LOGV2(6101610,
           "ASIO set_option response on peer-reset connection",
           "msg"_attr = "{}"_format(thrown ? thrown->message() : ""));
+}
+
+DEATH_TEST_REGEX(AsioTransportLayer, ScheduleOnReactorAfterShutdownFails, "Shutdown in progress") {
+    TestFixture tf;
+
+    Notification<void> shutdown;
+    auto reactor = tf.tla().getReactor(TransportLayer::kNewReactor);
+    auto reactorThread = stdx::thread([reactor, &shutdown] {
+        LOGV2(8703700, "running reactor");
+        reactor->run();
+        LOGV2(8703701, "reactor stopped, draining");
+        reactor->drain();
+        LOGV2(8703702, "reactor drain complete");
+        shutdown.set();
+    });
+    Notification<void> firstTask;
+    reactor->schedule([&](Status s) {
+        LOGV2(8703703, "first task scheduled", "status"_attr = s);
+        firstTask.set();
+    });
+    firstTask.get();
+
+    LOGV2(8703704, "shutting down reactor");
+    reactor->stop();
+    shutdown.get();
+
+    auto guaranteedReactor = makeGuaranteedExecutor(reactor);
+    guaranteedReactor->schedule(
+        [](Status s) { LOGV2(8703705, "task scheduled after stop", "status"_attr = s); });
+    reactorThread.join();
 }
 
 class AsioTransportLayerWithServiceContextTest : public ServiceContextTest {
@@ -865,7 +919,7 @@ TEST_F(AsioTransportLayerWithServiceContextTest, ShutdownDuringSSLHandshake) {
 #endif  // _WIN32
 #endif  // MONGO_CONFIG_SSL
 
-class AsioTransportLayerWithRouterPortTest : public unittest::Test {
+class AsioTransportLayerWithRouterPortTest : public ServiceContextTest {
 public:
     // We opted to use static ports for simplicity. If this results in test failures due to busy
     // ports, we may change the fixture, as well as the underlying transport layer, to dynamically
@@ -893,21 +947,26 @@ public:
     }
 
     void doDifferentiatesConnectionsCase(bool useRouterPort) {
-        auto isFromRouterPort = std::make_shared<Notification<bool>>();
-        sessionManager().setOnStartSession([isFromRouterPort](test::SessionThread& st) {
-            isFromRouterPort->set(st.session().isFromRouterPort());
+        auto onStartSession = std::make_shared<Notification<void>>();
+        sessionManager().setOnStartSession([&](test::SessionThread& st) {
+            ASSERT_EQ(st.session()->isFromRouterPort(), useRouterPort);
+
+            auto client =
+                getServiceContext()->getService()->makeClient("RouterPortTest", st.session());
+            ASSERT_EQ(client->isRouterClient(), useRouterPort);
+
+            onStartSession->set();
         });
         HostAndPort target{testHostName(), useRouterPort ? kRouterPort : kMainPort};
         auto conn = connect(target);
         ASSERT_OK(conn) << " target={}"_format(target);
-        ASSERT_FALSE(conn.getValue()->isFromRouterPort());
-        ASSERT_EQ(isFromRouterPort->get(), useRouterPort);
+        onStartSession->get();
     }
 
 private:
-    RAIIServerParameterControllerForTest _scopedFeature{"featureFlagEmbeddedRouter", true};
-    ScopedValueGuard<ClusterRole> _changeClusterRole{serverGlobalParams.clusterRole,
-                                                     ClusterRole::RouterServer};
+    RAIIServerParameterControllerForTest _scopedFeature{"featureFlagRouterPort", true};
+    ScopedValueGuard<ClusterRole> _scopedClusterRole{
+        serverGlobalParams.clusterRole, {ClusterRole::RouterServer, ClusterRole::ShardServer}};
     std::shared_ptr<void> _disableTfo = tfo::setConfigForTest(0, 0, 0, 1024, Status::OK());
     std::unique_ptr<TestFixture> _fixture;
 };
@@ -949,12 +1008,6 @@ public:
         ~FirstSessionManager() override {
             _join();
         }
-
-        Status start() override {
-            return Status::OK();
-        }
-
-        void appendStats(BSONObjBuilder*) const override {}
 
         void startSession(std::shared_ptr<Session> session) override {
             stdx::lock_guard lk{_mutex};
@@ -1147,6 +1200,17 @@ TEST_F(IngressAsioNetworkingBatonTest, AddAndRemoveSession) {
     auto future = baton->addSession(*session, NetworkingBaton::Type::In);
     ASSERT_TRUE(baton->cancelSession(*session));
     ASSERT_THROWS_CODE(future.get(), DBException, ErrorCodes::CallbackCanceled);
+
+    // Canceling the same session again should not succeed
+    ASSERT_FALSE(baton->cancelSession(*session));
+}
+
+TEST_F(IngressAsioNetworkingBatonTest, CancelUnknownSession) {
+    auto opCtx = client().makeOperationContext();
+    auto baton = opCtx->getBaton()->networking();
+
+    auto session = client().session();
+    ASSERT_FALSE(baton->cancelSession(*session));
 }
 
 TEST_F(IngressAsioNetworkingBatonTest, AddAndRemoveSessionWhileInPoll) {
@@ -1156,6 +1220,7 @@ TEST_F(IngressAsioNetworkingBatonTest, AddAndRemoveSessionWhileInPoll) {
     // returns from polling.
     auto opCtx = client().makeOperationContext();
     Notification<bool> cancelSessionResult;
+    Notification<bool> cancelSessionAgainResult;
 
     MilestoneThread thread([&](Notification<void>& isReady) {
         auto baton = opCtx->getBaton()->networking();
@@ -1169,10 +1234,61 @@ TEST_F(IngressAsioNetworkingBatonTest, AddAndRemoveSessionWhileInPoll) {
         // `cancelSession` to happen after `addSession`, and thus it must return `true`.
         baton->addSession(*session, NetworkingBaton::Type::In).getAsync([](Status) {});
         cancelSessionResult.set(baton->cancelSession(*session));
+        // A second cancel should return false
+        cancelSessionAgainResult.set(baton->cancelSession(*session));
     });
 
-    // TODO SERVER-64174 Change the following to `ASSERT_TRUE` once the underlying issue is fixed.
-    ASSERT_FALSE(cancelSessionResult.get(opCtx.get()));
+    ASSERT_TRUE(cancelSessionResult.get(opCtx.get()));
+    ASSERT_FALSE(cancelSessionAgainResult.get(opCtx.get()));
+}
+
+TEST_F(IngressAsioNetworkingBatonTest, CancelSessionTwiceWhileInPoll) {
+    // Exercises the case where we cancel the same session twice while blocked polling,
+    // specifically in the case where we can't run any scheduled tasks in between the two
+    // cancellations.
+    unittest::threadAssertionMonitoredTest([&](unittest::ThreadAssertionMonitor& monitor) {
+        auto opCtx = client().makeOperationContext();
+        auto baton = opCtx->getBaton()->networking();
+        auto session = client().session();
+
+        std::vector<Future<void>> futures;
+        futures.push_back(baton->addSession(*session, NetworkingBaton::Type::In));
+
+        stdx::thread thread;
+        {
+            FailPointEnableBlock fp("blockAsioNetworkingBatonBeforePoll");
+
+            thread = monitor.spawn([&] {
+                auto clkSource = getServiceContext()->getPreciseClockSource();
+                auto state = baton->run_until(clkSource, Date_t::max());
+                ASSERT_EQ(state, Waitable::TimeoutState::NoTimeout);
+            });
+
+            waitForTimesEntered(fp, 1);
+
+            // We should be able to cancel the session, but the second attempt should return false.
+            ASSERT_TRUE(baton->cancelSession(*session));
+            ASSERT_FALSE(baton->cancelSession(*session));
+
+            // Try to cancel again after re-adding the timer.
+            futures.push_back(baton->addSession(*session, NetworkingBaton::Type::In));
+            ASSERT_TRUE(baton->cancelSession(*session));
+            ASSERT_FALSE(baton->cancelSession(*session));
+        }
+
+        // Let the polling thread finish polling
+        baton->notify();
+
+        thread.join();
+
+        // Cancel should still return false.
+        ASSERT_FALSE(baton->cancelSession(*session));
+
+        // Check the futures all resolved to cancellation errors
+        for (auto& future : futures) {
+            ASSERT_EQ(future.getNoThrow(), ErrorCodes::CallbackCanceled);
+        }
+    });
 }
 
 TEST_F(IngressAsioNetworkingBatonTest, WaitAndNotify) {
@@ -1194,6 +1310,90 @@ TEST_F(IngressAsioNetworkingBatonTest, WaitAndNotify) {
     });
 
     notification.get(opCtx.get());
+}
+
+TEST_F(IngressAsioNetworkingBatonTest, NotifyDuringPollWithSessions) {
+    // Exercises the interaction between `notify()` and polling, specifically in the case where the
+    // notification occurs during polling. `thread` waits until polling has begun and then sends
+    // a notification, while the main thread verifies that `run_until()` is interrupted. This
+    // test covers the case where the baton has an active session, which may affect the mechanism
+    // used for polling.
+    auto opCtx = client().makeOperationContext();
+    auto baton = opCtx->getBaton()->networking();
+    auto clkSource = getServiceContext()->getPreciseClockSource();
+    auto session = client().session();
+
+    baton->addSession(*session, NetworkingBaton::Type::In).getAsync([](Status) {});
+
+    MilestoneThread thread([&](Notification<void>& isReady) {
+        FailPointEnableBlock fp("blockAsioNetworkingBatonBeforePoll");
+        isReady.set();
+        waitForTimesEntered(fp, 1);
+        baton->notify();
+    });
+
+    const auto state = baton->run_until(clkSource, Date_t::max());
+    ASSERT_EQ(state, Waitable::TimeoutState::NoTimeout);
+}
+
+TEST_F(IngressAsioNetworkingBatonTest, NotifyDuringPollNoSessions) {
+    // Exercises the interaction between `notify()` and polling, specifically in the case where the
+    // notification occurs during polling. `thread` waits until polling has begun and then sends
+    // a notification, while the main thread verifies that `run_until()` is interrupted. This test
+    // covers the case where the baton has no active sessions, which may affect the mechanism used
+    // for polling.
+    auto opCtx = client().makeOperationContext();
+    auto baton = opCtx->getBaton()->networking();
+    auto clkSource = getServiceContext()->getPreciseClockSource();
+
+    MilestoneThread thread([&](Notification<void>& isReady) {
+        FailPointEnableBlock fp("blockAsioNetworkingBatonBeforePoll");
+        isReady.set();
+        waitForTimesEntered(fp, 1);
+        baton->notify();
+    });
+
+    const auto state = baton->run_until(clkSource, Date_t::max());
+    ASSERT_EQ(state, Waitable::TimeoutState::NoTimeout);
+}
+
+TEST_F(IngressAsioNetworkingBatonTest, NotifyBeforePollWithSessions) {
+    // Exercises the interaction between `notify()` and polling in the case where the notification
+    // occurs outside of polling. This test covers the case where the baton has active sessions,
+    // which is a slightly different codepath from the no sessions case.
+    auto opCtx = client().makeOperationContext();
+    auto baton = opCtx->getBaton()->networking();
+    auto clkSource = getServiceContext()->getPreciseClockSource();
+    auto session = client().session();
+
+    baton->addSession(*session, NetworkingBaton::Type::In).getAsync([](Status) {});
+
+    // Notification prevents timeout
+    baton->notify();
+    auto state = baton->run_until(clkSource, Date_t::max());
+    ASSERT_EQ(state, Waitable::TimeoutState::NoTimeout);
+
+    // No pre-existing notification yields a timeout
+    state = baton->run_until(clkSource, clkSource->now() + Milliseconds(1));
+    ASSERT_EQ(state, Waitable::TimeoutState::Timeout);
+}
+
+TEST_F(IngressAsioNetworkingBatonTest, NotifyBeforePollNoSessions) {
+    // Exercises the interaction between `notify()` and polling in the case where the notification
+    // occurs outside of polling. This test covers the case where the baton has no active sessions,
+    // which is a slightly different codepath from the case where it has active sessions.
+    auto opCtx = client().makeOperationContext();
+    auto baton = opCtx->getBaton()->networking();
+    auto clkSource = getServiceContext()->getPreciseClockSource();
+
+    // Notification prevents timeout
+    baton->notify();
+    auto state = baton->run_until(clkSource, Date_t::max());
+    ASSERT_EQ(state, Waitable::TimeoutState::NoTimeout);
+
+    // No pre-existing notification yields a timeout
+    state = baton->run_until(clkSource, clkSource->now() + Milliseconds(1));
+    ASSERT_EQ(state, Waitable::TimeoutState::Timeout);
 }
 
 void blockIfBatonPolls(Client& client,
@@ -1283,6 +1483,27 @@ TEST_F(IngressAsioNetworkingBatonTest, RunUntilProperlyTimesout) {
     ASSERT(state == Waitable::TimeoutState::Timeout);
 }
 
+TEST_F(IngressAsioNetworkingBatonTest, AddAndRemoveTimer) {
+    auto opCtx = client().makeOperationContext();
+    auto baton = opCtx->getBaton()->networking();
+
+    auto timer = makeDummyTimer();
+    baton->waitUntil(*timer, Date_t::max()).getAsync([](Status) {});
+
+    ASSERT_TRUE(baton->cancelTimer(*timer));
+
+    // Canceling the same timer again should not succeed
+    ASSERT_FALSE(baton->cancelTimer(*timer));
+}
+
+TEST_F(IngressAsioNetworkingBatonTest, CancelUnknownTimer) {
+    auto opCtx = client().makeOperationContext();
+    auto baton = opCtx->getBaton()->networking();
+
+    auto timer = makeDummyTimer();
+    ASSERT_FALSE(baton->cancelTimer(*timer));
+}
+
 TEST_F(IngressAsioNetworkingBatonTest, AddAndRemoveTimerWhileInPoll) {
     auto opCtx = client().makeOperationContext();
     Notification<bool> cancelTimerResult;
@@ -1301,8 +1522,56 @@ TEST_F(IngressAsioNetworkingBatonTest, AddAndRemoveTimerWhileInPoll) {
         cancelTimerResult.set(baton->cancelTimer(*timer));
     });
 
-    // TODO SERVER-64174 Change the following to `ASSERT_TRUE` once the underlying issue is fixed.
-    ASSERT_FALSE(cancelTimerResult.get(opCtx.get()));
+    ASSERT_TRUE(cancelTimerResult.get(opCtx.get()));
+}
+
+TEST_F(IngressAsioNetworkingBatonTest, CancelTimerTwiceWhileInPoll) {
+    // Exercises the case where we cancel the same timer twice while blocked polling,
+    // specifically in the case where we can't run any scheduled tasks in between the two
+    // cancellations.
+    unittest::threadAssertionMonitoredTest([&](unittest::ThreadAssertionMonitor& monitor) {
+        auto opCtx = client().makeOperationContext();
+        auto baton = opCtx->getBaton()->networking();
+        auto timer = makeDummyTimer();
+
+        std::vector<Future<void>> futures;
+        futures.push_back(baton->waitUntil(*timer, Date_t::max()));
+
+        stdx::thread thread;
+        {
+            FailPointEnableBlock fp("blockAsioNetworkingBatonBeforePoll");
+
+            thread = monitor.spawn([&] {
+                auto clkSource = getServiceContext()->getPreciseClockSource();
+                auto state = baton->run_until(clkSource, Date_t::max());
+                ASSERT_EQ(state, Waitable::TimeoutState::NoTimeout);
+            });
+
+            waitForTimesEntered(fp, 1);
+
+            // We should be able to cancel the timer. A second attempt should return false
+            ASSERT_TRUE(baton->cancelTimer(*timer));
+            ASSERT_FALSE(baton->cancelTimer(*timer));
+
+            // Try to cancel again after re-adding the timer
+            futures.push_back(baton->waitUntil(*timer, Date_t::max()));
+            ASSERT_TRUE(baton->cancelTimer(*timer));
+            ASSERT_FALSE(baton->cancelTimer(*timer));
+        }
+
+        // Let the polling thread finish polling
+        baton->notify();
+
+        thread.join();
+
+        // We should still get false from cancel
+        ASSERT_FALSE(baton->cancelTimer(*timer));
+
+        // Check the futures resolved to cancellation errors
+        for (auto& future : futures) {
+            ASSERT_EQ(future.getNoThrow(), ErrorCodes::CallbackCanceled);
+        }
+    });
 }
 
 DEATH_TEST_F(IngressAsioNetworkingBatonTest, AddAnAlreadyAddedSession, "invariant") {

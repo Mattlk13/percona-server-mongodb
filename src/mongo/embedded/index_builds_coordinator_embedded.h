@@ -95,7 +95,7 @@ public:
     Status voteAbortIndexBuild(OperationContext* opCtx,
                                const UUID& buildUUID,
                                const HostAndPort& hostAndPort,
-                               const StringData& reason) override;
+                               StringData reason) override;
     Status voteCommitIndexBuild(OperationContext* opCtx,
                                 const UUID& buildUUID,
                                 const HostAndPort& hostAndPort) override;
@@ -118,7 +118,7 @@ private:
                                           std::shared_ptr<ReplIndexBuildState> replState) override;
 
     IndexBuildAction _drainSideWritesUntilNextActionIsAvailable(
-        OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) {
+        OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) override {
         return {};
     };
 

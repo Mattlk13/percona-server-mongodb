@@ -43,6 +43,7 @@
 #include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/basic_types.h"
 #include "mongo/db/commands/bulk_write_crud_op.h"
+#include "mongo/db/commands/write_commands_common.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/delete_request_gen.h"
 #include "mongo/db/ops/update_request.h"
@@ -162,13 +163,18 @@ NamespaceInfoEntry getFLENamespaceInfoEntry(const BSONObj& bulkWrite) {
     return nss[0];
 }
 
+bool isUnacknowledgedBulkWrite(OperationContext* opCtx) {
+    const WriteConcernOptions& writeConcern = opCtx->getWriteConcern();
+    return writeConcern.isUnacknowledged() &&
+        (writeConcern.syncMode == WriteConcernOptions::SyncMode::NONE ||
+         writeConcern.syncMode == WriteConcernOptions::SyncMode::UNSET);
+}
+
 write_ops::InsertCommandRequest makeInsertCommandRequestForFLE(
     const std::vector<mongo::BSONObj>& documents,
     const BulkWriteCommandRequest& req,
     const mongo::NamespaceInfoEntry& nsInfoEntry) {
     write_ops::InsertCommandRequest request(nsInfoEntry.getNs(), documents);
-    request.setDollarTenant(req.getDollarTenant());
-    request.setExpectPrefix(req.getExpectPrefix());
     auto& requestBase = request.getWriteCommandRequestBase();
     requestBase.setEncryptionInformation(nsInfoEntry.getEncryptionInformation());
     requestBase.setOrdered(req.getOrdered());
@@ -179,14 +185,19 @@ write_ops::InsertCommandRequest makeInsertCommandRequestForFLE(
 }
 
 write_ops::UpdateOpEntry makeUpdateOpEntryFromUpdateOp(const BulkWriteUpdateOp* op) {
+    uassert(ErrorCodes::FailedToParse,
+            "Cannot specify sort with multi=true",
+            !op->getSort() || !op->getMulti());
+
     write_ops::UpdateOpEntry update;
     update.setQ(op->getFilter());
     update.setMulti(op->getMulti());
     update.setC(op->getConstants());
     update.setU(op->getUpdateMods());
+    update.setSort(op->getSort());
     update.setHint(op->getHint());
     update.setCollation(op->getCollation());
-    update.setArrayFilters(op->getArrayFilters().value_or(std::vector<BSONObj>()));
+    update.setArrayFilters(op->getArrayFilters());
     update.setUpsert(op->getUpsert());
     update.setUpsertSupplied(op->getUpsertSupplied());
     update.setSampleId(op->getSampleId());
@@ -244,21 +255,17 @@ write_ops::UpdateCommandRequest makeUpdateCommandRequestFromUpdateOp(
     std::vector<write_ops::UpdateOpEntry> updates{makeUpdateOpEntryFromUpdateOp(op)};
     write_ops::UpdateCommandRequest updateCommand(nsEntry.getNs(), updates);
 
-    updateCommand.setDollarTenant(req.getDollarTenant());
-    updateCommand.setExpectPrefix(req.getExpectPrefix());
     updateCommand.setLet(req.getLet());
 
-    updateCommand.getWriteCommandRequestBase().setIsTimeseriesNamespace(
-        nsEntry.getIsTimeseriesNamespace());
-    updateCommand.getWriteCommandRequestBase().setCollectionUUID(nsEntry.getCollectionUUID());
+    auto& requestBase = updateCommand.getWriteCommandRequestBase();
+    requestBase.setIsTimeseriesNamespace(nsEntry.getIsTimeseriesNamespace());
+    requestBase.setCollectionUUID(nsEntry.getCollectionUUID());
 
-    updateCommand.getWriteCommandRequestBase().setEncryptionInformation(
-        nsEntry.getEncryptionInformation());
-    updateCommand.getWriteCommandRequestBase().setBypassDocumentValidation(
-        req.getBypassDocumentValidation());
+    requestBase.setEncryptionInformation(nsEntry.getEncryptionInformation());
+    requestBase.setBypassDocumentValidation(req.getBypassDocumentValidation());
 
-    updateCommand.getWriteCommandRequestBase().setStmtIds(std::vector<StmtId>{stmtId});
-    updateCommand.getWriteCommandRequestBase().setOrdered(req.getOrdered());
+    requestBase.setStmtIds(std::vector<StmtId>{stmtId});
+    requestBase.setOrdered(req.getOrdered());
 
     return updateCommand;
 }
@@ -267,7 +274,7 @@ write_ops::DeleteCommandRequest makeDeleteCommandRequestForFLE(
     OperationContext* opCtx,
     const BulkWriteDeleteOp* op,
     const BulkWriteCommandRequest& req,
-    const mongo::NamespaceInfoEntry& nsInfoEntry) {
+    const mongo::NamespaceInfoEntry& nsEntry) {
     write_ops::DeleteOpEntry deleteEntry;
     if (op->getCollation()) {
         deleteEntry.setCollation(op->getCollation());
@@ -277,15 +284,14 @@ write_ops::DeleteCommandRequest makeDeleteCommandRequestForFLE(
     deleteEntry.setQ(op->getFilter());
 
     std::vector<write_ops::DeleteOpEntry> deletes{deleteEntry};
-    write_ops::DeleteCommandRequest deleteRequest(nsInfoEntry.getNs(), deletes);
-    deleteRequest.setDollarTenant(req.getDollarTenant());
-    deleteRequest.setExpectPrefix(req.getExpectPrefix());
+    write_ops::DeleteCommandRequest deleteRequest(nsEntry.getNs(), deletes);
     deleteRequest.setLet(req.getLet());
     deleteRequest.setLegacyRuntimeConstants(Variables::generateRuntimeConstants(opCtx));
-    deleteRequest.getWriteCommandRequestBase().setEncryptionInformation(
-        nsInfoEntry.getEncryptionInformation());
-    deleteRequest.getWriteCommandRequestBase().setBypassDocumentValidation(
-        req.getBypassDocumentValidation());
+
+    auto& requestBase = deleteRequest.getWriteCommandRequestBase();
+    requestBase.setCollectionUUID(nsEntry.getCollectionUUID());
+    requestBase.setEncryptionInformation(nsEntry.getEncryptionInformation());
+    requestBase.setBypassDocumentValidation(req.getBypassDocumentValidation());
 
     return deleteRequest;
 }
@@ -300,12 +306,12 @@ BulkWriteCommandRequest makeSingleOpBulkWriteCommandRequest(
 
     // Make a copy of the operation and adjust its namespace index to 0.
     auto newOp = bulkWriteReq.getOps()[opIdx];
-    stdx::visit(OverloadedVisitor{
-                    [](mongo::BulkWriteInsertOp& op) { op.setInsert(0); },
-                    [](mongo::BulkWriteUpdateOp& op) { op.setUpdate(0); },
-                    [](mongo::BulkWriteDeleteOp& op) { op.setDeleteCommand(0); },
-                },
-                newOp);
+    visit(OverloadedVisitor{
+              [](mongo::BulkWriteInsertOp& op) { op.setInsert(0); },
+              [](mongo::BulkWriteUpdateOp& op) { op.setUpdate(0); },
+              [](mongo::BulkWriteDeleteOp& op) { op.setDeleteCommand(0); },
+          },
+          newOp);
 
     BulkWriteCommandRequest singleOpRequest;
     singleOpRequest.setOps({newOp});
@@ -314,7 +320,30 @@ BulkWriteCommandRequest makeSingleOpBulkWriteCommandRequest(
     singleOpRequest.setLet(bulkWriteReq.getLet());
     singleOpRequest.setStmtId(bulk_write_common::getStatementId(bulkWriteReq, opIdx));
     singleOpRequest.setDbName(DatabaseName::kAdmin);
+    singleOpRequest.setErrorsOnly(bulkWriteReq.getErrorsOnly());
     return singleOpRequest;
+}
+
+namespace {
+template <ClusterRole::Value role>
+UpdateMetrics updateMetricsInstance{"bulkWrite", role};
+
+// Update related command execution metrics.
+UpdateMetrics& bulkWriteUpdateMetric(ClusterRole role) {
+    if (role.hasExclusively(ClusterRole::ShardServer))
+        return updateMetricsInstance<ClusterRole::ShardServer>;
+    if (role.hasExclusively(ClusterRole::RouterServer))
+        return updateMetricsInstance<ClusterRole::RouterServer>;
+    MONGO_UNREACHABLE;
+}
+}  // namespace
+
+void incrementBulkWriteUpdateMetrics(
+    ClusterRole role,
+    const write_ops::UpdateModification& updateMod,
+    const mongo::NamespaceString& ns,
+    const boost::optional<std::vector<mongo::BSONObj>>& arrayFilters) {
+    incrementUpdateMetrics(updateMod, ns, bulkWriteUpdateMetric(role), arrayFilters);
 }
 
 }  // namespace bulk_write_common

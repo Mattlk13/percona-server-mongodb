@@ -42,6 +42,7 @@
 #include <vector>
 
 #include "mongo/db/query/optimizer/containers.h"
+#include "mongo/db/query/optimizer/syntax/syntax_fwd_declare.h"
 #include "mongo/db/query/optimizer/utils/strong_alias.h"
 #include "mongo/db/query/util/named_enum.h"
 
@@ -142,6 +143,16 @@ struct FieldProjectionMap {
 static constexpr const char* kIndexKeyPrefix = "<indexKey>";
 
 /**
+ * Function that replaces parameterized constants in a MatchExpression with their corresponding
+ * param id's in ABT.
+ *
+ * Represented by an ABT FunctionCall node with two children:
+ * (1) parameter id (int) that maps to the constant value
+ * (2) enum/int representation of the constant's sbe type tag
+ */
+static constexpr auto kParameterFunctionName = "getParam";
+
+/**
  * Memo-related types.
  */
 using GroupIdType = int64_t;
@@ -221,6 +232,14 @@ constexpr CEType& operator*=(CEType& v1, const SelectivityType v2) {
     v1._value *= v2._value;
     return v1;
 }
+
+// Holds a CE and the estimation method used to derive it.
+struct CERecord {
+    CEType _ce;
+    std::string _mode;
+
+    bool operator==(const CERecord& other) const = default;
+};
 
 // We can divide two cardinalities to obtain a selectivity.
 constexpr SelectivityType operator/(const CEType v1, const CEType v2) {
@@ -349,9 +368,40 @@ struct QueryHints {
     size_t _minIndexEqPrefixes = 1;
     size_t _maxIndexEqPrefixes = 1;
 
-    // Rather than sampling a fully random set of documents, sample N documents (5 by default)
+    // Rather than sampling a fully random set of documents, sample N documents (10 by default)
     // randomly and scan sequentially from each of them for the rest.
-    int32_t _numSamplingChunks = 5;
+    size_t _numSamplingChunks = 10;
+
+    // Rather than drawing an independent sample for each predicate, draw one sample and reuse it
+    // for all predicates on that collection. Only takes effect sampling in chunks is enabled.
+    bool _repeatableSample = false;
+
+    // If the collection size falls within this range, sampling is a valid estimation method.
+    size_t _samplingCollectionSizeMin = 100;
+    size_t _samplingCollectionSizeMax = 10000;
+
+    // Controls if we exclusively sample indexed fields.
+    bool _sampleIndexedFields = true;
+
+    // Controls if we sample the two most common indexed fields together.
+    bool _sampleTwoFields = true;
+
+    // If enabled, take the square root of numDocs for sample size.
+    bool _sqrtSampleSizeEnabled = true;
 };
+
+#define SCAN_ORDER(F) \
+    F(Forward)        \
+    F(Reverse)        \
+    F(Random)  // Uses a random cursor.
+
+QUERY_UTIL_NAMED_ENUM_DEFINE(ScanOrder, SCAN_ORDER);
+#undef SCAN_ORDER
+
+/*
+ * Type for storing mapping between query parameter IDs and Constants. Parameters always have a
+ * mapping to their associated Constant and will never be Nothing.
+ */
+using QueryParameterMap = opt::unordered_map<int32_t, Constant>;
 
 }  // namespace mongo::optimizer

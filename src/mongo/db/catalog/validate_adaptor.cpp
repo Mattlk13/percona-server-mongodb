@@ -161,13 +161,8 @@ void schemaValidationFailed(CollectionValidation::ValidateState* state,
 
     state->setCollectionSchemaViolated();
 
-    // When testing is enabled, only warn about non-compliant documents to prevent test failures.
-    if (TestingProctor::instance().isEnabled() ||
-        Collection::SchemaValidationResult::kWarn == result || state->warnOnSchemaValidation()) {
+    if (result != Collection::SchemaValidationResult::kPass) {
         results->warnings.push_back(kSchemaValidationFailedReason);
-    } else if (Collection::SchemaValidationResult::kError == result) {
-        results->errors.push_back(kSchemaValidationFailedReason);
-        results->valid = false;
     }
 }
 
@@ -179,7 +174,9 @@ Status _validateTimeseriesCount(const BSONObj& control,
     // Skips the check if a bucket is compressed, but we are not in a validate mode that will
     // decompress the bucket to actually go through the measurements.
     if (version == timeseries::kTimeseriesControlUncompressedVersion ||
-        (version == timeseries::kTimeseriesControlCompressedVersion && !shouldDecompressBSON)) {
+        ((version == timeseries::kTimeseriesControlCompressedSortedVersion ||
+          timeseries::kTimeseriesControlCompressedUnsortedVersion) &&
+         !shouldDecompressBSON)) {
         return Status::OK();
     }
     long long controlCount;
@@ -211,7 +208,8 @@ Status _validateTimeSeriesIdTimestamp(const CollectionPtr& collection, const BSO
         1000;
     int64_t oidEmbeddedTimestamp =
         recordBson.getField(timeseries::kBucketIdFieldName).OID().getTimestamp();
-    if (minTimestamp != oidEmbeddedTimestamp) {
+    // TODO SERVER-87065: Re-enable this check in testing.
+    if (minTimestamp != oidEmbeddedTimestamp && !TestingProctor::instance().isEnabled()) {
         return Status(
             ErrorCodes::InvalidIdField,
             fmt::format("Mismatch between the embedded timestamp {} in the time-series "
@@ -227,10 +225,11 @@ Status _validateTimeSeriesIdTimestamp(const CollectionPtr& collection, const BSO
  */
 Status _validateTimeseriesControlVersion(const BSONObj& recordBson, int bucketVersion) {
     if (bucketVersion != timeseries::kTimeseriesControlUncompressedVersion &&
-        bucketVersion != timeseries::kTimeseriesControlCompressedVersion) {
+        bucketVersion != timeseries::kTimeseriesControlCompressedSortedVersion &&
+        bucketVersion != timeseries::kTimeseriesControlCompressedUnsortedVersion) {
         return Status(
             ErrorCodes::BadValue,
-            fmt::format("Invalid value for 'control.version'. Expected 1 or 2, but got {}.",
+            fmt::format("Invalid value for 'control.version'. Expected 1, 2, or 3, but got {}.",
                         bucketVersion));
     }
     return Status::OK();
@@ -275,7 +274,9 @@ Status _validateTimeSeriesMinMax(const CollectionPtr& coll,
                                  bool shouldDecompressBSON) {
     // Skips the check if a bucket is compressed, but we are not in a validate mode that will
     // decompress the bucket to actually go through the measurements.
-    if (version == timeseries::kTimeseriesControlCompressedVersion && !shouldDecompressBSON) {
+    if ((version == timeseries::kTimeseriesControlCompressedSortedVersion ||
+         version == timeseries::kTimeseriesControlCompressedUnsortedVersion) &&
+        !shouldDecompressBSON) {
         return Status::OK();
     }
     auto min = minmax.min();
@@ -290,8 +291,8 @@ Status _validateTimeSeriesMinMax(const CollectionPtr& coll,
             return controlMin.wrap().woCompare(min) == 0 && controlMax.wrap().woCompare(max) == 0;
         }
     };
-
-    if (!checkMinAndMaxMatch()) {
+    // TODO SERVER-87065: re-enable in testing.
+    if (!checkMinAndMaxMatch() && !TestingProctor::instance().isEnabled()) {
         return Status(
             ErrorCodes::BadValue,
             fmt::format(
@@ -331,7 +332,8 @@ Status _validateTimeSeriesDataTimeField(const CollectionPtr& coll,
                                         int version,
                                         int* bucketCount,
                                         bool shouldDecompressBSON) {
-    timeseries::bucket_catalog::MinMax minmax;
+    TrackingContext trackingContext;
+    timeseries::bucket_catalog::MinMax minmax{trackingContext};
     if (version == timeseries::kTimeseriesControlUncompressedVersion) {
         for (const auto& metric : timeField.Obj()) {
             if (metric.type() != BSONType::Date) {
@@ -357,6 +359,7 @@ Status _validateTimeSeriesDataTimeField(const CollectionPtr& coll,
         try {
             BSONColumn col{timeField};
             Date_t prevTimestamp = Date_t::min();
+            bool detectedOutOfOrder = false;
             for (const auto& metric : col) {
                 if (!metric.eoo()) {
                     if (metric.type() != BSONType::Date) {
@@ -364,22 +367,34 @@ Status _validateTimeSeriesDataTimeField(const CollectionPtr& coll,
                             ErrorCodes::BadValue,
                             fmt::format("Time-series bucket '{}' field is not a Date", fieldName));
                     }
-                    // Checks the time values are sorted in increasing order for compressed buckets.
+                    // Checks the time values are sorted in increasing order for v2 buckets
+                    // (compressed, sorted). Skip the check if the bucket is v3 (compressed,
+                    // unsorted).
                     Date_t curTimestamp = metric.Date();
-                    if (curTimestamp >= prevTimestamp) {
-                        prevTimestamp = curTimestamp;
-                    } else {
-                        return Status(
-                            ErrorCodes::BadValue,
-                            fmt::format("Time-series bucket '{}' field is not in ascending order",
-                                        fieldName));
+                    if (curTimestamp < prevTimestamp) {
+                        if (version == timeseries::kTimeseriesControlCompressedSortedVersion) {
+                            return Status(
+                                ErrorCodes::BadValue,
+                                fmt::format(
+                                    "Time-series bucket '{}' field is not in ascending order",
+                                    fieldName));
+                        } else if (version ==
+                                   timeseries::kTimeseriesControlCompressedUnsortedVersion) {
+                            detectedOutOfOrder = true;
+                        }
                     }
+                    prevTimestamp = curTimestamp;
                     minmax.update(metric.wrap(fieldName), boost::none, coll->getDefaultCollator());
                     ++(*bucketCount);
                 } else {
                     return Status(ErrorCodes::BadValue,
                                   "Time-series bucket has missing time fields");
                 }
+            }
+            if (version == timeseries::kTimeseriesControlCompressedUnsortedVersion &&
+                !detectedOutOfOrder) {
+                return Status(ErrorCodes::BadValue,
+                              "Time-series bucket is v3 but has its measurements in-order on time");
             }
         } catch (DBException& e) {
             return Status(ErrorCodes::InvalidBSON,
@@ -408,7 +423,8 @@ Status _validateTimeSeriesDataField(const CollectionPtr& coll,
                                     int version,
                                     int bucketCount,
                                     bool shouldDecompressBSON) {
-    timeseries::bucket_catalog::MinMax minmax;
+    TrackingContext trackingContext;
+    timeseries::bucket_catalog::MinMax minmax{trackingContext};
     if (version == timeseries::kTimeseriesControlUncompressedVersion) {
         // Checks that indices are in increasing order and within the correct range.
         int prevIdx = INT_MIN;
@@ -591,7 +607,14 @@ void _timeseriesValidationFailed(CollectionValidation::ValidateState* state,
     }
     state->setTimeseriesDataInconsistent();
 
-    results->warnings.push_back(kTimeseriesValidationInconsistencyReason);
+    if (TestingProctor::instance().isEnabled()) {
+        // In testing this is a fatal error. Some time-series checks are vital to test correctness,
+        // such as the time field being out-of-order for v: 2 buckets.
+        results->errors.push_back(kTimeseriesValidationInconsistencyReason);
+        results->valid = false;
+    } else {
+        results->warnings.push_back(kTimeseriesValidationInconsistencyReason);
+    }
 }
 
 void _BSONSpecValidationFailed(CollectionValidation::ValidateState* state,
@@ -611,9 +634,10 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
                                        const RecordData& record,
                                        long long* nNonCompliantDocuments,
                                        size_t* dataSize,
-                                       ValidateResults* results) {
-    Status status =
-        validateBSON(record.data(), record.size(), _validateState->getBSONValidateMode());
+                                       ValidateResults* results,
+                                       ValidationVersion validationVersion) {
+    Status status = validateBSON(
+        record.data(), record.size(), _validateState->getBSONValidateMode(), validationVersion);
     if (!status.isOK()) {
         if (status.code() != ErrorCodes::NonConformantBSON) {
             return status;
@@ -660,7 +684,8 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
 
 void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
                                           ValidateResults* results,
-                                          BSONObjBuilder* output) {
+                                          BSONObjBuilder* output,
+                                          ValidationVersion validationVersion) {
     _numRecords = 0;  // need to reset it because this function can be called more than once.
     long long dataSizeTotal = 0;
     long long interruptIntervalNumBytes = 0;
@@ -719,8 +744,13 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
         interruptIntervalNumBytes += dataSize;
         dataSizeTotal += dataSize;
         size_t validatedSize = 0;
-        Status status = validateRecord(
-            opCtx, record->id, record->data, &nNonCompliantDocuments, &validatedSize, results);
+        Status status = validateRecord(opCtx,
+                                       record->id,
+                                       record->data,
+                                       &nNonCompliantDocuments,
+                                       &validatedSize,
+                                       results,
+                                       validationVersion);
 
         // Log the out-of-order entries as errors.
         //
@@ -831,7 +861,7 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
             interruptIntervalNumBytes >= kInterruptIntervalNumBytes) {
             // Periodically checks for interrupts and yields.
             opCtx->checkForInterrupt();
-            _validateState->yield(opCtx);
+            _validateState->yieldCursors(opCtx);
 
             if (interruptIntervalNumBytes >= kInterruptIntervalNumBytes) {
                 interruptIntervalNumBytes = 0;
@@ -956,7 +986,8 @@ void ValidateAdaptor::_enforceTimeseriesBucketsAreAlwaysCompressed(const BSONObj
                             .Obj()
                             .getIntField(timeseries::kBucketControlVersionFieldName);
 
-    if (bucketVersion != timeseries::kTimeseriesControlCompressedVersion) {
+    if (bucketVersion != timeseries::kTimeseriesControlCompressedSortedVersion &&
+        bucketVersion != timeseries::kTimeseriesControlCompressedUnsortedVersion) {
         LOGV2(7735100,
               "Expected time-series bucket to be compressed",
               "bucket"_attr = recordBson.toString());

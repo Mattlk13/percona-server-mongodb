@@ -29,7 +29,6 @@
 
 #pragma once
 
-#include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/expressions/runtime_environment.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
 #include "mongo/db/matcher/expression.h"
@@ -80,4 +79,20 @@ void bindClusteredCollectionBounds(const CanonicalQuery& cq,
                                    const sbe::PlanStage* root,
                                    const stage_builder::PlanStageData* data,
                                    sbe::RuntimeEnvironment* runtimeEnvironment);
+/**
+ * If the plan was cloned from SBE plan cache and limit and/or skip values were parameterized,
+ * this method is called to bind the current query's limit and skip values to corresponding slots.
+ */
+void bindLimitSkipInputSlots(const CanonicalQuery& cq,
+                             const stage_builder::PlanStageData* data,
+                             sbe::RuntimeEnvironment* runtimeEnvironment);
+
+/**
+ * In each $where expression in the given 'filter', recover the JS function predicate which has
+ * been previously extracted from the expression into SBE runtime environment during the input
+ * parameters bind-in process. In order to enable the filter to participate in replanning, we
+ * need to perform the reverse operation and put the JS function back into the filter.
+ */
+void recoverWhereExprPredicate(MatchExpression* filter, stage_builder::PlanStageData& data);
+
 }  // namespace mongo::input_params

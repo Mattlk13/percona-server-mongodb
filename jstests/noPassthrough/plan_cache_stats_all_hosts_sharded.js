@@ -3,8 +3,6 @@
 // @tags: [
 //   assumes_read_concern_unchanged,
 //   assumes_read_preference_unchanged,
-//   # TODO SERVER-67607: Test plan cache with CQF enabled.
-//   cqf_experimental_incompatible,
 // ]
 import {CreateShardedCollectionUtil} from "jstests/sharding/libs/create_sharded_collection_util.js";
 

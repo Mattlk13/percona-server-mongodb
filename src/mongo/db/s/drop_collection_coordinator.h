@@ -69,19 +69,28 @@ public:
                               << NamespaceStringUtil::serialize(
                                      originalNss(), SerializationContext::stateDefault()))) {}
 
-    ~DropCollectionCoordinator() = default;
+    ~DropCollectionCoordinator() override = default;
 
     void checkIfOptionsConflict(const BSONObj& doc) const final {}
 
     /**
      * Locally drops a collection, cleans its CollectionShardingRuntime metadata and refreshes the
      * catalog cache.
-     * The oplog entry associated with the drop collection will be generated with the fromMigrate
-     * flag.
+     *
+     * When fromMigrate is set, the related oplog entry will be marked with a 'fromMigrate' field to
+     * reduce its visibility.
+     *
+     * When dropSystemCollections is set, system collections are allowed to be dropped. Therefore,
+     * if nss is a system collection but dropSystemCollections is false, the drop will fail.
+     *
+     * If expectedUUID is set and doesn't match the value persisted on the CollectionCatalog, then
+     * this is a no-op. If expectedUUID is not set, no UUID check will be performed.
      */
     static void dropCollectionLocally(OperationContext* opCtx,
                                       const NamespaceString& nss,
-                                      bool fromMigrate);
+                                      bool fromMigrate,
+                                      bool dropSystemCollections,
+                                      const boost::optional<UUID>& expectedUUID = boost::none);
 
 private:
     const BSONObj _critSecReason;

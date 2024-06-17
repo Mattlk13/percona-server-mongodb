@@ -9,6 +9,8 @@ import {configureFailPoint} from "jstests/libs/fail_point_util.js";
 import {IndexBuildTest} from "jstests/noPassthrough/libs/index_build.js";
 
 function test(expireAfterSecondsVal) {
+    const disabledValue = 2147483647;
+
     jsTestLog("Testing expireAfterSeconds = " + expireAfterSecondsVal);
 
     const rst = new ReplSetTest({
@@ -33,8 +35,7 @@ function test(expireAfterSecondsVal) {
     // invalid values of expireAfterSeconds, so we use a failpoint to disable that checking to
     // simulate a value leftover from very old MongoDB versions.
     const fp = configureFailPoint(primary, 'skipTTLIndexValidationOnCreateIndex');
-    const fp2 = configureFailPoint(primary,
-                                   'skipTTLIndexInvalidExpireAfterSecondsValidationForCreateIndex');
+    const fp2 = configureFailPoint(primary, 'skipTTLIndexExpireAfterSecondsValidation');
     try {
         assert.commandWorked(coll.createIndex({t: 1}, {expireAfterSeconds: expireAfterSecondsVal}));
     } finally {
@@ -82,7 +83,7 @@ function test(expireAfterSecondsVal) {
            'Index was not replicated as a TTL index during initial sync.');
     assert.eq(
         newNodeSpec.expireAfterSeconds,
-        2147483647,  // This is the "disabled" value for expireAfterSeconds
+        disabledValue,
         expireAfterSecondsVal +
             ' expireAferSeconds was replicated as something other than disabled during initial sync.');
 
@@ -105,22 +106,31 @@ function test(expireAfterSecondsVal) {
     const newPrimaryCatalogContents = newPrimaryColl.aggregate([{$listCatalog: {}}]).toArray();
     jsTestLog("Catalog contents on new primary: " + tojson(newPrimaryCatalogContents));
 
-    const collModOplogEntries =
-        rst.findOplog(primary,
-                      {
-                          op: 'c',
-                          ns: newPrimaryColl.getDB().getCollection('$cmd').getFullName(),
-                          'o.collMod': coll.getName(),
-                          'o.index.name': 't_1',
-                          'o.index.expireAfterSeconds': newNodeSpec.expireAfterSeconds
-                      },
-                      /*limit=*/ 1)
-            .toArray();
-    assert.eq(collModOplogEntries.length,
-              1,
-              'TTL index with ' + expireAfterSecondsVal +
-                  ' expireAfterSeconds was not fixed using collMod during step-up: ' +
-                  tojson(rst.findOplog(primary, {op: {$ne: 'n'}}, /*limit=*/ 10).toArray()));
+    assert.soon(
+        () => {
+            return 1 ==
+                rst.findOplog(primary,
+                              {
+                                  op: 'c',
+                                  ns: newPrimaryColl.getDB().getCollection('$cmd').getFullName(),
+                                  'o.collMod': coll.getName(),
+                                  'o.index.name': 't_1',
+                                  'o.index.expireAfterSeconds': newNodeSpec.expireAfterSeconds
+                              },
+                              /*limit=*/ 1)
+                    .toArray()
+                    .length;
+        },
+        'TTL index with ' + expireAfterSecondsVal +
+            ' expireAfterSeconds was not fixed using collMod during step-up: ' +
+            tojson(rst.findOplog(primary, {op: {$ne: 'n'}}, /*limit=*/ 10).toArray()));
+
+    const catalog = coll.aggregate([{$listCatalog: {}}]).toArray();
+    assert.eq(catalog[0].db, db.getName());
+    assert.eq(catalog[0].name, coll.getName());
+    assert.eq(catalog[0].md.indexes.length, 2);
+    assert.eq(catalog[0].md.indexes[0].spec.name, "_id_");
+    assert.eq(catalog[0].md.indexes[1].spec.expireAfterSeconds, disabledValue);
 
     rst.stopSet();
 }

@@ -4,12 +4,13 @@
 //   requires_non_retryable_writes,
 //   # Uses $function operator.
 //   requires_scripting,
+//   requires_system_dot_js_stored_functions,
 // ]
 
 const testDB = db.getSiblingDB('system_js_access');
 const coll = testDB.system_js_access;
 coll.drop();
-testDB.system.js.deleteMany({});
+testDB.getCollection('system.js').deleteMany({});
 
 assert.commandWorked(coll.insert([
     {"name": "Alice", "age": 68},
@@ -21,7 +22,7 @@ assert.commandWorked(coll.insert([
 ]));
 
 // Store JS function in database.
-assert.commandWorked(testDB.system.js.insert({
+assert.commandWorked(testDB.getCollection('system.js').insert({
     _id: "isAdult",
     value: function(age) {
         return age >= 21;

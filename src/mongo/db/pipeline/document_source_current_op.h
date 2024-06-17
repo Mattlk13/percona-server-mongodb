@@ -48,6 +48,7 @@
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_current_op_gen.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/pipeline.h"
@@ -119,11 +120,11 @@ public:
         }
 
         ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level,
-                                                     bool isImplicitDefault) const {
+                                                     bool isImplicitDefault) const override {
             return onlyReadConcernLocalSupported(kStageName, level, isImplicitDefault);
         }
 
-        void assertSupportsMultiDocumentTransaction() const {
+        void assertSupportsMultiDocumentTransaction() const override {
             transactionNotSupported(kStageName);
         }
 
@@ -153,7 +154,7 @@ public:
         if (showLocalOps) {
             hostTypeRequirement = HostTypeRequirement::kLocalOnly;
         } else if (_targetAllNodes.value_or(false)) {
-            hostTypeRequirement = HostTypeRequirement::kAllShardServers;
+            hostTypeRequirement = HostTypeRequirement::kAllShardHosts;
         } else {
             hostTypeRequirement = HostTypeRequirement::kAnyShard;
         }
@@ -179,7 +180,7 @@ public:
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement spec, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
-    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final override;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     void addVariableRefs(std::set<Variables::Id>* refs) const final {}
 

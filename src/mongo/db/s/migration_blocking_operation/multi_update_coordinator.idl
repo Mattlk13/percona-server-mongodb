@@ -31,16 +31,21 @@ global:
 
 imports:
     - "mongo/db/basic_types.idl"
+    - "mongo/db/session/logical_session_id.idl"
+    - "mongo/s/database_version.idl"
+    - "mongo/s/error_status.idl"
 
 enums:
-    MultiUpdateCoordinatorState:
-        description: The state of a MultiUpdateCoordinator.
+    MultiUpdateCoordinatorPhase:
+        description: The phase of a MultiUpdateCoordinator.
         type: string
         values:
             kUnused: "unused"
+            kAcquireSession: "acquireSession"
             kBlockMigrations: "blockMigrations"
             kPerformUpdate: "performUpdate"
-            kCleanup: "cleanup"
+            kSuccess: "success"
+            kFailure: "failure"
             kDone: "done"
 
 structs:
@@ -55,20 +60,35 @@ structs:
             updateCommand:
                 type: object_owned
                 description: The original multi update command that triggered the coordinator.
+            ns:
+                cpp_name: nss
+                type: namespacestring
+                description: "The namespace of the collection being updated."
 
     MultiUpdateCoordinatorMutableFields:
         description: Contains mutable fields for a MultiUpdateCoordinator.
         strict: false
         fields:
-            state:
-                type: MultiUpdateCoordinatorState
-                description: The state of the MultiUpdateCoordinator.
+            phase:
+                type: MultiUpdateCoordinatorPhase
+                description: The phase of the MultiUpdateCoordinator.
                 default: kUnused
-            error:
+            result:
                 type: object_owned
                 description: >-
-                    If the MultiUpdateCoordinator fails, the error reason will be stored here.
-                    Not present on success.
+                    Stores the result of the underlying update command. By the end of the operation either this field or abortReason will be set.
+                optional: true
+            abortReason:
+                type: ErrorStatus
+                description: Stores the abort reason in the case of a failure. By the end of the operation either this field or result will be set.
+                optional: true
+            lsid:
+                type: LogicalSessionId
+                description: "The sessionId to track this update."
+                optional: true
+            txnNumber:
+                type: TxnNumber
+                description: "The txnNumber for the update session."
                 optional: true
 
     MultiUpdateCoordinatorDocument:

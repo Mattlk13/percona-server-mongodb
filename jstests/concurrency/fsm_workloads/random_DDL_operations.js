@@ -11,7 +11,6 @@
 import {
     uniformDistTransitions
 } from "jstests/concurrency/fsm_workload_helpers/state_transition_utils.js";
-import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
 
 const dbPrefix = jsTestName() + '_DB_';
 const dbCount = 2;
@@ -32,6 +31,15 @@ function getRandomShard(connCache) {
 }
 
 export const $config = (function() {
+    let data = {
+        movePrimaryAllowedErrorCodes: [
+            ErrorCodes.ConflictingOperationInProgress,
+            // The cloning phase has failed (e.g. as a result of a stepdown). When a failure
+            // occurs at this phase, the movePrimary operation does not recover.
+            7120202
+        ]
+    };
+
     let states = {
         create: function(db, collName, connCache) {
             db = getRandomDb(db);
@@ -47,6 +55,7 @@ export const $config = (function() {
             const coll = getRandomCollection(db);
 
             jsTestLog('Executing drop state: ' + coll.getFullName());
+
             assert.eq(coll.drop(), true);
         },
         rename: function(db, collName, connCache) {
@@ -70,12 +79,8 @@ export const $config = (function() {
 
             jsTestLog('Executing movePrimary state: ' + db.getName() + ' to ' + shardId);
             assert.commandWorkedOrFailedWithCode(
-                db.adminCommand({movePrimary: db.getName(), to: shardId}), [
-                    ErrorCodes.ConflictingOperationInProgress,
-                    // The cloning phase has failed (e.g. as a result of a stepdown). When a failure
-                    // occurs at this phase, the movePrimary operation does not recover.
-                    7120202
-                ]);
+                db.adminCommand({movePrimary: db.getName(), to: shardId}),
+                this.movePrimaryAllowedErrorCodes);
         },
         collMod: function(db, collName, connCache) {
             db = getRandomDb(db);
@@ -87,18 +92,12 @@ export const $config = (function() {
                 [ErrorCodes.NamespaceNotFound, ErrorCodes.ConflictingOperationInProgress]);
         },
         checkDatabaseMetadataConsistency: function(db, collName, connCache) {
-            if (this.skipMetadataChecks) {
-                return;
-            }
             db = getRandomDb(db);
             jsTestLog('Executing checkMetadataConsistency state for database: ' + db.getName());
             const inconsistencies = db.checkMetadataConsistency().toArray();
             assert.eq(0, inconsistencies.length, tojson(inconsistencies));
         },
         checkCollectionMetadataConsistency: function(db, collName, connCache) {
-            if (this.skipMetadataChecks) {
-                return;
-            }
             db = getRandomDb(db);
             const coll = getRandomCollection(db);
             jsTestLog('Executing checkMetadataConsistency state for collection: ' +
@@ -109,10 +108,6 @@ export const $config = (function() {
     };
 
     let setup = function(db, collName, cluster) {
-        this.skipMetadataChecks =
-            // TODO SERVER-70396: remove this flag
-            !FeatureFlagUtil.isEnabled(db.getMongo(), 'CheckMetadataConsistency');
-
         for (var i = 0; i < dbCount; i++) {
             const dbName = dbPrefix + i;
             const newDb = db.getSiblingDB(dbName);
@@ -129,6 +124,7 @@ export const $config = (function() {
         threadCount: 12,
         iterations: 64,
         startState: 'create',
+        data: data,
         states: states,
         transitions: uniformDistTransitions(states),
         setup: setup,

@@ -5,10 +5,10 @@
  *
  * @tags: [
  *   uses_atclustertime,
- *   requires_fcv_72,
+ *   requires_fcv_80,
  *   featureFlagReshardingImprovements,
  *   featureFlagMoveCollection,
- *   featureFlagTrackUnshardedCollectionsOnShardingCatalog,
+ *   # TODO (SERVER-87812) Remove multiversion_incompatible tag
  *   multiversion_incompatible,
  *   assumes_balancer_off
  * ]
@@ -28,8 +28,7 @@ const ns = dbName + '.' + unsplittableCollName;
 let shard0 = st.shard0.shardName;
 
 assert.commandWorked(st.s.adminCommand({enableSharding: dbName, primaryShard: shard0}));
-assert.commandWorked(
-    st.s.getDB(dbName).runCommand({createUnsplittableCollection: unsplittableCollName}));
+assert.commandWorked(st.s.getDB(dbName).runCommand({create: unsplittableCollName}));
 
 const sourceCollection = st.s.getCollection(ns);
 const mongos = sourceCollection.getMongo();

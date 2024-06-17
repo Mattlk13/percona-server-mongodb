@@ -2,6 +2,7 @@
 // primary in each shard. However, this test shuts down the primary of the shard. Since whether or
 // not the shell detects the new primary before issuing the command is nondeterministic, skip the
 // consistency check for this test.
+
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 TestData.skipCheckShardFilteringMetadata = true;
 

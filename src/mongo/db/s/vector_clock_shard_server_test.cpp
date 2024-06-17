@@ -31,7 +31,6 @@
 #include <string>
 #include <utility>
 
-#include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
@@ -40,7 +39,6 @@
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/bsontypes_util.h"
 #include "mongo/bson/timestamp.h"
-#include "mongo/db/cluster_role.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/keys_collection_client_direct.h"
 #include "mongo/db/keys_collection_manager.h"
@@ -51,14 +49,12 @@
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
-#include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/vector_clock.h"
 #include "mongo/db/vector_clock_document_gen.h"
 #include "mongo/db/vector_clock_mutable.h"
-#include "mongo/transport/session.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/framework.h"
@@ -186,6 +182,8 @@ TEST_F(VectorClockShardServerTest, GossipOutInternal) {
     // $topologyTime.
     ASSERT_TRUE(obj.hasField("$clusterTime"));
     ASSERT_EQ(obj["$clusterTime"].Obj()["clusterTime"].timestamp(), clusterTime.asTimestamp());
+    // No signature is attached for internal clients.
+    ASSERT_FALSE(obj["$clusterTime"].Obj().hasField("signature"));
     ASSERT_TRUE(obj.hasField("$configTime"));
     ASSERT_EQ(obj["$configTime"].timestamp(), VectorClock::kInitialComponentTime.asTimestamp());
     ASSERT_TRUE(obj.hasField("$topologyTime"));
@@ -209,6 +207,10 @@ TEST_F(VectorClockShardServerTest, GossipOutExternal) {
     // $configTime or $topologyTime.
     ASSERT_TRUE(obj.hasField("$clusterTime"));
     ASSERT_EQ(obj["$clusterTime"].Obj()["clusterTime"].timestamp(), clusterTime.asTimestamp());
+    // A signature is always attached for external clients. Client is authed, so it receives a dummy
+    // signature.
+    ASSERT_TRUE(obj["$clusterTime"].Obj().hasField("signature"));
+    ASSERT_EQ(obj["$clusterTime"].Obj()["signature"].Obj()["keyId"].Long(), 0);
     ASSERT_FALSE(obj.hasField("$configTime"));
     ASSERT_FALSE(obj.hasField("$topologyTime"));
 }
@@ -222,12 +224,12 @@ TEST_F(VectorClockShardServerTest, GossipInInternal) {
     auto dummySignature =
         BSON("hash" << BSONBinData("\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1", 20, BinDataGeneral)
                     << "keyId" << 0);
-    vc->gossipIn(nullptr,
-                 BSON("$clusterTime"
-                      << BSON("clusterTime" << Timestamp(2, 2) << "signature" << dummySignature)
-                      << "$configTime" << Timestamp(2, 2) << "$topologyTime" << Timestamp(2, 2)),
-                 false,
-                 true);
+    auto timepointsObj = BSON(
+        "$clusterTime" << BSON("clusterTime" << Timestamp(2, 2) << "signature" << dummySignature)
+                       << "$configTime" << Timestamp(2, 2) << "$topologyTime" << Timestamp(2, 2));
+    auto timepoints = GossipedVectorClockComponents::parse(
+        IDLParserContext("VectorClockComponents"), timepointsObj);
+    vc->gossipIn(operationContext(), timepoints, false, true);
 
     // On shard servers, gossip in from internal clients should update $clusterTime, $configTime,
     // and $topologyTime.
@@ -236,24 +238,24 @@ TEST_F(VectorClockShardServerTest, GossipInInternal) {
     ASSERT_EQ(afterTime.configTime().asTimestamp(), Timestamp(2, 2));
     ASSERT_EQ(afterTime.topologyTime().asTimestamp(), Timestamp(2, 2));
 
-    vc->gossipIn(nullptr,
-                 BSON("$clusterTime"
-                      << BSON("clusterTime" << Timestamp(1, 1) << "signature" << dummySignature)
-                      << "$configTime" << Timestamp(1, 1) << "$topologyTime" << Timestamp(1, 1)),
-                 false,
-                 true);
+    timepointsObj = BSON("$clusterTime"
+                         << BSON("clusterTime" << Timestamp(1, 1) << "signature" << dummySignature)
+                         << "$configTime" << Timestamp(1, 1) << "$topologyTime" << Timestamp(1, 1));
+    timepoints = GossipedVectorClockComponents::parse(IDLParserContext("VectorClockComponents"),
+                                                      timepointsObj);
+    vc->gossipIn(operationContext(), timepoints, false, true);
 
     auto afterTime2 = vc->getTime();
     ASSERT_EQ(afterTime2.clusterTime().asTimestamp(), Timestamp(2, 2));
     ASSERT_EQ(afterTime2.configTime().asTimestamp(), Timestamp(2, 2));
     ASSERT_EQ(afterTime2.topologyTime().asTimestamp(), Timestamp(2, 2));
 
-    vc->gossipIn(nullptr,
-                 BSON("$clusterTime"
-                      << BSON("clusterTime" << Timestamp(3, 3) << "signature" << dummySignature)
-                      << "$configTime" << Timestamp(3, 3) << "$topologyTime" << Timestamp(3, 3)),
-                 false,
-                 true);
+    // Gossiping works without a signature, since it's treated as a dummy signature.
+    timepointsObj = BSON("$clusterTime" << BSON("clusterTime" << Timestamp(3, 3)) << "$configTime"
+                                        << Timestamp(3, 3) << "$topologyTime" << Timestamp(3, 3));
+    timepoints = GossipedVectorClockComponents::parse(IDLParserContext("VectorClockComponents"),
+                                                      timepointsObj);
+    vc->gossipIn(operationContext(), timepoints, false, true);
 
     auto afterTime3 = vc->getTime();
     ASSERT_EQ(afterTime3.clusterTime().asTimestamp(), Timestamp(3, 3));
@@ -270,11 +272,12 @@ TEST_F(VectorClockShardServerTest, GossipInExternal) {
     auto dummySignature =
         BSON("hash" << BSONBinData("\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1", 20, BinDataGeneral)
                     << "keyId" << 0);
-    vc->gossipIn(nullptr,
-                 BSON("$clusterTime"
-                      << BSON("clusterTime" << Timestamp(2, 2) << "signature" << dummySignature)
-                      << "$configTime" << Timestamp(2, 2) << "$topologyTime" << Timestamp(2, 2)),
-                 false);
+    auto timepointsObj = BSON(
+        "$clusterTime" << BSON("clusterTime" << Timestamp(2, 2) << "signature" << dummySignature)
+                       << "$configTime" << Timestamp(2, 2) << "$topologyTime" << Timestamp(2, 2));
+    auto timepoints = GossipedVectorClockComponents::parse(
+        IDLParserContext("VectorClockComponents"), timepointsObj);
+    vc->gossipIn(operationContext(), timepoints, false);
 
     // On shard servers, gossip in from external clients should update $clusterTime, but not
     // $configTime or $topologyTime.
@@ -283,22 +286,25 @@ TEST_F(VectorClockShardServerTest, GossipInExternal) {
     ASSERT_EQ(afterTime.configTime(), VectorClock::kInitialComponentTime);
     ASSERT_EQ(afterTime.topologyTime(), VectorClock::kInitialComponentTime);
 
-    vc->gossipIn(nullptr,
-                 BSON("$clusterTime"
-                      << BSON("clusterTime" << Timestamp(1, 1) << "signature" << dummySignature)
-                      << "$configTime" << Timestamp(1, 1) << "$topologyTime" << Timestamp(1, 1)),
-                 false);
+    timepointsObj = BSON("$clusterTime"
+                         << BSON("clusterTime" << Timestamp(1, 1) << "signature" << dummySignature)
+                         << "$configTime" << Timestamp(1, 1) << "$topologyTime" << Timestamp(1, 1));
+    timepoints = GossipedVectorClockComponents::parse(IDLParserContext("VectorClockComponents"),
+                                                      timepointsObj);
+    vc->gossipIn(operationContext(), timepoints, false);
 
     auto afterTime2 = vc->getTime();
     ASSERT_EQ(afterTime2.clusterTime().asTimestamp(), Timestamp(2, 2));
     ASSERT_EQ(afterTime2.configTime(), VectorClock::kInitialComponentTime);
     ASSERT_EQ(afterTime2.topologyTime(), VectorClock::kInitialComponentTime);
 
-    vc->gossipIn(nullptr,
-                 BSON("$clusterTime"
-                      << BSON("clusterTime" << Timestamp(3, 3) << "signature" << dummySignature)
-                      << "$configTime" << Timestamp(3, 3) << "$topologyTime" << Timestamp(3, 3)),
-                 false);
+    // Gossiping works without a signature, since it's treated as a dummy signature and the test's
+    // client is authorized to advance the clock.
+    timepointsObj = BSON("$clusterTime" << BSON("clusterTime" << Timestamp(3, 3)) << "$configTime"
+                                        << Timestamp(3, 3) << "$topologyTime" << Timestamp(3, 3));
+    timepoints = GossipedVectorClockComponents::parse(IDLParserContext("VectorClockComponents"),
+                                                      timepointsObj);
+    vc->gossipIn(operationContext(), timepoints, false);
 
     auto afterTime3 = vc->getTime();
     ASSERT_EQ(afterTime3.clusterTime().asTimestamp(), Timestamp(3, 3));
@@ -310,8 +316,6 @@ class VectorClockPersistenceTest : public ShardServerTestFixture {
 protected:
     void setUp() override {
         ShardServerTestFixture::setUp();
-
-        serverGlobalParams.clusterRole = ClusterRole::ShardServer;
 
         auto replCoord = repl::ReplicationCoordinator::get(operationContext());
         ASSERT_OK(replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));

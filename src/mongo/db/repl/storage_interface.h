@@ -301,6 +301,20 @@ public:
                                    const TimestampedBSONObj& update) = 0;
 
     /**
+     * Updates all matching documents in a collection. Never upsert.
+     *
+     * If the collection has more than 1 document, the update will be performed on all the documents
+     * found. The update is performed at the given timestamp.
+     * Returns 'NamespaceNotFound' if the collection does not exist. This does not implicitly
+     * create the collection so that the caller can create the collection with any collection
+     * options they want (ex: capped, temp, collation, etc.).
+     */
+    virtual Status updateDocuments(OperationContext* opCtx,
+                                   const NamespaceString& nss,
+                                   const BSONObj& query,
+                                   const TimestampedBSONObj& update) = 0;
+
+    /**
      * Finds a single document in the collection referenced by the specified _id.
      *
      * Not supported on collections with a default collation.
@@ -342,21 +356,21 @@ public:
                                   const BSONObj& filter) = 0;
 
     /**
-     * Searches for an oplog entry with a timestamp <= 'timestamp'. Returns boost::none if no
+     * Searches for an oplog optime with a timestamp <= 'timestamp'. Returns boost::none if no
      * matches are found.
      */
-    virtual boost::optional<BSONObj> findOplogEntryLessThanOrEqualToTimestamp(
+    virtual boost::optional<OpTimeAndWallTime> findOplogOpTimeLessThanOrEqualToTimestamp(
         OperationContext* opCtx, const CollectionPtr& oplog, const Timestamp& timestamp) = 0;
 
     /**
-     * Calls findOplogEntryLessThanOrEqualToTimestamp with endless WriteConflictException retries.
+     * Calls findOplogOpTimeLessThanOrEqualToTimestamp with endless WriteConflictException retries.
      * Other errors get thrown. Concurrent oplog reads with the validate cmd on the same collection
      * may throw WCEs. Obeys opCtx interrupts.
      *
-     * Call this function instead of findOplogEntryLessThanOrEqualToTimestamp if the caller cannot
+     * Call this function instead of findOplogOpTimeLessThanOrEqualToTimestamp if the caller cannot
      * fail, say for correctness.
      */
-    virtual boost::optional<BSONObj> findOplogEntryLessThanOrEqualToTimestampRetryOnWCE(
+    virtual boost::optional<OpTimeAndWallTime> findOplogOpTimeLessThanOrEqualToTimestampRetryOnWCE(
         OperationContext* opCtx, const CollectionPtr& oplog, const Timestamp& timestamp) = 0;
 
     /**
@@ -412,6 +426,11 @@ public:
      * timestamps are not persisted in the storage layer.
      */
     virtual void setInitialDataTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) = 0;
+
+    /**
+     * Returns the initial timestamp of data at startup.
+     */
+    virtual Timestamp getInitialDataTimestamp(ServiceContext* serviceCtx) const = 0;
 
     /**
      * Reverts the state of all database data to the last stable timestamp.

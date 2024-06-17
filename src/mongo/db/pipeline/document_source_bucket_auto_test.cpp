@@ -587,11 +587,26 @@ TEST_F(BucketAutoTests, FailsWithInvalidNumberOfBuckets) {
         40243);
 }
 
-TEST_F(BucketAutoTests, FailsWithNonExpressionGroupBy) {
+TEST_F(BucketAutoTests, FailsWithNonOrInvalidExpressionGroupBy) {
     auto spec = fromjson("{$bucketAuto : {groupBy : 'test', buckets : 1}}");
     ASSERT_THROWS_CODE(createBucketAuto(spec), AssertionException, 40239);
 
     spec = fromjson("{$bucketAuto : {groupBy : {test : 'test'}, buckets : 1}}");
+    ASSERT_THROWS_CODE(createBucketAuto(spec), AssertionException, 40239);
+
+    spec = fromjson("{$bucketAuto : {groupBy : '', buckets : 1}}");
+    ASSERT_THROWS_CODE(createBucketAuto(spec), AssertionException, 40239);
+
+    spec = fromjson("{$bucketAuto : {groupBy : {}}, buckets : 1}}");
+    ASSERT_THROWS_CODE(createBucketAuto(spec), AssertionException, 40239);
+
+    spec = fromjson("{$bucketAuto : {groupBy : '$'}, buckets : 1}}");
+    ASSERT_THROWS_CODE(createBucketAuto(spec), AssertionException, 40239);
+
+    spec = fromjson("{$bucketAuto : {groupBy : []}, buckets : 1}}");
+    ASSERT_THROWS_CODE(createBucketAuto(spec), AssertionException, 40239);
+
+    spec = fromjson("{$bucketAuto : {groupBy : null}, buckets : 1}}");
     ASSERT_THROWS_CODE(createBucketAuto(spec), AssertionException, 40239);
 }
 
@@ -703,7 +718,7 @@ TEST_F(BucketAutoTests, ShouldFailIfBufferingTooManyDocuments) {
 TEST_F(BucketAutoTests, ShouldCorrectlyTrackMemoryUsageBetweenPauses) {
     auto expCtx = getExpCtx();
     expCtx->allowDiskUse = false;
-    const size_t maxMemoryUsageBytes = 1000;
+    const size_t maxMemoryUsageBytes = 2000;
 
     VariablesParseState vps = expCtx->variablesParseState;
     auto groupByExpression = ExpressionFieldPath::parse(expCtx.get(), "$a", vps);
@@ -948,9 +963,7 @@ TEST_F(BucketAutoTests, QueryShapeReParseSerializedStage) {
                 "granularity": "R5",
                 "output": {
                     "count": {
-                        "$sum": {
-                            "$const":1
-                        }
+                        "$sum": 1
                     },
                     "years": {
                         "$push": "$year"

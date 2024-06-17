@@ -49,7 +49,7 @@
 #include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
 #include "mongo/idl/idl_parser.h"
-#include "mongo/s/sharding_router_test_fixture.h"
+#include "mongo/s/sharding_mongos_test_fixture.h"
 #include "mongo/s/sharding_task_executor.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/unittest/framework.h"
@@ -76,7 +76,7 @@ LogicalSessionId constructFullLsid() {
 
 class ShardingTaskExecutorTest : public ShardingTestFixture {
 protected:
-    void setUp() {
+    void setUp() override {
         ShardingTestFixture::setUp();
 
         configTargeter()->setFindHostReturnValue(kTestConfigShardHost);

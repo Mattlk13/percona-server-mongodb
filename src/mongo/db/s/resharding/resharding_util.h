@@ -241,8 +241,9 @@ RecipientShardEntry makeRecipientShard(ShardId shardId,
  * namespace components.
  *
  *      <db>.system.resharding.<existing collection's UUID>
+ * or   <db>.system.buckets.resharding.<existing collection's UUID> for a timeseries source ns.
  */
-NamespaceString constructTemporaryReshardingNss(StringData db, const UUID& sourceUuid);
+NamespaceString constructTemporaryReshardingNss(const NamespaceString& nss, const UUID& sourceUuid);
 
 /**
  * Gets the recipient shards for a resharding operation.
@@ -371,6 +372,13 @@ void validateShardDistribution(const std::vector<ShardKeyRange>& shardDistributi
  * Returns true if the provenance is moveCollection or balancerMoveCollection.
  */
 bool isMoveCollection(boost::optional<ProvenanceEnum> provenance);
+
+/**
+ * Helper function to create a thread pool for _markKilledExecutor member of resharding POS.
+ */
+std::shared_ptr<ThreadPool> makeThreadPoolForMarkKilledExecutor(const std::string& poolName);
+
+boost::optional<Status> coordinatorAbortedError();
 
 }  // namespace resharding
 }  // namespace mongo

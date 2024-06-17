@@ -106,8 +106,10 @@ public:
 
     bool isConnected() override;
 
-    bool isFromLoadBalancer() const override {
-        return _isFromLoadBalancer;
+    bool isFromLoadBalancer() const override;
+
+    bool bindsToOperationState() const override {
+        return isFromLoadBalancer();
     }
 
     bool isFromRouterPort() const override {
@@ -247,7 +249,7 @@ protected:
     Future<Message> sendHTTPResponse(const BatonHandle& baton = nullptr);
 
     bool shouldOverrideMaxConns(
-        const std::vector<stdx::variant<CIDR, std::string>>& exemptions) const override;
+        const std::vector<std::variant<CIDR, std::string>>& exemptions) const override;
 
     enum BlockingMode {
         unknown,
@@ -274,6 +276,15 @@ protected:
     bool _ranHandshake = false;
     std::shared_ptr<const SSLConnectionContext> _sslContext;
 #endif
+
+    /**
+     * Synchronizes construction of _sslSocket in maybeHandshakeSSLForIngress and access of
+     * _sslSocket during shutdown in end(). Without synchronization, end() can operate on _socket
+     * while its ownership is being passed to _sslSocket.
+     * TODO (SERVER-83933) Remove this mutex after SSL handshake logic is moved to occur before
+     * concurrent accesses can occur.
+     */
+    Mutex _sslSocketLock{};
 
     AsioTransportLayer* const _tl;
     bool _isIngressSession;

@@ -56,6 +56,7 @@
 #include "mongo/transport/grpc/server.h"
 #include "mongo/transport/grpc/service.h"
 #include "mongo/transport/grpc/util.h"
+#include "mongo/transport/test_fixtures.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/unittest/thread_assertion_monitor.h"
 #include "mongo/util/assert_util.h"
@@ -69,6 +70,10 @@
 namespace mongo::transport::grpc {
 
 #define ASSERT_EQ_MSG(a, b) ASSERT_EQ((a).opMsgDebugString(), (b).opMsgDebugString())
+#define ASSERT_GRPC_STUB_CONNECTED(stub) \
+    ASSERT_EQ(stub.connect().error_code(), ::grpc::StatusCode::OK)
+#define ASSERT_GRPC_STUB_NOT_CONNECTED(stub) \
+    ASSERT_EQ(stub.connect(Milliseconds(50)).error_code(), ::grpc::StatusCode::UNAVAILABLE)
 
 inline Message makeUniqueMessage() {
     OpMsg msg;
@@ -164,7 +169,6 @@ private:
 class CommandServiceTestFixtures : public ServiceContextTest {
 public:
     static constexpr auto kBindAddress = "localhost";
-    static constexpr auto kBindPort = 1234;
     static constexpr auto kMaxThreads = 100;
     static constexpr auto kServerCertificateKeyFile = "jstests/libs/server_SAN.pem";
     static constexpr auto kClientCertificateKeyFile = "jstests/libs/client.pem";
@@ -213,37 +217,29 @@ public:
                     Create(_channel.get(), _unauthenticatedCommandStreamMethod, context)};
         }
 
-        void assertConnected() {
-            ASSERT_EQ(connect().error_code(), ::grpc::StatusCode::OK);
-        }
-
-        void assertNotConnected() {
-            ASSERT_EQ(connect(Milliseconds(50)).error_code(), ::grpc::StatusCode::UNAVAILABLE);
-        }
-
     private:
         std::shared_ptr<::grpc::ChannelInterface> _channel;
         ::grpc::internal::RpcMethod _unauthenticatedCommandStreamMethod;
         ::grpc::internal::RpcMethod _authenticatedCommandStreamMethod;
     };
 
-    static HostAndPort defaultServerAddress() {
-        return HostAndPort(kBindAddress, kBindPort);
+    static HostAndPort defaultServerAddress(int port) {
+        return HostAndPort(kBindAddress, port);
     }
 
     static Server::Options makeServerOptions() {
         Server::Options options;
-        options.addresses = {HostAndPort(kBindAddress, kBindPort)};
+        options.addresses = {HostAndPort(kBindAddress, test::kLetKernelChoosePort)};
         options.maxThreads = kMaxThreads;
         options.tlsCAFile = kCAFile;
-        options.tlsPEMKeyFile = kServerCertificateKeyFile;
+        options.tlsCertificateKeyFile = kServerCertificateKeyFile;
         options.tlsAllowInvalidCertificates = false;
         options.tlsAllowConnectionsWithoutCertificates = false;
         return options;
     }
 
     static GRPCClient::Options makeClientOptions() {
-        GRPCClient::Options options;
+        GRPCClient::Options options{};
         options.tlsCAFile = kCAFile;
         options.tlsCertificateKeyFile = kClientCertificateKeyFile;
         return options;
@@ -252,7 +248,7 @@ public:
     static GRPCTransportLayer::Options makeTLOptions() {
         GRPCTransportLayer::Options options{};
         options.bindIpList = {};
-        options.bindPort = kBindPort;
+        options.bindPort = test::kLetKernelChoosePort;
         options.maxServerThreads = kMaxThreads;
         options.useUnixDomainSockets = false;
         options.unixDomainSocketPermissions = DEFAULT_UNIX_PERMS;
@@ -311,12 +307,13 @@ public:
 
             for (auto& options : serverOptions) {
                 auto handler = [rpcHandler, &options, &monitor](auto session) {
-                    ON_BLOCK_EXIT([&] { session->end(); });
+                    ON_BLOCK_EXIT([&] { session->setTerminationStatus(Status::OK()); });
                     monitor.spawn([&]() { ASSERT_DOES_NOT_THROW(rpcHandler(options, session)); })
                         .join();
                 };
                 auto server = makeServer(handler, options);
                 server->start();
+                options.addresses = server->getListeningAddresses();
                 servers.push_back(std::move(server));
             }
             ON_BLOCK_EXIT([&servers] {
@@ -327,7 +324,8 @@ public:
                 }
             });
 
-            auto clientThread = monitor.spawn([&] { clientThreadBody(servers, monitor); });
+            auto clientThread =
+                monitor.spawn([&] { ASSERT_DOES_NOT_THROW(clientThreadBody(servers, monitor)); });
             clientThread.join();
         });
     }
@@ -359,7 +357,7 @@ public:
                 server->start(
                     monitor,
                     [address, rpcHandler](std::shared_ptr<IngressSession> session) {
-                        ON_BLOCK_EXIT([&]() { session->end(); });
+                        ON_BLOCK_EXIT([&]() { session->setTerminationStatus(Status::OK()); });
                         rpcHandler(address, session);
                     },
                     wvProvider);
@@ -383,26 +381,36 @@ public:
         });
     }
 
-    static Stub makeStub(boost::optional<Stub::Options> options = boost::none) {
-        return makeStub("localhost:{}"_format(kBindPort), options);
+    static Stub makeStub(const HostAndPort& addr,
+                         boost::optional<Stub::Options> options = boost::none) {
+        return makeStub(fmt::format("{}:{}", addr.host(), addr.port()), options);
     }
 
-    static Stub makeStubWithCerts(std::string caFile, std::string clientCertFile) {
+    static Stub makeStubWithCerts(const HostAndPort& addr,
+                                  std::string caFile,
+                                  std::string clientCertFile) {
         auto stubOptions = CommandServiceTestFixtures::Stub::Options{};
         stubOptions.tlsCAFile = caFile;
         stubOptions.tlsCertificateKeyFile = clientCertFile;
-        return makeStub(stubOptions);
+        return makeStub(addr, stubOptions);
     }
 
     static CommandService::RPCHandler makeEchoHandler() {
-        return [](std::shared_ptr<IngressSession> session) {
-            auto msg = uassertStatusOK(session->sourceMessage());
-            uassertStatusOK(session->sinkMessage(std::move(msg)));
-            session->end();
+        return [](auto session) {
+            while (true) {
+                try {
+                    auto msg = uassertStatusOK(session->sourceMessage());
+                    ASSERT_OK(session->sinkMessage(std::move(msg)));
+                } catch (ExceptionFor<ErrorCodes::StreamTerminated>&) {
+                    // Continues to serve the echo commands until the stream is terminated
+                    // gracefully.
+                    return;
+                }
+            }
         };
     }
 
-    static Stub makeStub(StringData address, boost::optional<Stub::Options> options = boost::none) {
+    static Stub makeStub(StringData uri, boost::optional<Stub::Options> options = boost::none) {
         if (!options) {
             options.emplace();
             options->tlsCAFile = kCAFile;
@@ -418,9 +426,11 @@ public:
         if (options->tlsCAFile) {
             sslOps.pem_root_certs = ssl_util::readPEMFile(options->tlsCAFile.get()).getValue();
         }
-        auto credentials = ::grpc::SslCredentials(sslOps);
 
-        return Stub{::grpc::CreateChannel(address.toString(), credentials)};
+        auto credentials = util::isUnixSchemeGRPCFormattedURI(uri)
+            ? ::grpc::InsecureChannelCredentials()
+            : ::grpc::SslCredentials(sslOps);
+        return Stub(::grpc::CreateChannel(uri.toString(), credentials));
     }
 
     /**
@@ -448,9 +458,8 @@ public:
     }
 };
 
-inline std::shared_ptr<EgressSession> makeEgressSession(
-    GRPCTransportLayer& tl,
-    const HostAndPort& addr = CommandServiceTestFixtures::defaultServerAddress()) {
+inline std::shared_ptr<EgressSession> makeEgressSession(GRPCTransportLayer& tl,
+                                                        const HostAndPort& addr) {
     auto swSession = tl.connect(
         addr, ConnectSSLMode::kGlobalSSLMode, CommandServiceTestFixtures::kDefaultConnectTimeout);
     return std::dynamic_pointer_cast<EgressSession>(uassertStatusOK(swSession));

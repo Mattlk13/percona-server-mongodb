@@ -50,7 +50,7 @@ WindowStage::WindowStage(std::unique_ptr<PlanStage> input,
                          bool allowDiskUse,
                          PlanNodeId planNodeId,
                          bool participateInTrialRunTracking)
-    : PlanStage("window"_sd, planNodeId, participateInTrialRunTracking),
+    : PlanStage("window"_sd, nullptr /* yieldPolicy */, planNodeId, participateInTrialRunTracking),
       _currSlots(std::move(currSlots)),
       _boundTestingSlots(std::move(boundTestingSlots)),
       _partitionSlotCount(partitionSlotCount),
@@ -113,7 +113,7 @@ std::unique_ptr<PlanStage> WindowStage::clone() const {
                                          _collatorSlot,
                                          _allowDiskUse,
                                          _commonStats.nodeId,
-                                         _participateInTrialRunTracking);
+                                         participateInTrialRunTracking());
 }
 
 void WindowStage::doSaveState(bool relinquishCursor) {
@@ -215,7 +215,7 @@ bool WindowStage::fetchNextRow() {
         value::MaterializedRow row(rowSize);
         size_t idx = 0;
         for (auto accessor : _inCurrAccessors) {
-            auto [tag, val] = accessor->copyOrMoveValue();
+            auto [tag, val] = accessor->getCopyOfValue();
             row.reset(idx++, true, tag, val);
         }
         _rows.push_back(std::move(row));

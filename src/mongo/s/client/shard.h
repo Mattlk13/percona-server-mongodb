@@ -56,6 +56,7 @@
 #include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/shard_id.h"
 #include "mongo/executor/remote_command_response.h"
+#include "mongo/s/client/shard_gen.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/util/duration.h"
@@ -127,7 +128,7 @@ public:
     /**
      * Returns the current connection string for the shard.
      */
-    virtual ConnectionString getConnString() const = 0;
+    virtual const ConnectionString& getConnString() const = 0;
 
     /**
      * Returns the RemoteCommandTargeter for the hosts in this shard.
@@ -248,10 +249,11 @@ public:
      * commands return errors in a different format than regular commands do, so checking for
      * retriable errors must be done differently.
      */
-    BatchedCommandResponse runBatchWriteCommand(OperationContext* opCtx,
-                                                Milliseconds maxTimeMS,
-                                                const BatchedCommandRequest& batchRequest,
-                                                RetryPolicy retryPolicy);
+    virtual BatchedCommandResponse runBatchWriteCommand(OperationContext* opCtx,
+                                                        Milliseconds maxTimeMS,
+                                                        const BatchedCommandRequest& batchRequest,
+                                                        const WriteConcernOptions& writeConcern,
+                                                        RetryPolicy retryPolicy) = 0;
 
     /**
      * Warning: This method exhausts the cursor and pulls all data into memory.
@@ -271,10 +273,6 @@ public:
         boost::optional<long long> limit,
         const boost::optional<BSONObj>& hint = boost::none);
 
-    // This timeout will be used by default in operations against the config server, unless
-    // explicitly overridden
-    static const Milliseconds kDefaultConfigCommandTimeout;
-
     /**
      * Returns false if the error is a retriable error and/or causes a replset monitor update. These
      * errors, if from a remote call, should not be further propagated back to another server
@@ -286,10 +284,22 @@ public:
 protected:
     Shard(const ShardId& id);
 
+    /**
+     * Submits the batch request applying the specified retry policy and timeout and using the
+     * machinery provided by each implementation.
+     * Callers of this function must ensure to have configured the write concern settings
+     * accordingly to their specific semantics.
+     */
+    BatchedCommandResponse _submitBatchWriteCommand(OperationContext* opCtx,
+                                                    const BSONObj& serialisedBatchRequest,
+                                                    const DatabaseName& dbName,
+                                                    Milliseconds maxTimeMS,
+                                                    RetryPolicy retryPolicy);
+
 private:
     /**
-     * Runs the specified command against the shard backed by this object with a timeout set to the
-     * minimum of maxTimeMSOverride or the timeout of the OperationContext.
+     * Runs the specified command against the shard backed by this object with a timeout set to
+     * the minimum of maxTimeMSOverride or the timeout of the OperationContext.
      *
      * The return value exposes RemoteShard's host for calls to updateReplSetMonitor.
      *

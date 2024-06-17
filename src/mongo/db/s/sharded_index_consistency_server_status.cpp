@@ -36,7 +36,7 @@
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/s/periodic_sharded_index_consistency_checker.h"
-#include "mongo/db/s/sharding_runtime_d_params_gen.h"
+#include "mongo/db/s/sharding_config_server_parameters_gen.h"
 #include "mongo/db/server_options.h"
 #include "mongo/platform/atomic_word.h"
 
@@ -50,7 +50,7 @@ bool isConfigServerWithShardedIndexConsistencyCheckEnabled() {
 
 class ShardedIndexConsistencyServerStatus final : public ServerStatusSection {
 public:
-    ShardedIndexConsistencyServerStatus() : ServerStatusSection("shardedIndexConsistency") {}
+    using ServerStatusSection::ServerStatusSection;
 
     bool includeByDefault() const override {
         return isConfigServerWithShardedIndexConsistencyCheckEnabled();
@@ -68,8 +68,10 @@ public:
                            .getNumShardedCollsWithInconsistentIndexes());
         return builder.obj();
     }
-
-} indexConsistencyServerStatus;
+};
+auto& indexConsistencyServerStatus =
+    *ServerStatusSectionBuilder<ShardedIndexConsistencyServerStatus>("shardedIndexConsistency")
+         .forShard();
 
 }  // namespace
 }  // namespace mongo

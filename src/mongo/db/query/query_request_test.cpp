@@ -487,6 +487,7 @@ TEST(QueryRequestTest, ParseFromCommandAllFlagsTrue) {
         "awaitData: true,"
         "allowPartialResults: true,"
         "readOnce: true,"
+        "includeQueryStatsMetrics: true,"
         "allowSpeculativeMajorityRead: true, '$db': 'test'}");
 
     unique_ptr<FindCommandRequest> findCommand(
@@ -498,6 +499,7 @@ TEST(QueryRequestTest, ParseFromCommandAllFlagsTrue) {
     ASSERT(findCommand->getTailable() && findCommand->getAwaitData());
     ASSERT(findCommand->getAllowPartialResults());
     ASSERT(findCommand->getReadOnce());
+    ASSERT(findCommand->getIncludeQueryStatsMetrics());
     ASSERT(findCommand->getAllowSpeculativeMajorityRead());
 }
 
@@ -523,6 +525,14 @@ TEST(QueryRequestTest, ParseFromCommandReadOnceDefaultsToFalse) {
     unique_ptr<FindCommandRequest> findCommand(
         query_request_helper::makeFromFindCommandForTests(cmdObj));
     ASSERT(!findCommand->getReadOnce());
+}
+
+TEST(QueryRequestTest, ParseFromCommandIncludeQueryStatsMetricsDefaultsToFalse) {
+    BSONObj cmdObj = fromjson("{find: 'testns', '$db': 'test'}");
+
+    unique_ptr<FindCommandRequest> findCommand(
+        query_request_helper::makeFromFindCommandForTests(cmdObj));
+    ASSERT(!findCommand->getIncludeQueryStatsMetrics());
 }
 
 TEST(QueryRequestTest, ParseFromCommandValidMinMax) {
@@ -903,6 +913,14 @@ TEST(QueryRequestTest, ParseFromCommandLegacyRuntimeConstantsSubfieldsWrongType)
                           << "test");
     ASSERT_THROWS_CODE(query_request_helper::makeFromFindCommandForTests(cmdObj),
                        AssertionException,
+                       ErrorCodes::TypeMismatch);
+}
+
+TEST(QueryRequestTest, ParseFromCommandIncludeQueryStatsMetricsWrongType) {
+    BSONObj cmdObj = fromjson("{find: 'testns', '$db': 'test', 'includeQueryStatsMetrics': 42}");
+
+    ASSERT_THROWS_CODE(query_request_helper::makeFromFindCommandForTests(cmdObj),
+                       DBException,
                        ErrorCodes::TypeMismatch);
 }
 
@@ -1572,6 +1590,22 @@ TEST(QueryRequestTest, ConvertToAggregationWithAllowDiskUseFalseSucceeds) {
     ASSERT_EQ(false, ar.getAllowDiskUse());
 }
 
+TEST(QueryRequestTest, ConvertToAggregationWithIncludeQueryStatsMetricsTrueSucceeds) {
+    FindCommandRequest findCommand(testns);
+    findCommand.setIncludeQueryStatsMetrics(true);
+    auto ar = query_request_conversion::asAggregateCommandRequest(findCommand);
+
+    ASSERT_TRUE(ar.getIncludeQueryStatsMetrics());
+}
+
+TEST(QueryRequestTest, ConvertToAggregationWithIncludeQueryStatsMetricsFalseSucceeds) {
+    FindCommandRequest findCommand(testns);
+    findCommand.setIncludeQueryStatsMetrics(false);
+    auto ar = query_request_conversion::asAggregateCommandRequest(findCommand);
+
+    ASSERT_FALSE(ar.getIncludeQueryStatsMetrics());
+}
+
 TEST(QueryRequestTest, ConvertToFindWithAllowDiskUseTrueSucceeds) {
     FindCommandRequest findCommand(testns);
     findCommand.setAllowDiskUse(true);
@@ -1592,19 +1626,31 @@ TEST(QueryRequestTest, ConvertToFindWithAllowDiskUseFalseSucceeds) {
 
 TEST(QueryRequestHelperTest, ValidateResponseMissingFields) {
     BSONObjBuilder builder;
-    ASSERT_THROWS_CODE(query_request_helper::validateCursorResponse(
-                           builder.asTempObj(), boost::none, SerializationContext()),
-                       DBException,
-                       6253507);
+    QueryTestServiceContext serviceContext;
+    auto uniqueTxn = serviceContext.makeOperationContext();
+    OperationContext* opCtx = uniqueTxn.get();
+    ASSERT_THROWS_CODE(
+        query_request_helper::validateCursorResponse(builder.asTempObj(),
+                                                     auth::ValidatedTenancyScope::get(opCtx),
+                                                     boost::none,
+                                                     SerializationContext()),
+        DBException,
+        6253507);
 }
 
 TEST(QueryRequestHelperTest, ValidateResponseWrongDataType) {
     BSONObjBuilder builder;
     builder.append("cursor", 1);
-    ASSERT_THROWS_CODE(query_request_helper::validateCursorResponse(
-                           builder.asTempObj(), boost::none, SerializationContext()),
-                       DBException,
-                       ErrorCodes::TypeMismatch);
+    QueryTestServiceContext serviceContext;
+    auto uniqueTxn = serviceContext.makeOperationContext();
+    OperationContext* opCtx = uniqueTxn.get();
+    ASSERT_THROWS_CODE(
+        query_request_helper::validateCursorResponse(builder.asTempObj(),
+                                                     auth::ValidatedTenancyScope::get(opCtx),
+                                                     boost::none,
+                                                     SerializationContext()),
+        DBException,
+        ErrorCodes::TypeMismatch);
 }
 
 TEST(QueryRequestHelperTest, ParsedCursorRemainsValidAfterBSONDestroyed) {

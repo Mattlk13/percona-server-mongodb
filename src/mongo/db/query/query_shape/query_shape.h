@@ -40,12 +40,6 @@
 #include "mongo/crypto/sha256_block.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/pipeline/aggregate_command_gen.h"
-#include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/pipeline.h"
-#include "mongo/db/query/find_command.h"
-#include "mongo/db/query/parsed_find_command.h"
-#include "mongo/db/query/query_request_helper.h"
 #include "mongo/db/query/query_shape/serialization_options.h"
 #include "mongo/db/query/query_shape/shape_helpers.h"
 
@@ -82,7 +76,7 @@ struct CmdSpecificShapeComponents {
      * We cannot just use sizeof() because there are some variable size data members (like BSON
      * objects) which depend on the particular instance.
      */
-    virtual int64_t size() const = 0;
+    virtual size_t size() const = 0;
 
     // Some template boilerplate to allow sub-classes to overload the hash implementation.
     template <typename H>
@@ -130,15 +124,22 @@ public:
      * The Query Shape Hash is defined to be the SHA256 Hash of the representatice query shape. This
      * helper computes that.
      */
-    QueryShapeHash sha256Hash(OperationContext*,
-                              const SerializationContext& serializationContext) const;
+    virtual QueryShapeHash sha256Hash(OperationContext*,
+                                      const SerializationContext& serializationContext) const;
 
     /**
      * The size of a query shape is important, since we store these in space-constrained
      * environments like the query stats store.
      */
-    int64_t size() const;
+    size_t size() const;
 
+    /**
+     * This should be overriden by a child class if it has members whose sizes are not included in
+     * specificComponents().size().
+     */
+    virtual size_t extraSize() const {
+        return 0;
+    }
     template <typename H>
     friend H AbslHashValue(H h, const Shape& shape) {
         h = H::combine(std::move(h), shape.nssOrUUID, shape.specificComponents());

@@ -78,6 +78,7 @@
 #include "mongo/db/query/optimizer/containers.h"
 #include "mongo/db/query/optimizer/props.h"
 #include "mongo/db/query/optimizer/utils/path_utils.h"
+#include "mongo/db/query/optimizer/utils/reftracker_utils.h"
 #include "mongo/db/query/optimizer/utils/strong_alias.h"
 #include "mongo/db/query/optimizer/utils/utils.h"
 #include "mongo/db/query/query_knobs_gen.h"
@@ -222,9 +223,30 @@ std::unique_ptr<sbe::EExpression> SBEExpressionLowering::transport(
     if (sbe::EPrimBinary::isComparisonOp(sbeOp)) {
         boost::optional<sbe::value::SlotId> collatorSlot =
             _providedSlots.getSlotIfExists("collator"_sd);
-        if (collatorSlot) {
-            return sbe::makeE<sbe::EPrimBinary>(
-                sbeOp, std::move(lhs), std::move(rhs), sbe::makeE<sbe::EVariable>(*collatorSlot));
+
+        auto collationExpr = [&]() -> std::unique_ptr<sbe::EExpression> {
+            if (collatorSlot) {
+                return sbe::makeE<sbe::EVariable>(*collatorSlot);
+            }
+            return nullptr;
+        };
+
+        switch (_comparisonOpSemantics) {
+            case ComparisonOpSemantics::kTypeBracketing:
+                // If binary operations are type bracketed, then we can translate this comparison
+                // directly to SBE's type bracketed comparison operator.
+                return sbe::makeE<sbe::EPrimBinary>(
+                    sbeOp, std::move(lhs), std::move(rhs), collationExpr());
+            case ComparisonOpSemantics::kTotalOrder:
+                // If binary operations have a total order, then we generate the comparison using a
+                // cmp3w expression to achieve the desired semantics. For example, a < b will
+                // generate lt(cmp3w(a, b), 0).
+                return sbe::makeE<sbe::EPrimBinary>(
+                    sbeOp,
+                    sbe::makeE<sbe::EPrimBinary>(
+                        sbe::EPrimBinary::cmp3w, std::move(lhs), std::move(rhs), collationExpr()),
+                    sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64, 0),
+                    collationExpr());
         }
     }
 
@@ -390,7 +412,7 @@ std::unique_ptr<sbe::EExpression> SBEExpressionLowering::transport(
         return handleShardFilterFunctionCall(fn, args, name);
     }
 
-    if (name == parameterFunctionName) {
+    if (name == kParameterFunctionName) {
         uassert(8128700, "Invalid number of arguments to getParam()", fn.nodes().size() == 2);
         const auto* paramId = fn.nodes().at(0).cast<Constant>();
         auto paramIdVal = paramId->getValueInt32();
@@ -490,7 +512,7 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::generateInternal(
     const ABT& n, SlotVarMap& slotMap, boost::optional<sbe::value::SlotId>& ridSlot) {
     tassert(
         7239200, "Should not be lowering only logical ABT node", !n.cast<ExclusivelyLogicalNode>());
-    return algebra::walk<false>(n, *this, slotMap, ridSlot);
+    return algebra::walk<true>(n, *this, slotMap, ridSlot);
 }
 
 void SBENodeLowering::mapProjToSlot(SlotVarMap& slotMap,
@@ -503,7 +525,8 @@ void SBENodeLowering::mapProjToSlot(SlotVarMap& slotMap,
     }
 }
 
-std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const RootNode& n,
+std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const ABT& abtn,
+                                                      const RootNode& n,
                                                       SlotVarMap& slotMap,
                                                       boost::optional<sbe::value::SlotId>& ridSlot,
                                                       const ABT& child,
@@ -541,24 +564,12 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const RootNode& n,
     return input;
 }
 
-std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const EvaluationNode& n,
-                                                      SlotVarMap& slotMap,
-                                                      boost::optional<sbe::value::SlotId>& ridSlot,
-                                                      const ABT& child,
-                                                      const ABT& binds) {
-    auto input = generateInternal(child, slotMap, ridSlot);
-
-    // If the evaluation node is only renaming a variable, do not place a project stage.
-    if (auto varPtr = n.getProjection().cast<Variable>(); varPtr != nullptr) {
-        mapProjToSlot(slotMap, n.getProjectionName(), slotMap.at(varPtr->name()));
-        return input;
-    }
-
+void SBENodeLowering::extractAndLowerExpressions(const EvaluationNode& n,
+                                                 SlotVarMap& slotMap,
+                                                 sbe::SlotExprPairVector& projectsOut) {
     auto& binder = n.binder();
     auto& names = binder.names();
     auto& exprs = binder.exprs();
-
-    sbe::SlotExprPairVector projects;
 
     const auto& groupProps = _nodeToGroupPropsMap.at(&n);
     for (size_t idx = 0; idx < exprs.size(); ++idx) {
@@ -566,13 +577,67 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const EvaluationNode& n,
         auto slot = _slotIdGenerator.generate();
 
         mapProjToSlot(slotMap, names[idx], slot);
-        projects.emplace_back(slot, std::move(expr));
+        projectsOut.emplace_back(slot, std::move(expr));
+    }
+}
+
+std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const ABT& abtn,
+                                                      const EvaluationNode& n,
+                                                      SlotVarMap& slotMap,
+                                                      boost::optional<sbe::value::SlotId>& ridSlot,
+                                                      const ABT& child,
+                                                      const ABT& binds) {
+    // If the evaluation node is only renaming a variable, do not place a project stage.
+    if (auto varPtr = n.getProjection().cast<Variable>(); varPtr != nullptr) {
+        auto input = generateInternal(child, slotMap, ridSlot);
+        mapProjToSlot(slotMap, n.getProjectionName(), slotMap.at(varPtr->name()));
+        return input;
+    }
+
+    // Dependency analysis: this node can be merged with its child into the same project stage if it
+    // is independent from the child and the child is not a simple rename of a variable.
+    if (child.is<EvaluationNode>()) {
+        if (child.cast<EvaluationNode>()->getProjection().cast<Variable>() == nullptr) {
+            ProjectionNameSet varRefs = mongo::optimizer::collectVariableReferences(abtn);
+            const DefinitionsMap childDefs = _env.hasDefinitions(child.ref())
+                ? _env.getDefinitions(child.ref())
+                : DefinitionsMap{};
+            bool foundDependency = false;
+            for (const ProjectionName& varName : varRefs) {
+                auto it = childDefs.find(varName);
+                if (it != childDefs.cend() && it->second.definedBy.is<EvaluationNode>()) {
+                    foundDependency = true;
+                    break;
+                }
+            }
+            if (!foundDependency) {
+                // This node can be merged with its child.
+                _evalMap.insert(std::make_pair(child.cast<EvaluationNode>(), &n));
+                return generateInternal(child, slotMap, ridSlot);
+            }
+        }
+    }
+
+    auto input = generateInternal(child, slotMap, ridSlot);
+
+    sbe::SlotExprPairVector projects;
+    extractAndLowerExpressions(n, slotMap, projects);
+
+    auto childEval = &n;
+    auto it = _evalMap.find(childEval);
+    while (it != _evalMap.end()) {
+        auto parentEval = it->second;
+        extractAndLowerExpressions(*parentEval, slotMap, projects);
+        _evalMap.erase(it);
+        childEval = parentEval;
+        it = _evalMap.find(childEval);
     }
 
     return sbe::makeS<sbe::ProjectStage>(std::move(input), std::move(projects), getPlanNodeId(n));
 }
 
-std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const FilterNode& n,
+std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const ABT& abtn,
+                                                      const FilterNode& n,
                                                       SlotVarMap& slotMap,
                                                       boost::optional<sbe::value::SlotId>& ridSlot,
                                                       const ABT& child,
@@ -594,17 +659,24 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const FilterNode& n,
     }
 }
 
-std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const LimitSkipNode& n,
+std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const ABT& abtn,
+                                                      const LimitSkipNode& n,
                                                       SlotVarMap& slotMap,
                                                       boost::optional<sbe::value::SlotId>& ridSlot,
                                                       const ABT& child) {
     auto input = generateInternal(child, slotMap, ridSlot);
 
     return sbe::makeS<sbe::LimitSkipStage>(
-        std::move(input), n.getProperty().getLimit(), n.getProperty().getSkip(), getPlanNodeId(n));
+        std::move(input),
+        sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64,
+                                   sbe::value::bitcastFrom<int64_t>(n.getProperty().getLimit())),
+        sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64,
+                                   sbe::value::bitcastFrom<int64_t>(n.getProperty().getSkip())),
+        getPlanNodeId(n));
 }
 
-std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const ExchangeNode& n,
+std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const ABT& abtn,
+                                                      const ExchangeNode& n,
                                                       SlotVarMap& slotMap,
                                                       boost::optional<sbe::value::SlotId>& ridSlot,
                                                       const ABT& child,
@@ -694,7 +766,8 @@ static sbe::value::SortDirection collationOpToSBESortDirection(const CollationOp
     MONGO_UNREACHABLE;
 }
 
-std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const CollationNode& n,
+std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const ABT& abtn,
+                                                      const CollationNode& n,
                                                       SlotVarMap& slotMap,
                                                       boost::optional<sbe::value::SlotId>& ridSlot,
                                                       const ABT& child,
@@ -717,12 +790,14 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const CollationNode& n,
     const auto& nodeProps = _nodeToGroupPropsMap.at(&n);
     const auto& physProps = nodeProps._physicalProps;
 
-    size_t limit = std::numeric_limits<std::size_t>::max();
+    std::unique_ptr<sbe::EExpression> limit = nullptr;
     if (properties::hasProperty<properties::LimitSkipRequirement>(physProps)) {
         const auto& limitSkipReq =
             properties::getPropertyConst<properties::LimitSkipRequirement>(physProps);
         tassert(6624221, "We should not have skip set here", limitSkipReq.getSkip() == 0);
-        limit = limitSkipReq.getLimit();
+        limit =
+            sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64,
+                                       sbe::value::bitcastFrom<int64_t>(limitSkipReq.getLimit()));
     }
 
     // TODO: obtain defaults for these.
@@ -734,13 +809,15 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const CollationNode& n,
                                       std::move(orderBySlots),
                                       std::move(directions),
                                       std::move(vals),
-                                      limit,
+                                      std::move(limit),
                                       memoryLimit,
                                       allowDiskUse,
+                                      _yieldPolicy,
                                       nodeProps._planNodeId);
 }
 
-std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const UniqueNode& n,
+std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const ABT& abtn,
+                                                      const UniqueNode& n,
                                                       SlotVarMap& slotMap,
                                                       boost::optional<sbe::value::SlotId>& ridSlot,
                                                       const ABT& child,
@@ -759,7 +836,8 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const UniqueNode& n,
     return sbe::makeS<sbe::UniqueStage>(std::move(input), std::move(keySlots), getPlanNodeId(n));
 }
 
-std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const SpoolProducerNode& n,
+std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const ABT& abtn,
+                                                      const SpoolProducerNode& n,
                                                       SlotVarMap& slotMap,
                                                       boost::optional<sbe::value::SlotId>& ridSlot,
                                                       const ABT& child,
@@ -781,7 +859,7 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const SpoolProducerNode& n
     switch (n.getType()) {
         case SpoolProducerType::Eager:
             return sbe::makeS<sbe::SpoolEagerProducerStage>(
-                std::move(input), n.getSpoolId(), std::move(vals), planNodeId);
+                std::move(input), n.getSpoolId(), std::move(vals), _yieldPolicy, planNodeId);
 
         case SpoolProducerType::Lazy: {
             auto expr = lowerExpression(filter, slotMap, &_nodeToGroupPropsMap.at(&n));
@@ -793,7 +871,8 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const SpoolProducerNode& n
     MONGO_UNREACHABLE;
 }
 
-std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const SpoolConsumerNode& n,
+std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const ABT& abtn,
+                                                      const SpoolConsumerNode& n,
                                                       SlotVarMap& slotMap,
                                                       boost::optional<sbe::value::SlotId>& ridSlot,
                                                       const ABT& binder) {
@@ -808,17 +887,18 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const SpoolConsumerNode& n
     switch (n.getType()) {
         case SpoolConsumerType::Stack:
             return sbe::makeS<sbe::SpoolConsumerStage<true /*isStack*/>>(
-                n.getSpoolId(), std::move(vals), planNodeId);
+                n.getSpoolId(), std::move(vals), _yieldPolicy, planNodeId);
 
         case SpoolConsumerType::Regular:
             return sbe::makeS<sbe::SpoolConsumerStage<false /*isStack*/>>(
-                n.getSpoolId(), std::move(vals), planNodeId);
+                n.getSpoolId(), std::move(vals), _yieldPolicy, planNodeId);
     }
 
     MONGO_UNREACHABLE;
 }
 
-std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const GroupByNode& n,
+std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const ABT& abtn,
+                                                      const GroupByNode& n,
                                                       SlotVarMap& slotMap,
                                                       boost::optional<sbe::value::SlotId>& ridSlot,
                                                       const ABT& child,
@@ -882,10 +962,12 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const GroupByNode& n,
                                          // is permitted here, we will need to generate merging
                                          // expressions during lowering.
                                          sbe::makeSlotExprPairVec() /*mergingExprs*/,
+                                         _yieldPolicy,
                                          groupProps._planNodeId);
 }
 
-std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const NestedLoopJoinNode& n,
+std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const ABT& abtn,
+                                                      const NestedLoopJoinNode& n,
                                                       SlotVarMap& slotMap,
                                                       boost::optional<sbe::value::SlotId>& ridSlot,
                                                       const ABT& leftChild,
@@ -934,7 +1016,8 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const NestedLoopJoinNode& 
                                           getPlanNodeId(n));
 }
 
-std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const HashJoinNode& n,
+std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const ABT& abtn,
+                                                      const HashJoinNode& n,
                                                       SlotVarMap& slotMap,
                                                       boost::optional<sbe::value::SlotId>& ridSlot,
                                                       const ABT& leftChild,
@@ -966,10 +1049,12 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const HashJoinNode& n,
                                           std::move(innerKeys),
                                           std::move(innerProjects),
                                           collatorSlot,
+                                          _yieldPolicy,
                                           getPlanNodeId(n));
 }
 
-std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const MergeJoinNode& n,
+std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const ABT& abtn,
+                                                      const MergeJoinNode& n,
                                                       SlotVarMap& slotMap,
                                                       boost::optional<sbe::value::SlotId>& ridSlot,
                                                       const ABT& leftChild,
@@ -1003,7 +1088,8 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const MergeJoinNode& n,
 }
 
 
-std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const SortedMergeNode& n,
+std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const ABT& abtn,
+                                                      const SortedMergeNode& n,
                                                       SlotVarMap& slotMap,
                                                       boost::optional<sbe::value::SlotId>& ridSlot,
                                                       const ABTVector& children,
@@ -1066,7 +1152,8 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const SortedMergeNode& n,
                                              getPlanNodeId(n));
 }
 
-std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const UnionNode& n,
+std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const ABT& abtn,
+                                                      const UnionNode& n,
                                                       SlotVarMap& slotMap,
                                                       boost::optional<sbe::value::SlotId>& ridSlot,
                                                       const ABTVector& children,
@@ -1112,7 +1199,8 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const UnionNode& n,
         std::move(loweredChildren), std::move(inputVals), std::move(outputVals), getPlanNodeId(n));
 }
 
-std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const UnwindNode& n,
+std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const ABT& abtn,
+                                                      const UnwindNode& n,
                                                       SlotVarMap& slotMap,
                                                       boost::optional<sbe::value::SlotId>& ridSlot,
                                                       const ABT& child,
@@ -1166,7 +1254,8 @@ void SBENodeLowering::generateSlots(SlotVarMap& slotMap,
 }
 
 
-std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const PhysicalScanNode& n,
+std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const ABT& abtn,
+                                                      const PhysicalScanNode& n,
                                                       SlotVarMap& slotMap,
                                                       boost::optional<sbe::value::SlotId>& ridSlot,
                                                       const ABT& /*binds*/) {
@@ -1204,8 +1293,10 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const PhysicalScanNode& n,
                                                       callbacks);
         }
 
+        ScanOrder scanOrder = n.getScanOrder();
+
         bool forwardScan = [&]() {
-            switch (_scanOrder) {
+            switch (scanOrder) {
                 case ScanOrder::Forward:
                 case ScanOrder::Random:
                     return true;
@@ -1233,7 +1324,7 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const PhysicalScanNode& n,
             planNodeId,
             callbacks,
             gDeprioritizeUnboundedUserCollectionScans.load(), /* lowPriority */
-            _scanOrder == ScanOrder::Random);
+            scanOrder == ScanOrder::Random);
     } else {
         tasserted(6624355, "Unknown scan type.");
     }
@@ -1241,7 +1332,10 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const PhysicalScanNode& n,
 }
 
 std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(
-    const CoScanNode& n, SlotVarMap& slotMap, boost::optional<sbe::value::SlotId>& ridSlot) {
+    const ABT& abtn,
+    const CoScanNode& n,
+    SlotVarMap& slotMap,
+    boost::optional<sbe::value::SlotId>& ridSlot) {
     return sbe::makeS<sbe::CoScanStage>(getPlanNodeId(n));
 }
 
@@ -1285,7 +1379,8 @@ std::unique_ptr<sbe::EExpression> SBENodeLowering::convertBoundsToExpr(
     return sbe::makeE<sbe::EFunction>("ks", toInlinedVector(std::move(ksFnArgs)));
 }
 
-std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const IndexScanNode& n,
+std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const ABT& abtn,
+                                                      const IndexScanNode& n,
                                                       SlotVarMap& slotMap,
                                                       boost::optional<sbe::value::SlotId>& ridSlot,
                                                       const ABT&) {
@@ -1356,7 +1451,8 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const IndexScanNode& n,
                                                  getPlanNodeId(n));
 }
 
-std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const SeekNode& n,
+std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const ABT& abtn,
+                                                      const SeekNode& n,
                                                       SlotVarMap& slotMap,
                                                       boost::optional<sbe::value::SlotId>& ridSlot,
                                                       const ABT& /*binds*/,

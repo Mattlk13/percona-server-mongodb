@@ -46,16 +46,18 @@
 #include "mongo/db/s/active_migrations_registry.h"
 #include "mongo/db/s/metrics/sharding_data_transform_cumulative_metrics.h"
 #include "mongo/db/s/range_deleter_service.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_statistics.h"
 #include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/vector_clock.h"
+#include "mongo/idl/cluster_server_parameter_server_status.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/routing_information_cache.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -63,7 +65,7 @@ namespace {
 
 class ShardingServerStatus final : public ServerStatusSection {
 public:
-    ShardingServerStatus() : ServerStatusSection("sharding") {}
+    using ServerStatusSection::ServerStatusSection;
 
     bool includeByDefault() const override {
         return serverGlobalParams.clusterRole.has(ClusterRole::ShardServer) ||
@@ -109,6 +111,8 @@ public:
             grid->getBalancerConfiguration()->getMaxChunkSizeBytes();
         result.append("maxChunkSizeInBytes", maxChunkSizeInBytes);
 
+        _clusterParameterStatus.report(opCtx, &result);
+
         // Get a migration status report if a migration is active. The call to
         // getActiveMigrationStatusReport will take an IS lock on the namespace of the active
         // migration if there is one that is active.
@@ -121,11 +125,15 @@ public:
         return result.obj();
     }
 
-} shardingServerStatus;
+private:
+    ClusterServerParameterServerStatus _clusterParameterStatus;
+};
+auto& shardingServerStatus =
+    *ServerStatusSectionBuilder<ShardingServerStatus>("sharding").forShard();
 
 class ShardingStatisticsServerStatus final : public ServerStatusSection {
 public:
-    ShardingStatisticsServerStatus() : ServerStatusSection("shardingStatistics") {}
+    using ServerStatusSection::ServerStatusSection;
 
     bool includeByDefault() const override {
         return serverGlobalParams.clusterRole.has(ClusterRole::ShardServer) ||
@@ -142,9 +150,14 @@ public:
         if (auto const shardingState = ShardingState::get(opCtx); shardingState->enabled()) {
             auto const grid = Grid::get(opCtx);
             auto const catalogCache = grid->catalogCache();
+            auto const routingInfoCache = RoutingInformationCache::get(opCtx);
 
             ShardingStatistics::get(opCtx).report(&result);
             catalogCache->report(&result);
+            if (routingInfoCache) {
+                routingInfoCache->report(&result);
+            }
+
             auto nRangeDeletions = [&]() {
                 try {
                     return RangeDeleterService::get(opCtx)->totalNumOfRegisteredTasks();
@@ -180,12 +193,14 @@ public:
 
         // The serverStatus command is run before the FCV is initialized so we ignore it when
         // checking whether the global index feature is enabled here.
-        if (gFeatureFlagGlobalIndexes.isEnabledAndIgnoreFCVUnsafeAtStartup()) {
+        if (gFeatureFlagGlobalIndexes.isEnabledUseLatestFCVWhenUninitialized(
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
             Metrics::getForGlobalIndexes(sCtx)->reportForServerStatus(bob);
         }
     }
-
-} shardingStatisticsServerStatus;
+};
+auto& shardingStatisticsServerStatus =
+    *ServerStatusSectionBuilder<ShardingStatisticsServerStatus>("shardingStatistics").forShard();
 
 }  // namespace
 }  // namespace mongo

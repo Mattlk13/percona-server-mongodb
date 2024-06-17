@@ -34,6 +34,7 @@
 #include <boost/functional/hash.hpp>
 #include <boost/optional.hpp>
 #include <climits>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -102,7 +103,7 @@ public:
         return RecordId(kMaxRepr);
     }
 
-    RecordId() : _format(Format::kNull){};
+    RecordId() : _format(Format::kNull) {}
 
     ~RecordId() {
         if (_format == Format::kBigStr) {
@@ -112,7 +113,7 @@ public:
 
     RecordId(RecordId&& other) : _format(other._format), _data(other._data) {
         other._format = kNull;
-    };
+    }
 
     RecordId(const RecordId& other) : _format(other._format), _data(other._data) {
         if (_format == Format::kBigStr) {
@@ -126,21 +127,16 @@ public:
         RecordId tmp{other};
         *this = std::move(tmp);
         return *this;
-    };
+    }
 
 
     RecordId& operator=(RecordId&& other) {
-        swap(other);
-        return *this;
-    }
-
-    void swap(RecordId& other) {
-        // We perform a byte-wise swap here to avoid concerns with the actual underlying type of the
-        // RecordId.
-        std::array<std::byte, sizeof(RecordId)> tmp;
-        std::memcpy(reinterpret_cast<void*>(tmp.data()), this, sizeof(RecordId));
+        if (_format == Format::kBigStr) {
+            HeapStr::getBufferFrom(_data).~ConstSharedBuffer();
+        }
         std::memcpy(reinterpret_cast<void*>(this), &other, sizeof(RecordId));
-        std::memcpy(reinterpret_cast<void*>(&other), tmp.data(), sizeof(RecordId));
+        other._format = kNull;
+        return *this;
     }
 
     /**
@@ -157,7 +153,7 @@ public:
      * retrieved using getStr().
      */
     explicit RecordId(const char* str, int32_t size) {
-        invariant(size > 0, "key size must be greater than 0");
+        uassert(8273007, fmt::format("key size must be greater than 0. size: {}", size), size > 0);
         uassert(
             5894900,
             fmt::format("Size of RecordId ({}) is above limit of {} bytes", size, kBigStrMaxSize),
@@ -250,11 +246,16 @@ public:
      * Returns true if this RecordId is not suitable for storage in a RecordStore.
      */
     bool isNull() const {
-        // In the the int64_t format, null can also be represented by '0'.
-        if (_format == Format::kLong) {
-            return getLong() == 0;
+        switch (_format) {
+            case Format::kNull:
+                return true;
+            case Format::kLong:
+                // In the the int64_t format, null can also be represented by '0'.
+                return getLong() == 0;
+            default:
+                return false;
         }
-        return _format == Format::kNull;
+        MONGO_UNREACHABLE;
     }
 
     /**
@@ -307,6 +308,16 @@ public:
         }
         MONGO_UNREACHABLE;
     }
+
+    std::strong_ordering operator<=>(const RecordId& rhs) const {
+        return compare(rhs) <=> 0;
+    }
+
+    bool operator==(const RecordId& rhs) const {
+        return std::is_eq(*this <=> rhs);
+    }
+
+    bool operator!=(const RecordId& rhs) const = default;
 
     size_t hash() const {
         size_t hash = 0;
@@ -591,35 +602,12 @@ class RecordIdChecks {
 };
 }  // namespace details
 
-inline bool operator==(const RecordId& lhs, const RecordId& rhs) {
-    return lhs.compare(rhs) == 0;
-}
-inline bool operator!=(const RecordId& lhs, const RecordId& rhs) {
-    return lhs.compare(rhs);
-}
-inline bool operator<(const RecordId& lhs, const RecordId& rhs) {
-    return lhs.compare(rhs) < 0;
-}
-inline bool operator<=(const RecordId& lhs, const RecordId& rhs) {
-    return lhs.compare(rhs) <= 0;
-}
-inline bool operator>(const RecordId& lhs, const RecordId& rhs) {
-    return lhs.compare(rhs) > 0;
-}
-inline bool operator>=(const RecordId& lhs, const RecordId& rhs) {
-    return lhs.compare(rhs) >= 0;
-}
-
 inline StringBuilder& operator<<(StringBuilder& stream, const RecordId& id) {
     return stream << "RecordId(" << id.toString() << ')';
 }
 
 inline std::ostream& operator<<(std::ostream& stream, const RecordId& id) {
     return stream << "RecordId(" << id.toString() << ')';
-}
-
-inline void swap(RecordId& lhs, RecordId& rhs) {
-    lhs.swap(rhs);
 }
 
 }  // namespace mongo

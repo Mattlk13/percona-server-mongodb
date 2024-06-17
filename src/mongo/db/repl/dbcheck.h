@@ -42,6 +42,7 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/health_log_gen.h"
+#include "mongo/db/catalog/throttle_cursor.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
@@ -105,7 +106,8 @@ std::unique_ptr<HealthLogEntry> dbCheckWarningHealthLogEntry(
     const std::string& msg,
     ScopeEnum scope,
     OplogEntriesEnum operation,
-    const Status& err);
+    const Status& err,
+    const BSONObj& context = BSONObj());
 /**
  * Get a HealthLogEntry for a dbCheck batch.
  */
@@ -119,10 +121,54 @@ std::unique_ptr<HealthLogEntry> dbCheckBatchEntry(
     const std::string& foundHash,
     const BSONObj& minKey,
     const BSONObj& maxKey,
+    int64_t nConsecutiveIdenticalIndexKeysAtEnd,
     const boost::optional<Timestamp>& timestamp,
     const repl::OpTime& optime,
-    const boost::optional<CollectionOptions>& options = boost::none);
+    const boost::optional<CollectionOptions>& options = boost::none,
+    const boost::optional<BSONObj>& indexSpec = boost::none);
 
+
+struct ReadSourceWithTimestamp {
+    RecoveryUnit::ReadSource readSource;
+    boost::optional<Timestamp> timestamp = boost::none;
+};
+
+/**
+ * Helper that takes in a keystring with a recordId appended at the end, and returns the size
+ * of the keystring itself (without recordId appended).
+ */
+size_t getKeyStringSizeWithoutRecordId(const Collection* collection,
+                                       const key_string::Value& keyString);
+
+/**
+ * Helper for converting a keystring to its BSON format. Converting a keystring to BSON will remove
+ * the RecordId, as BSON objects cannot store the RecordId. As a result, if you then convert the
+ * BSON back to keystring format, that keystring will not have a RecordId.
+ */
+BSONObj _keyStringToBsonSafeHelper(const key_string::Value& keyString, const Ordering& ordering);
+
+/**
+ * DbCheckAcquisition is a helper class to acquire locks and set RecoveryUnit state for the dbCheck
+ * operation.
+ */
+class DbCheckAcquisition {
+public:
+    explicit DbCheckAcquisition(OperationContext* opCtx,
+                                const NamespaceString& nss,
+                                ReadSourceWithTimestamp readSource,
+                                PrepareConflictBehavior prepareConflictBehavior);
+
+    ~DbCheckAcquisition();
+
+private:
+    OperationContext* _opCtx;
+
+public:
+    const ReadSourceScope readSourceScope;
+    const PrepareConflictBehavior prevPrepareConflictBehavior;
+    const DataCorruptionDetectionMode prevDataCorruptionMode;
+    const CollectionAcquisition coll;
+};
 
 /**
  * Hashing collections or indexes.
@@ -148,15 +194,16 @@ public:
      * @param maxBytes The maximum number of bytes to hash.
      */
     DbCheckHasher(OperationContext* opCtx,
-                  const CollectionPtr& collection,
+                  const DbCheckAcquisition& acquisition,
                   const BSONObj& start,
                   const BSONObj& end,
                   boost::optional<SecondaryIndexCheckParameters> secondaryIndexCheckParameters,
+                  DataThrottle* dataThrottle,
                   boost::optional<StringData> indexName = boost::none,
                   int64_t maxCount = std::numeric_limits<int64_t>::max(),
                   int64_t maxBytes = std::numeric_limits<int64_t>::max());
 
-    ~DbCheckHasher();
+    ~DbCheckHasher() = default;
 
     /**
      * Hashes all documents up to the deadline.
@@ -166,13 +213,15 @@ public:
                                   Date_t deadline = Date_t::max());
 
     /**
-     * Hash index keys up to the deadline.
+     * Hash index keys between first and last inclusive.
+     * If nConsecutiveIdenticalKeysAtEnd > 1, this means that the last keystring is in a series
+     * of consecutive identical keys, and we should only hash nConsecutiveIdenticalKeysAtEnd of
+     * those.
      */
     Status hashForExtraIndexKeysCheck(OperationContext* opCtx,
                                       const Collection* collection,
-                                      const key_string::Value& first,
-                                      const key_string::Value& last,
-                                      Date_t deadline = Date_t::max());
+                                      const BSONObj& firstBson,
+                                      const BSONObj& lastBson);
 
     /**
      * Checks if a document has missing index keys by finding the index keys that should be
@@ -193,40 +242,50 @@ public:
      *
      * Again, not the same as the `end` passed in; this is MinKey if no items have been hashed.
      */
-    BSONObj lastKey(void) const;
+    BSONObj lastKeySeen(void) const;
 
     int64_t bytesSeen(void) const;
 
     int64_t docsSeen(void) const;
 
+    int64_t keysSeen(void) const;
+
+    int64_t countSeen(void) const;
+
+    int64_t nConsecutiveIdenticalIndexKeysSeenAtEnd(void) const;
+
 private:
     /**
-     * Checks if we can hash `obj` without going over our limits.
+     * Checks if we can hash `obj` without going over our limits for collection check.
      */
-    bool _canHash(const BSONObj& obj);
+    bool _canHashForCollectionCheck(const BSONObj& obj);
 
     OperationContext* _opCtx;
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> _exec;
     md5_state_t _state;
 
     BSONObj _maxKey;
-    BSONObj _last = kMinBSONKey;
+    BSONObj _lastKeySeen = kMinBSONKey;
 
     boost::optional<StringData> _indexName;
 
+    // Represents the max number of docs or keys seen, which varies based on the validation mode:
+    //  - "dataConsistency": _countDocsSeen <= _maxCount
+    //  - "dataConsistencyAndMissingIndexKeysCheck": (_countDocsSeen + _countKeysSeen) <= _maxCount
+    //  - "extraIndexKeysCheck": _countKeysSeen <= _maxCount
     int64_t _maxCount = 0;
-    int64_t _countSeen = 0;
+    int64_t _countDocsSeen = 0;
+    int64_t _countKeysSeen = 0;
 
     int64_t _maxBytes = 0;
     int64_t _bytesSeen = 0;
-
-    DataCorruptionDetectionMode _previousDataCorruptionMode;
-    PrepareConflictBehavior _previousPrepareConflictBehavior;
+    int64_t _nConsecutiveIdenticalIndexKeysSeenAtEnd = 0;
 
     std::vector<const IndexCatalogEntry*> _indexes;
     std::vector<BSONObj> _missingIndexKeys;
 
     boost::optional<SecondaryIndexCheckParameters> _secondaryIndexCheckParameters;
+    DataThrottle* _dataThrottle;
 };
 
 namespace repl {

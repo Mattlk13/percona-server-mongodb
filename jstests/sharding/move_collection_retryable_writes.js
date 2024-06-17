@@ -5,11 +5,12 @@
  * @tags: [
  *  uses_atclustertime,
  *  featureFlagRecoverableShardsvrReshardCollectionCoordinator,
- *  requires_fcv_72,
+ *  requires_fcv_80,
  *  featureFlagReshardingImprovements,
  *  featureFlagMoveCollection,
- *  featureFlagTrackUnshardedCollectionsOnShardingCatalog,
+ *  # TODO (SERVER-87812) Remove multiversion_incompatible tag
  *  multiversion_incompatible,
+ *  temp_disabled_embedded_router_uncategorized,
  * ]
  */
 

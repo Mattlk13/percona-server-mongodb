@@ -63,7 +63,6 @@
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/delayable_timeout_callback.h"
 #include "mongo/db/repl/heartbeat_response_action.h"
@@ -89,6 +88,7 @@
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/session/kill_sessions_local.h"
 #include "mongo/db/storage/control/journal_flusher.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/logv2/log.h"
@@ -996,7 +996,7 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigFinish(
 
         lk.lock();
         if (_topCoord->isSteppingDownUnconditionally()) {
-            invariant(opCtx->lockState()->isRSTLExclusive());
+            invariant(shard_role_details::getLocker(opCtx.get())->isRSTLExclusive());
             LOGV2(21481,
                   "Stepping down from primary, because we received a new config via heartbeat");
             // We need to release the mutex before yielding locks for prepared transactions, which

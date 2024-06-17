@@ -42,6 +42,7 @@
 #include "mongo/db/s/balancer/balancer_chunk_selection_policy.h"
 #include "mongo/db/s/balancer/balancer_policy.h"
 #include "mongo/db/s/balancer/cluster_statistics.h"
+#include "mongo/db/s/balancer/move_unsharded_policy.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
@@ -84,7 +85,7 @@ public:
     static Balancer* get(OperationContext* operationContext);
 
     Balancer();
-    ~Balancer();
+    ~Balancer() override;
 
     /**
      * Invoked when the config server primary enters the 'PRIMARY' state and is invoked while the
@@ -186,6 +187,12 @@ private:
         Terminating,
     };
 
+    struct MigrationStats {
+        int unshardedCollections{0};
+        int rebalancedChunks{0};
+        int defragmentedChunks{0};
+    };
+
     /**
      * ReplicaSetAwareService entry points.
      */
@@ -198,7 +205,7 @@ private:
     void onStepUpComplete(OperationContext* opCtx, long long term) final;
     void onStepDown() final;
     void onBecomeArbiter() final;
-    inline std::string getServiceName() const override final {
+    inline std::string getServiceName() const final {
         return "Balancer";
     }
 
@@ -245,9 +252,10 @@ private:
      * Schedules migrations for the specified set of chunks and returns how many chunks were
      * successfully processed.
      */
-    int _moveChunks(OperationContext* opCtx,
-                    const MigrateInfoVector& chunksToRebalance,
-                    const MigrateInfoVector& chunksToDefragment);
+    MigrationStats _doMigrations(OperationContext* opCtx,
+                                 const MigrateInfoVector& unshardedToMove,
+                                 const MigrateInfoVector& chunksToRebalance,
+                                 const MigrateInfoVector& chunksToDefragment);
 
     void _onActionsStreamPolicyStateUpdate();
 
@@ -293,8 +301,8 @@ private:
 
     stdx::condition_variable _actionStreamCondVar;
 
-    // Number of moved chunks in last round
-    int _balancedLastTime;
+    // Number of migrations in last round
+    MigrationStats _balancedLastTime;
 
     // Source for cluster statistics. Depends on the source of randomness above so it should be
     // created after it and destroyed before it.
@@ -310,7 +318,9 @@ private:
 
     std::unique_ptr<AutoMergerPolicy> _autoMergerPolicy;
 
-    std::unique_ptr<stdx::unordered_set<NamespaceString>> _imbalancedCollectionsCache;
+    std::unique_ptr<MoveUnshardedPolicy> _moveUnshardedPolicy;
+
+    stdx::unordered_set<NamespaceString> _imbalancedCollectionsCache;
 };
 
 }  // namespace mongo

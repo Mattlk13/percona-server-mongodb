@@ -63,6 +63,12 @@ class FixtureLib:
         return core.programs.mongos_program(logger, job_num, executable, process_kwargs,
                                             mongos_options)
 
+    def mongot_program(self, logger, job_num, executable=None, process_kwargs=None,
+                       mongot_options=None):
+        """Return a Process instance that starts a mongot with arguments constructed from 'kwargs'."""
+        return core.programs.mongot_program(logger, job_num, executable, process_kwargs,
+                                            mongot_options)
+
     def generic_program(self, logger, args, process_kwargs=None, **kwargs):
         """Return a Process instance that starts an arbitrary executable.
 
@@ -144,11 +150,17 @@ class _FixtureConfig(object):
         self.WT_INDEX_CONFIG = config.WT_INDEX_CONFIG
         self.MIXED_BIN_VERSIONS = config.MIXED_BIN_VERSIONS
         self.LINEAR_CHAIN = config.LINEAR_CHAIN
+        self.TLS_MODE = config.TLS_MODE
+        self.TLS_CA_FILE = config.TLS_CA_FILE
+        self.SHELL_GRPC = config.SHELL_GRPC
+        self.SHELL_TLS_CERTIFICATE_KEY_FILE = config.SHELL_TLS_CERTIFICATE_KEY_FILE
         self.NUM_REPLSET_NODES = config.NUM_REPLSET_NODES
         self.NUM_SHARDS = config.NUM_SHARDS
         self.DEFAULT_MONGOS_EXECUTABLE = config.DEFAULT_MONGOS_EXECUTABLE
         self.MONGOS_EXECUTABLE = config.MONGOS_EXECUTABLE
         self.MONGOS_SET_PARAMETERS = config.MONGOS_SET_PARAMETERS
+        self.DEFAULT_MONGOT_EXECUTABLE = config.DEFAULT_MONGOT_EXECUTABLE
+        self.MONGOT_EXECUTABLE = config.MONGOT_EXECUTABLE
         self.DBPATH_PREFIX = config.DBPATH_PREFIX
         self.DEFAULT_DBPATH_PREFIX = config.DEFAULT_DBPATH_PREFIX
         self.DOCKER_COMPOSE_BUILD_IMAGES = config.DOCKER_COMPOSE_BUILD_IMAGES

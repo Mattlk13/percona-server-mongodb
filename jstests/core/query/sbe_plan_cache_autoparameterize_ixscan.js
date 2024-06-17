@@ -3,26 +3,22 @@
  * that they can be correctly recovered from the cache with new parameter values.
  *
  * @tags: [
- *   not_allowed_with_security_token,
+ *   not_allowed_with_signed_security_token,
  *   assumes_read_concern_unchanged,
  *   assumes_read_preference_unchanged,
  *   assumes_unsharded_collection,
  *   does_not_support_stepdowns,
  *   # The SBE plan cache was enabled by default in 6.3.
  *   requires_fcv_63,
- *   # Plan cache state is node-local and will not get migrated alongside tenant data.
+ *   # Plan cache state is node-local and will not get migrated alongside user data.
  *   tenant_migration_incompatible,
+ *   assumes_balancer_off,
+ *   # This test is specifically verifying the behavior of the SBE plan cache, which is only enabled
+ *   # when SBE is enabled.
+ *   featureFlagSbeFull,
  * ]
  */
 import {getPlanCacheKeyFromExplain, getQueryHashFromExplain} from "jstests/libs/analyze_plan.js";
-import {checkSBEEnabled} from "jstests/libs/sbe_util.js";
-
-// This test is specifically verifying the behavior of the SBE plan cache, which is only enabled
-// when SBE is enabled.
-if (!checkSBEEnabled(db)) {
-    jsTestLog("Skipping test because SBE is not enabled");
-    quit();
-}
 
 const coll = db[jsTestName()];
 coll.drop();
@@ -65,11 +61,11 @@ assert.eq(1, coll.getPlanCache().list().length, cacheEntries);
 const explain = coll.find(filter2).sort(sortPattern).explain();
 const planCacheKey = cacheEntry.planCacheKey;
 assert.neq(null, planCacheKey, cacheEntry);
-assert.eq(planCacheKey, getPlanCacheKeyFromExplain(explain, db), explain);
+assert.eq(planCacheKey, getPlanCacheKeyFromExplain(explain), explain);
 
 const queryHash = cacheEntry.queryHash;
 assert.neq(null, queryHash, cacheEntry);
-assert.eq(queryHash, getQueryHashFromExplain(explain, db), explain);
+assert.eq(queryHash, getQueryHashFromExplain(explain), explain);
 
 // Clear the plan cache, and run 'filter2' again. This time, verify that we create a cache entry
 // with the same planCacheKey and queryHash as before.
@@ -84,3 +80,38 @@ assert.eq(newCacheEntry.queryHash, queryHash, newCacheEntry);
 
 // The query should also return the same results as before.
 assert.eq(results, cacheResults);
+
+// Test that Infinity value in a filter should not be parameterized.
+// These two queries have the same query shape but should not have a same plan cache key because
+// the filter with a infinity value should not be eligible for auto-parameterization.
+const filterWithInf = {
+    "a": {$not: {$gt: NumberDecimal("Infinity")}}
+};
+const filterWithVeryLargeValue = {
+    "a": {$not: {$gt: NumberDecimal("9.999999999999999999999999999999999E+6144")}}
+};
+
+assert.neq(
+    getPlanCacheKeyFromExplain(coll.explain().aggregate([{$match: filterWithInf}])),
+    getPlanCacheKeyFromExplain(coll.explain().aggregate([{$match: filterWithVeryLargeValue}])));
+
+// Auto-parameterization should still apply if no infinity value is involved.
+assert.eq(
+    getPlanCacheKeyFromExplain(coll.explain().aggregate([{$match: {"a": {$not: {$gt: 1}}}}])),
+    getPlanCacheKeyFromExplain(coll.explain().aggregate([{$match: filterWithVeryLargeValue}])));
+
+const singleElemIn = {
+    "a": {$in: [1]}
+};
+const multipleElemsIn = {
+    "a": {$in: [1, 2]}
+};
+const multipleElemsIn2 = {
+    "a": {$in: [3, 4]}
+};
+assert.neq(getPlanCacheKeyFromExplain(coll.explain().aggregate([{$match: singleElemIn}])),
+           getPlanCacheKeyFromExplain(coll.explain().aggregate([{$match: multipleElemsIn}])));
+
+// Auto-parameterization should still apply if there's no single-element $in query.
+assert.eq(getPlanCacheKeyFromExplain(coll.explain().aggregate([{$match: multipleElemsIn}])),
+          getPlanCacheKeyFromExplain(coll.explain().aggregate([{$match: multipleElemsIn2}])));

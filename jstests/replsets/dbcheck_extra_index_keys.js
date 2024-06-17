@@ -6,13 +6,20 @@
  *   featureFlagSecondaryIndexChecksInDbCheck
  * ]
  */
-import {configureFailPoint, kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
 import {
-    awaitDbCheckCompletion,
+    assertCompleteCoverage,
     checkHealthLog,
+    checkNumSnapshots,
+    defaultSnapshotSize,
+    logQueries,
     resetAndInsert,
-    runDbCheck
+    resetAndInsertTwoFields,
+    resetSnapshotSize,
+    runDbCheck,
+    setSnapshotSize,
 } from "jstests/replsets/libs/dbcheck_utils.js";
+
 (function() {
 "use strict";
 
@@ -22,37 +29,6 @@ TestData.skipCheckDBHashes = true;
 
 const dbName = "dbCheckExtraIndexKeys";
 const collName = "dbCheckExtraIndexKeysColl";
-
-const allErrorsOrWarningsQuery = {
-    $or: [{"severity": "warning"}, {"severity": "error"}]
-};
-const recordNotFoundQuery = {
-    "severity": "error",
-    "msg": "found extra index key entry without corresponding document"
-};
-const recordDoesNotMatchQuery = {
-    "severity": "error",
-    "msg":
-        "found index key entry with corresponding document/keystring set that does not contain the expected key string"
-};
-const collNotFoundWarningQuery = {
-    severity: "warning",
-    "msg": "abandoning dbCheck extra index keys check because collection no longer exists"
-};
-const indexNotFoundWarningQuery = {
-    severity: "warning",
-    "msg": "abandoning dbCheck extra index keys check because index no longer exists"
-};
-const warningQuery = {
-    "severity": "warning"
-};
-const infoOrErrorQuery = {
-    $or: [{"severity": "info", "operation": "dbCheckBatch"}, {"severity": "error"}]
-};
-const infoBatchQuery = {
-    "severity": "info",
-    "operation": "dbCheckBatch"
-}
 
 const replSet = new ReplSetTest({
     name: jsTestName(),
@@ -72,24 +48,18 @@ const secondaryHealthLog = secondary.getDB("local").system.healthlog;
 const primaryDB = primary.getDB(dbName);
 const secondaryDB = secondary.getDB(dbName);
 assert.commandWorked(primaryDB.createCollection(collName));
-const defaultNumDocs = 1000;
 const defaultMaxDocsPerBatch = 100;
-const defaultSnapshotSize = 1000;
 const writeConcern = {
     w: 'majority'
 };
 
 const debugBuild = primaryDB.adminCommand('buildInfo').debug;
 
-function setSnapshotSize(snapshotSize) {
-    assert.commandWorked(primaryDB.adminCommand(
-        {"setParameter": 1, "dbCheckMaxExtraIndexKeysReverseLookupPerSnapshot": snapshotSize}));
-    assert.commandWorked(secondaryDB.adminCommand(
-        {"setParameter": 1, "dbCheckMaxExtraIndexKeysReverseLookupPerSnapshot": snapshotSize}));
-}
-function resetSnapshotSize() {
-    setSnapshotSize(defaultSnapshotSize);
-}
+assert.commandWorked(primaryDB.adminCommand({
+    setParameter: 1,
+    maxDbCheckMBperSec:
+        0 /* Turn off throttling because stalls and pauses sometimes break this test */
+}));
 
 function getNumDocsChecked(nDocsInserted, start, end) {
     let actualNumDocs = nDocsInserted;
@@ -104,12 +74,12 @@ function getNumDocsChecked(nDocsInserted, start, end) {
 }
 
 function checkNumBatchesAndSnapshots(
-    healthLog, nDocs, batchSize, snapshotSize, inconsistentBatch = false) {
-    const expectedNumBatches = Math.ceil(nDocs / batchSize);
+    healthLog, nDocsChecked, batchSize, snapshotSize, inconsistentBatch = false) {
+    const expectedNumBatches = Math.ceil(nDocsChecked / batchSize);
 
-    let query = infoBatchQuery;
+    let query = logQueries.infoBatchQuery;
     if (inconsistentBatch) {
-        query = {"severity": "error", "msg": "dbCheck batch inconsistent"};
+        query = logQueries.inconsistentBatchQuery;
     }
 
     checkHealthLog(healthLog, query, expectedNumBatches);
@@ -118,418 +88,31 @@ function checkNumBatchesAndSnapshots(
         let expectedNumSnapshots = expectedNumBatches;
         if (snapshotSize < batchSize) {
             const snapshotsPerBatch = Math.ceil(batchSize / snapshotSize);
-            const lastBatchSize = nDocs % batchSize == 0 ? batchSize : nDocs % batchSize;
+            const lastBatchSize =
+                nDocsChecked % batchSize == 0 ? batchSize : nDocsChecked % batchSize;
             const lastBatchSnapshots = Math.ceil(lastBatchSize / snapshotSize);
 
             expectedNumSnapshots =
                 ((expectedNumBatches - 1) * snapshotsPerBatch) + lastBatchSnapshots;
         }
-        const actualNumSnapshots =
-            rawMongoProgramOutput()
-                .split(/7844808.*Catalog snapshot for extra index keys check ending/)
-                .length -
-            1;
-        assert.eq(actualNumSnapshots,
-                  expectedNumSnapshots,
-                  "expected " + expectedNumSnapshots +
-                      " catalog snapshots during extra index keys check, found " +
-                      actualNumSnapshots);
+        checkNumSnapshots(debugBuild, expectedNumSnapshots);
     }
-}
-
-function collNotFoundBeforeDbCheck() {
-    jsTestLog(
-        "Testing that an collection that doesn't exist before dbcheck will generate a health log entry");
-
-    resetAndInsert(replSet, primaryDB, collName, defaultNumDocs);
-
-    const hangBeforeExtraIndexKeysCheck =
-        configureFailPoint(primaryDB, "hangBeforeExtraIndexKeysCheck");
-
-    let dbCheckParameters = {
-        validateMode: "extraIndexKeysCheck",
-        secondaryIndex: "a_1",
-        maxDocsPerBatch: defaultMaxDocsPerBatch,
-        batchWriteConcern: writeConcern
-    };
-    runDbCheck(replSet, primaryDB, collName, dbCheckParameters);
-
-    hangBeforeExtraIndexKeysCheck.wait();
-
-    assert.commandWorked(primaryDB.runCommand({drop: collName}));
-    replSet.awaitReplication();
-
-    hangBeforeExtraIndexKeysCheck.off();
-    awaitDbCheckCompletion(replSet, primaryDB);
-    checkHealthLog(primaryHealthLog, collNotFoundWarningQuery, 1);
-    // If index not found before db check, we won't create any oplog entry.
-    checkHealthLog(secondaryHealthLog, warningQuery, 0);
-
-    // No other info or error logs.
-    checkHealthLog(primaryHealthLog, infoOrErrorQuery, 0);
-    checkHealthLog(secondaryHealthLog, infoOrErrorQuery, 0);
-}
-
-function indexNotFoundBeforeDbCheck() {
-    jsTestLog(
-        "Testing that an index that doesn't exist before dbcheck will generate a health log entry");
-
-    resetAndInsert(replSet, primaryDB, collName, defaultNumDocs);
-    let dbCheckParameters = {
-        validateMode: "extraIndexKeysCheck",
-        secondaryIndex: "a_1",
-        maxDocsPerBatch: defaultMaxDocsPerBatch,
-        batchWriteConcern: writeConcern
-    };
-    runDbCheck(replSet, primaryDB, collName, dbCheckParameters, true /*awaitCompletion*/);
-
-    checkHealthLog(primaryHealthLog, indexNotFoundWarningQuery, 1);
-    // If index not found before db check, we won't create any oplog entry.
-    checkHealthLog(secondaryHealthLog, warningQuery, 0);
-
-    // No other info or error logs.
-    checkHealthLog(primaryHealthLog, infoOrErrorQuery, 0);
-    checkHealthLog(secondaryHealthLog, infoOrErrorQuery, 0);
-}
-
-function collNotFoundDuringReverseLookup() {
-    jsTestLog(
-        "Testing that a collection that doesn't exist during reverse lookup will generate a health log entry");
-
-    resetAndInsert(replSet, primaryDB, collName, defaultNumDocs);
-    assert.commandWorked(primaryDB.runCommand({
-        createIndexes: collName,
-        indexes: [{key: {a: 1}, name: 'a_1'}],
-    }));
-    replSet.awaitReplication();
-
-    const hangBeforeReverseLookupCatalogSnapshot =
-        configureFailPoint(primaryDB, "hangBeforeReverseLookupCatalogSnapshot");
-
-    let dbCheckParameters = {
-        validateMode: "extraIndexKeysCheck",
-        secondaryIndex: "a_1",
-        maxDocsPerBatch: defaultMaxDocsPerBatch,
-        batchWriteConcern: writeConcern
-    };
-    runDbCheck(replSet, primaryDB, collName, dbCheckParameters);
-
-    hangBeforeReverseLookupCatalogSnapshot.wait();
-
-    assert.commandWorked(primaryDB.runCommand({drop: collName}));
-    replSet.awaitReplication();
-
-    hangBeforeReverseLookupCatalogSnapshot.off();
-
-    awaitDbCheckCompletion(replSet, primaryDB);
-    jsTestLog("checking primary health log");
-    checkHealthLog(primaryHealthLog, collNotFoundWarningQuery, 1);
-    // If index not found during reverse lookup, we won't create any oplog entry for that batch.
-    jsTestLog("checking secondary health log");
-    checkHealthLog(secondaryHealthLog, warningQuery, 0);
-
-    checkHealthLog(primaryHealthLog, infoOrErrorQuery, 0);
-    checkHealthLog(secondaryHealthLog, infoOrErrorQuery, 0);
-}
-
-function indexNotFoundDuringReverseLookup() {
-    jsTestLog(
-        "Testing that an index that doesn't exist during reverse lookup will generate a health log entry");
-
-    resetAndInsert(replSet, primaryDB, collName, defaultNumDocs);
-    assert.commandWorked(primaryDB.runCommand({
-        createIndexes: collName,
-        indexes: [{key: {a: 1}, name: 'a_1'}],
-    }));
-    replSet.awaitReplication();
-
-    const hangBeforeReverseLookupCatalogSnapshot =
-        configureFailPoint(primaryDB, "hangBeforeReverseLookupCatalogSnapshot");
-
-    let dbCheckParameters = {
-        validateMode: "extraIndexKeysCheck",
-        secondaryIndex: "a_1",
-        maxDocsPerBatch: defaultMaxDocsPerBatch,
-        batchWriteConcern: writeConcern
-    };
-    runDbCheck(replSet, primaryDB, collName, dbCheckParameters);
-
-    hangBeforeReverseLookupCatalogSnapshot.wait();
-
-    assert.commandWorked(primaryDB.runCommand({dropIndexes: collName, index: "a_1"}));
-
-    hangBeforeReverseLookupCatalogSnapshot.off();
-
-    awaitDbCheckCompletion(replSet, primaryDB);
-    jsTestLog("checking primary health log");
-    checkHealthLog(primaryHealthLog, indexNotFoundWarningQuery, 1);
-    // If index not found during reverse lookup, we won't create any oplog entry for that batch.
-    jsTestLog("checking secondary health log");
-    checkHealthLog(secondaryHealthLog, warningQuery, 0);
-
-    checkHealthLog(primaryHealthLog, infoOrErrorQuery, 0);
-    checkHealthLog(secondaryHealthLog, infoOrErrorQuery, 0);
-}
-
-function collNotFoundDuringHashing() {
-    jsTestLog(
-        "Testing that a collection that doesn't exist during hashing will generate a health log entry");
-
-    resetAndInsert(replSet, primaryDB, collName, defaultNumDocs);
-    assert.commandWorked(primaryDB.runCommand({
-        createIndexes: collName,
-        indexes: [{key: {a: 1}, name: 'a_1'}],
-    }));
-    replSet.awaitReplication();
-
-    const hangBeforeExtraIndexKeysHashing =
-        configureFailPoint(primaryDB, "hangBeforeExtraIndexKeysHashing");
-
-    let dbCheckParameters = {
-        validateMode: "extraIndexKeysCheck",
-        secondaryIndex: "a_1",
-        maxDocsPerBatch: defaultMaxDocsPerBatch,
-        batchWriteConcern: writeConcern
-    };
-    runDbCheck(replSet, primaryDB, collName, dbCheckParameters);
-
-    hangBeforeExtraIndexKeysHashing.wait();
-
-    assert.commandWorked(primaryDB.runCommand({drop: collName}));
-    replSet.awaitReplication();
-
-    hangBeforeExtraIndexKeysHashing.off();
-
-    awaitDbCheckCompletion(replSet, primaryDB);
-
-    jsTestLog("checking primary health log");
-    checkHealthLog(primaryHealthLog, collNotFoundWarningQuery, 1);
-    // If index not found during hashing, we won't create any oplog entry for that batch.
-    jsTestLog("checking secondary health log");
-    checkHealthLog(secondaryHealthLog, warningQuery, 0);
-
-    checkHealthLog(primaryHealthLog, infoOrErrorQuery, 0);
-    checkHealthLog(secondaryHealthLog, infoOrErrorQuery, 0);
-}
-
-function indexNotFoundDuringHashing() {
-    jsTestLog(
-        "Testing that an index that doesn't exist during hashing will generate a health log entry");
-
-    resetAndInsert(replSet, primaryDB, collName, defaultNumDocs);
-    assert.commandWorked(primaryDB.runCommand({
-        createIndexes: collName,
-        indexes: [{key: {a: 1}, name: 'a_1'}],
-    }));
-    replSet.awaitReplication();
-
-    const hangBeforeExtraIndexKeysHashing =
-        configureFailPoint(primaryDB, "hangBeforeExtraIndexKeysHashing");
-
-    let dbCheckParameters = {
-        validateMode: "extraIndexKeysCheck",
-        secondaryIndex: "a_1",
-        maxDocsPerBatch: defaultMaxDocsPerBatch,
-        batchWriteConcern: writeConcern
-    };
-    runDbCheck(replSet, primaryDB, collName, dbCheckParameters);
-
-    hangBeforeExtraIndexKeysHashing.wait();
-
-    assert.commandWorked(primaryDB.runCommand({dropIndexes: collName, index: "a_1"}));
-
-    hangBeforeExtraIndexKeysHashing.off();
-
-    awaitDbCheckCompletion(replSet, primaryDB);
-    jsTestLog("checking primary health log");
-    checkHealthLog(primaryHealthLog, indexNotFoundWarningQuery, 1);
-    // If index not found during hashing, we won't create any oplog entry for that batch.
-    jsTestLog("checking secondary health log");
-    checkHealthLog(secondaryHealthLog, warningQuery, 0);
-
-    checkHealthLog(primaryHealthLog, infoOrErrorQuery, 0);
-    checkHealthLog(secondaryHealthLog, infoOrErrorQuery, 0);
-}
-
-function keysChangedBeforeHashing() {
-    jsTestLog(
-        "Testing that if keys within batch boundaries change in between reverse lookup and hashing we won't error.");
-
-    resetAndInsert(replSet, primaryDB, collName, 10);
-    const primaryColl = primaryDB.getCollection(collName);
-    primaryColl.deleteOne({a: 3});
-
-    assert.commandWorked(primaryDB.runCommand({
-        createIndexes: collName,
-        indexes: [{key: {a: 1}, name: 'a_1'}],
-    }));
-    replSet.awaitReplication();
-
-    const hangBeforeExtraIndexKeysHashing =
-        configureFailPoint(primaryDB, "hangBeforeExtraIndexKeysHashing");
-
-    // First batch should 0, 1, 2, 4, 5. Batch boundaries will be [0, 5].
-    let dbCheckParameters = {
-        validateMode: "extraIndexKeysCheck",
-        secondaryIndex: "a_1",
-        maxDocsPerBatch: 5,
-        batchWriteConcern: writeConcern
-    };
-    runDbCheck(replSet, primaryDB, collName, dbCheckParameters);
-
-    hangBeforeExtraIndexKeysHashing.wait();
-
-    // Actual batch will be 1, 2, 3, 4.
-    primaryColl.deleteOne({a: 0});
-    primaryColl.insertOne({a: 3});
-    primaryColl.deleteOne({a: 5});
-
-    hangBeforeExtraIndexKeysHashing.off();
-
-    awaitDbCheckCompletion(replSet, primaryDB);
-
-    checkHealthLog(primaryHealthLog, allErrorsOrWarningsQuery, 0);
-    checkHealthLog(secondaryHealthLog, allErrorsOrWarningsQuery, 0);
-
-    jsTestLog("Checking for correct number of batches on primary");
-    checkHealthLog(primaryHealthLog, infoBatchQuery, 2);
-    jsTestLog("Checking for correct number of batches on secondary");
-    checkHealthLog(secondaryHealthLog, infoBatchQuery, 2);
-}
-
-function allIndexKeysNotFoundDuringReverseLookup(nDocs) {
-    clearRawMongoProgramOutput();
-    jsTestLog(
-        "Testing that if all the index keys are deleted during reverse lookup we log a warning and exit dbcheck");
-
-    resetAndInsert(replSet, primaryDB, collName, nDocs);
-    const primaryColl = primaryDB.getCollection(collName);
-    assert.commandWorked(primaryDB.runCommand({
-        createIndexes: collName,
-        indexes: [{key: {a: 1}, name: 'a_1'}],
-    }));
-    replSet.awaitReplication();
-
-    const hangAfterReverseLookupCatalogSnapshot =
-        configureFailPoint(primaryDB, "hangAfterReverseLookupCatalogSnapshot");
-
-    // Batch size 1.
-    let dbCheckParameters = {
-        validateMode: "extraIndexKeysCheck",
-        secondaryIndex: "a_1",
-        maxDocsPerBatch: 1,
-        batchWriteConcern: writeConcern
-    };
-    runDbCheck(replSet, primaryDB, collName, dbCheckParameters);
-
-    hangAfterReverseLookupCatalogSnapshot.wait();
-
-    jsTestLog("Removing all docs");
-    assert.commandWorked(primaryColl.deleteMany({}));
-    replSet.awaitReplication();
-    assert.eq(primaryColl.find({}).count(), 0);
-
-    hangAfterReverseLookupCatalogSnapshot.off();
-
-    awaitDbCheckCompletion(replSet, primaryDB);
-    let query = {
-        severity: "warning",
-        "msg":
-            "abandoning dbCheck extra index keys check because there are no keys left in the index"
-    };
-    checkHealthLog(primaryHealthLog, query, 1);
-    // If all index keys are deleted during reverse lookup, we won't create any oplog entry.
-    checkHealthLog(secondaryHealthLog, query, 0);
-
-    checkHealthLog(primaryHealthLog, infoBatchQuery, 1);
-    checkHealthLog(secondaryHealthLog, infoBatchQuery, 1);
-
-    // Only the one warning entry.
-    checkHealthLog(primaryHealthLog, allErrorsOrWarningsQuery, 1);
-    checkHealthLog(secondaryHealthLog, allErrorsOrWarningsQuery, 0);
-
-    if (debugBuild) {
-        assert(rawMongoProgramOutput().match(/7844803.*could not find any keys in index/),
-               "expected 'could not find any keys in index' log");
-    }
-}
-
-function keyNotFoundDuringReverseLookup(nDocs) {
-    clearRawMongoProgramOutput();
-    jsTestLog("Testing that if a key is deleted during reverse lookup we continue with db check");
-
-    resetAndInsert(replSet, primaryDB, collName, nDocs);
-    const primaryColl = primaryDB.getCollection(collName);
-    assert.commandWorked(primaryDB.runCommand({
-        createIndexes: collName,
-        indexes: [{key: {a: 1}, name: 'a_1'}],
-    }));
-    replSet.awaitReplication();
-
-    const hangAfterReverseLookupCatalogSnapshot =
-        configureFailPoint(primaryDB, "hangAfterReverseLookupCatalogSnapshot");
-
-    // Batch size 1.
-    let dbCheckParameters = {
-        validateMode: "extraIndexKeysCheck",
-        secondaryIndex: "a_1",
-        maxDocsPerBatch: 1,
-        batchWriteConcern: writeConcern
-    };
-    runDbCheck(replSet, primaryDB, collName, dbCheckParameters);
-
-    hangAfterReverseLookupCatalogSnapshot.wait();
-    jsTestLog("Removing one doc");
-    assert.commandWorked(primaryColl.deleteOne({"a": 1}));
-    replSet.awaitReplication();
-    assert.eq(primaryColl.find({}).count(), nDocs - 1);
-
-    // TODO SERVER-80257: Replace using this failpoint with test commands instead.
-    const skipUpdatingIndexDocumentPrimary =
-        configureFailPoint(primaryDB, "skipUpdatingIndexDocument", {indexName: "a_1"});
-    const skipUpdatingIndexDocumentSecondary =
-        configureFailPoint(secondaryDB, "skipUpdatingIndexDocument", {indexName: "a_1"});
-
-    jsTestLog("Updating docs to remove index key field");
-    assert.commandWorked(primaryColl.updateMany({}, {$unset: {"a": ""}}));
-    replSet.awaitReplication();
-    assert.eq(primaryColl.find({a: {$exists: true}}).count(), 0);
-
-    hangAfterReverseLookupCatalogSnapshot.off();
-
-    awaitDbCheckCompletion(replSet, primaryDB);
-
-    jsTestLog("checking primary health log");
-    // First doc was valid, second doc was not found but we continue with dbcheck.
-    checkHealthLog(primaryHealthLog, recordDoesNotMatchQuery, nDocs - 2);
-    checkHealthLog(primaryHealthLog, allErrorsOrWarningsQuery, nDocs - 2);
-    jsTestLog("checking secondary health log");
-    checkHealthLog(secondaryHealthLog, allErrorsOrWarningsQuery, 0);
-
-    jsTestLog("checking primary for correct num of health logs");
-    checkHealthLog(primaryHealthLog, infoBatchQuery, nDocs - 1);
-
-    jsTestLog("checking secondary for correct num of health logs");
-    checkHealthLog(secondaryHealthLog, infoBatchQuery, nDocs - 1);
-
-    skipUpdatingIndexDocumentPrimary.off();
-    skipUpdatingIndexDocumentSecondary.off();
 }
 
 function noExtraIndexKeys(
-    nDocs, batchSize, snapshotSize, skipLookupForExtraKeys, start = null, end = null) {
+    nDocs, batchSize, snapshotSize, skipLookupForExtraKeys, docSuffix, start = null, end = null) {
     clearRawMongoProgramOutput();
-    jsTestLog("Testing that a valid index will not result in any health log entries with " + nDocs +
-              " docs, batchSize: " + batchSize + ", snapshotSize: " + snapshotSize +
-              ", skipLookupForExtraKeys: " + skipLookupForExtraKeys + ", start:" + start +
-              ", end:" + end);
+    jsTestLog(`Testing that a valid index will not result in any health log entries with ${nDocs} docs, 
+    batchSize: ${batchSize}, snapshotSize: ${snapshotSize}
+              , skipLookupForExtraKeys: ${skipLookupForExtraKeys}, docSuffix: ${docSuffix}
+              , start: ${start}, end: ${end}`);
 
-    resetAndInsert(replSet, primaryDB, collName, nDocs);
+    resetAndInsert(replSet, primaryDB, collName, nDocs, docSuffix);
     assert.commandWorked(primaryDB.runCommand({
         createIndexes: collName,
         indexes: [{key: {a: 1}, name: 'a_1'}],
     }));
-    setSnapshotSize(snapshotSize);
+    setSnapshotSize(replSet, snapshotSize);
     replSet.awaitReplication();
 
     assert.eq(primaryDB.getCollection(collName).find({}).count(), nDocs);
@@ -542,41 +125,51 @@ function noExtraIndexKeys(
         skipLookupForExtraKeys: skipLookupForExtraKeys
     };
     if (start != null) {
-        dbCheckParameters = {...dbCheckParameters, start: {a: start} }
+        if (docSuffix) {
+            dbCheckParameters = {...dbCheckParameters, start: {a: start.toString() + docSuffix} }
+        } else {
+            dbCheckParameters = {...dbCheckParameters, start: {a: start} }
+        }
     }
     if (end != null) {
-        dbCheckParameters = {...dbCheckParameters, end: {a: end} }
+        if (docSuffix) {
+            dbCheckParameters = {...dbCheckParameters, end: {a: end.toString() + docSuffix} }
+        } else {
+            dbCheckParameters = {...dbCheckParameters, end: {a: end} }
+        }
     }
     runDbCheck(replSet, primaryDB, collName, dbCheckParameters, true /* awaitCompletion */);
 
-    checkHealthLog(primaryHealthLog, allErrorsOrWarningsQuery, 0);
-    checkHealthLog(secondaryHealthLog, allErrorsOrWarningsQuery, 0);
+    checkHealthLog(primaryHealthLog, logQueries.allErrorsOrWarningsQuery, 0);
+    checkHealthLog(secondaryHealthLog, logQueries.allErrorsOrWarningsQuery, 0);
 
-    const nDocsChecked = getNumDocsChecked(nDocs, start, end);
+    const nDocsChecked = getNumDocsChecked(nDocs, start, end, docSuffix);
 
     jsTestLog("Checking for correct number of batches on primary");
     checkNumBatchesAndSnapshots(primaryHealthLog, nDocsChecked, batchSize, snapshotSize);
     jsTestLog("Checking for correct number of batches on secondary");
     checkNumBatchesAndSnapshots(secondaryHealthLog, nDocsChecked, batchSize, snapshotSize);
+    assertCompleteCoverage(primaryHealthLog, nDocs, docSuffix, start, end);
+    assertCompleteCoverage(secondaryHealthLog, nDocs, docSuffix, start, end);
 
-    resetSnapshotSize();
+    resetSnapshotSize(replSet);
 }
 
 function recordNotFound(
-    nDocs, batchSize, snapshotSize, skipLookupForExtraKeys, start = null, end = null) {
+    nDocs, batchSize, snapshotSize, skipLookupForExtraKeys, docSuffix, start = null, end = null) {
     clearRawMongoProgramOutput();
-    jsTestLog("Testing that an extra key will generate a health log entry with " + nDocs +
-              " docs, batchSize: " + batchSize + ", snapshotSize: " + snapshotSize +
-              ", skipLookupForExtraKeys: " + skipLookupForExtraKeys + ", start:" + start +
-              ", end:" + end);
+    jsTestLog(`Testing that an extra key will generate a health log entry with ${nDocs} docs, 
+              batchSize: ${batchSize}, snapshotSize: ${snapshotSize}
+                        , skipLookupForExtraKeys: ${skipLookupForExtraKeys}, docSuffix: ${docSuffix}
+                        , start: ${start}, end: ${end}`);
 
-    resetAndInsert(replSet, primaryDB, collName, nDocs);
+    resetAndInsert(replSet, primaryDB, collName, nDocs, docSuffix);
     const primaryColl = primaryDB.getCollection(collName);
     assert.commandWorked(primaryDB.runCommand({
         createIndexes: collName,
         indexes: [{key: {a: 1}, name: 'a_1'}],
     }));
-    setSnapshotSize(snapshotSize);
+    setSnapshotSize(replSet, snapshotSize);
     replSet.awaitReplication();
     assert.eq(primaryColl.find({}).count(), nDocs);
 
@@ -599,55 +192,64 @@ function recordNotFound(
         skipLookupForExtraKeys: skipLookupForExtraKeys
     };
     if (start != null) {
-        dbCheckParameters = {...dbCheckParameters, start: {a: start} }
+        if (docSuffix) {
+            dbCheckParameters = {...dbCheckParameters, start: {a: start.toString() + docSuffix} }
+        } else {
+            dbCheckParameters = {...dbCheckParameters, start: {a: start} }
+        }
     }
     if (end != null) {
-        dbCheckParameters = {...dbCheckParameters, end: {a: end} }
+        if (docSuffix) {
+            dbCheckParameters = {...dbCheckParameters, end: {a: end.toString() + docSuffix} }
+        } else {
+            dbCheckParameters = {...dbCheckParameters, end: {a: end} }
+        }
     }
     runDbCheck(replSet, primaryDB, collName, dbCheckParameters, true /*awaitCompletion*/);
 
-    const nDocsChecked = getNumDocsChecked(nDocs, start, end);
+    const nDocsChecked = getNumDocsChecked(nDocs, start, end, docSuffix);
 
     if (skipLookupForExtraKeys) {
-        checkHealthLog(primaryHealthLog, allErrorsOrWarningsQuery, 0);
+        checkHealthLog(primaryHealthLog, logQueries.allErrorsOrWarningsQuery, 0);
     } else {
         jsTestLog("Checking primary for record not found error");
-        checkHealthLog(primaryHealthLog, recordNotFoundQuery, nDocsChecked);
+        checkHealthLog(primaryHealthLog, logQueries.recordNotFoundQuery, nDocsChecked);
         // No other errors on primary.
-        checkHealthLog(primaryHealthLog, allErrorsOrWarningsQuery, nDocsChecked);
+        checkHealthLog(primaryHealthLog, logQueries.allErrorsOrWarningsQuery, nDocsChecked);
     }
 
     jsTestLog(
         "Checking secondary for record not found error, should have 0 since secondary skips reverse lookup");
-    checkHealthLog(secondaryHealthLog, allErrorsOrWarningsQuery, 0);
+    checkHealthLog(secondaryHealthLog, logQueries.allErrorsOrWarningsQuery, 0);
 
     jsTestLog("Checking for correct number of batches on primary");
     checkNumBatchesAndSnapshots(primaryHealthLog, nDocsChecked, batchSize, snapshotSize);
     jsTestLog("Checking for correct number of batches on secondary");
     checkNumBatchesAndSnapshots(secondaryHealthLog, nDocsChecked, batchSize, snapshotSize);
+    assertCompleteCoverage(primaryHealthLog, nDocs, docSuffix, start, end);
+    assertCompleteCoverage(secondaryHealthLog, nDocs, docSuffix, start, end);
 
     skipUnindexingDocumentWhenDeletedPrimary.off();
     skipUnindexingDocumentWhenDeletedSecondary.off();
-    resetSnapshotSize();
+    resetSnapshotSize(replSet);
 }
 
 function recordDoesNotMatch(
-    nDocs, batchSize, snapshotSize, skipLookupForExtraKeys, start = null, end = null) {
+    nDocs, batchSize, snapshotSize, skipLookupForExtraKeys, docSuffix, start = null, end = null) {
     clearRawMongoProgramOutput();
-    jsTestLog(
-        "Testing that a key with a record that does not contain the expected keystring will generate a health log entry with " +
-        nDocs + " docs, batchSize: " + batchSize + ", snapshotSize: " + snapshotSize +
-        ", skipLookupForExtraKeys: " + skipLookupForExtraKeys + ", start:" + start +
-        ", end:" + end);
+    jsTestLog(`Testing that a key with a record that does not contain the expected keystring will generate a health log entry with ${nDocs} docs, 
+        batchSize: ${batchSize}, snapshotSize: ${snapshotSize}
+                  , skipLookupForExtraKeys: ${skipLookupForExtraKeys}, docSuffix: ${docSuffix}
+                  , start: ${start}, end: ${end}`);
 
-    resetAndInsert(replSet, primaryDB, collName, nDocs);
+    resetAndInsert(replSet, primaryDB, collName, nDocs, docSuffix);
     const primaryColl = primaryDB.getCollection(collName);
 
     assert.commandWorked(primaryDB.runCommand({
         createIndexes: collName,
         indexes: [{key: {a: 1}, name: 'a_1'}],
     }));
-    setSnapshotSize(snapshotSize);
+    setSnapshotSize(replSet, snapshotSize);
     replSet.awaitReplication();
     assert.eq(primaryColl.find({}).count(), nDocs);
 
@@ -671,49 +273,58 @@ function recordDoesNotMatch(
         skipLookupForExtraKeys: skipLookupForExtraKeys
     };
     if (start != null) {
-        dbCheckParameters = {...dbCheckParameters, start: {a: start} }
+        if (docSuffix) {
+            dbCheckParameters = {...dbCheckParameters, start: {a: start.toString() + docSuffix} }
+        } else {
+            dbCheckParameters = {...dbCheckParameters, start: {a: start} }
+        }
     }
     if (end != null) {
-        dbCheckParameters = {...dbCheckParameters, end: {a: end} }
+        if (docSuffix) {
+            dbCheckParameters = {...dbCheckParameters, end: {a: end.toString() + docSuffix} }
+        } else {
+            dbCheckParameters = {...dbCheckParameters, end: {a: end} }
+        }
     }
     runDbCheck(replSet, primaryDB, collName, dbCheckParameters, true /*awaitCompletion*/);
 
-    const nDocsChecked = getNumDocsChecked(nDocs, start, end);
+    const nDocsChecked = getNumDocsChecked(nDocs, start, end, docSuffix);
     if (skipLookupForExtraKeys) {
-        checkHealthLog(primaryHealthLog, allErrorsOrWarningsQuery, 0);
+        checkHealthLog(primaryHealthLog, logQueries.allErrorsOrWarningsQuery, 0);
     } else {
         jsTestLog("Checking primary for record does not match error");
-        checkHealthLog(primaryHealthLog, recordDoesNotMatchQuery, nDocsChecked);
+        checkHealthLog(primaryHealthLog, logQueries.recordDoesNotMatchQuery, nDocsChecked);
 
         // No other errors on primary.
-        checkHealthLog(primaryHealthLog, allErrorsOrWarningsQuery, nDocsChecked);
+        checkHealthLog(primaryHealthLog, logQueries.allErrorsOrWarningsQuery, nDocsChecked);
     }
     jsTestLog(
         "Checking secondary for record does not match error, should have 0 since secondary skips reverse lookup");
-    checkHealthLog(secondaryHealthLog, allErrorsOrWarningsQuery, 0);
+    checkHealthLog(secondaryHealthLog, logQueries.allErrorsOrWarningsQuery, 0);
 
     jsTestLog("Checking for correct number of batches on primary");
     checkNumBatchesAndSnapshots(primaryHealthLog, nDocsChecked, batchSize, snapshotSize);
     jsTestLog("Checking for correct number of batches on secondary");
     checkNumBatchesAndSnapshots(secondaryHealthLog, nDocsChecked, batchSize, snapshotSize);
+    assertCompleteCoverage(primaryHealthLog, nDocs, docSuffix, start, end);
+    assertCompleteCoverage(secondaryHealthLog, nDocs, docSuffix, start, end);
 
     skipUpdatingIndexDocumentPrimary.off();
     skipUpdatingIndexDocumentSecondary.off();
-    resetSnapshotSize();
+    resetSnapshotSize(replSet);
 }
 
 function hashingInconsistentExtraKeyOnPrimary(
-    nDocs, batchSize, snapshotSize, skipLookupForExtraKeys, start = null, end = null) {
+    nDocs, batchSize, snapshotSize, skipLookupForExtraKeys, docSuffix, start = null, end = null) {
     clearRawMongoProgramOutput();
-    jsTestLog(
-        "Testing that an extra key on only the primary will log an inconsistent batch health log entry: " +
-        nDocs + "docs, batchSize: " + batchSize + ", snapshotSize: " + snapshotSize +
-        ", skipLookupForExtraKeys: " + skipLookupForExtraKeys + ", start:" + start +
-        ", end:" + end);
+    jsTestLog(`Testing that an extra key on only the primary will log an inconsistent batch health log entry with ${nDocs} docs, 
+        batchSize: ${batchSize}, snapshotSize: ${snapshotSize}
+                  , skipLookupForExtraKeys: ${skipLookupForExtraKeys}, docSuffix: ${docSuffix}
+                  , start: ${start}, end: ${end}`);
 
-    setSnapshotSize(snapshotSize);
+    setSnapshotSize(replSet, snapshotSize);
     const primaryColl = primaryDB.getCollection(collName);
-    resetAndInsert(replSet, primaryDB, collName, nDocs);
+    resetAndInsert(replSet, primaryDB, collName, nDocs, docSuffix);
     assert.commandWorked(primaryDB.runCommand({
         createIndexes: collName,
         indexes: [{key: {a: 1}, name: 'a_1'}],
@@ -739,28 +350,39 @@ function hashingInconsistentExtraKeyOnPrimary(
         skipLookupForExtraKeys: skipLookupForExtraKeys
     };
     if (start != null) {
-        dbCheckParameters = {...dbCheckParameters, start: {a: start} }
+        if (docSuffix) {
+            dbCheckParameters = {...dbCheckParameters, start: {a: start.toString() + docSuffix} }
+        } else {
+            dbCheckParameters = {...dbCheckParameters, start: {a: start} }
+        }
     }
     if (end != null) {
-        dbCheckParameters = {...dbCheckParameters, end: {a: end} }
+        if (docSuffix) {
+            dbCheckParameters = {...dbCheckParameters, end: {a: end.toString() + docSuffix} }
+        } else {
+            dbCheckParameters = {...dbCheckParameters, end: {a: end} }
+        }
     }
     runDbCheck(replSet, primaryDB, collName, dbCheckParameters, true /*awaitCompletion*/);
 
-    const nDocsChecked = getNumDocsChecked(nDocs, start, end);
+    const nDocsChecked = getNumDocsChecked(nDocs, start, end, docSuffix);
     if (skipLookupForExtraKeys) {
         jsTestLog("Checking primary for errors");
-        checkHealthLog(primaryHealthLog, allErrorsOrWarningsQuery, 0);
+        checkHealthLog(primaryHealthLog, logQueries.allErrorsOrWarningsQuery, 0);
 
         jsTestLog("Checking secondary for record not found error, should have 0");
-        checkHealthLog(secondaryHealthLog, recordNotFoundQuery, 0);
+        checkHealthLog(secondaryHealthLog, logQueries.recordNotFoundQuery, 0);
     } else {
         jsTestLog("Checking primary for record not found error");
-        checkHealthLog(primaryHealthLog, recordNotFoundQuery, nDocsChecked);
+        checkHealthLog(
+            primaryHealthLog,
+            {...logQueries.recordNotFoundQuery, "data.context.keyString.a": {$exists: true}},
+            nDocsChecked);
         jsTestLog("Checking secondary for record not found error, should have 0");
-        checkHealthLog(secondaryHealthLog, recordNotFoundQuery, 0);
+        checkHealthLog(secondaryHealthLog, logQueries.recordNotFoundQuery, 0);
 
         // No other errors on primary.
-        checkHealthLog(primaryHealthLog, allErrorsOrWarningsQuery, nDocsChecked);
+        checkHealthLog(primaryHealthLog, logQueries.allErrorsOrWarningsQuery, nDocsChecked);
     }
 
     jsTestLog("Checking for correct number of batches on primary");
@@ -768,60 +390,152 @@ function hashingInconsistentExtraKeyOnPrimary(
     jsTestLog("Checking for correct number of inconsistent batches on secondary");
     checkNumBatchesAndSnapshots(
         secondaryHealthLog, nDocsChecked, batchSize, snapshotSize, true /* inconsistentBatch */);
+    assertCompleteCoverage(primaryHealthLog, nDocs, docSuffix, start, end);
+    assertCompleteCoverage(
+        secondaryHealthLog, nDocs, docSuffix, start, end, true /* inconsistentBatch */);
 
     skipUnindexingDocumentWhenDeleted.off();
-    resetSnapshotSize();
+    resetSnapshotSize(replSet);
 }
 
-indexNotFoundBeforeDbCheck();
-indexNotFoundDuringHashing();
-indexNotFoundDuringReverseLookup();
-collNotFoundBeforeDbCheck();
-collNotFoundDuringHashing();
-collNotFoundDuringReverseLookup();
-keysChangedBeforeHashing();
-indexNotFoundDuringReverseLookup();
-allIndexKeysNotFoundDuringReverseLookup(10);
-keyNotFoundDuringReverseLookup(10);
+function hashingInconsistentExtraKeyOnPrimaryCompoundIndex(
+    nDocs, batchSize, snapshotSize, skipLookupForExtraKeys, docSuffix, start = null, end = null) {
+    clearRawMongoProgramOutput();
+    jsTestLog(`Testing that an extra key on only the primary with compound index will log an inconsistent batch health log entry with ${nDocs} docs, 
+batchSize: ${batchSize}, snapshotSize: ${snapshotSize}
+          , skipLookupForExtraKeys: ${skipLookupForExtraKeys}, docSuffix: ${docSuffix}
+          , start: ${start}, end: ${end}`);
 
-function runMainTests(nDocs, batchSize, snapshotSize, start = null, end = null) {
+    setSnapshotSize(replSet, snapshotSize);
+    const primaryColl = primaryDB.getCollection(collName);
+    resetAndInsertTwoFields(replSet, primaryDB, collName, nDocs, docSuffix);
+    assert.commandWorked(primaryDB.runCommand({
+        createIndexes: collName,
+        indexes: [{key: {a: 1, b: 1}, name: 'a_1b_1'}],
+    }));
+    replSet.awaitReplication();
+    assert.eq(primaryColl.find({}).count(), nDocs);
+
+    // Set up inconsistency.
+    const skipUnindexingDocumentWhenDeleted =
+        configureFailPoint(primaryDB, "skipUnindexingDocumentWhenDeleted", {indexName: "a_1b_1"});
+    jsTestLog("Deleting docs");
+    assert.commandWorked(primaryColl.deleteMany({}));
+
+    replSet.awaitReplication();
+    assert.eq(primaryColl.find({}).count(), 0);
+    assert.eq(secondaryDB.getCollection(collName).find({}).count(), 0);
+
+    let dbCheckParameters = {
+        validateMode: "extraIndexKeysCheck",
+        secondaryIndex: "a_1b_1",
+        maxDocsPerBatch: batchSize,
+        batchWriteConcern: writeConcern,
+        skipLookupForExtraKeys: skipLookupForExtraKeys
+    };
+    if (start != null) {
+        if (docSuffix) {
+            dbCheckParameters = {...dbCheckParameters, start: {a: start.toString() + docSuffix} }
+        } else {
+            dbCheckParameters = {...dbCheckParameters, start: {a: start} }
+        }
+    }
+    if (end != null) {
+        if (docSuffix) {
+            dbCheckParameters = {...dbCheckParameters, end: {a: end.toString() + docSuffix} }
+        } else {
+            dbCheckParameters = {...dbCheckParameters, end: {a: end} }
+        }
+    }
+    runDbCheck(replSet, primaryDB, collName, dbCheckParameters, true /*awaitCompletion*/);
+
+    const nDocsChecked = getNumDocsChecked(nDocs, start, end, docSuffix);
+    if (skipLookupForExtraKeys) {
+        jsTestLog("Checking primary for errors");
+        checkHealthLog(primaryHealthLog, logQueries.allErrorsOrWarningsQuery, 0);
+
+        jsTestLog("Checking secondary for record not found error, should have 0");
+        checkHealthLog(secondaryHealthLog, logQueries.recordNotFoundQuery, 0);
+    } else {
+        jsTestLog("Checking primary for record not found error");
+        checkHealthLog(primaryHealthLog,
+                       {
+                           ...logQueries.recordNotFoundQuery,
+                           "data.context.keyString.a": {$exists: true},
+                           "data.context.keyString.b": {$exists: true}
+                       },
+                       nDocsChecked);
+        jsTestLog("Checking secondary for record not found error, should have 0");
+        checkHealthLog(secondaryHealthLog, logQueries.recordNotFoundQuery, 0);
+
+        // No other errors on primary.
+        checkHealthLog(primaryHealthLog, logQueries.allErrorsOrWarningsQuery, nDocsChecked);
+    }
+
+    jsTestLog("Checking for correct number of batches on primary");
+    checkNumBatchesAndSnapshots(primaryHealthLog, nDocsChecked, batchSize, snapshotSize);
+    jsTestLog("Checking for correct number of inconsistent batches on secondary");
+    checkNumBatchesAndSnapshots(
+        secondaryHealthLog, nDocsChecked, batchSize, snapshotSize, true /* inconsistentBatch */);
+    assertCompleteCoverage(primaryHealthLog, nDocs, docSuffix, start, end);
+    assertCompleteCoverage(
+        secondaryHealthLog, nDocs, docSuffix, start, end, true /* inconsistentBatch */);
+
+    skipUnindexingDocumentWhenDeleted.off();
+    resetSnapshotSize(replSet);
+}
+
+function runMainTests(nDocs, batchSize, snapshotSize, docSuffix, start = null, end = null) {
     [true, false].forEach((skipLookupForExtraKeys) => {
-        noExtraIndexKeys(nDocs, batchSize, snapshotSize, skipLookupForExtraKeys, start, end);
-        recordDoesNotMatch(nDocs, batchSize, snapshotSize, skipLookupForExtraKeys, start, end);
-        recordNotFound(nDocs, batchSize, snapshotSize, skipLookupForExtraKeys, start, end);
+        noExtraIndexKeys(
+            nDocs, batchSize, snapshotSize, skipLookupForExtraKeys, docSuffix, start, end);
+        recordDoesNotMatch(
+            nDocs, batchSize, snapshotSize, skipLookupForExtraKeys, docSuffix, start, end);
+        recordNotFound(
+            nDocs, batchSize, snapshotSize, skipLookupForExtraKeys, docSuffix, start, end);
         hashingInconsistentExtraKeyOnPrimary(
-            nDocs, batchSize, snapshotSize, skipLookupForExtraKeys, start, end);
+            nDocs, batchSize, snapshotSize, skipLookupForExtraKeys, docSuffix, start, end);
+        hashingInconsistentExtraKeyOnPrimaryCompoundIndex(
+            nDocs, batchSize, snapshotSize, skipLookupForExtraKeys, docSuffix, start, end);
     });
 }
 
-// Test with docs < batch size
-runMainTests(10, defaultMaxDocsPerBatch, defaultSnapshotSize);
+// Test with integer index entries (1, 2, 3, etc.), single character string entries ("1",
+// "2", "3", etc.), and long string entries ("1aaaaaaaaaa")
+[null,
+ "",
+ "aaaaaaaaaa"]
+    .forEach((docSuffix) => {
+        // Test with docs < batch size
+        runMainTests(10, defaultMaxDocsPerBatch, defaultSnapshotSize, docSuffix);
 
-// Test with docs > batch size.
-runMainTests(1000, defaultMaxDocsPerBatch, defaultSnapshotSize);
+        // Test with docs > batch size.
+        runMainTests(1000, defaultMaxDocsPerBatch, defaultSnapshotSize, docSuffix);
 
-// Test with snapshot size < batch size
-runMainTests(1000, 99 /* batchSize */, 19 /* snapshotSize */);
+        // Test with snapshot size < batch size
+        runMainTests(1000, 99 /* batchSize */, 19 /* snapshotSize */, docSuffix);
 
-// Pass in start/end parameters with full range.
-runMainTests(10, defaultMaxDocsPerBatch, defaultSnapshotSize, 0, 9);
-// Test a specific range.
-runMainTests(10, defaultMaxDocsPerBatch, defaultSnapshotSize, 2, 8);
-// Start < first doc (a: 0)
-runMainTests(10, defaultMaxDocsPerBatch, defaultSnapshotSize, -1, 8);
-// End > last doc (a: 9)
-runMainTests(10, defaultMaxDocsPerBatch, defaultSnapshotSize, 3, 10);
+        // Pass in start/end parameters with full range.
+        runMainTests(10, defaultMaxDocsPerBatch, defaultSnapshotSize, docSuffix, 0, 9);
+        // Test a specific range.
+        runMainTests(10, defaultMaxDocsPerBatch, defaultSnapshotSize, docSuffix, 2, 8);
+        // Start < first doc (a: 0)
+        runMainTests(10, defaultMaxDocsPerBatch, defaultSnapshotSize, docSuffix, -1, 8);
+        // End > last doc (a: 9)
+        if (docSuffix) {
+            runMainTests(10, defaultMaxDocsPerBatch, defaultSnapshotSize, docSuffix, "3", "9z");
+        } else {
+            runMainTests(10, defaultMaxDocsPerBatch, defaultSnapshotSize, docSuffix, 3, 10);
+        }
+    });
 
 // Test with start/end parameters and multiple batches/snapshots
-runMainTests(1000, 99 /* batchSize */, 98 /* snapshotSize*/, 99, 901);
-runMainTests(1000, defaultMaxDocsPerBatch, 19 /* snapshotSize */, -1, 301);
-runMainTests(1000, 99 /* batchSize */, 20 /* snapshotSize */, 699, 1000);
-
-// TODO SERVER-79849 Add testing for:
-// * Reached bytes per batch ends batch.
-// * Total bytes seen over limit ends dbcheck
-// * Total keys seen over limit ends dbcheck
-// * Docs in current interval over limit slows rate.
+// Test with specific range in the middle of the index and snapshotSize < batchSize.
+runMainTests(1000, 99 /* batchSize */, 98 /* snapshotSize*/, null /*docSuffix*/, 99, 901);
+// Test with start < first doc and multiple batches/snapshots.
+runMainTests(1000, defaultMaxDocsPerBatch, 19 /* snapshotSize */, null /*docSuffix*/, -1, 301);
+// Test with end > last doc and multiple batches/snapshots.
+runMainTests(1000, 99 /* batchSize */, 20 /* snapshotSize */, null /*docSuffix*/, 699, 1000);
 
 // TODO SERVER-79846:
 // * Test progress meter/stats are correct

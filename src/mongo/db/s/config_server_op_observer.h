@@ -57,7 +57,7 @@ class ConfigServerOpObserver final : public OpObserverNoop {
 
 public:
     ConfigServerOpObserver();
-    ~ConfigServerOpObserver();
+    ~ConfigServerOpObserver() override;
 
     NamespaceFilters getNamespaceFilters() const final {
         return {NamespaceFilter::kConfigAndSystem, NamespaceFilter::kConfigAndSystem};
@@ -67,6 +67,7 @@ public:
                    const CollectionPtr& coll,
                    std::vector<InsertStatement>::const_iterator begin,
                    std::vector<InsertStatement>::const_iterator end,
+                   const std::vector<RecordId>& recordIds,
                    std::vector<bool> fromMigrate,
                    bool defaultFromMigrate,
                    OpStateAccumulator* opAccumulator = nullptr) override;

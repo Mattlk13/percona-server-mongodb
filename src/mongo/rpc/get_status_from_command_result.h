@@ -46,6 +46,12 @@ class Status;
  */
 Status getStatusFromCommandResult(const BSONObj& result);
 
+/**
+ * Converts error "result" into a Status object.  The input is expected to be the object returned
+ * by running a command.  Assumes the result does not represent ok: 1.
+ */
+Status getErrorStatusFromCommandResult(const BSONObj& result);
+
 
 /**
  * Extracts the write concern error from a command response.
@@ -59,6 +65,12 @@ Status getWriteConcernStatusFromCommandResult(const BSONObj& cmdResponse);
  * be used with bulk writes.
  */
 Status getFirstWriteErrorStatusFromCommandResult(const BSONObj& cmdResponse);
+
+/**
+ * Extracts the first write error from a bulk write command response and converts it into a status.
+ * This ignores all errors after the first.
+ */
+Status getFirstWriteErrorStatusFromBulkWriteResult(const BSONObj& cmdResponse);
 
 /**
  * Extracts any type of error from a write command response.

@@ -8,24 +8,16 @@
  *   # If all chunks are moved off of a shard, it can cause the plan cache to miss commands.
  *   assumes_balancer_off,
  *   does_not_support_stepdowns,
- *   # TODO SERVER-67607: Test plan cache with CQF enabled.
- *   cqf_experimental_incompatible,
+ *   featureFlagSbeFull,
  * ]
  */
 
 import {getQueryHashFromExplain} from "jstests/libs/analyze_plan.js";
 import {getPlanCacheNumEntries, getPlanCacheSize} from "jstests/libs/plan_cache_utils.js";
-import {checkSBEEnabled} from "jstests/libs/sbe_util.js";
 
 const conn = MongoRunner.runMongod();
 assert.neq(conn, null, "mongod failed to start");
 const db = conn.getDB("sbe_plan_cache_size_metric");
-
-if (!checkSBEEnabled(db)) {
-    jsTest.log("Skipping test because SBE is not enabled");
-    MongoRunner.stopMongod(conn);
-    quit();
-}
 
 function getCacheEntriesByQueryHashKey(coll, queryHash) {
     return coll.aggregate([{$planCacheStats: {}}, {$match: {queryHash}}]).toArray();
@@ -33,7 +25,7 @@ function getCacheEntriesByQueryHashKey(coll, queryHash) {
 
 function assertQueryInPlanCache(coll, query) {
     const explainResult = assert.commandWorked(coll.explain().find(query).finish());
-    const queryHash = getQueryHashFromExplain(explainResult, db);
+    const queryHash = getQueryHashFromExplain(explainResult);
     const planCacheEntries = getCacheEntriesByQueryHashKey(coll, queryHash);
     assert.eq(1, planCacheEntries.length, planCacheEntries);
 }

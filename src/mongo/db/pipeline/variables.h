@@ -190,6 +190,12 @@ public:
      */
     void seedVariablesWithLetParameters(ExpressionContext* expCtx, BSONObj letParameters);
 
+    /**
+     * Serializes this Variables object to a BSONObj, according to the top level field names of
+     * 'varsToSerialize'.
+     */
+    BSONObj toBSON(const VariablesParseState& vps, const BSONObj& varsToSerialize) const;
+
     bool hasValue(Variables::Id id) const {
         return _definitions.find(id) != _definitions.end();
     };
@@ -229,6 +235,17 @@ public:
      * Define the value of the $$USER_ROLES variable.
      */
     void defineUserRoles(OperationContext* opCtx);
+
+    /**
+     * Define the value of the $$NOW variable by reading the current time.
+     */
+    void defineLocalNow();
+
+    /**
+     * Define the value of the $$CLUSTER_TIME variable by consulting the VectorClock (may be
+     * expensive due to mutex).
+     */
+    void defineClusterTime(OperationContext* opCtx);
 
 private:
     struct ValueAndState {

@@ -189,7 +189,18 @@ public:
      * When all of the storage startup tasks are completed as a whole, then this function is called
      * by the external force managing the startup process.
      */
-    virtual void notifyStartupComplete() {}
+    virtual void notifyStorageStartupRecoveryComplete() {}
+
+    /**
+     * Perform any operations in the storage layer that are unblocked now that the server has exited
+     * replication startup recovery and considers itself stable.
+     *
+     * This will be called during a node's transition to steady state replication.
+     *
+     * This function may race with shutdown. As a result, any steps within this function that should
+     * not race with shutdown should obtain the global lock.
+     */
+    virtual void notifyReplStartupRecoveryComplete(OperationContext* opCtx) {}
 
     /**
      * Returns a new interface to the storage engine's recovery unit.  The recovery
@@ -335,9 +346,7 @@ public:
     };
 
     virtual StatusWith<std::unique_ptr<StreamingCursor>> beginNonBlockingBackup(
-        OperationContext* opCtx,
-        boost::optional<Timestamp> checkpointTimestamp,
-        const BackupOptions& options) = 0;
+        OperationContext* opCtx, const BackupOptions& options) = 0;
 
     virtual void endNonBlockingBackup(OperationContext* opCtx) = 0;
 
@@ -375,7 +384,7 @@ public:
      * record stores.
      */
     virtual std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStoreFromExistingIdent(
-        OperationContext* opCtx, StringData ident) = 0;
+        OperationContext* opCtx, StringData ident, KeyFormat keyFormat) = 0;
 
     /**
      * This method will be called before there is a clean shutdown.  Storage engines should
@@ -466,7 +475,7 @@ public:
      * CheckpointIteration should be chosen when performing untimestamped drops as they
      * will make the ident wait for a catalog checkpoint before proceeding with the ident drop.
      */
-    virtual void addDropPendingIdent(const stdx::variant<Timestamp, CheckpointIteration>& dropTime,
+    virtual void addDropPendingIdent(const std::variant<Timestamp, CheckpointIteration>& dropTime,
                                      std::shared_ptr<Ident> ident,
                                      DropIdentCallback&& onDrop = nullptr) = 0;
 
@@ -495,7 +504,7 @@ public:
      * underlying storage engine must take a checkpoint at this point.
      * Acquires a resource mutex before taking the checkpoint.
      */
-    virtual void checkpoint(OperationContext* opCtx) = 0;
+    virtual void checkpoint() = 0;
 
     /**
      * Returns the checkpoint iteration the committed write will be part of.
@@ -590,7 +599,7 @@ public:
      * Sets the oldest timestamp for which the storage engine must maintain snapshot history
      * through. Additionally, all future writes must be newer or equal to this value.
      */
-    virtual void setOldestTimestamp(Timestamp timestamp) = 0;
+    virtual void setOldestTimestamp(Timestamp timestamp, bool force) = 0;
 
     /**
      * Gets the oldest timestamp for which the storage engine must maintain snapshot history
@@ -722,12 +731,18 @@ public:
      *
      * TODO SERVER-81069: Remove this since it's intrinsically tied to encryption options only.
      */
-    virtual StatusWith<BSONObj> getSanitizedStorageOptionsForSecondaryReplication(
+    virtual BSONObj getSanitizedStorageOptionsForSecondaryReplication(
         const BSONObj& options) const = 0;
     /**
      * Instructs the storage engine to dump its internal state.
      */
     virtual void dump() const = 0;
+
+    /**
+     * Toggles auto compact for a database. Auto compact periodically iterates through all of
+     * the files available and runs compaction if they are eligible.
+     */
+    virtual Status autoCompact(OperationContext* opCtx, const AutoCompactOptions& options) = 0;
 };
 
 }  // namespace mongo

@@ -63,16 +63,16 @@ class BucketCatalogServerStatus : public ServerStatusSection {
     BucketCounts _getBucketCounts(const BucketCatalog& catalog) const {
         BucketCounts sum;
         for (auto const& stripe : catalog.stripes) {
-            stdx::lock_guard stripeLock{stripe.mutex};
-            sum += {stripe.openBucketsById.size(),
-                    stripe.openBucketsByKey.size(),
-                    stripe.idleBuckets.size()};
+            stdx::lock_guard stripeLock{stripe->mutex};
+            sum += {stripe->openBucketsById.size(),
+                    stripe->openBucketsByKey.size(),
+                    stripe->idleBuckets.size()};
         }
         return sum;
     }
 
 public:
-    BucketCatalogServerStatus() : ServerStatusSection("bucketCatalog") {}
+    using ServerStatusSection::ServerStatusSection;
 
     bool includeByDefault() const override {
         return true;
@@ -94,8 +94,7 @@ public:
         builder.appendNumber("numOpenBuckets", static_cast<long long>(counts.open));
         builder.appendNumber("numIdleBuckets", static_cast<long long>(counts.idle));
         builder.appendNumber("numArchivedBuckets", static_cast<long long>(numActive - counts.open));
-        builder.appendNumber("memoryUsage",
-                             static_cast<long long>(bucketCatalog.memoryUsage.load()));
+        builder.appendNumber("memoryUsage", static_cast<long long>(getMemoryUsage(bucketCatalog)));
 
         // Append the global execution stats for all namespaces.
         appendExecutionStatsToBuilder(bucketCatalog.globalExecutionStats, builder);
@@ -105,7 +104,9 @@ public:
 
         return builder.obj();
     }
-} bucketCatalogServerStatus;
+};
+auto& bucketCatalogServerStatus =
+    *ServerStatusSectionBuilder<BucketCatalogServerStatus>("bucketCatalog").forShard();
 
 }  // namespace
 }  // namespace mongo::timeseries::bucket_catalog

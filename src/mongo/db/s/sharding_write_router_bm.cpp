@@ -57,9 +57,7 @@
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/collection_sharding_state_factory_shard.h"
-#include "mongo/db/s/collection_sharding_state_factory_standalone.h"
 #include "mongo/db/s/operation_sharding_state.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_write_router.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
@@ -83,6 +81,7 @@
 #include "mongo/s/resharding/type_collection_fields_gen.h"
 #include "mongo/s/shard_version.h"
 #include "mongo/s/shard_version_factory.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/s/type_collection_common_types_gen.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/util/assert_util.h"
@@ -142,11 +141,17 @@ protected:
 
             auto [chunks, chunkManager] = createChunks(nShards, nChunks, shards);
 
-            ShardingState::get(serviceContext)->setInitialized(originatorShard, clusterId);
-
+            const HostAndPort kConfigHostAndPort{"DummyConfig", 12345};
+            ShardingState::create(serviceContext);
             CollectionShardingStateFactory::set(
                 serviceContext,
                 std::make_unique<CollectionShardingStateFactoryShard>(serviceContext));
+
+            ShardingState::get(serviceContext)
+                ->setRecoveryCompleted({clusterId,
+                                        ClusterRole::ShardServer,
+                                        ConnectionString(kConfigHostAndPort),
+                                        originatorShard});
 
             _shardVersion.emplace(ShardVersionFactory::make(
                 chunkManager, originatorShard, boost::optional<CollectionIndexes>(boost::none)));

@@ -56,6 +56,7 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/collection_uuid_mismatch.h"
 #include "mongo/db/catalog/commit_quorum_options.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog/index_catalog.h"
@@ -94,11 +95,13 @@
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/db/timeseries/catalog_helper.h"
 #include "mongo/db/timeseries/timeseries_commands_conversion_helper.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/rpc/op_msg.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/decorable.h"
 #include "mongo/util/fail_point.h"
@@ -346,8 +349,8 @@ void assertNoMovePrimaryInProgress(OperationContext* opCtx, const NamespaceStrin
         auto scopedCss = CollectionShardingState::assertCollectionLockedAndAcquire(opCtx, nss);
 
         auto collDesc = scopedCss->getCollectionDescription(opCtx);
-        // Only collections that are not registered in the sharding catalog are affected by
-        // movePrimary
+        // All the unsharded, untracked collections owned by the primary are affected by the
+        // movePrimary.
         if (!collDesc.hasRoutingTable()) {
             if (scopedDss->isMovePrimaryInProgress()) {
                 LOGV2(4909200, "assertNoMovePrimaryInProgress", logAttrs(nss));
@@ -407,8 +410,19 @@ void runCreateIndexesOnNewCollection(OperationContext* opCtx,
             hangBeforeCreateIndexesCollectionCreate.pauseWhileSet();
         }
 
-        OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE unsafeCreateCollection(
-            opCtx);
+        // TODO (SERVER-77915): Remove once 8.0 becomes last LTS.
+        // TODO (SERVER-82066): Update handling for direct connections.
+        // TODO (SERVER-81937): Update handling for transactions.
+        // TODO (SERVER-85366): Update handling for retryable writes.
+        boost::optional<OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE>
+            allowCollectionCreation;
+        const auto fcvSnapshot = serverGlobalParams.featureCompatibility.acquireFCVSnapshot();
+        if (!fcvSnapshot.isVersionInitialized() ||
+            !feature_flags::g80CollectionCreationPath.isEnabled(fcvSnapshot) ||
+            !OperationShardingState::get(opCtx).isComingFromRouter(opCtx) ||
+            opCtx->inMultiDocumentTransaction() || opCtx->isRetryableWrite()) {
+            allowCollectionCreation.emplace(opCtx);
+        }
         auto createStatus =
             createCollection(opCtx, ns.dbName(), builder.obj().getOwned(), idIndexSpec);
 
@@ -516,7 +530,6 @@ CreateIndexesReply runCreateIndexesWithCoordinator(OperationContext* opCtx,
                                                     cmd.getCollectionUUID()),
                                                 LockMode::MODE_IX);
 
-            validateTTLOptions(opCtx, collection.getCollectionPtr().get(), cmd);
             checkEncryptedFieldIndexRestrictions(opCtx, collection.getCollectionPtr().get(), cmd);
             addNoteForColumnstoreIndexPreview(cmd, &reply);
 
@@ -535,6 +548,8 @@ CreateIndexesReply runCreateIndexesWithCoordinator(OperationContext* opCtx,
                 indexesAlreadyExist(opCtx, collection.getCollectionPtr(), specs, &reply)) {
                 return boost::none;
             }
+
+            validateTTLOptions(opCtx, collection.getCollectionPtr().get(), cmd);
 
             if (collection.exists() &&
                 !UncommittedCatalogUpdates::get(opCtx).isCreatedCollection(opCtx, ns)) {
@@ -561,8 +576,11 @@ CreateIndexesReply runCreateIndexesWithCoordinator(OperationContext* opCtx,
                           << ns.toStringForErrorMsg() << " in a multi-document transaction.",
             !opCtx->inMultiDocumentTransaction());
 
-    if (feature_flags::gIndexBuildGracefulErrorHandling.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
+    // We need to use isEnabledUseLastLTSFCVWhenUninitialized because it's possible for
+    // createIndexes to be sent directly to an initial sync node with uninitialized FCV if the
+    // collection is not replicated.
+    if (feature_flags::gIndexBuildGracefulErrorHandling.isEnabledUseLastLTSFCVWhenUninitialized(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
         uassertStatusOK(IndexBuildsCoordinator::checkDiskSpaceSufficientToStartIndexBuild(opCtx));
     }
 
@@ -744,6 +762,7 @@ public:
     bool allowedWithSecurityToken() const final {
         return true;
     }
+
     class Invocation final : public InvocationBase {
     public:
         using InvocationBase::InvocationBase;
@@ -752,11 +771,15 @@ public:
             return true;
         }
 
+        bool isSubjectToIngressAdmissionControl() const override {
+            return true;
+        }
+
         NamespaceString ns() const final {
             return request().getNamespace();
         }
 
-        void doCheckAuthorization(OperationContext* opCtx) const {
+        void doCheckAuthorization(OperationContext* opCtx) const override {
             Privilege p(CommandHelpers::resourcePatternForNamespace(ns()), ActionType::createIndex);
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
@@ -767,6 +790,11 @@ public:
             const auto& origCmd = request();
             const auto* cmd = &origCmd;
 
+            uassert(ErrorCodes::Error(8293400),
+                    str::stream() << "Cannot create index on special internal config collection "
+                                  << NamespaceString::kPreImagesCollectionName,
+                    !origCmd.getNamespace().isChangeStreamPreImagesCollection());
+
             // If the request namespace refers to a time-series collection, transforms the user
             // time-series index request to one on the underlying bucket.
             boost::optional<CreateIndexesCommand> timeseriesCmdOwnership;
@@ -774,6 +802,8 @@ public:
                 origCmd.getIsTimeseriesNamespace() && *origCmd.getIsTimeseriesNamespace();
             if (auto options = timeseries::getTimeseriesOptions(
                     opCtx, origCmd.getNamespace(), !isCommandOnTimeseriesBucketNamespace)) {
+                checkCollectionUUIDMismatch(
+                    opCtx, origCmd.getNamespace(), nullptr, origCmd.getCollectionUUID());
                 timeseriesCmdOwnership =
                     timeseries::makeTimeseriesCreateIndexesCommand(opCtx, origCmd, *options);
                 cmd = &timeseriesCmdOwnership.value();
@@ -808,7 +838,7 @@ public:
                     }
                     // Reset the snapshot because we have released locks and need a fresh snapshot
                     // if we reacquire the locks again later.
-                    opCtx->recoveryUnit()->abandonSnapshot();
+                    shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
                     // This is a bit racy since we are not holding a lock across discovering an
                     // in-progress build and starting to listen for completion. It is good enough,
                     // however: we can only wait longer than needed, not less.

@@ -5,7 +5,7 @@
 // Simple covered index query test
 
 // Include helpers for analyzing explain output.
-import {isIndexOnly} from "jstests/libs/analyze_plan.js";
+import {getOptimizer, isIndexOnly} from "jstests/libs/analyze_plan.js";
 
 var coll = db.getCollection("covered_simple_id");
 coll.drop();
@@ -41,27 +41,51 @@ assert.eq(0,
           "simple.id.3 - docs examined should be 0 for covered query");
 
 // Test no query
-var plan = coll.find({}, {_id: 1}).hint({_id: 1}).explain("executionStats");
-assert(isIndexOnly(db, plan.queryPlanner.winningPlan),
-       "simple.id.4 - indexOnly should be true on covered query");
-assert.eq(0,
-          plan.executionStats.totalDocsExamined,
-          "simple.id.4 - docs examined should be 0 for covered query");
+if (!TestData.isHintsToQuerySettingsSuite) {
+    // This guard excludes this test case from being run on the cursor_hints_to_query_settings
+    // suite. The suite replaces cursor hints with query settings. Query settings do not force
+    // indexes, and therefore empty filter will result in collection scans.
+    var plan = coll.find({}, {_id: 1}).hint({_id: 1}).explain("executionStats");
+    assert(isIndexOnly(db, plan.queryPlanner.winningPlan),
+           "simple.id.4 - indexOnly should be true on covered query");
+    assert.eq(0,
+              plan.executionStats.totalDocsExamined,
+              "simple.id.4 - docs examined should be 0 for covered query");
+}
 
 // Test range query
 var plan = coll.find({_id: {$gt: 2, $lt: 6}}, {_id: 1}).hint({_id: 1}).explain("executionStats");
-assert(isIndexOnly(db, plan.queryPlanner.winningPlan),
-       "simple.id.5 - indexOnly should be true on covered query");
-assert.eq(0,
-          plan.executionStats.totalDocsExamined,
-          "simple.id.5 - docs examined should be 0 for covered query");
+switch (getOptimizer(plan)) {
+    case "classic":
+        assert(isIndexOnly(db, plan.queryPlanner.winningPlan),
+               "simple.id.5 - indexOnly should be true on covered query");
+        assert.eq(0,
+                  plan.executionStats.totalDocsExamined,
+                  "simple.id.5 - docs examined should be 0 for covered query");
+        break;
+    case "CQF":
+        // TODO SERVER-77719: Ensure that the decision for using the scan lines up with CQF
+        // optimizer. M2: allow only collscans, M4: check bonsai behavior for index scan.
+        break;
+    default:
+        break
+}
 
 // Test in query
 var plan = coll.find({_id: {$in: [5, 8]}}, {_id: 1}).hint({_id: 1}).explain("executionStats");
-assert(isIndexOnly(db, plan.queryPlanner.winningPlan),
-       "simple.id.6 - indexOnly should be true on covered query");
-assert.eq(0,
-          plan.executionStats.totalDocsExamined,
-          "simple.id.6 - docs examined should be 0 for covered query");
-
+switch (getOptimizer(plan)) {
+    case "classic":
+        assert(isIndexOnly(db, plan.queryPlanner.winningPlan),
+               "simple.id.6 - indexOnly should be true on covered query");
+        assert.eq(0,
+                  plan.executionStats.totalDocsExamined,
+                  "simple.id.6 - docs examined should be 0 for covered query");
+        break;
+    case "CQF":
+        // TODO SERVER-77719: Ensure that the decision for using the scan lines up with CQF
+        // optimizer. M2: allow only collscans, M4: check bonsai behavior for index scan.
+        break;
+    default:
+        break
+}
 print('all tests pass');

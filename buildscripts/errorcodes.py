@@ -43,7 +43,7 @@ _CODE_PATTERNS = [
         r"(?:StatusOK)?"
         r"(?:WithContext)?"
         r"\s*\(",
-        r"MONGO_UNREACHABLE_TASSERT\(",
+        r"MONGO_UN(?:REACHABLE|IMPLEMENTED)_TASSERT\(",
         # DBException and AssertionException constructors
         r"(?:DB|Assertion)Exception\s*[({]",
         # Calls to all LOGV2* variants
@@ -324,7 +324,6 @@ def main():
 
     if options.ticket:
         next_code_gen = get_next_code(seen, coerce_to_number(options.ticket))
-        print("next: %s" % next(next_code_gen))
     else:
         next_code_gen = get_next_code(seen, 0)
 

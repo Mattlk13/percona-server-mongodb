@@ -1,8 +1,13 @@
 /**
  * Utility class for testing query settings.
  */
-import {getQueryPlanner} from "jstests/libs/analyze_plan.js";
-import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {
+    getAggPlanStages,
+    getEngine,
+    getPlanStages,
+    getQueryPlanners,
+    getWinningPlanFromExplain
+} from "jstests/libs/analyze_plan.js";
 
 export class QuerySettingsUtils {
     /**
@@ -15,17 +20,29 @@ export class QuerySettingsUtils {
     }
 
     /**
-     * Makes an query instance of the find command with an optional filter clause.
+     * Makes an query instance of the find command.
      */
-    makeFindQueryInstance(filter = {}) {
-        return {find: this.collName, $db: this.db.getName(), filter};
+    makeFindQueryInstance(findObj) {
+        return {find: this.collName, $db: this.db.getName(), ...findObj};
     }
 
     /**
-     * Makes an query instance of the aggregate command with an optional pipeline clause.
+     * Makes a query instance of the distinct command.
      */
-    makeAggregateQueryInstance(pipeline = [], collName = this.collName) {
-        return {aggregate: collName, $db: this.db.getName(), pipeline};
+    makeDistinctQueryInstance(distinctObj) {
+        return {distinct: this.collName, $db: this.db.getName(), ...distinctObj};
+    }
+
+    /**
+     * Makes a query instance of the aggregate command with an optional pipeline clause.
+     */
+    makeAggregateQueryInstance(aggregateObj, collectionless = false) {
+        return {
+            aggregate: collectionless ? 1 : this.collName,
+            $db: this.db.getName(),
+            cursor: {},
+            ...aggregateObj
+        };
     }
 
     /**
@@ -38,14 +55,32 @@ export class QuerySettingsUtils {
     /**
      * Return query settings for the current tenant without query hashes.
      */
-    getQuerySettings(opts = {}) {
-        return this.adminDB
-            .aggregate([
-                {$querySettings: opts},
-                {$project: {queryShapeHash: 0}},
-                {$sort: {representativeQuery: 1}},
-            ])
-            .toArray();
+    getQuerySettings({showDebugQueryShape = false,
+                      showQueryShapeHash = false,
+                      filter = undefined} = {}) {
+        const pipeline = [{$querySettings: showDebugQueryShape ? {showDebugQueryShape} : {}}];
+        if (filter) {
+            pipeline.push({$match: filter});
+        }
+        if (!showQueryShapeHash) {
+            pipeline.push({$project: {queryShapeHash: 0}});
+        }
+        pipeline.push({$sort: {representativeQuery: 1}});
+        return this.adminDB.aggregate(pipeline).toArray();
+    }
+
+    /**
+     * Return queryShapeHash for a given query from querySettings.
+     */
+    getQueryHashFromQuerySettings(representativeQuery) {
+        const settings =
+            this.getQuerySettings({showQueryShapeHash: true, filter: {representativeQuery}});
+        assert.lte(
+            settings.length,
+            1,
+            `query ${tojson(representativeQuery)} is expected to have 0 or 1 settings, but got ${
+                tojson(settings)}`);
+        return settings.length === 0 ? undefined : settings[0].queryShapeHash;
     }
 
     /**
@@ -57,23 +92,31 @@ export class QuerySettingsUtils {
 
     /**
      * Helper function to assert equality of QueryShapeConfigurations. In order to ease the
-     * assertion logic, 'queryShapeHash' field is removed from the QueryShapeConfiguration prior to
-     * assertion.
+     * assertion logic, 'queryShapeHash' field is removed from the QueryShapeConfiguration prior
+     * to assertion.
      *
      * Since in sharded clusters the query settings may arrive with a delay to the mongos, the
      * assertion is done via 'assert.soon'.
+     *
+     * The settings list is not expected to be in any particular order.
      */
-    assertQueryShapeConfiguration(expectedQueryShapeConfigurations) {
+    assertQueryShapeConfiguration(expectedQueryShapeConfigurations, shouldRunExplain = true) {
         assert.soon(
             () => {
-                return bsonWoCompare(this.getQuerySettings(), expectedQueryShapeConfigurations) ==
-                    0;
+                let currentQueryShapeConfigurationWo = this.getQuerySettings();
+                currentQueryShapeConfigurationWo.sort(bsonWoCompare);
+                let expectedQueryShapeConfigurationWo = [...expectedQueryShapeConfigurations];
+                expectedQueryShapeConfigurationWo.sort(bsonWoCompare);
+                return bsonWoCompare(currentQueryShapeConfigurationWo,
+                                     expectedQueryShapeConfigurationWo) == 0;
             },
             "current query settings = " + tojson(this.getQuerySettings()) +
                 ", expected query settings = " + tojson(expectedQueryShapeConfigurations));
 
-        for (let {representativeQuery, settings} of expectedQueryShapeConfigurations) {
-            this.assertExplainQuerySettings(representativeQuery, settings);
+        if (shouldRunExplain) {
+            for (let {representativeQuery, settings} of expectedQueryShapeConfigurations) {
+                this.assertExplainQuerySettings(representativeQuery, settings);
+            }
         }
     }
 
@@ -83,34 +126,23 @@ export class QuerySettingsUtils {
     assertExplainQuerySettings(query, expectedQuerySettings) {
         // Pass query without the $db field to explain command, because it injects the $db field
         // inside the query before processing.
-        const {$db: _, ...queryWithoutDollarDb} = query;
-        if (query.find) {
-            const explain =
-                assert.commandWorked(this.db.runCommand({explain: queryWithoutDollarDb}));
-            const queryPlanner = getQueryPlanner(explain);
-            assert.docEq(expectedQuerySettings, queryPlanner.querySettings, queryPlanner);
+        const queryWithoutDollarDb = this.withoutDollarDB(query);
+        const explain = (() => {
+            if (query.find || query.distinct) {
+                return assert.commandWorked(this.db.runCommand({explain: queryWithoutDollarDb}));
+            } else if (query.aggregate) {
+                return assert.commandWorked(
+                    this.db.runCommand({explain: {...queryWithoutDollarDb, cursor: {}}}));
+            } else {
+                assert(false,
+                       `Attempting to run explain for unknown query type. Query: ${tojson(query)}`);
+            }
+        })();
+        if (explain) {
+            getQueryPlanners(explain).forEach(queryPlanner => {
+                assert.docEq(expectedQuerySettings, queryPlanner.querySettings, queryPlanner);
+            });
         }
-    }
-
-    // Adjust the 'clusterServerParameterRefreshIntervalSecs' value for faster fetching of
-    // 'querySettings' cluster parameter on mongos from the configsvr.
-    // TODO: SERVER-81062 Update cluster parameter cache on set-/removeQuerySettings and perform
-    // single retry on failure.
-    setClusterParamRefreshSecs(newValue) {
-        if (FixtureHelpers.isMongos(this.db)) {
-            const response = assert.commandWorked(this.db.adminCommand(
-                {getParameter: 1, clusterServerParameterRefreshIntervalSecs: 1}));
-            const oldValue = response.clusterServerParameterRefreshIntervalSecs;
-            assert.commandWorked(this.db.adminCommand(
-                {setParameter: 1, clusterServerParameterRefreshIntervalSecs: newValue}));
-            return {
-                restore: () => {
-                    assert.commandWorked(this.db.adminCommand(
-                        {setParameter: 1, clusterServerParameterRefreshIntervalSecs: oldValue}));
-                }
-            };
-        }
-        return {restore: () => {}};
     }
 
     /**
@@ -122,7 +154,75 @@ export class QuerySettingsUtils {
             const setting = settingsArray.pop();
             assert.commandWorked(
                 this.adminDB.runCommand({removeQuerySettings: setting.representativeQuery}));
+            // Check that the given setting has indeed been removed.
             this.assertQueryShapeConfiguration(settingsArray);
         }
+    }
+
+    /**
+     * Helper method for setting & removing query settings for testing purposes. Accepts a
+     * 'runTest' anonymous function which will be executed once the provided query settings have
+     * been propagated throughout the cluster.
+     */
+    withQuerySettings(representativeQuery, settings, runTest) {
+        const queryShapeHash = assert
+                                   .commandWorked(this.db.adminCommand(
+                                       {setQuerySettings: representativeQuery, settings: settings}))
+                                   .queryShapeHash;
+        assert.soon(() => (this.getQuerySettings({filter: {queryShapeHash}}).length === 1));
+        const result = runTest();
+        assert.commandWorked(db.adminCommand({removeQuerySettings: representativeQuery}));
+        assert.soon(() => (this.getQuerySettings({filter: {queryShapeHash}}).length === 0));
+        return result;
+    }
+
+    withoutDollarDB(cmd) {
+        const {$db: _, ...rest} = cmd;
+        return rest;
+    }
+
+    /**
+     * Asserts that the expected engine is run on the input query and settings.
+     */
+    assertQueryFramework({query, settings, expectedEngine}) {
+        // Ensure that query settings cluster parameter is empty.
+        this.assertQueryShapeConfiguration([]);
+
+        // Apply the provided settings for the query.
+        if (settings) {
+            assert.commandWorked(
+                this.db.adminCommand({setQuerySettings: query, settings: settings}));
+            // Wait until the settings have taken effect.
+            const expectedConfiguration = [this.makeQueryShapeConfiguration(settings, query)];
+            this.assertQueryShapeConfiguration(expectedConfiguration);
+        }
+
+        const withoutDollarDB = query.aggregate ? {...this.withoutDollarDB(query), cursor: {}}
+                                                : this.withoutDollarDB(query);
+        const explain = assert.commandWorked(this.db.runCommand({explain: withoutDollarDB}));
+        const engine = getEngine(explain);
+        assert.eq(
+            engine, expectedEngine, `Expected engine to be ${expectedEngine} but found ${engine}`);
+
+        // Ensure that no $cursor stage exists, which means the whole query got pushed down to find,
+        // if 'expectedEngine' is SBE.
+        if (query.aggregate) {
+            const cursorStages = getAggPlanStages(explain, "$cursor");
+
+            if (expectedEngine === "sbe") {
+                assert.eq(cursorStages.length, 0, cursorStages);
+            } else {
+                assert.gte(cursorStages.length, 0, cursorStages);
+            }
+        }
+
+        // If a hinted index exists, assert it was used.
+        if (query.hint) {
+            const winningPlan = getWinningPlanFromExplain(explain);
+            const ixscanStage = getPlanStages(winningPlan, "IXSCAN")[0];
+            assert.eq(query.hint, ixscanStage.keyPattern, winningPlan);
+        }
+
+        this.removeAllQuerySettings();
     }
 }

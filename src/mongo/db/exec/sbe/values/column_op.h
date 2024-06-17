@@ -38,94 +38,21 @@
 namespace mongo::sbe::value {
 /**
  * The ColumnOpType struct is used as a means to declare various properties about a ColumnOp.
- * These properties include the ColumnOp's expected input type, the ColumnOp's output type on
- * existent input, the ColumnOp's output type on missing input, and other properties represented
- * using flags.
+ * These properties include for the moment a flag declaring intrinsic properties of the operation.
  */
 struct ColumnOpType {
     enum Flags : uint32_t {
         kNoFlags = 0u,
 
-        // ColumnOp always returns Nothing if the input is Nothing.
-        kOutputNothingOnMissingInput = 1u << 0u,
-
-        // ColumnOp always returns a non-Nothing value if the input is Nothing.
-        kOutputNonNothingOnMissingInput = 1u << 1u,
-
-        // ColumnOp always returns a non-Nothing value if the input matches the expected input type.
-        kOutputNonNothingOnExpectedInput = 1u << 2u,
-
-        // ColumnOp always returns a non-Nothing value if the input is non-Nothing
-        kOutputNonNothingOnExistingInput = 1u << 3u,
-
-        // ColumnOp is a monotonic function
-        kMonotonic = 1u << 4u,
+        // ColumnOp is a monotonic function, i.e. when invoked on a value v1 which is smaller in
+        // sort order than v2, the result is guaranteeded to be less or equal (or greater than
+        // equal, if monotic descending) than the result of invoking the operation on v2.
+        kMonotonic = 1u << 0u,
     };
 
-    // Indicates ColumnOp always returns a non-Nothing value if the input is Nothing.
-    struct ReturnNonNothingOnMissing {};
-
-    // Indicates ColumnOp always returns Nothing if the input is Nothing.
-    struct ReturnNothingOnMissing {};
-
-    // Indicates ColumnOp always returns a non-Nothing Null value if the input is Nothing.
-    struct ReturnNullOnMissing {};
-
-    // Indicates ColumnOp always returns a non-Nothing Boolean value if the input is Nothing.
-    struct ReturnBoolOnMissing {};
-
-    struct OnMissingInput {
-        // 'outputTag' indicates ColumnOp's output type when the input is Nothing. If 'outputTag'
-        // is equal to TypeTags::Nothing, that means that the ColumnOp may return any type when
-        // the input is Nothing. (Note that 'outputTag' is independent of and has no effect on
-        // whether ColumnOp returns Nothing or a non-Nothing value when the input is Nothing.)
-        constexpr OnMissingInput(TypeTags outputTag = TypeTags::Nothing) : tag(outputTag) {}
-
-        constexpr OnMissingInput(ReturnNonNothingOnMissing, TypeTags outputTag = TypeTags::Nothing)
-            : flags(kOutputNonNothingOnMissingInput), tag(outputTag) {}
-
-        constexpr OnMissingInput(ReturnNothingOnMissing) : flags(kOutputNothingOnMissingInput) {}
-
-        constexpr OnMissingInput(ReturnNullOnMissing)
-            : flags(kOutputNonNothingOnMissingInput), tag(TypeTags::Null) {}
-
-        constexpr OnMissingInput(ReturnBoolOnMissing)
-            : flags(kOutputNonNothingOnMissingInput), tag(TypeTags::Boolean) {}
-
-        const Flags flags = kNoFlags;
-        const TypeTags tag = TypeTags::Nothing;
-    };
-
-    constexpr ColumnOpType(Flags flags,
-                           TypeTags expectedTag,
-                           TypeTags outputTag,
-                           OnMissingInput onMissingInput)
-        : flags(static_cast<ColumnOpType::Flags>(flags | onMissingInput.flags)),
-          expectedTag(expectedTag),
-          outputTag(outputTag),
-          outputTagOnMissing(onMissingInput.tag) {}
+    constexpr ColumnOpType(Flags flags) : flags(flags) {}
 
     const Flags flags{kNoFlags};
-
-    // Indicates ColumnOp's expected input type. If the ColumnOp does not have an "expected input
-    // type" (i.e. it supports any type of input), 'expectedTag' will be equal to TypeTags::Nothing.
-    // When 'expectedTag' is not TypeTags::Nothing, that means the ColumnOp is guaranteed to return
-    // Nothing when the input is a non-Nothing value whose type does not match 'expectedTag'.
-    const TypeTags expectedTag{TypeTags::Nothing};
-
-    // Indicates ColumnOp's output type on existent input. If the ColumnOp does not have an "output
-    // type" (i.e. it may return any type on existent input), then 'outputTag' will be equal to
-    // TypeTags::Nothing. When 'outputTag' is not TypeTags::Nothing, that means that the ColumnOp
-    // is guaranteed to return either Nothing or a value whose type matches 'outputTag' when the
-    // input is a non-Nothing value.
-    const TypeTags outputTag{TypeTags::Nothing};
-
-    // Indicates ColumnOp's output type on missing input. If the ColumnOp does not have an "output
-    // type on missing input" (i.e. it may return any type on missing input), 'outputTagOnMissing'
-    // will be equal to TypeTags::Nothing. When 'outputTagOnMissing' is not TypeTags::Nothing, that
-    // means that the ColumnOp is guaranteed to return either Nothing or a value whose type matches
-    // 'outputTagOnMissing' when the input is Nothing.
-    const TypeTags outputTagOnMissing{TypeTags::Nothing};
 };
 
 constexpr ColumnOpType::Flags operator~(ColumnOpType::Flags flags) {
@@ -158,8 +85,8 @@ public:
         using ProcessSingleFn = std::pair<TypeTags, Value> (*)(const ColumnOpFunctorData*,
                                                                TypeTags,
                                                                Value);
-        using ProcessBatchFn = void (*)(
-            const ColumnOpFunctorData*, const TypeTags*, const Value*, TypeTags*, Value*, size_t);
+        using ProcessBatchFn =
+            void (*)(const ColumnOpFunctorData*, TypeTags, const Value*, TypeTags*, Value*, size_t);
 
         constexpr MethodTable(ProcessSingleFn processSingleFn,
                               ProcessBatchFn processBatchFn) noexcept
@@ -195,13 +122,9 @@ public:
     using SingleFn = FuncT1;
     using BatchFn = std::conditional_t<std::is_same_v<FuncT2, std::monostate>, FuncT1, FuncT2>;
 
-    // Check if this op is guaranteed to output Nothing when the input is Nothing.
-    static constexpr bool outputNothingOnMissingInput =
-        (OpType.flags & ColumnOpType::kOutputNothingOnMissingInput) != ColumnOpType::kNoFlags;
-
     // Check if 'BatchFn' provides a general batch callback that uses a variable-size batch.
-    static constexpr bool hasGeneralBatchFn = std::
-        is_invocable_v<const BatchFn&, const TypeTags*, const Value*, TypeTags*, Value*, size_t>;
+    static constexpr bool hasGeneralBatchFn =
+        std::is_invocable_v<const BatchFn&, TypeTags, const Value*, TypeTags*, Value*, size_t>;
 
     // If 2 functors were provided to makeColumnOp(), the second functor must provide a batch
     // callback.
@@ -216,7 +139,7 @@ public:
     }
 
     static void processBatchFn(const ColumnOpFunctorData* cofd,
-                               const TypeTags* inTags,
+                               TypeTags inTag,
                                const Value* inVals,
                                TypeTags* outTags,
                                Value* outVals,
@@ -224,12 +147,10 @@ public:
         const ColumnOpFunctor& cof = *static_cast<const ColumnOpFunctor*>(cofd);
 
         if constexpr (hasGeneralBatchFn) {
-            cof.getBatchFn()(inTags, inVals, outTags, outVals, count);
+            cof.getBatchFn()(inTag, inVals, outTags, outVals, count);
         } else {
             for (size_t i = 0; i < count; ++i) {
-                auto [tag, val] = processSingleFn(cofd, inTags[i], inVals[i]);
-                outTags[i] = tag;
-                outVals[i] = val;
+                std::tie(outTags[i], outVals[i]) = processSingleFn(cofd, inTag, inVals[i]);
             }
         }
     }
@@ -304,12 +225,36 @@ struct ColumnOp {
         return methodTable.processSingleFn(cofd, tag, val);
     }
 
+    void processBatch(TypeTags inTag,
+                      const Value* inVals,
+                      TypeTags* outTags,
+                      Value* outVals,
+                      size_t count) const {
+        methodTable.processBatchFn(cofd, inTag, inVals, outTags, outVals, count);
+    }
+
+    // Helper method that takes care of extracting contiguous chunks of homogeneous values
+    // so that they can be invoked by the batch function.
     void processBatch(const TypeTags* inTags,
                       const Value* inVals,
                       TypeTags* outTags,
                       Value* outVals,
                       size_t count) const {
-        methodTable.processBatchFn(cofd, inTags, inVals, outTags, outVals, count);
+        for (size_t index = 0; index < count;) {
+            // Compute the length of the chunk having the same type.
+            size_t chunkSize = 1;
+            while ((index + chunkSize) < count && inTags[index] == inTags[index + chunkSize]) {
+                chunkSize++;
+            }
+            if (chunkSize == 1) {
+                std::tie(outTags[index], outVals[index]) =
+                    processSingle(inTags[index], inVals[index]);
+            } else {
+                processBatch(
+                    inTags[index], &inVals[index], &outTags[index], &outVals[index], chunkSize);
+            }
+            index += chunkSize;
+        }
     }
 
     const ColumnOpType opType;

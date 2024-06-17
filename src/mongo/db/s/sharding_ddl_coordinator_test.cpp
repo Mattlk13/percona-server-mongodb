@@ -27,10 +27,9 @@
  *    it in the license file.
  */
 
-#include "mongo/db/s/sharding_ddl_coordinator.h"
-
-#include "mongo/db/concurrency/locker_impl.h"
+#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
+#include "mongo/db/s/sharding_ddl_coordinator.h"
 #include "mongo/db/s/sharding_ddl_coordinator_external_state_for_test.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
 
@@ -73,11 +72,11 @@ protected:
               _shardingDDLCoordinatorMetadata(coordinatorMetadata),
               _additionalNss(additionalNss) {}
 
-        ShardingDDLCoordinatorMetadata const& metadata() const {
+        ShardingDDLCoordinatorMetadata const& metadata() const override {
             return _shardingDDLCoordinatorMetadata;
         }
 
-        void setMetadata(ShardingDDLCoordinatorMetadata&& metadata) {}
+        void setMetadata(ShardingDDLCoordinatorMetadata&& metadata) override {}
 
         boost::optional<BSONObj> reportForCurrentOp(
             MongoProcessInterface::CurrentOpConnectionsMode connMode,
@@ -87,7 +86,7 @@ protected:
 
         void checkIfOptionsConflict(const BSONObj& doc) const final {}
 
-        std::set<NamespaceString> _getAdditionalLocksToAcquire(OperationContext* opCtx) {
+        std::set<NamespaceString> _getAdditionalLocksToAcquire(OperationContext* opCtx) override {
             return _additionalNss;
         };
 
@@ -124,7 +123,7 @@ TEST_F(ShardingDDLCoordinatorTest, AcquiresDDLLocks) {
         coordinator->fulfillPromises();
         CancellationSource cancellationSource;
 
-        coordinator->_locker = std::make_unique<LockerImpl>(getServiceContext());
+        coordinator->_locker = std::make_unique<Locker>(getServiceContext());
 
         // Just run the '_acquireAllLocksAsync()' bit of ShardingDDLCoordinator::run().
         ExecutorFuture<void>(**_scopedExecutor)

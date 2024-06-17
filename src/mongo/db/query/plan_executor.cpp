@@ -68,19 +68,33 @@ void PlanExecutor::checkFailPointPlanExecAlwaysFails() {
     }
 }
 
+void PlanExecutor::releaseAllAcquiredResources() {
+    auto opCtx = getOpCtx();
+    invariant(opCtx);
+
+    saveState();
+    // Detach + reattach forces us to release all resources back to the storage engine. This is
+    // currently a side-effect of how Storage Engine cursors are implemented in the plans.
+    //
+    // TODO SERVER-87866: See if we can remove this if saveState/restoreState actually release all
+    // resources.
+    detachFromOperationContext();
+    reattachToOperationContext(opCtx);
+}
+
 const CollectionPtr& VariantCollectionPtrOrAcquisition::getCollectionPtr() const {
-    return *stdx::visit(OverloadedVisitor{
-                            [](const CollectionPtr* collectionPtr) { return collectionPtr; },
-                            [](const CollectionAcquisition& collectionAcquisition) {
-                                return &collectionAcquisition.getCollectionPtr();
-                            },
-                        },
-                        _collectionPtrOrAcquisition);
+    return *visit(OverloadedVisitor{
+                      [](const CollectionPtr* collectionPtr) { return collectionPtr; },
+                      [](const CollectionAcquisition& collectionAcquisition) {
+                          return &collectionAcquisition.getCollectionPtr();
+                      },
+                  },
+                  _collectionPtrOrAcquisition);
 }
 
 boost::optional<ScopedCollectionFilter> VariantCollectionPtrOrAcquisition::getShardingFilter(
     OperationContext* opCtx) const {
-    return stdx::visit(
+    return visit(
         OverloadedVisitor{
             [&](const CollectionPtr* collPtr) -> boost::optional<ScopedCollectionFilter> {
                 auto scopedCss = CollectionShardingState::assertCollectionLockedAndAcquire(

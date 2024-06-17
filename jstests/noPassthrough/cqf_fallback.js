@@ -1,6 +1,10 @@
 /**
  * Verify that expressions and operators are correctly routed to CQF where eligible. This decision
  * is based on several factors including the query text, collection metadata, etc..
+ *
+ * @tags: [
+ *   disables_test_commands,
+ * ]
  */
 import {usedBonsaiOptimizer} from "jstests/libs/optimizer_utils.js";
 
@@ -21,6 +25,19 @@ if (assert.commandWorked(db.adminCommand({getParameter: 1, internalQueryFramewor
 
 assert.commandWorked(
     db.adminCommand({configureFailPoint: 'enableExplainInBonsai', 'mode': 'alwaysOn'}));
+
+// 'runWithParams' as defined in 'optimizer_utils.js' doesn't have access to the db defined in this
+// test.
+function runWithFastPathsDisabled(fn) {
+    try {
+        assert.commandWorked(
+            db.adminCommand({setParameter: 1, internalCascadesOptimizerDisableFastPath: true}));
+        return fn();
+    } finally {
+        assert.commandWorked(
+            db.adminCommand({setParameter: 1, internalCascadesOptimizerDisableFastPath: false}));
+    }
+}
 
 function assertSupportedByBonsaiFully(cmd) {
     // A supported stage must use the new optimizer.
@@ -286,6 +303,8 @@ assertNotSupportedByBonsai({find: coll.getName(), filter: {}, allowSpeculativeMa
 assertNotSupportedByBonsai({find: coll.getName(), filter: {}, tailable: true, awaitData: true},
                            false);
 // collation
+assertSupportedByBonsaiFully({find: coll.getName(), filter: {}, collation: {}});
+assertSupportedByBonsaiFully({find: coll.getName(), filter: {}, collation: {locale: "simple"}});
 assertNotSupportedByBonsai({find: coll.getName(), filter: {}, collation: {locale: "fr_CA"}}, false);
 assertNotSupportedByBonsai({
     aggregate: coll.getName(),
@@ -294,12 +313,22 @@ assertNotSupportedByBonsai({
     cursor: {}
 },
                            false);
-// let
+
+// When let variables are used in the query, it is experimentally supported.
 assertNotSupportedByBonsai({find: coll.getName(), projection: {foo: "$$val"}, let : {val: 1}},
-                           false);
-assertNotSupportedByBonsai(
-    {aggregate: coll.getName(), pipeline: [{$match: {a: "$$val"}}], let : {val: 1}, cursor: {}},
-    false);
+                           true);
+assertNotSupportedByBonsai({
+    aggregate: coll.getName(),
+    pipeline: [{$match: {$expr: {$eq: ["$a", "$$val"]}}}],
+    let : {val: 1},
+    cursor: {}
+},
+                           true);
+
+// When let variables are specified but unused in the query, it is eligible for CQF.
+assertSupportedByBonsaiFully(
+    {aggregate: coll.getName(), pipeline: [{$match: {a: 2}}], let : {val: 1}, cursor: {}});
+
 // limit
 assertNotSupportedByBonsai({find: coll.getName(), filter: {}, limit: 1}, true);
 assertNotSupportedByBonsai({aggregate: coll.getName(), pipeline: [{$limit: 1}], cursor: {}}, true);
@@ -319,7 +348,8 @@ const rtc = {
 };
 assertNotSupportedByBonsai({find: coll.getName(), filter: {}, runtimeConstants: rtc}, false);
 assertNotSupportedByBonsai(
-    {aggregate: coll.getName(), pipeline: [], cursor: {}, runtimeConstants: rtc}, false);
+    {aggregate: coll.getName(), pipeline: [], cursor: {}, runtimeConstants: rtc, fromMongos: true},
+    false);
 // showRecordId
 assertNotSupportedByBonsai({find: coll.getName(), filter: {}, showRecordId: true}, false);
 // singleBatch
@@ -356,8 +386,11 @@ rst.stopSet();
 
 // Unsupported index type (sparse).
 assert.commandWorked(coll.createIndex({a: 1}, {sparse: true}));
-assertNotSupportedByBonsai({find: coll.getName(), filter: {}});
-assertNotSupportedByBonsai({aggregate: coll.getName(), pipeline: [], cursor: {}});
+// Fast path implementations assume a collection scan and therefore don't check indexes.
+runWithFastPathsDisabled(() => {
+    assertNotSupportedByBonsai({find: coll.getName(), filter: {}});
+    assertNotSupportedByBonsai({aggregate: coll.getName(), pipeline: [], cursor: {}});
+});
 
 // Query with $natural on a collection with a sparse index (unsupported) is eligible for CQF.
 assertSupportedByBonsaiFully({find: coll.getName(), filter: {}, hint: {$natural: 1}});
@@ -371,8 +404,11 @@ assertSupportedByBonsaiFully(
 coll.drop();
 assert.commandWorked(coll.insert({a: 1}));
 assert.commandWorked(coll.createIndex({"$**": 1}));
-assertNotSupportedByBonsai({find: coll.getName(), filter: {}});
-assertNotSupportedByBonsai({aggregate: coll.getName(), pipeline: [], cursor: {}});
+// Fast path implementations assume a collection scan and therefore don't check indexes.
+runWithFastPathsDisabled(() => {
+    assertNotSupportedByBonsai({find: coll.getName(), filter: {}});
+    assertNotSupportedByBonsai({aggregate: coll.getName(), pipeline: [], cursor: {}});
+});
 
 // Query with $natural on a collection with a wildcard index (unsupported) is eligible for CQF.
 assertSupportedByBonsaiFully({find: coll.getName(), filter: {}, hint: {$natural: 1}});
@@ -385,8 +421,11 @@ assertSupportedByBonsaiFully(
 // TTL index is not supported.
 coll.drop();
 assert.commandWorked(coll.createIndex({a: 1}, {expireAfterSeconds: 50}));
-assertNotSupportedByBonsai({find: coll.getName(), filter: {}});
-assertNotSupportedByBonsai({aggregate: coll.getName(), pipeline: [], cursor: {}});
+// Fast path implementations assume a collection scan and therefore don't check indexes.
+runWithFastPathsDisabled(() => {
+    assertNotSupportedByBonsai({find: coll.getName(), filter: {}});
+    assertNotSupportedByBonsai({aggregate: coll.getName(), pipeline: [], cursor: {}});
+});
 
 // Query with $natural on a collection with a TTL index (unsupported) is eligible for CQF.
 assertSupportedByBonsaiFully({find: coll.getName(), filter: {}, hint: {$natural: 1}});
@@ -399,8 +438,11 @@ assertSupportedByBonsaiFully(
 // Unsupported index with non-simple collation.
 coll.drop();
 assert.commandWorked(coll.createIndex({a: 1}, {collation: {locale: "fr_CA"}}));
-assertNotSupportedByBonsai({find: coll.getName(), filter: {}});
-assertNotSupportedByBonsai({aggregate: coll.getName(), pipeline: [], cursor: {}});
+// Fast path implementations assume a collection scan and therefore don't check indexes.
+runWithFastPathsDisabled(() => {
+    assertNotSupportedByBonsai({find: coll.getName(), filter: {}});
+    assertNotSupportedByBonsai({aggregate: coll.getName(), pipeline: [], cursor: {}});
+});
 
 // Query with $natural on a collection with a non-simple collation index (unsupported) is eligible
 // for CQF.
@@ -457,8 +499,11 @@ assertSupportedByBonsaiFully({aggregate: coll.getName(), pipeline: [], cursor: {
 
 // Unhiding the unsupported index means the query is not eligible for CQF.
 coll.unhideIndex({a: 1});
-assertNotSupportedByBonsai({find: coll.getName(), filter: {}});
-assertNotSupportedByBonsai({aggregate: coll.getName(), pipeline: [], cursor: {}});
+// Fast path implementations assume a collection scan and therefore don't check indexes.
+runWithFastPathsDisabled(() => {
+    assertNotSupportedByBonsai({find: coll.getName(), filter: {}});
+    assertNotSupportedByBonsai({aggregate: coll.getName(), pipeline: [], cursor: {}});
+});
 
 // Test-only index type.
 coll.drop();
@@ -482,8 +527,9 @@ assertSupportedByBonsaiFully({find: coll.getName(), filter: {}});
 assertSupportedByBonsaiFully({aggregate: coll.getName(), pipeline: [], cursor: {}});
 
 // Queries on a collection with a hashed index that reference _id only experimentally supported,
-// tryBonsai falls back to classic engine
-assertSupportedByBonsaiExperimentally({find: coll.getName(), filter: {_id: 1}}, false);
+// tryBonsai falls back to classic engine. Use batchSize param to avoid triggering EXPRESS path.
+assertSupportedByBonsaiExperimentally({find: coll.getName(), filter: {_id: 1}, batchSize: 200},
+                                      false);
 assertSupportedByBonsaiExperimentally(
     {aggregate: coll.getName(), pipeline: [{$match: {_id: 1}}], cursor: {}});
 assertSupportedByBonsaiFully({find: coll.getName(), filter: {a: 1}});
@@ -681,3 +727,40 @@ try {
               ErrorCodes.BadValue,
               "Expected a BadValue error, but encountered: " + e.message);
 }
+
+// Show that finds and aggregations against sharded collections are eligible for bonsai.
+let shardingConn = new ShardingTest({
+    shards: 2,
+    mongos: 1,
+    other: {
+        shardOptions: {
+            setParameter: {
+                "failpoint.enableExplainInBonsai": tojson({mode: "alwaysOn"}),
+                featureFlagCommonQueryFramework: true,
+                internalQueryFrameworkControl: 'tryBonsai'
+            }
+        },
+        mongosOptions: {
+            setParameter: {
+                featureFlagCommonQueryFramework: true,
+            }
+        },
+    }
+});
+
+db = shardingConn.getDB("test");
+coll = db[jsTestName()];
+coll.drop();
+
+coll.insertMany([...Array(100).keys()].map(i => {
+    return {_id: i, a: i};
+}));
+shardingConn.shardColl(coll.getName(), {_id: 1}, {_id: 50}, {_id: 51});
+
+explain = coll.explain().aggregate({$match: {a: {$gt: 12}}});
+assert(usedBonsaiOptimizer(explain), tojson(explain));
+
+explain = coll.explain().find({a: {$gt: 12}}).finish();
+assert(usedBonsaiOptimizer(explain), tojson(explain));
+
+shardingConn.stop();

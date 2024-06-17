@@ -39,6 +39,7 @@
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/vector_clock.h"
 #include "mongo/executor/hedging_metrics.h"
+#include "mongo/idl/cluster_server_parameter_server_status.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/num_hosts_targeted_metrics.h"
@@ -50,7 +51,7 @@ namespace {
 
 class ShardingServerStatus final : public ServerStatusSection {
 public:
-    ShardingServerStatus() : ServerStatusSection("sharding") {}
+    using ServerStatusSection::ServerStatusSection;
 
     bool includeByDefault() const override {
         return true;
@@ -87,14 +88,20 @@ public:
             grid->getBalancerConfiguration()->getMaxChunkSizeBytes();
         result.append("maxChunkSizeInBytes", maxChunkSizeInBytes);
 
+        _clusterParameterStatus.report(opCtx, &result);
+
         return result.obj();
     }
 
-} shardingServerStatus;
+private:
+    ClusterServerParameterServerStatus _clusterParameterStatus;
+};
+auto& shardingServerStatus =
+    *ServerStatusSectionBuilder<ShardingServerStatus>("sharding").forRouter();
 
 class ShardingStatisticsServerStatus final : public ServerStatusSection {
 public:
-    ShardingStatisticsServerStatus() : ServerStatusSection("shardingStatistics") {}
+    using ServerStatusSection::ServerStatusSection;
 
     bool includeByDefault() const override {
         return true;
@@ -112,12 +119,13 @@ public:
         catalogCache->report(&result);
         return result.obj();
     }
-
-} shardingStatisticsServerStatus;
+};
+auto& shardingStatisitcsServerStatus =
+    *ServerStatusSectionBuilder<ShardingStatisticsServerStatus>("shardingStatistics").forRouter();
 
 class HedgingMetricsServerStatus : public ServerStatusSection {
 public:
-    HedgingMetricsServerStatus() : ServerStatusSection("hedgingMetrics") {}
+    using ServerStatusSection::ServerStatusSection;
 
     ~HedgingMetricsServerStatus() override = default;
 
@@ -129,8 +137,9 @@ public:
                             const BSONElement& configElement) const override {
         return HedgingMetrics::get(opCtx)->toBSON();
     }
-
-} hedgingMetricsServerStatus;
+};
+auto& hedgingMetricsServerStatus =
+    *ServerStatusSectionBuilder<HedgingMetricsServerStatus>("hedgingMetrics").forRouter();
 
 }  // namespace
 }  // namespace mongo

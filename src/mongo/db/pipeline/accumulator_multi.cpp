@@ -234,7 +234,7 @@ void AccumulatorMinMaxN::_processValue(const Value& val) {
         }
     }
 
-    _set.emplace(SimpleMemoryToken{val.getApproximateSize(), &_memUsageTracker}, val);
+    _set.emplace(SimpleMemoryUsageToken{val.getApproximateSize(), &_memUsageTracker}, val);
     checkMemUsage();
 }
 
@@ -323,8 +323,9 @@ void AccumulatorFirstLastN::_processValue(const Value& val) {
         }
     }
 
-    _deque.emplace_back(SimpleMemoryToken{valToProcess.getApproximateSize(), &_memUsageTracker},
-                        std::move(valToProcess));
+    _deque.emplace_back(
+        SimpleMemoryUsageToken{valToProcess.getApproximateSize(), &_memUsageTracker},
+        std::move(valToProcess));
     checkMemUsage();
 }
 
@@ -358,7 +359,7 @@ boost::intrusive_ptr<Expression> AccumulatorFirstLastN::parseExpression(
 }
 
 void AccumulatorFirstLastN::reset() {
-    _deque = std::deque<SimpleMemoryTokenWith<Value>>();
+    _deque = std::deque<SimpleMemoryUsageTokenWith<Value>>();
 }
 
 Value AccumulatorFirstLastN::getValue(bool toBeMerged) {
@@ -536,7 +537,7 @@ std::tuple<SortPattern, BSONArray, bool> parseAccumulatorTopBottomNSortBy(
             // since the evaluated argument wouldn't have the same metadata as the original
             // document. Instead we use [{$meta: "textScore"}] as the sortFields expression so the
             // sortFields array contains the data we need for sorting.
-            const auto serialized = part.expression->serialize(SerializationOptions{});
+            const auto serialized = part.expression->serialize();
             sortFieldsExpBab.append(serialized.getDocument().toBson());
             hasMeta = true;
         } else {
@@ -653,8 +654,8 @@ void AccumulatorTopBottomN<sense, single>::_processValue(const Value& val) {
     const auto memUsage = keyOutPair.first.getApproximateSize() +
         keyOutPair.second.getApproximateSize() + sizeof(KeyOutPair);
     _map->emplace(keyOutPair.first,
-                  SimpleMemoryTokenWith<Value>{SimpleMemoryToken{memUsage, &_memUsageTracker},
-                                               keyOutPair.second});
+                  SimpleMemoryUsageTokenWith<Value>{
+                      SimpleMemoryUsageToken{memUsage, &_memUsageTracker}, keyOutPair.second});
     checkMemUsage();
 }
 

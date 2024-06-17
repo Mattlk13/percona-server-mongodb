@@ -104,10 +104,10 @@ public:
             auto* opCtx = opCtxHolder.get();
             managerState->setAuthzVersion(opCtx, AuthorizationManager::schemaVersion26Final);
         }
-        auto authzManager = std::make_unique<AuthorizationManagerImpl>(
-            getServiceContext(), std::move(localManagerState));
+        auto authzManager =
+            std::make_unique<AuthorizationManagerImpl>(getService(), std::move(localManagerState));
         authzManager->setAuthEnabled(true);
-        AuthorizationManager::set(getServiceContext(), std::move(authzManager));
+        AuthorizationManager::set(getService(), std::move(authzManager));
         Client::releaseCurrent();
         Client::initThread(getThreadName(), getServiceContext()->getService(), session);
         authzSession = AuthorizationSession::get(getClient());
@@ -325,11 +325,19 @@ OperationSessionInfoFromClient initializeOpSessionInfoWithRequestBody(
     bool attachToOpCtx,
     bool isReplSetMemberOrMongos) {
     auto opMsgRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired,
         DatabaseName::createDatabaseName_forTest(boost::none, "test_unused_dbname"),
+
         requestBody,
         BSONObj());
-    return initializeOperationSessionInfo(
-        opCtx, opMsgRequest, requiresAuth, attachToOpCtx, isReplSetMemberOrMongos);
+    auto osi = OperationSessionInfoFromClient::parse(IDLParserContext{"OperationSessionInfo"},
+                                                     opMsgRequest.body);
+    return initializeOperationSessionInfo(opCtx,
+                                          opMsgRequest.getValidatedTenantId(),
+                                          osi,
+                                          requiresAuth,
+                                          attachToOpCtx,
+                                          isReplSetMemberOrMongos);
 }
 
 TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_NoSessionIdNoTransactionNumber) {

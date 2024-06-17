@@ -73,25 +73,42 @@ TEST_F(QueryPlannerTest, EqualityIndexScanWithTrailingFields) {
 }
 
 TEST_F(QueryPlannerTest, ExprEqCanUseIndex) {
-    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    params.mainCollectionInfo.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
     addIndex(BSON("a" << 1));
-    runQuery(fromjson("{a: {$_internalExprEq: 1}}"));
+    runQuery(fromjson("{$expr: {$eq: ['$a', 1]}}"));
     ASSERT_EQUALS(getNumSolutions(), 1U);
     assertSolutionExists(
-        "{fetch: {filter: null, node: {ixscan: {pattern: {a: 1}, bounds: {a: "
+        "{fetch: {filter: {$expr: {$eq: ['$a', {$const: 1}]}}, node: {ixscan: {pattern: {a: 1}, "
+        "bounds: {a: "
         "[[1,1,true,true]]}}}}}");
 }
 
 TEST_F(QueryPlannerTest, ExprEqCannotUseMultikeyFieldOfIndex) {
     MultikeyPaths multikeyPaths{{0U}};
     addIndex(BSON("a.b" << 1), multikeyPaths);
-    runQuery(fromjson("{'a.b': {$_internalExprEq: 1}}"));
+    runQuery(fromjson("{$expr: {$eq: ['$a.b', 1]}}"));
     assertNumSolutions(1U);
-    assertSolutionExists("{cscan: {dir: 1, filter: {'a.b': {$_internalExprEq: 1}}}}");
+    assertSolutionExists("{cscan: {dir: 1, filter: {$and: [{$expr: {$eq: ['$a.b', 1]}}]}}}");
+}
+
+// Test that when a $expr predicate is ANDed with an index-eligible predicate, an imprecise
+// $_internalExpr predicate is pushed into the IXSCAN bounds, to filter out results before fetching.
+TEST_F(QueryPlannerTest, ExprQueryOnMultiKeyIndexPushesImpreciseFilterToIxscan) {
+    params.mainCollectionInfo.options = QueryPlannerParams::INCLUDE_COLLSCAN;
+    addIndex(BSON("a" << 1 << "b" << 1), false /* multikey */);
+    runQuery(fromjson("{$and: [{a: 123}, {$expr: {$eq: ['$b', 456]}}]}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists(
+        "{cscan: {filter: {$and: [{a: 123}, {$expr: {$eq: ['$b', 456]}}]}, dir: 1}}");
+    assertSolutionExists(
+        "{fetch: {filter: {$expr: {$eq: ['$b', 456]}}, node: "
+        "{ixscan: {pattern: {a:1,b:1}, bounds: "
+        "{a: [[123,123,true,true]], b: [[456,456,true,true]]}}}}}");
 }
 
 TEST_F(QueryPlannerTest, MustFetchWhenIndexKeyRequiredToCoverSortIsMultikey) {
-    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    params.mainCollectionInfo.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
 
     // 'b' is multikey.
     MultikeyPaths multikeyPaths{{}, {0U}};
@@ -109,7 +126,7 @@ TEST_F(QueryPlannerTest, MustFetchWhenIndexKeyRequiredToCoverSortIsMultikey) {
 }
 
 TEST_F(QueryPlannerTest, CoveredWhenMultikeyIndexComponentIsNotRequiredByQuery) {
-    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    params.mainCollectionInfo.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
 
     // 'c' is multikey.
     MultikeyPaths multikeyPaths{{}, {}, {0U}};
@@ -127,7 +144,7 @@ TEST_F(QueryPlannerTest, CoveredWhenMultikeyIndexComponentIsNotRequiredByQuery) 
 }
 
 TEST_F(QueryPlannerTest, CoveredWhenQueryOnNonMultikeyDottedPath) {
-    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    params.mainCollectionInfo.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
 
     addIndex(BSON("a" << 1 << "b.c" << 1));
 
@@ -143,7 +160,7 @@ TEST_F(QueryPlannerTest, CoveredWhenQueryOnNonMultikeyDottedPath) {
 }
 
 TEST_F(QueryPlannerTest, MustFetchWhenFilterNonEmptyButMissingLeadingField) {
-    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    params.mainCollectionInfo.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
     addIndex(BSON("a" << 1 << "b" << 1));
 
     runQueryAsCommand(
@@ -159,7 +176,7 @@ TEST_F(QueryPlannerTest, MustFetchWhenFilterNonEmptyButMissingLeadingField) {
 }
 
 TEST_F(QueryPlannerTest, MustFetchWhenIndexKeyRequiredtoCoverProjectIsMultikey) {
-    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    params.mainCollectionInfo.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
     // 'b' is multikey.
     MultikeyPaths multikeyPaths{{}, {0U}};
     addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
@@ -175,7 +192,7 @@ TEST_F(QueryPlannerTest, MustFetchWhenIndexKeyRequiredtoCoverProjectIsMultikey) 
 }
 
 TEST_F(QueryPlannerTest, CoveredWhenKeysAreNotMultikey) {
-    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    params.mainCollectionInfo.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
     // 'b' is multikey.
     MultikeyPaths multikeyPaths{{}, {0U}, {}};
     addIndex(BSON("a" << 1 << "b" << 1 << "c" << 1), multikeyPaths);
@@ -193,7 +210,7 @@ TEST_F(QueryPlannerTest, CoveredWhenKeysAreNotMultikey) {
 }
 
 TEST_F(QueryPlannerTest, CanProduceCoveredSortPlanWhenSortOrderDifferentThanIndexKeyOrder) {
-    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    params.mainCollectionInfo.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
     addIndex(fromjson("{a: 1, b: 1}"));
 
     runQueryAsCommand(
@@ -217,25 +234,25 @@ TEST_F(QueryPlannerTest, EqCanUseHashedIndexWithRegex) {
 }
 
 TEST_F(QueryPlannerTest, ExprEqCanUseHashedIndex) {
-    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    params.mainCollectionInfo.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
     addIndex(BSON("a"
                   << "hashed"));
-    runQuery(fromjson("{a: {$_internalExprEq: 1}}"));
+    runQuery(fromjson("{$expr: {$eq: ['$a', 1]}}"));
     ASSERT_EQUALS(getNumSolutions(), 1U);
     assertSolutionExists(
-        "{fetch: {filter: {a: {$_internalExprEq: 1}}, node: {ixscan: {filter: null, pattern: {a: "
-        "'hashed'}}}}}");
+        "{fetch: {filter: {$and: [{$expr: {$eq: ['$a', {$const: 1}]}}]}, node: "
+        "{ixscan: {filter: null, pattern: {a: 'hashed'}}}}}");
 }
 
 TEST_F(QueryPlannerTest, ExprEqCanUseHashedIndexWithRegex) {
-    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    params.mainCollectionInfo.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
     addIndex(BSON("a"
                   << "hashed"));
-    runQuery(fromjson("{a: {$_internalExprEq: /abc/}}"));
+    runQuery(fromjson("{$expr: {$eq: ['$a', /abc/]}}"));
     ASSERT_EQUALS(getNumSolutions(), 1U);
     assertSolutionExists(
-        "{fetch: {filter: {a: {$_internalExprEq: /abc/}}, node: {ixscan: {filter: null, pattern: "
-        "{a: 'hashed'}}}}}");
+        "{fetch: {filter: {$and: [{$expr: {$eq: ['$a', {$const: /abc/}]}}]}, node: "
+        "{ixscan: {filter: null, pattern: {a: 'hashed'}}}}}");
 }
 
 
@@ -400,7 +417,7 @@ TEST_F(QueryPlannerTest, NotEqualsNullInElemMatchValueSparseMultiKeyIndex) {
     assertSolutionExists("{cscan: {dir: 1}}");
     assertSolutionExists(
         "{fetch: {node: {ixscan: {pattern: {x: 1},"
-        "bounds: {'x': [['MinKey', undefined, true, false], [null, 'MaxKey',false,true]]}}}}}");
+        "bounds: {'x': [['MinKey', null, true, false], [null, 'MaxKey',false,true]]}}}}}");
 }
 
 TEST_F(QueryPlannerTest, NotEqualsNullInElemMatchObjectSparseMultiKeyBelowElemMatch) {
@@ -733,7 +750,7 @@ TEST_F(QueryPlannerTest, BasicSortBooleanIndexKeyPattern) {
 
 // SERVER-14070
 TEST_F(QueryPlannerTest, CompoundIndexWithEqualityPredicatesProvidesSort) {
-    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
     addIndex(BSON("a" << 1 << "b" << 1));
     runQuerySortProj(fromjson("{a: 1, b: 1}"), fromjson("{b: 1}"), BSONObj());
 
@@ -886,48 +903,36 @@ TEST_F(QueryPlannerTest, NonPrefixRegex) {
     addIndex(BSON("a" << 1));
     runQuery(fromjson("{a: /foo/}"));
 
-    ASSERT_EQUALS(getNumSolutions(), 2U);
+    assertNumSolutions(1U);
     assertSolutionExists("{cscan: {dir: 1, filter: {a: /foo/}}}");
-    assertSolutionExists(
-        "{fetch: {filter: null, node: "
-        "{ixscan: {filter: {a: /foo/}, pattern: {a: 1}}}}}");
 }
 
 TEST_F(QueryPlannerTest, NonPrefixRegexCovering) {
     addIndex(BSON("a" << 1));
     runQuerySortProj(fromjson("{a: /foo/}"), BSONObj(), fromjson("{_id: 0, a: 1}"));
 
-    ASSERT_EQUALS(getNumSolutions(), 2U);
+    assertNumSolutions(1U);
     assertSolutionExists(
         "{proj: {spec: {_id: 0, a: 1}, node: "
         "{cscan: {dir: 1, filter: {a: /foo/}}}}}");
-    assertSolutionExists(
-        "{proj: {spec: {_id: 0, a: 1}, node: "
-        "{ixscan: {filter: {a: /foo/}, pattern: {a: 1}}}}}");
 }
 
 TEST_F(QueryPlannerTest, NonPrefixRegexAnd) {
     addIndex(BSON("a" << 1 << "b" << 1));
     runQuery(fromjson("{a: /foo/, b: 2}"));
 
-    ASSERT_EQUALS(getNumSolutions(), 2U);
+    assertNumSolutions(1U);
     assertSolutionExists("{cscan: {dir: 1, filter: {$and: [{b: 2}, {a: /foo/}]}}}");
-    assertSolutionExists(
-        "{fetch: {filter: null, node: {ixscan: "
-        "{filter: {a: /foo/}, pattern: {a: 1, b: 1}}}}}");
 }
 
 TEST_F(QueryPlannerTest, NonPrefixRegexAndCovering) {
     addIndex(BSON("a" << 1 << "b" << 1));
     runQuerySortProj(fromjson("{a: /foo/, b: 2}"), BSONObj(), fromjson("{_id: 0, a: 1, b: 1}"));
 
-    ASSERT_EQUALS(getNumSolutions(), 2U);
+    assertNumSolutions(1U);
     assertSolutionExists(
         "{proj: {spec: {_id: 0, a: 1, b: 1}, node: "
         "{cscan: {dir: 1, filter: {$and: [{b: 2}, {a: /foo/}]}}}}}");
-    assertSolutionExists(
-        "{proj: {spec: {_id: 0, a: 1, b: 1}, node: "
-        "{ixscan: {filter: {a: /foo/}, pattern: {a: 1, b: 1}}}}}");
 }
 
 TEST_F(QueryPlannerTest, NonPrefixRegexOrCovering) {
@@ -961,13 +966,10 @@ TEST_F(QueryPlannerTest, TwoRegexCompoundIndexCovering) {
     addIndex(BSON("a" << 1 << "b" << 1));
     runQuerySortProj(fromjson("{a: /0/, b: /1/}"), BSONObj(), fromjson("{_id: 0, a: 1, b: 1}"));
 
-    ASSERT_EQUALS(getNumSolutions(), 2U);
+    assertNumSolutions(1U);
     assertSolutionExists(
         "{proj: {spec: {_id: 0, a: 1, b: 1}, node: "
         "{cscan: {dir: 1, filter: {$and:[{a:/0/},{b:/1/}]}}}}}");
-    assertSolutionExists(
-        "{proj: {spec: {_id: 0, a: 1, b: 1}, node: "
-        "{ixscan: {filter: {$and:[{a:/0/},{b:/1/}]}, pattern: {a: 1, b: 1}}}}}");
 }
 
 TEST_F(QueryPlannerTest, TwoRegexSameFieldCovering) {
@@ -975,13 +977,10 @@ TEST_F(QueryPlannerTest, TwoRegexSameFieldCovering) {
     runQuerySortProj(
         fromjson("{$and: [{a: /0/}, {a: /1/}]}"), BSONObj(), fromjson("{_id: 0, a: 1}"));
 
-    ASSERT_EQUALS(getNumSolutions(), 2U);
+    assertNumSolutions(1U);
     assertSolutionExists(
         "{proj: {spec: {_id: 0, a: 1}, node: "
         "{cscan: {dir: 1, filter: {$and:[{a:/0/},{a:/1/}]}}}}}");
-    assertSolutionExists(
-        "{proj: {spec: {_id: 0, a: 1}, node: "
-        "{ixscan: {filter: {$and:[{a:/0/},{a:/1/}]}, pattern: {a: 1}}}}}");
 }
 
 TEST_F(QueryPlannerTest, ThreeRegexSameFieldCovering) {
@@ -989,13 +988,10 @@ TEST_F(QueryPlannerTest, ThreeRegexSameFieldCovering) {
     runQuerySortProj(
         fromjson("{$and: [{a: /0/}, {a: /1/}, {a: /2/}]}"), BSONObj(), fromjson("{_id: 0, a: 1}"));
 
-    ASSERT_EQUALS(getNumSolutions(), 2U);
+    assertNumSolutions(1U);
     assertSolutionExists(
         "{proj: {spec: {_id: 0, a: 1}, node: "
         "{cscan: {dir: 1, filter: {$and:[{a:/0/},{a:/1/},{a:/2/}]}}}}}");
-    assertSolutionExists(
-        "{proj: {spec: {_id: 0, a: 1}, node: "
-        "{ixscan: {filter: {$and:[{a:/0/},{a:/1/},{a:/2/}]}, pattern: {a: 1}}}}}");
 }
 
 TEST_F(QueryPlannerTest, NonPrefixRegexMultikey) {
@@ -1003,11 +999,8 @@ TEST_F(QueryPlannerTest, NonPrefixRegexMultikey) {
     addIndex(BSON("a" << 1), true);
     runQuery(fromjson("{a: /foo/}"));
 
-    ASSERT_EQUALS(getNumSolutions(), 2U);
+    assertNumSolutions(1U);
     assertSolutionExists("{cscan: {filter: {a: /foo/}, dir: 1}}");
-    assertSolutionExists(
-        "{fetch: {filter: {a: /foo/}, node: {ixscan: "
-        "{pattern: {a: 1}, filter: null}}}}");
 }
 
 TEST_F(QueryPlannerTest, ThreeRegexSameFieldMultikey) {
@@ -1015,20 +1008,8 @@ TEST_F(QueryPlannerTest, ThreeRegexSameFieldMultikey) {
     addIndex(BSON("a" << 1), true);
     runQuery(fromjson("{$and: [{a: /0/}, {a: /1/}, {a: /2/}]}"));
 
-    ASSERT_EQUALS(getNumSolutions(), 4U);
+    assertNumSolutions(1U);
     assertSolutionExists("{cscan: {filter: {$and:[{a:/0/},{a:/1/},{a:/2/}]}, dir: 1}}");
-    assertSolutionExists(
-        "{fetch: {filter: {$and:[{a:/0/},{a:/1/},{a:/2/}]}, node: {ixscan: "
-        "{pattern: {a: 1}, filter: null, "
-        "bounds: {a: [['', {}, true, false], [/0/, /0/, true, true]]}}}}}");
-    assertSolutionExists(
-        "{fetch: {filter: {$and:[{a:/1/},{a:/0/},{a:/2/}]}, node: {ixscan: "
-        "{pattern: {a: 1}, filter: null, "
-        "bounds: {a: [['', {}, true, false], [/1/, /1/, true, true]]}}}}}");
-    assertSolutionExists(
-        "{fetch: {filter: {$and:[{a:/2/},{a:/0/},{a:/1/}]}, node: {ixscan: "
-        "{pattern: {a: 1}, filter: null, "
-        "bounds: {a: [['', {}, true, false], [/2/, /2/, true, true]]}}}}}");
 }
 
 //
@@ -1377,7 +1358,7 @@ TEST_F(QueryPlannerTest, NENull) {
     assertSolutionExists("{cscan: {dir: 1}}");
     assertSolutionExists(
         "{fetch: {filter: null, node: {ixscan: {pattern: {a:1}, bounds: {a: "
-        "[['MinKey',undefined,true,false],[null,'MaxKey',false,true]]}}}}}");
+        "[['MinKey',null,true,false],[null,'MaxKey',false,true]]}}}}}");
 }
 
 TEST_F(QueryPlannerTest, NinNull) {
@@ -1388,7 +1369,7 @@ TEST_F(QueryPlannerTest, NinNull) {
     assertSolutionExists("{cscan: {dir: 1}}");
     assertSolutionExists(
         "{fetch: {filter: null, node: {ixscan: {pattern: {a:1}, "
-        "bounds: {a: [['MinKey',undefined,true,false],"
+        "bounds: {a: [['MinKey',null,true,false],"
         "[null,4,false,false],"
         "[4,'MaxKey',false,true]]}}}}}");
 }
@@ -1404,7 +1385,7 @@ TEST_F(QueryPlannerTest, NENullWithSort) {
         "{cscan: {filter: {a: {$ne: null}}, dir: 1}}}}}");
     assertSolutionExists(
         "{fetch: {filter: null, node: {ixscan: {pattern: {a:1}, "
-        "bounds: {a: [['MinKey',undefined,true,false],"
+        "bounds: {a: [['MinKey',null,true,false],"
         "[null,'MaxKey',false,true]]}}}}}");
 }
 
@@ -1416,7 +1397,7 @@ TEST_F(QueryPlannerTest, NENullWithProjection) {
     assertSolutionExists("{proj: {spec: {_id: 0, a: 1}, node: {cscan: {dir: 1}}}}");
     assertSolutionExists(
         "{proj: {spec: {_id: 0, a: 1}, node: {ixscan: {pattern: {a:1}, "
-        "bounds: {a: [['MinKey',undefined,true,false],[null,'MaxKey',false,true]]}}}}}");
+        "bounds: {a: [['MinKey',null,true,false],[null,'MaxKey',false,true]]}}}}}");
 }
 
 TEST_F(QueryPlannerTest, NENullWithSortAndProjection) {
@@ -1430,7 +1411,7 @@ TEST_F(QueryPlannerTest, NENullWithSortAndProjection) {
     assertSolutionExists(
         "{proj: {spec: {_id: 0, a: 1}, node: {"
         "  ixscan: {pattern: {a:1}, bounds: {"
-        "    a: [['MinKey',undefined,true,false], [null,'MaxKey',false,true]]"
+        "    a: [['MinKey',null,true,false], [null,'MaxKey',false,true]]"
         "}}}}}");
 }
 
@@ -1473,7 +1454,7 @@ TEST_F(QueryPlannerTest, NinWithNullCantUseMultikeyIndex) {
 }
 
 TEST_F(QueryPlannerTest, FetchAfterSortWhenOnlyProjectNeedsDocuments) {
-    params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
+    params.mainCollectionInfo.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
     addIndex(fromjson("{a: 1, b: 1}"));
 
     runQueryAsCommand(

@@ -67,10 +67,10 @@ public:
     DocumentSourceMatch(std::unique_ptr<MatchExpression> expr,
                         const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
-    virtual ~DocumentSourceMatch() = default;
+    ~DocumentSourceMatch() override = default;
 
-    virtual boost::intrusive_ptr<DocumentSource> clone(
-        const boost::intrusive_ptr<ExpressionContext>& newExpCtx) const {
+    boost::intrusive_ptr<DocumentSource> clone(
+        const boost::intrusive_ptr<ExpressionContext>& newExpCtx) const override {
         // Raw new is needed to access non-public constructors.
         return new DocumentSourceMatch(*this, newExpCtx);
     }
@@ -168,10 +168,11 @@ public:
     }
 
     /**
-     * Combines the filter in this $match with the filter of 'other' using a $and, updating this
-     * match in place.
+     * Combines the filter in this $match with the filter of 'other' using a specified join
+     * predicate, updating this match in place. Currently, the join predicate can be "$and" or
+     * "$or".
      */
-    void joinMatchWith(boost::intrusive_ptr<DocumentSourceMatch> other);
+    void joinMatchWith(boost::intrusive_ptr<DocumentSourceMatch> other, StringData joinPred);
 
 
     bool hasQuery() const override;

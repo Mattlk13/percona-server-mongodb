@@ -3,13 +3,16 @@
  *
  * @tags: [
  *   # The test runs commands that are not allowed with security token: bulkWrite.
- *   not_allowed_with_security_token,
+ *   not_allowed_with_signed_security_token,
  *   command_not_supported_in_serverless,
- *   # TODO SERVER-52419 Remove this tag.
- *   featureFlagBulkWriteCommand,
+ *   requires_fcv_80
  * ]
  */
-import {cursorEntryValidator, cursorSizeValidator} from "jstests/libs/bulk_write_utils.js";
+import {
+    cursorEntryValidator,
+    cursorSizeValidator,
+    summaryFieldsValidator
+} from "jstests/libs/bulk_write_utils.js";
 
 var coll = db.getCollection("coll");
 var coll1 = db.getCollection("coll1");
@@ -27,7 +30,8 @@ var res = db.adminCommand({
 });
 
 assert.commandWorked(res);
-assert.eq(res.numErrors, 0, "bulkWrite command response: " + tojson(res));
+summaryFieldsValidator(
+    res, {nErrors: 0, nInserted: 1, nDeleted: 1, nMatched: 0, nModified: 0, nUpserted: 0});
 
 cursorSizeValidator(res, 2);
 cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1});
@@ -50,7 +54,8 @@ res = db.adminCommand({
 
 assert.commandWorked(res);
 cursorSizeValidator(res, 3);
-assert.eq(res.numErrors, 0, "bulkWrite command response: " + tojson(res));
+summaryFieldsValidator(
+    res, {nErrors: 0, nInserted: 2, nDeleted: 1, nMatched: 0, nModified: 0, nUpserted: 0});
 cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1});
 cursorEntryValidator(res.cursor.firstBatch[1], {ok: 1, idx: 1, n: 1});
 cursorEntryValidator(res.cursor.firstBatch[2], {ok: 1, idx: 2, n: 1});
@@ -71,7 +76,8 @@ res = db.adminCommand({
 
 assert.commandWorked(res);
 cursorSizeValidator(res, 1);
-assert.eq(res.numErrors, 0, "bulkWrite command response: " + tojson(res));
+summaryFieldsValidator(
+    res, {nErrors: 0, nInserted: 0, nDeleted: 1, nMatched: 0, nModified: 0, nUpserted: 0});
 cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1});
 assert(!coll.findOne());
 
@@ -90,7 +96,8 @@ res = db.adminCommand({
 
 assert.commandWorked(res);
 cursorSizeValidator(res, 1);
-assert.eq(res.numErrors, 0, "bulkWrite command response: " + tojson(res));
+summaryFieldsValidator(
+    res, {nErrors: 0, nInserted: 0, nDeleted: 0, nMatched: 0, nModified: 0, nUpserted: 0});
 cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 0});
 assert.eq("MongoDB", coll1.findOne().skey);
 
@@ -112,7 +119,8 @@ res = db.adminCommand({
 
 assert.commandWorked(res);
 cursorSizeValidator(res, 4);
-assert.eq(res.numErrors, 0, "bulkWrite command response: " + tojson(res));
+summaryFieldsValidator(
+    res, {nErrors: 0, nInserted: 3, nDeleted: 1, nMatched: 0, nModified: 0, nUpserted: 0});
 
 cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1});
 cursorEntryValidator(res.cursor.firstBatch[1], {ok: 1, idx: 1, n: 1});

@@ -94,86 +94,85 @@ public:
                       std::unique_ptr<KVEngine> engine,
                       StorageEngineOptions options = StorageEngineOptions());
 
-    virtual ~StorageEngineImpl();
+    ~StorageEngineImpl() override;
 
-    virtual void notifyStartupComplete() override;
+    void notifyStorageStartupRecoveryComplete() override;
 
-    virtual RecoveryUnit* newRecoveryUnit() override;
+    void notifyReplStartupRecoveryComplete(OperationContext* opCtx) override;
 
-    virtual std::vector<DatabaseName> listDatabases(
+    RecoveryUnit* newRecoveryUnit() override;
+
+    std::vector<DatabaseName> listDatabases(
         boost::optional<TenantId> tenantId = boost::none) const override;
 
-    virtual bool supportsCappedCollections() const override {
+    bool supportsCappedCollections() const override {
         return _supportsCappedCollections;
     }
 
-    virtual Status dropDatabase(OperationContext* opCtx, const DatabaseName& dbName) override;
+    Status dropDatabase(OperationContext* opCtx, const DatabaseName& dbName) override;
 
-    virtual void flushAllFiles(OperationContext* opCtx, bool callerHoldsReadLock) override;
+    void flushAllFiles(OperationContext* opCtx, bool callerHoldsReadLock) override;
 
-    virtual Status beginBackup(OperationContext* opCtx) override;
+    Status beginBackup(OperationContext* opCtx) override;
 
-    virtual void endBackup(OperationContext* opCtx) override;
+    void endBackup(OperationContext* opCtx) override;
 
-    virtual Status disableIncrementalBackup(OperationContext* opCtx) override;
+    Status disableIncrementalBackup(OperationContext* opCtx) override;
 
-    virtual StatusWith<std::unique_ptr<StreamingCursor>> beginNonBlockingBackup(
-        OperationContext* opCtx,
-        boost::optional<Timestamp> checkpointTimestamp,
-        const BackupOptions& options) override;
+    StatusWith<std::unique_ptr<StreamingCursor>> beginNonBlockingBackup(
+        OperationContext* opCtx, const BackupOptions& options) override;
 
-    virtual void endNonBlockingBackup(OperationContext* opCtx) override;
+    void endNonBlockingBackup(OperationContext* opCtx) override;
 
-    virtual StatusWith<std::deque<std::string>> extendBackupCursor(
-        OperationContext* opCtx) override;
+    StatusWith<std::deque<std::string>> extendBackupCursor(OperationContext* opCtx) override;
 
-    virtual bool supportsCheckpoints() const override;
+    bool supportsCheckpoints() const override;
 
-    virtual bool isEphemeral() const override;
+    bool isEphemeral() const override;
 
-    virtual Status repairRecordStore(OperationContext* opCtx,
-                                     RecordId catalogId,
-                                     const NamespaceString& nss) override;
+    Status repairRecordStore(OperationContext* opCtx,
+                             RecordId catalogId,
+                             const NamespaceString& nss) override;
 
-    virtual std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStore(
+    std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStore(OperationContext* opCtx,
+                                                                   KeyFormat keyFormat) override;
+
+    std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStoreForResumableIndexBuild(
         OperationContext* opCtx, KeyFormat keyFormat) override;
 
-    virtual std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStoreForResumableIndexBuild(
-        OperationContext* opCtx, KeyFormat keyFormat) override;
+    std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStoreFromExistingIdent(
+        OperationContext* opCtx, StringData ident, KeyFormat keyFormat) override;
 
-    virtual std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStoreFromExistingIdent(
-        OperationContext* opCtx, StringData ident) override;
+    void cleanShutdown(ServiceContext* svcCtx) override;
 
-    virtual void cleanShutdown(ServiceContext* svcCtx) override;
+    void setStableTimestamp(Timestamp stableTimestamp, bool force = false) override;
 
-    virtual void setStableTimestamp(Timestamp stableTimestamp, bool force = false) override;
+    Timestamp getStableTimestamp() const override;
 
-    virtual Timestamp getStableTimestamp() const override;
+    void setInitialDataTimestamp(Timestamp initialDataTimestamp) override;
 
-    virtual void setInitialDataTimestamp(Timestamp initialDataTimestamp) override;
+    Timestamp getInitialDataTimestamp() const override;
 
-    virtual Timestamp getInitialDataTimestamp() const override;
+    void setOldestTimestampFromStable() override;
 
-    virtual void setOldestTimestampFromStable() override;
+    void setOldestTimestamp(Timestamp newOldestTimestamp, bool force) override;
 
-    virtual void setOldestTimestamp(Timestamp newOldestTimestamp) override;
+    Timestamp getOldestTimestamp() const override;
 
-    virtual Timestamp getOldestTimestamp() const override;
-
-    virtual void setOldestActiveTransactionTimestampCallback(
+    void setOldestActiveTransactionTimestampCallback(
         StorageEngine::OldestActiveTransactionTimestampCallback) override;
 
-    virtual bool supportsRecoverToStableTimestamp() const override;
+    bool supportsRecoverToStableTimestamp() const override;
 
-    virtual bool supportsRecoveryTimestamp() const override;
+    bool supportsRecoveryTimestamp() const override;
 
-    virtual StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) override;
+    StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) override;
 
-    virtual boost::optional<Timestamp> getRecoveryTimestamp() const override;
+    boost::optional<Timestamp> getRecoveryTimestamp() const override;
 
-    virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp() const override;
+    boost::optional<Timestamp> getLastStableRecoveryTimestamp() const override;
 
-    virtual Timestamp getAllDurableTimestamp() const override;
+    Timestamp getAllDurableTimestamp() const override;
 
     boost::optional<Timestamp> getOplogNeededForCrashRecovery() const final;
 
@@ -342,7 +341,7 @@ public:
     }
 
     void addDropPendingIdent(
-        const stdx::variant<Timestamp, StorageEngine::CheckpointIteration>& dropTime,
+        const std::variant<Timestamp, StorageEngine::CheckpointIteration>& dropTime,
         std::shared_ptr<Ident> ident,
         DropIdentCallback&& onDrop) override;
 
@@ -352,11 +351,11 @@ public:
 
     void startTimestampMonitor() override;
 
-    void checkpoint(OperationContext* opCtx) override;
+    void checkpoint() override;
 
     StorageEngine::CheckpointIteration getCheckpointIteration() const override;
 
-    virtual bool hasDataBeenCheckpointed(
+    bool hasDataBeenCheckpointed(
         StorageEngine::CheckpointIteration checkpointIteration) const override;
 
     StatusWith<ReconcileResult> reconcileCatalogAndIdents(
@@ -408,10 +407,12 @@ public:
 
     void setPinnedOplogTimestamp(const Timestamp& pinnedTimestamp) override;
 
-    StatusWith<BSONObj> getSanitizedStorageOptionsForSecondaryReplication(
+    BSONObj getSanitizedStorageOptionsForSecondaryReplication(
         const BSONObj& options) const override;
 
     void dump() const override;
+
+    Status autoCompact(OperationContext* opCtx, const AutoCompactOptions& options) override;
 
 private:
     using CollIter = std::list<std::string>::iterator;

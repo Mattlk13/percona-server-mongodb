@@ -118,7 +118,7 @@ public:
     explicit AsioReactorTimer(asio::io_context& ctx)
         : _timer(std::make_shared<TimerType>(asio::system_timer(ctx))) {}
 
-    ~AsioReactorTimer() {
+    ~AsioReactorTimer() override {
         // The underlying timer won't get destroyed until the last promise from _asyncWait
         // has been filled, so cancel the timer so our promises get fulfilled
         cancel();
@@ -207,9 +207,18 @@ public:
     void drain() override {
         ThreadIdGuard threadIdGuard(this);
         _ioContext.restart();
-        while (_ioContext.poll()) {
-            LOGV2_DEBUG(23012, 2, "Draining remaining work in reactor.");
-        }
+        /**
+         * Do a single drain before setting the bit that prevents further scheduling because some
+         * outstanding work might spawn and schedule additional work. Once all the current and
+         * immediately subsequent work is drained, we can set the flag that prevents further
+         * scheduling. Then, we drain once more to catch any stragglers that got scheduled between
+         * returning from poll and setting the _closedForScheduling bit.
+         */
+        do {
+            while (_ioContext.poll()) {
+                LOGV2_DEBUG(23012, 2, "Draining remaining work in reactor.");
+            }
+        } while (!_closedForScheduling.swap(true));
         _ioContext.stop();
     }
 
@@ -222,7 +231,12 @@ public:
     }
 
     void schedule(Task task) override {
-        asio::post(_ioContext, [task = _stats.wrapTask(std::move(task))] { task(Status::OK()); });
+        if (_closedForScheduling.load()) {
+            task({ErrorCodes::ShutdownInProgress, "Shutdown in progress"});
+        } else {
+            asio::post(_ioContext,
+                       [task = _stats.wrapTask(std::move(task))] { task(Status::OK()); });
+        }
     }
 
     void dispatch(Task task) override {
@@ -247,7 +261,7 @@ private:
     class ReactorClockSource final : public ClockSource {
     public:
         explicit ReactorClockSource(AsioReactor* reactor) : _reactor(reactor) {}
-        ~ReactorClockSource() = default;
+        ~ReactorClockSource() override = default;
 
         Milliseconds getPrecision() override {
             MONGO_UNREACHABLE;
@@ -281,6 +295,8 @@ private:
     ExecutorStats _stats;
 
     asio::io_context _ioContext;
+
+    AtomicWord<bool> _closedForScheduling{false};
 };
 
 thread_local AsioReactor* AsioReactor::_reactorForThread = nullptr;
@@ -634,8 +650,9 @@ StatusWith<std::shared_ptr<Session>> AsioTransportLayer::connect(
         // TODO SERVER-62035: enable the following on Windows.
         if (timeout > Milliseconds(0)) {
             timer->waitUntil(_timerService->now() + timeout)
-                .getAsync([finishLine, session](Status status) {
+                .getAsync([finishLine, session, timeout](Status status) {
                     if (status.isOK() && finishLine->arriveStrongly()) {
+                        LOGV2(8524900, "Handshake timeout threshold hit", "timeout"_attr = timeout);
                         session->end();
                     }
                 });
@@ -1075,7 +1092,7 @@ Status AsioTransportLayer::setup() {
 
         acceptor.bind(*addr, ec);
         if (ec) {
-            return errorCodeToStatus(ec, "setup bind");
+            return errorCodeToStatus(ec, "setup bind").withContext(addr.toString());
         }
 
 #ifndef _WIN32
@@ -1147,7 +1164,15 @@ void AsioTransportLayer::_runListener() noexcept {
     setThreadName("listener");
 
     stdx::unique_lock lk(_mutex);
-    if (_isShutdown) {
+    ON_BLOCK_EXIT([&] {
+        if (!lk.owns_lock()) {
+            lk.lock();
+        }
+        _listener.state = Listener::State::kShutdown;
+        _listener.cv.notify_all();
+    });
+
+    if (_isShutdown || _listener.state == Listener::State::kShuttingDown) {
         return;
     }
 
@@ -1173,14 +1198,9 @@ void AsioTransportLayer::_runListener() noexcept {
 #endif
     LOGV2(23016, "Waiting for connections", "port"_attr = _listenerPort, "ssl"_attr = ssl);
 
-    _listener.active = true;
+    _listener.state = Listener::State::kActive;
     _listener.cv.notify_all();
-    ON_BLOCK_EXIT([&] {
-        _listener.active = false;
-        _listener.cv.notify_all();
-    });
-
-    while (!_isShutdown) {
+    while (!_isShutdown && (_listener.state == Listener::State::kActive)) {
         lk.unlock();
         _acceptorReactor->run();
         lk.lock();
@@ -1212,18 +1232,17 @@ Status AsioTransportLayer::start() {
         return ShutdownStatus;
     }
 
-    if (_sessionManager) {
-        uassertStatusOK(_sessionManager->start());
-    }
-
     if (_listenerOptions.isIngress()) {
-        invariant(_sessionManager);
-        _listener.thread = stdx::thread([this] { _runListener(); });
-        _listener.cv.wait(lk, [&] { return _isShutdown || _listener.active; });
-        return Status::OK();
+        // Only start the listener thread if the TL wasn't shut down before start() was invoked.
+        if (_listener.state == Listener::State::kNew) {
+            invariant(_sessionManager);
+            _listener.thread = stdx::thread([this] { _runListener(); });
+            _listener.cv.wait(lk, [&] { return _listener.state != Listener::State::kNew; });
+        }
+    } else {
+        invariant(_acceptorRecords.empty());
     }
 
-    invariant(_acceptorRecords.empty());
     return Status::OK();
 }
 
@@ -1234,19 +1253,34 @@ void AsioTransportLayer::shutdown() {
         // We were already stopped
         return;
     }
-    lk.unlock();
+
+    stopAcceptingSessionsWithLock(std::move(lk));
+
     _timerService->stop();
+
     if (_sessionManager) {
         LOGV2(4784923, "Shutting down the ASIO transport SessionManager");
         if (!_sessionManager->shutdown(kSessionShutdownTimeout)) {
             LOGV2(20563, "SessionManager did not shutdown within the time limit");
         }
     }
-    lk.lock();
+}
 
+void AsioTransportLayer::stopAcceptingSessionsWithLock(stdx::unique_lock<Mutex> lk) {
     if (!_listenerOptions.isIngress()) {
         // Egress only reactors never start a listener
         return;
+    }
+
+    if (auto oldState = _listener.state; oldState != Listener::State::kShutdown) {
+        _listener.state = Listener::State::kShuttingDown;
+        if (oldState == Listener::State::kActive) {
+            while (_listener.state != Listener::State::kShutdown) {
+                lk.unlock();
+                _acceptorReactor->stop();
+                lk.lock();
+            }
+        }
     }
 
     auto thread = std::exchange(_listener.thread, {});
@@ -1255,16 +1289,13 @@ void AsioTransportLayer::shutdown() {
         return;
     }
 
-    // Spam stop() on the reactor, it interrupts run()
-    while (_listener.active) {
-        lk.unlock();
-        _acceptorReactor->stop();
-        lk.lock();
-    }
-
     // Release the lock and wait for the thread to die
     lk.unlock();
     thread.join();
+}
+
+void AsioTransportLayer::stopAcceptingSessions() {
+    stopAcceptingSessionsWithLock(stdx::unique_lock(_mutex));
 }
 
 ReactorHandle AsioTransportLayer::getReactor(WhichReactor which) {

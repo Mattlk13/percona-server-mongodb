@@ -54,7 +54,6 @@
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/concurrency/resource_catalog.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -73,6 +72,7 @@
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
@@ -122,7 +122,7 @@ public:
             std::make_unique<repl::ReplicationCoordinatorMock>(getServiceContext()));
     }
 
-    void tearDown() {
+    void tearDown() override {
         globalLock.reset();
     }
 
@@ -140,7 +140,7 @@ protected:
 
 class CollectionCatalogIterationTest : public ServiceContextMongoDTest {
 public:
-    void setUp() {
+    void setUp() override {
         ServiceContextMongoDTest::setUp();
         opCtx = makeOperationContext();
         globalLock.emplace(opCtx.get());
@@ -162,7 +162,7 @@ public:
         }
     }
 
-    void tearDown() {
+    void tearDown() override {
         for (auto& it : dbMap) {
             for (auto& kv : it.second) {
                 catalog.deregisterCollection(
@@ -217,7 +217,7 @@ protected:
 
 class CollectionCatalogResourceTest : public ServiceContextMongoDTest {
 public:
-    void setUp() {
+    void setUp() override {
         ServiceContextMongoDTest::setUp();
         opCtx = makeOperationContext();
         globalLock.emplace(opCtx.get());
@@ -242,7 +242,7 @@ public:
         ASSERT_EQ(5, numEntries);
     }
 
-    void tearDown() {
+    void tearDown() override {
         std::vector<UUID> collectionsToDeregister;
         for (auto&& coll :
              catalog.range(DatabaseName::createDatabaseName_forTest(boost::none, "resourceDb"))) {
@@ -746,7 +746,8 @@ TEST_F(ForEachCollectionFromDbTest, ForEachCollectionFromDb) {
         auto dbLock = std::make_unique<Lock::DBLock>(opCtx, dbName, MODE_IX);
         int numCollectionsTraversed = 0;
         catalog::forEachCollectionFromDb(opCtx, dbName, MODE_X, [&](const Collection* collection) {
-            ASSERT_TRUE(opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_X));
+            ASSERT_TRUE(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(
+                collection->ns(), MODE_X));
             numCollectionsTraversed++;
             return true;
         });
@@ -759,7 +760,8 @@ TEST_F(ForEachCollectionFromDbTest, ForEachCollectionFromDb) {
         auto dbLock = std::make_unique<Lock::DBLock>(opCtx, dbName, MODE_IX);
         int numCollectionsTraversed = 0;
         catalog::forEachCollectionFromDb(opCtx, dbName, MODE_IS, [&](const Collection* collection) {
-            ASSERT_TRUE(opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_IS));
+            ASSERT_TRUE(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(
+                collection->ns(), MODE_IS));
             numCollectionsTraversed++;
             return true;
         });
@@ -793,14 +795,14 @@ TEST_F(ForEachCollectionFromDbTest, ForEachCollectionFromDbWithPredicate) {
             dbName,
             MODE_X,
             [&](const Collection* collection) {
-                ASSERT_TRUE(
-                    opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_X));
+                ASSERT_TRUE(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(
+                    collection->ns(), MODE_X));
                 numCollectionsTraversed++;
                 return true;
             },
             [&](const Collection* collection) {
-                ASSERT_TRUE(
-                    opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_NONE));
+                ASSERT_TRUE(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(
+                    collection->ns(), MODE_NONE));
                 return collection->getCollectionOptions().temp;
             });
 
@@ -816,14 +818,14 @@ TEST_F(ForEachCollectionFromDbTest, ForEachCollectionFromDbWithPredicate) {
             dbName,
             MODE_IX,
             [&](const Collection* collection) {
-                ASSERT_TRUE(
-                    opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_IX));
+                ASSERT_TRUE(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(
+                    collection->ns(), MODE_IX));
                 numCollectionsTraversed++;
                 return true;
             },
             [&](const Collection* collection) {
-                ASSERT_TRUE(
-                    opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_NONE));
+                ASSERT_TRUE(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(
+                    collection->ns(), MODE_NONE));
                 return !collection->getCollectionOptions().temp;
             });
 
@@ -837,17 +839,20 @@ TEST_F(ForEachCollectionFromDbTest, ForEachCollectionFromDbWithPredicate) {
 class OneOffRead {
 public:
     OneOffRead(OperationContext* opCtx, const Timestamp& ts) : _opCtx(opCtx) {
-        _opCtx->recoveryUnit()->abandonSnapshot();
+        shard_role_details::getRecoveryUnit(_opCtx)->abandonSnapshot();
         if (ts.isNull()) {
-            _opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+            shard_role_details::getRecoveryUnit(_opCtx)->setTimestampReadSource(
+                RecoveryUnit::ReadSource::kNoTimestamp);
         } else {
-            _opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided, ts);
+            shard_role_details::getRecoveryUnit(_opCtx)->setTimestampReadSource(
+                RecoveryUnit::ReadSource::kProvided, ts);
         }
     }
 
     ~OneOffRead() {
-        _opCtx->recoveryUnit()->abandonSnapshot();
-        _opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+        shard_role_details::getRecoveryUnit(_opCtx)->abandonSnapshot();
+        shard_role_details::getRecoveryUnit(_opCtx)->setTimestampReadSource(
+            RecoveryUnit::ReadSource::kNoTimestamp);
     }
 
 private:
@@ -882,6 +887,16 @@ public:
         UUID uuid = _createCollection(opCtx, nss, boost::none, allowMixedModeWrites);
         wuow.commit();
         return uuid;
+    }
+
+    void createCollectionWithUUID(OperationContext* opCtx,
+                                  const NamespaceString& nss,
+                                  Timestamp timestamp,
+                                  UUID uuid) {
+        _setupDDLOperation(opCtx, timestamp);
+        WriteUnitOfWork wuow(opCtx);
+        _createCollection(opCtx, nss, uuid, false);
+        wuow.commit();
     }
 
     void dropCollection(OperationContext* opCtx, const NamespaceString& nss, Timestamp timestamp) {
@@ -1094,13 +1109,15 @@ protected:
 
 private:
     void _setupDDLOperation(OperationContext* opCtx, Timestamp timestamp) {
-        opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
-        opCtx->recoveryUnit()->abandonSnapshot();
+        RecoveryUnit* recoveryUnit = shard_role_details::getRecoveryUnit(opCtx);
 
-        if (!opCtx->recoveryUnit()->getCommitTimestamp().isNull()) {
-            opCtx->recoveryUnit()->clearCommitTimestamp();
+        recoveryUnit->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+        recoveryUnit->abandonSnapshot();
+
+        if (!recoveryUnit->getCommitTimestamp().isNull()) {
+            recoveryUnit->clearCommitTimestamp();
         }
-        opCtx->recoveryUnit()->setCommitTimestamp(timestamp);
+        recoveryUnit->setCommitTimestamp(timestamp);
     }
 
     UUID _createCollection(OperationContext* opCtx,
@@ -1280,8 +1297,9 @@ private:
                     std::function<void()> callback;
                 };
 
-                newOpCtx.get()->recoveryUnit()->registerChangeForCatalogVisibility(
-                    std::make_unique<ChangeForCatalogVisibility>(commitHandler));
+                shard_role_details::getRecoveryUnit(newOpCtx.get())
+                    ->registerChangeForCatalogVisibility(
+                        std::make_unique<ChangeForCatalogVisibility>(commitHandler));
             }
 
             ddlOperation(newOpCtx.get());
@@ -1289,8 +1307,9 @@ private:
             // The preCommit handler must be registered after the DDL operation so it's executed
             // after any preCommit hooks set up in the operation.
             if (openSnapshotBeforeCommit) {
-                newOpCtx.get()->recoveryUnit()->registerPreCommitHook(
-                    [&commitHandler](OperationContext* opCtx) { commitHandler(); });
+                shard_role_details::getRecoveryUnit(newOpCtx.get())
+                    ->registerPreCommitHook(
+                        [&commitHandler](OperationContext* opCtx) { commitHandler(); });
             }
 
             wuow.commit();
@@ -1739,7 +1758,7 @@ TEST_F(CollectionCatalogTimestampTest, OpenEarlierAlreadyDropPendingCollection) 
         ASSERT_EQ(
             CollectionCatalog::get(opCtx.get())->lookupCollectionByNamespace(opCtx.get(), firstNss),
             openedColl);
-        opCtx->recoveryUnit()->abandonSnapshot();
+        shard_role_details::getRecoveryUnit(opCtx.get())->abandonSnapshot();
 
         // Once snapshot is abandoned, openedColl has been released so it should not match the
         // collection lookup.
@@ -1764,7 +1783,7 @@ TEST_F(CollectionCatalogTimestampTest, OpenEarlierAlreadyDropPendingCollection) 
         ASSERT_EQ(CollectionCatalog::get(opCtx.get())
                       ->lookupCollectionByNamespace(opCtx.get(), secondNss),
                   openedColl);
-        opCtx->recoveryUnit()->abandonSnapshot();
+        shard_role_details::getRecoveryUnit(opCtx.get())->abandonSnapshot();
     }
 }
 
@@ -1806,7 +1825,7 @@ TEST_F(CollectionCatalogTimestampTest, OpenNewCollectionUsingDropPendingCollecti
     ASSERT_NE(coll, openedColl);
     // Ensure the idents are shared between the opened collection and the drop pending collection.
     ASSERT_EQ(coll->getSharedIdent(), openedColl->getSharedIdent());
-    opCtx->recoveryUnit()->abandonSnapshot();
+    shard_role_details::getRecoveryUnit(opCtx.get())->abandonSnapshot();
 }
 
 TEST_F(CollectionCatalogTimestampTest, OpenExistingCollectionWithReaper) {
@@ -1854,7 +1873,7 @@ TEST_F(CollectionCatalogTimestampTest, OpenExistingCollectionWithReaper) {
 
     {
         // Remove the collection reference in UncommittedCatalogUpdates.
-        opCtx->recoveryUnit()->abandonSnapshot();
+        shard_role_details::getRecoveryUnit(opCtx.get())->abandonSnapshot();
 
         storageEngine->dropIdentsOlderThan(opCtx.get(), Timestamp::max());
         ASSERT_EQ(0, storageEngine->getNumDropPendingIdents());
@@ -2166,7 +2185,7 @@ TEST_F(CollectionCatalogTimestampTest, CollectionLifetimeTiedToStorageTransactio
         ASSERT_EQ(coll, fetchedColl.get());
         ASSERT_EQ(coll->getSharedIdent(), fetchedColl->getSharedIdent());
 
-        opCtx->recoveryUnit()->abandonSnapshot();
+        shard_role_details::getRecoveryUnit(opCtx.get())->abandonSnapshot();
         ASSERT(!OpenedCollections::get(opCtx.get()).lookupByNamespace(nss));
     }
 
@@ -2190,7 +2209,7 @@ TEST_F(CollectionCatalogTimestampTest, CollectionLifetimeTiedToStorageTransactio
         wuow.commit();
         ASSERT(!OpenedCollections::get(opCtx.get()).lookupByNamespace(nss));
 
-        opCtx->recoveryUnit()->abandonSnapshot();
+        shard_role_details::getRecoveryUnit(opCtx.get())->abandonSnapshot();
         ASSERT(!OpenedCollections::get(opCtx.get()).lookupByNamespace(nss));
     }
 
@@ -2215,7 +2234,7 @@ TEST_F(CollectionCatalogTimestampTest, CollectionLifetimeTiedToStorageTransactio
         wuow.reset();
         ASSERT(!OpenedCollections::get(opCtx.get()).lookupByNamespace(nss));
 
-        opCtx->recoveryUnit()->abandonSnapshot();
+        shard_role_details::getRecoveryUnit(opCtx.get())->abandonSnapshot();
         ASSERT(!OpenedCollections::get(opCtx.get()).lookupByNamespace(nss));
     }
 }
@@ -3389,6 +3408,60 @@ TEST_F(CollectionCatalogTimestampTest, IndexCatalogEntryCopying) {
     ASSERT_EQ(0, latestColl->getIndexCatalog()->numIndexesReady());
     ASSERT_EQ(1, latestColl->getIndexCatalog()->numIndexesInProgress());
     ASSERT(!entry->isReady());
+}
+
+TEST_F(CollectionCatalogTimestampTest, OpenCollectionAfterDropAndCreateWithSameNsAndUUID) {
+    // Simulates a scenario where a collection was dropped and later recreated using the same
+    // NS and UUID. This can be the case when moving collections to another replica set / shard and
+    // then back to the original owner.
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.b");
+    auto collUUID = UUID::gen();
+
+    // Create and drop collection.
+    const Timestamp createCollectionTs = Timestamp(10, 10);
+    const Timestamp firstCollectionDropTs = Timestamp(20, 20);
+    createCollectionWithUUID(opCtx.get(), nss, createCollectionTs, collUUID);
+
+    const auto firstIdent = CollectionCatalog::get(opCtx.get())
+                                ->lookupCollectionByNamespace(opCtx.get(), nss)
+                                ->getRecordStore()
+                                ->getIdent();
+
+    dropCollection(opCtx.get(), nss, firstCollectionDropTs);
+
+    // Recreate collection with same NS and UUID, at a later timestamp.
+    const Timestamp createCollectionSecondTs = Timestamp(30, 30);
+    createCollectionWithUUID(opCtx.get(), nss, createCollectionSecondTs, collUUID);
+
+    auto latestCatalog = CollectionCatalog::get(opCtx.get());
+    auto latestCollection = latestCatalog->lookupCollectionByNamespace(opCtx.get(), nss);
+    const auto secondIdent = latestCollection->getRecordStore()->getIdent();
+
+    // Open the collection at a point in-time before the drop.
+    const Timestamp readTimestamp = Timestamp(15, 15);
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_IS);
+    OneOffRead oor(opCtx.get(), readTimestamp);
+    auto coll = CollectionCatalog::get(opCtx.get())
+                    ->establishConsistentCollection(opCtx.get(), nss, readTimestamp);
+
+    // The two collection idents are different, thus the RecordStore pointers must be different.
+    ASSERT_NE(firstIdent, secondIdent);
+    ASSERT_NE(coll->getRecordStore(), latestCollection->getRecordStore());
+
+    // Open the PIT collection in another client.
+    auto newClient = opCtx->getServiceContext()->getService()->makeClient("alternativeClient");
+    auto newOpCtx = newClient->makeOperationContext();
+    Lock::GlobalLock globalLockAlt(newOpCtx.get(), MODE_IS);
+    OneOffRead oorAlt(newOpCtx.get(), readTimestamp);
+    auto collAlt = CollectionCatalog::get(newOpCtx.get())
+                       ->establishConsistentCollection(newOpCtx.get(), nss, readTimestamp);
+
+    // Both PIT reads at the same timestamp should point to the same ident, but the RecordStore
+    // pointer will be different. This is expected, as PIT created collections are local to the
+    // operation. This is fine because the RecordStore is only ever used to read (it is not possible
+    // to write in the past).
+    ASSERT_EQ(coll->getRecordStore()->getIdent(), collAlt->getRecordStore()->getIdent());
+    ASSERT_NE(coll->getRecordStore(), collAlt->getRecordStore());
 }
 
 TEST_F(CollectionCatalogTimestampTest, MixedModeWrites) {

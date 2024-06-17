@@ -60,19 +60,19 @@ namespace mongo {
 using std::string;
 using std::stringstream;
 
-class AppendOplogNoteCmd : public BasicCommand {
+class ClusterAppendOplogNoteCmd : public BasicCommand {
 public:
-    AppendOplogNoteCmd() : BasicCommand("appendOplogNote") {}
+    ClusterAppendOplogNoteCmd() : BasicCommand("appendOplogNote") {}
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
-    virtual bool adminOnly() const {
+    bool adminOnly() const override {
         return true;
     }
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
 
@@ -92,10 +92,10 @@ public:
         return Status::OK();
     }
 
-    virtual bool run(OperationContext* opCtx,
-                     const DatabaseName& dbName,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
+    bool run(OperationContext* opCtx,
+             const DatabaseName& dbName,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
 
         auto shardResponses = scatterGatherUnversionedTargetAllShards(
             opCtx,
@@ -109,6 +109,6 @@ public:
         return appendRawResponses(opCtx, &errmsg, &result, shardResponses).responseOK;
     }
 };
-MONGO_REGISTER_COMMAND(AppendOplogNoteCmd).forRouter();
+MONGO_REGISTER_COMMAND(ClusterAppendOplogNoteCmd).forRouter();
 
 }  // namespace mongo

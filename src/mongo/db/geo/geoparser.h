@@ -126,12 +126,21 @@ public:
 
     static GeoSpecifier parseGeoSpecifier(const BSONElement& elem);
     static GeoJSONType parseGeoJSONType(const BSONObj& obj);
+    // Throw an assertion if the passed in object has an invalid 'type', whether the value is
+    // non-string or not recognized.
+    static void assertValidGeoJSONType(const BSONObj& obj);
+    static GeoJSONType geoJSONTypeStringToEnum(StringData type);
+    static StringData geoJSONTypeEnumToString(GeoParser::GeoJSONType type);
 
     // Legacy points can contain extra data as extra fields - these are valid to index
     // e.g. { x: 1, y: 1, z: 1 }
     static Status parseLegacyPoint(const BSONElement& elem,
                                    PointWithCRS* out,
                                    bool allowAddlFields = false);
+    static Status parseFlatPointCoordinates(const BSONElement& elem,
+                                            BSONElement& x,
+                                            BSONElement& y,
+                                            bool allowAddlFields = false);
     // Parse the BSON object after $box, $center, etc.
     static Status parseLegacyBox(const BSONObj& obj, BoxWithCRS* out);
     static Status parseLegacyCenter(const BSONObj& obj, CapWithCRS* out);

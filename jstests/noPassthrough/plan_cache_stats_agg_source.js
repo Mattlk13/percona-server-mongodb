@@ -1,9 +1,5 @@
 /**
  * Tests for the $planCacheStats aggregation metadata source.
- * @tags: [
- *   # TODO SERVER-67607: Test plan cache with CQF enabled.
- *   cqf_experimental_incompatible,
- * ]
  */
 import {
     getAggPlanStage,
@@ -12,14 +8,14 @@ import {
     getPlanStage,
     getPlanStages,
 } from "jstests/libs/analyze_plan.js";
-import {checkSBEEnabled} from "jstests/libs/sbe_util.js";
+import {checkSbeFullyEnabled} from "jstests/libs/sbe_util.js";
 
 const conn = MongoRunner.runMongod();
 assert.neq(null, conn, "mongod failed to start up");
 
 const testDb = conn.getDB("test");
 const coll = testDb.plan_cache_stats_agg_source;
-const isSBEEnabled = checkSBEEnabled(testDb);
+const isSBEEnabled = checkSbeFullyEnabled(testDb);
 
 function makeMatchForFilteringByShape(query) {
     const keyHash = getPlanCacheKeyFromShape({query: query, collection: coll, db: testDb});

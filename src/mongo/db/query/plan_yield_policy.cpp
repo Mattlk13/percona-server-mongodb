@@ -34,11 +34,11 @@
 
 #include "mongo/db/catalog/collection_uuid_mismatch_info.h"
 #include "mongo/db/concurrency/exception_util.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/shard_role.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/yieldable.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/util/assert_util.h"
@@ -46,29 +46,36 @@
 
 namespace mongo {
 
-PlanYieldPolicy::PlanYieldPolicy(
-    OperationContext* opCtx,
-    YieldPolicy policy,
-    ClockSource* cs,
-    int yieldIterations,
-    Milliseconds yieldPeriod,
-    stdx::variant<const Yieldable*, YieldThroughAcquisitions> yieldable,
-    std::unique_ptr<const YieldPolicyCallbacks> callbacks)
+PlanYieldPolicy::PlanYieldPolicy(OperationContext* opCtx,
+                                 YieldPolicy policy,
+                                 ClockSource* cs,
+                                 int yieldIterations,
+                                 Milliseconds yieldPeriod,
+                                 std::variant<const Yieldable*, YieldThroughAcquisitions> yieldable,
+                                 std::unique_ptr<const YieldPolicyCallbacks> callbacks)
     : _policy(getPolicyOverrideForOperation(opCtx, policy)),
       _yieldable(yieldable),
       _callbacks(std::move(callbacks)),
-      _elapsedTracker(cs, yieldIterations, yieldPeriod) {
-    stdx::visit(OverloadedVisitor{[&](const Yieldable* collectionPtr) {
-                                      invariant(!collectionPtr || collectionPtr->yieldable() ||
-                                                policy == YieldPolicy::WRITE_CONFLICT_RETRY_ONLY ||
-                                                policy == YieldPolicy::INTERRUPT_ONLY ||
-                                                policy == YieldPolicy::ALWAYS_TIME_OUT ||
-                                                policy == YieldPolicy::ALWAYS_MARK_KILLED);
-                                  },
-                                  [&](const YieldThroughAcquisitions& yieldThroughAcquisitions) {
-                                      // CollectionAcquisitions are always yieldable.
-                                  }},
-                _yieldable);
+      _elapsedTracker(cs, yieldIterations, yieldPeriod),
+      _fastClock(opCtx->getServiceContext()->getFastClockSource()) {
+    visit(OverloadedVisitor{[&](const Yieldable* collectionPtr) {
+                                invariant(!collectionPtr || collectionPtr->yieldable() ||
+                                          policy == YieldPolicy::WRITE_CONFLICT_RETRY_ONLY ||
+                                          policy == YieldPolicy::INTERRUPT_ONLY ||
+                                          policy == YieldPolicy::ALWAYS_TIME_OUT ||
+                                          policy == YieldPolicy::ALWAYS_MARK_KILLED);
+                            },
+                            [&](const YieldThroughAcquisitions& yieldThroughAcquisitions) {
+                                // CollectionAcquisitions are always yieldable.
+                            }},
+          _yieldable);
+
+    // If 'internalQueryExecYieldIterations' is the default value, we will only reply on time period
+    // to check for yielding, so we can avoid do the check for every iteration instead do the check
+    // every half of the period.
+    _yieldIntervalMs = internalQueryExecYieldIterations.load() == -1
+        ? internalQueryExecYieldPeriodMS.load() / 2
+        : -1;
 }
 
 PlanYieldPolicy::YieldPolicy PlanYieldPolicy::getPolicyOverrideForOperation(
@@ -87,7 +94,7 @@ PlanYieldPolicy::YieldPolicy PlanYieldPolicy::getPolicyOverrideForOperation(
 
     // If the state of our locks held is not yieldable at all, we will assume this is an internal
     // operation that will not yield.
-    if (!opCtx->lockState()->canSaveLockState() &&
+    if (!shard_role_details::getLocker(opCtx)->canSaveLockState() &&
         (desired == YieldPolicy::YIELD_AUTO || desired == YieldPolicy::YIELD_MANUAL)) {
         return YieldPolicy::INTERRUPT_ONLY;
     }
@@ -95,13 +102,13 @@ PlanYieldPolicy::YieldPolicy PlanYieldPolicy::getPolicyOverrideForOperation(
     return desired;
 }
 
-bool PlanYieldPolicy::shouldYieldOrInterrupt(OperationContext* opCtx) {
+bool PlanYieldPolicy::doShouldYieldOrInterrupt(OperationContext* opCtx) {
     if (_policy == YieldPolicy::INTERRUPT_ONLY) {
         return _elapsedTracker.intervalHasElapsed();
     }
     if (!canAutoYield())
         return false;
-    invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
     if (_forceYield)
         return true;
     return _elapsedTracker.intervalHasElapsed();
@@ -124,7 +131,7 @@ Status PlanYieldPolicy::yieldOrInterrupt(OperationContext* opCtx,
         return opCtx->checkForInterruptNoAssert();
     }
 
-    invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
     // After we finish yielding (or in any early return), call resetTimer() to prevent yielding
     // again right away. We delay the resetTimer() call so that the clock doesn't start ticking
@@ -145,12 +152,12 @@ Status PlanYieldPolicy::yieldOrInterrupt(OperationContext* opCtx,
                 // flag for the duration of yield will force any calls to abandonSnapshot() to
                 // commit the transaction, rather than abort it, in order to leave the cursors
                 // valid.
-                opCtx->recoveryUnit()->setAbandonSnapshotMode(
+                shard_role_details::getRecoveryUnit(opCtx)->setAbandonSnapshotMode(
                     RecoveryUnit::AbandonSnapshotMode::kCommit);
                 exitGuard.emplace([&] {
-                    invariant(opCtx->recoveryUnit()->abandonSnapshotMode() ==
+                    invariant(shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshotMode() ==
                               RecoveryUnit::AbandonSnapshotMode::kCommit);
-                    opCtx->recoveryUnit()->setAbandonSnapshotMode(
+                    shard_role_details::getRecoveryUnit(opCtx)->setAbandonSnapshotMode(
                         RecoveryUnit::AbandonSnapshotMode::kAbort);
                 });
             }
@@ -159,20 +166,20 @@ Status PlanYieldPolicy::yieldOrInterrupt(OperationContext* opCtx,
                 // This yield policy doesn't release locks, but it does relinquish our storage
                 // snapshot.
                 invariant(!opCtx->isLockFreeReadsOp());
-                opCtx->recoveryUnit()->abandonSnapshot();
+                shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
             } else {
                 if (usesCollectionAcquisitions()) {
                     performYieldWithAcquisitions(opCtx, whileYieldingFn);
                 } else {
-                    const Yieldable* yieldablePtr = stdx::get<const Yieldable*>(yieldable);
+                    const Yieldable* yieldablePtr = get<const Yieldable*>(yieldable);
                     invariant(yieldablePtr);
                     performYield(opCtx, *yieldablePtr, whileYieldingFn);
                 }
             }
 
             restoreState(opCtx,
-                         stdx::holds_alternative<const Yieldable*>(yieldable)
-                             ? stdx::get<const Yieldable*>(yieldable)
+                         holds_alternative<const Yieldable*>(yieldable)
+                             ? get<const Yieldable*>(yieldable)
                              : nullptr);
             return Status::OK();
         } catch (const StorageUnavailableException& e) {
@@ -211,7 +218,7 @@ void PlanYieldPolicy::performYield(OperationContext* opCtx,
 
     // Release any storage engine resources. This requires holding a global lock to correctly
     // synchronize with states such as shutdown and rollback.
-    opCtx->recoveryUnit()->abandonSnapshot();
+    shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
 
     // Check for interrupt before releasing locks. This avoids the complexities of having to
     // re-acquire locks to clean up when we are interrupted. This is the main interrupt check during
@@ -220,7 +227,7 @@ void PlanYieldPolicy::performYield(OperationContext* opCtx,
         opCtx->checkForInterrupt();  // throws
     }
 
-    Locker* locker = opCtx->lockState();
+    Locker* locker = shard_role_details::getLocker(opCtx);
     Locker::LockSnapshot snapshot;
     locker->saveLockStateAndUnlock(&snapshot);
 
@@ -251,7 +258,7 @@ void PlanYieldPolicy::performYieldWithAcquisitions(OperationContext* opCtx,
 
     // Release any storage engine resources. This requires holding a global lock to correctly
     // synchronize with states such as shutdown and rollback.
-    opCtx->recoveryUnit()->abandonSnapshot();
+    shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
 
     // Check for interrupt before releasing locks. This avoids the complexities of having to
     // re-acquire locks to clean up when we are interrupted. This is the main interrupt check during

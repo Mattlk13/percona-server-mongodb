@@ -28,14 +28,16 @@
  */
 
 #include "mongo/db/s/collection_sharding_state_factory_shard.h"
+
 #include "mongo/db/s/collection_sharding_runtime.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 namespace mongo {
+
 CollectionShardingStateFactoryShard::CollectionShardingStateFactoryShard(
     ServiceContext* serviceContext)
-    : CollectionShardingStateFactory(serviceContext) {}
+    : _serviceContext(serviceContext) {}
 
 std::unique_ptr<CollectionShardingState> CollectionShardingStateFactoryShard::make(
     const NamespaceString& nss) {

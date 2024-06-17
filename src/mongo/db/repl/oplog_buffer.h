@@ -29,13 +29,17 @@
 
 #pragma once
 
+#include "mongo/util/assert_util.h"
 #include <boost/optional.hpp>
 #include <cstddef>
 #include <string>
 #include <vector>
 
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/commands/server_status_metric.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/repl/oplog_batch.h"
 #include "mongo/util/interruptible.h"
 #include "mongo/util/time_support.h"
 
@@ -95,7 +99,8 @@ public:
      */
     virtual void push(OperationContext* opCtx,
                       Batch::const_iterator begin,
-                      Batch::const_iterator end) = 0;
+                      Batch::const_iterator end,
+                      boost::optional<std::size_t> bytes = boost::none) = 0;
 
     /**
      * Returns when enough space is available.
@@ -136,6 +141,14 @@ public:
      * Otherwise, removes last item (saves in "value") from the oplog buffer and returns true.
      */
     virtual bool tryPop(OperationContext* opCtx, Value* value) = 0;
+
+    /**
+     * Returns false if oplog buffer is empty. "batch" is left unchanged.
+     * Otherwise, removes last batch (saves in "batch") from the oplog buffer and returns true.
+     */
+    virtual bool tryPopBatch(OperationContext* opCtx, OplogBatch<Value>* batch) {
+        MONGO_UNIMPLEMENTED;
+    }
 
     /**
      * Waits uninterruptibly for "waitDuration" for an operation to be pushed into the oplog buffer.
@@ -182,20 +195,35 @@ public:
      * "waitForData" will return immediately even if there is data in the queue.  This
      * is an optimization and subclasses may choose not to implement this function.
      */
-    virtual void enterDrainMode(){};
+    virtual void enterDrainMode() {
+        MONGO_UNIMPLEMENTED;
+    }
 
     /**
      * Leaves "drain mode".  May only be called by the producer.
      */
-    virtual void exitDrainMode(){};
+    virtual void exitDrainMode() {
+        MONGO_UNIMPLEMENTED;
+    }
+
+    /**
+     * Returns true if this buffer is in drain mode and empty.
+     */
+    virtual bool inDrainModeAndEmpty() {
+        MONGO_UNIMPLEMENTED;
+    }
 };
 
 class OplogBuffer::Counters {
 public:
-    explicit Counters(const std::string& prefix)
-        : count(prefix + ".count"),
-          size(prefix + ".sizeBytes"),
-          maxSize(prefix + ".maxSizeBytes") {}
+    // Number of operations in this OplogBuffer.
+    Counter64 count;
+
+    // Total size of operations in this OplogBuffer. Measured in bytes.
+    Counter64 size;
+
+    // Maximum size of operations in this OplogBuffer. Measured in bytes.
+    Counter64 maxSize;
 
     /**
      * Sets maximum size of operations for this OplogBuffer.
@@ -219,26 +247,65 @@ public:
         size.increment(std::size_t(value.objsize()));
     }
 
+    void incrementN(std::size_t cnt, std::size_t sz) {
+        count.increment(cnt);
+        size.increment(sz);
+    }
+
     void decrement(const Value& value) {
         count.decrement(1);
         size.decrement(std::size_t(value.objsize()));
     }
 
-    // Number of operations in this OplogBuffer.
-    CounterMetric count;
+    void decrementN(std::size_t cnt, std::size_t sz) {
+        count.decrement(cnt);
+        size.decrement(sz);
+    }
+};
 
-    // Total size of operations in this OplogBuffer. Measured in bytes.
-    CounterMetric size;
+class OplogBufferMetrics {
+public:
+    OplogBuffer::Counters* getWriteBufferCounter() {
+        return &_writeBufferCounter;
+    }
 
-    // Maximum size of operations in this OplogBuffer. Measured in bytes.
-    CounterMetric maxSize;
+    OplogBuffer::Counters* getApplyBufferCounter() {
+        return &_applyBufferCounter;
+    }
+
+    BSONObj getReport() const {
+        BSONObjBuilder applierSubBuilder;
+        applierSubBuilder.append("count", _applyBufferCounter.count.get());
+        applierSubBuilder.append("sizeBytes", _applyBufferCounter.size.get());
+        applierSubBuilder.append("maxSizeBytes", _applyBufferCounter.maxSize.get());
+        if (feature_flags::gReduceMajorityWriteLatency.isEnabled(
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+            BSONObjBuilder builder;
+            BSONObjBuilder writerSubBuilder;
+            writerSubBuilder.append("count", _writeBufferCounter.count.get());
+            writerSubBuilder.append("sizeBytes", _writeBufferCounter.size.get());
+            writerSubBuilder.append("maxSizeBytes", _writeBufferCounter.maxSize.get());
+            builder.append("write", writerSubBuilder.obj());
+            builder.append("apply", applierSubBuilder.obj());
+            return builder.obj();
+        }
+        return applierSubBuilder.obj();
+    }
+
+    operator BSONObj() const {
+        return getReport();
+    }
+
+private:
+    OplogBuffer::Counters _writeBufferCounter;
+    OplogBuffer::Counters _applyBufferCounter;
 };
 
 /**
  * An OplogBuffer interface which also supports random access by timestamp.
  * The entries in a RandomAccessOplogBuffer must be pushed in strict timestamp order.
  *
- * The user of a RandomAccesOplogBuffer may seek to or find timestamps which have already been read
+ * The user of a RandomAccessOplogBuffer may seek to or find timestamps which have already been read
  * from the buffer.  It is up to the implementing subclass to ensure that such timestamps are
  * available to be read.
  */

@@ -84,11 +84,12 @@ intrusive_ptr<DocumentSource> DocumentSourceAddFields::create(
     const intrusive_ptr<ExpressionContext>& expCtx) {
 
     const bool isIndependentOfAnyCollection = false;
-    return make_intrusive<DocumentSourceSingleDocumentTransformation>(
+    auto docSrc = make_intrusive<DocumentSourceSingleDocumentTransformation>(
         expCtx,
         projection_executor::AddFieldsProjectionExecutor::create(expCtx, fieldPath, expr),
         kStageName,
         isIndependentOfAnyCollection);
+    return docSrc;
 }
 
 intrusive_ptr<DocumentSource> DocumentSourceAddFields::createFromBson(

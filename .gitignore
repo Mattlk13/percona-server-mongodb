@@ -1,6 +1,7 @@
 /.ccls_cache
 /build
-/src/mongo/db/modules
+/src/mongo/db/modules/*
+!/src/mongo/db/modules/enterprise/
 /.jsdbshell
 /.cache
 /.dbshell
@@ -177,6 +178,7 @@ debian/mongodb
 .idea
 CMakeLists.txt
 !src/third_party/abseil-cpp/**/CMakeLists.txt
+!/src/third_party/snappy/**/CMakeLists.txt
 
 # XCode projects
 .xcworkspace
@@ -271,26 +273,30 @@ jstestfuzz/
 
 # Bazel-related work
 # (Note that each string does NOT terminate with a '/' so that gitignore works properly)
-bazel-bin
-bazel-mongo*
-bazel-out
-bazel-testlogs
+bazel-*
 bazelisk
+buildifier
 .bazelrc.local
+.bazel_info_for_ninja.txt
+.ninja_last_command_line_targets.txt
 
 # generated configs for external fixture suites
 docker_compose/
 
 # artifacts from antithesis docker base image builds
 antithesis-dist-test
-buildscripts/antithesis/base_images/mongo_binaries/dist-test
+buildscripts/antithesis/base_images/mongo_binaries/bin
+buildscripts/antithesis/base_images/mongo_binaries/lib
 buildscripts/antithesis/base_images/mongo_binaries/libvoidstar.so
+buildscripts/antithesis/base_images/mongo_binaries/tsan.suppressions
 
+buildscripts/antithesis/base_images/workload/bin
+buildscripts/antithesis/base_images/workload/lib
 buildscripts/antithesis/base_images/workload/src
-buildscripts/antithesis/base_images/workload/mongo
 buildscripts/antithesis/base_images/workload/jstestfuzz
 buildscripts/antithesis/base_images/workload/QA
 buildscripts/antithesis/base_images/workload/libvoidstar.so
+buildscripts/antithesis/base_images/workload/tsan.suppressions
 
 # default download location for resmoke core-analyzer
 core-analyzer

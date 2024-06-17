@@ -35,13 +35,13 @@
 namespace mongo::query_shape {
 namespace {
 
-BSONObj projectionShape(boost::optional<projection_ast::Projection> proj,
+BSONObj projectionShape(const boost::optional<projection_ast::Projection>& proj,
                         const SerializationOptions& opts =
                             SerializationOptions::kRepresentativeQueryShapeSerializeOptions) {
     return proj ? projection_ast::serialize(*proj->root(), opts) : BSONObj();
 }
 
-BSONObj sortShape(boost::optional<SortPattern> sort,
+BSONObj sortShape(const boost::optional<SortPattern>& sort,
                   const SerializationOptions& opts =
                       SerializationOptions::kRepresentativeQueryShapeSerializeOptions) {
     return sort
@@ -151,6 +151,28 @@ void FindCmdShapeComponents::HashValue(absl::HashState state) const {
                              hasField);
 }
 
+uint32_t FindCmdShapeComponents::optionalArgumentsEncoding() const {
+    uint32_t res{0};
+    for (const auto& arg : {singleBatch,
+                            allowDiskUse,
+                            returnKey,
+                            showRecordId,
+                            tailable,
+                            awaitData,
+                            mirrored,
+                            oplogReplay}) {
+        if (arg.has_value()) {
+            res |= arg ? 0b11 : 0b10;
+        }
+        res <<= 2;
+    }
+
+    res |= static_cast<uint32_t>(hasField.skip);
+    res |= static_cast<uint32_t>(hasField.limit) << 1;
+
+    return res;
+}
+
 std::unique_ptr<FindCommandRequest> FindCmdShape::toFindCommandRequest() const {
     auto fcr = std::make_unique<FindCommandRequest>(nssOrUUID);
 
@@ -227,4 +249,29 @@ void FindCmdShape::appendLetCmdSpecificShapeComponents(
     }
 }
 
+QueryShapeHash FindCmdShape::sha256Hash(OperationContext*, const SerializationContext&) const {
+    // Allocate a buffer on the stack for serialization of parts of the "find" command shape.
+    constexpr std::size_t bufferSizeOnStack = 256;
+    StackBufBuilderBase<bufferSizeOnStack> findCommandShapeBuffer;
+
+    // Write small or typically empty "find" command shape parts to the buffer.
+    findCommandShapeBuffer.appendStr(FindCommandRequest::kCommandName, false /*includeEndingNull*/);
+
+    // Append bits corresponding to the optional command parameter values and a one bit indicator
+    // whether the command specification includes a namespace or a UUID of a collection.
+    findCommandShapeBuffer.appendNum(components.optionalArgumentsEncoding() << 1 |
+                                     (nssOrUUID.isNamespaceString() ? 1 : 0));
+    auto nssDataRange = nssOrUUID.asDataRange();
+    findCommandShapeBuffer.appendBuf(nssDataRange.data(), nssDataRange.length());
+    findCommandShapeBuffer.appendBuf(components.min.objdata(), components.min.objsize());
+    findCommandShapeBuffer.appendBuf(components.max.objdata(), components.max.objsize());
+    findCommandShapeBuffer.appendBuf(components.sort.objdata(), components.sort.objsize());
+    findCommandShapeBuffer.appendBuf(collation.objdata(), collation.objsize());
+    findCommandShapeBuffer.appendBuf(_let.shapifiedLet.objdata(), _let.shapifiedLet.objsize());
+    return SHA256Block::computeHash(
+        {ConstDataRange{findCommandShapeBuffer.buf(),
+                        static_cast<std::size_t>(findCommandShapeBuffer.len())},
+         components.filter.asDataRange(),
+         components.projection.asDataRange()});
+}
 }  // namespace mongo::query_shape

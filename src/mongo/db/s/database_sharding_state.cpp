@@ -43,17 +43,18 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/db/cluster_role.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/s/operation_sharding_state.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/shard_id.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
 #include "mongo/platform/mutex.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/assert_util.h"
@@ -120,6 +121,41 @@ private:
 const ServiceContext::Decoration<DatabaseShardingStateMap> DatabaseShardingStateMap::get =
     ServiceContext::declareDecoration<DatabaseShardingStateMap>();
 
+
+void checkPlacementConflictTimestamp(const boost::optional<LogicalTime> atClusterTime,
+                                     const DatabaseVersion& receivedDatabaseVersion,
+                                     const DatabaseName& dbName,
+                                     const DatabaseVersion& installedDatabaseVersion) {
+    // placementConflictTimestamp equal to Timestamp(0, 0) means ignore, even for atClusterTime
+    // transactions.
+    const auto shouldIgnorePlacementConflict = receivedDatabaseVersion.getPlacementConflictTime()
+        ? receivedDatabaseVersion.getPlacementConflictTime()->asTimestamp() == Timestamp(0, 0)
+        : false;
+
+    if (atClusterTime && !shouldIgnorePlacementConflict) {
+        uassert(ErrorCodes::MigrationConflict,
+                str::stream() << "Database " << dbName.toStringForErrorMsg()
+                              << " has undergone a catalog change operation at time "
+                              << installedDatabaseVersion.getTimestamp()
+                              << " and no longer satisfies the requirements for the current "
+                                 "transaction which requires "
+                              << atClusterTime->asTimestamp() << ". Transaction will be aborted.",
+                atClusterTime->asTimestamp() >= installedDatabaseVersion.getTimestamp());
+    } else if (receivedDatabaseVersion.getPlacementConflictTime() &&
+               !shouldIgnorePlacementConflict) {
+        uassert(ErrorCodes::MigrationConflict,
+                str::stream() << "Database " << dbName.toStringForErrorMsg()
+                              << " has undergone a catalog change operation at time "
+                              << installedDatabaseVersion.getTimestamp()
+                              << " and no longer satisfies the requirements for the current "
+                                 "transaction which requires "
+                              << receivedDatabaseVersion.getPlacementConflictTime()->asTimestamp()
+                              << ". Transaction will be aborted.",
+                receivedDatabaseVersion.getPlacementConflictTime()->asTimestamp() >=
+                    installedDatabaseVersion.getTimestamp());
+    }
+}
+
 }  // namespace
 
 DatabaseShardingState::DatabaseShardingState(const DatabaseName& dbName) : _dbName(dbName) {}
@@ -163,14 +199,14 @@ DatabaseShardingState::ScopedSharedDatabaseShardingState DatabaseShardingState::
 DatabaseShardingState::ScopedExclusiveDatabaseShardingState
 DatabaseShardingState::assertDbLockedAndAcquireExclusive(OperationContext* opCtx,
                                                          const DatabaseName& dbName) {
-    dassert(opCtx->lockState()->isDbLockedForMode(dbName, MODE_IS));
+    dassert(shard_role_details::getLocker(opCtx)->isDbLockedForMode(dbName, MODE_IS));
     return acquireExclusive(opCtx, dbName);
 }
 
 DatabaseShardingState::ScopedSharedDatabaseShardingState
 DatabaseShardingState::assertDbLockedAndAcquireShared(OperationContext* opCtx,
                                                       const DatabaseName& dbName) {
-    dassert(opCtx->lockState()->isDbLockedForMode(dbName, MODE_IS));
+    dassert(shard_role_details::getLocker(opCtx)->isDbLockedForMode(dbName, MODE_IS));
     return acquireShared(opCtx, dbName);
 }
 
@@ -193,9 +229,10 @@ void DatabaseShardingState::assertMatchingDbVersion(OperationContext* opCtx,
 void DatabaseShardingState::assertMatchingDbVersion(OperationContext* opCtx,
                                                     const DatabaseVersion& receivedVersion) const {
     {
-        const auto critSecSignal = getCriticalSectionSignal(
-            opCtx->lockState()->isWriteLocked() ? ShardingMigrationCriticalSection::kWrite
-                                                : ShardingMigrationCriticalSection::kRead);
+        const auto critSecSignal =
+            getCriticalSectionSignal(shard_role_details::getLocker(opCtx)->isWriteLocked()
+                                         ? ShardingMigrationCriticalSection::kWrite
+                                         : ShardingMigrationCriticalSection::kRead);
         const auto optCritSecReason = getCriticalSectionReason();
 
         uassert(StaleDbRoutingVersion(_dbName, receivedVersion, boost::none, critSecSignal),
@@ -213,9 +250,14 @@ void DatabaseShardingState::assertMatchingDbVersion(OperationContext* opCtx,
     uassert(StaleDbRoutingVersion(_dbName, receivedVersion, *wantedVersion),
             str::stream() << "Version mismatch for the database " << _dbName.toStringForErrorMsg(),
             receivedVersion == *wantedVersion);
+
+    // Check placement conflicts for multi-document transactions.
+    const auto atClusterTime = repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime();
+    checkPlacementConflictTimestamp(atClusterTime, receivedVersion, _dbName, *wantedVersion);
 }
 
 void DatabaseShardingState::assertIsPrimaryShardForDb(OperationContext* opCtx) const {
+    using namespace fmt::literals;
     if (_dbName == DatabaseName::kConfig || _dbName == DatabaseName::kAdmin) {
         uassert(7393700,
                 "The config server is the primary shard for database: {}"_format(
@@ -243,7 +285,7 @@ void DatabaseShardingState::assertIsPrimaryShardForDb(OperationContext* opCtx) c
 }
 
 void DatabaseShardingState::setDbInfo(OperationContext* opCtx, const DatabaseType& dbInfo) {
-    invariant(opCtx->lockState()->isDbLockedForMode(_dbName, MODE_IX));
+    invariant(shard_role_details::getLocker(opCtx)->isDbLockedForMode(_dbName, MODE_IX));
 
     LOGV2(7286900,
           "Setting this node's cached database info",
@@ -253,7 +295,7 @@ void DatabaseShardingState::setDbInfo(OperationContext* opCtx, const DatabaseTyp
 }
 
 void DatabaseShardingState::clearDbInfo(OperationContext* opCtx, bool cancelOngoingRefresh) {
-    invariant(opCtx->lockState()->isDbLockedForMode(_dbName, MODE_IX));
+    invariant(shard_role_details::getLocker(opCtx)->isDbLockedForMode(_dbName, MODE_IX));
 
     if (cancelOngoingRefresh) {
         _cancelDbMetadataRefresh();
@@ -289,12 +331,12 @@ void DatabaseShardingState::exitCriticalSectionNoChecks(OperationContext* opCtx)
 }
 
 void DatabaseShardingState::setMovePrimaryInProgress(OperationContext* opCtx) {
-    invariant(opCtx->lockState()->isDbLockedForMode(_dbName, MODE_X));
+    invariant(shard_role_details::getLocker(opCtx)->isDbLockedForMode(_dbName, MODE_X));
     _movePrimaryInProgress = true;
 }
 
 void DatabaseShardingState::unsetMovePrimaryInProgress(OperationContext* opCtx) {
-    invariant(opCtx->lockState()->isDbLockedForMode(_dbName, MODE_IX));
+    invariant(shard_role_details::getLocker(opCtx)->isDbLockedForMode(_dbName, MODE_IX));
     _movePrimaryInProgress = false;
 }
 

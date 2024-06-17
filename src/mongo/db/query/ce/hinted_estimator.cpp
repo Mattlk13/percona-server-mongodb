@@ -77,19 +77,22 @@ public:
     template <typename T, typename... Ts>
     CEType transport(ABT::reference_type n, const T& /*node*/, Ts&&...) {
         if (canBeLogicalNode<T>()) {
-            return _heuristicCE.deriveCE(_metadata, _memo, _logicalProps, n);
+            return _heuristicCE.deriveCE(_metadata, _memo, _logicalProps, _queryParameters, n)._ce;
         }
         return {0.0};
     }
 
-    static CEType derive(const Metadata& metadata,
-                         const cascades::Memo& memo,
-                         const PartialSchemaSelHints& pathHints,
-                         const PartialSchemaIntervalSelHints& intervalHints,
-                         const properties::LogicalProps& logicalProps,
-                         const ABT::reference_type logicalNodeRef) {
-        HintedTransport instance(metadata, memo, logicalProps, pathHints, intervalHints);
-        return algebra::transport<true>(logicalNodeRef, instance);
+    static CERecord derive(const Metadata& metadata,
+                           const cascades::Memo& memo,
+                           const PartialSchemaSelHints& pathHints,
+                           const PartialSchemaIntervalSelHints& intervalHints,
+                           const properties::LogicalProps& logicalProps,
+                           const QueryParameterMap& queryParameters,
+                           const ABT::reference_type logicalNodeRef) {
+        HintedTransport instance(
+            metadata, memo, logicalProps, pathHints, intervalHints, queryParameters);
+        CEType ce = algebra::transport<true>(logicalNodeRef, instance);
+        return {ce, "hinted"};
     }
 
 private:
@@ -97,13 +100,15 @@ private:
                     const cascades::Memo& memo,
                     const properties::LogicalProps& logicalProps,
                     const PartialSchemaSelHints& pathHints,
-                    const PartialSchemaIntervalSelHints& intervalHints)
+                    const PartialSchemaIntervalSelHints& intervalHints,
+                    const QueryParameterMap& queryParameters)
         : _heuristicCE(),
           _metadata(metadata),
           _memo(memo),
           _logicalProps(logicalProps),
           _pathHints(pathHints),
-          _intervalHints(intervalHints) {}
+          _intervalHints(intervalHints),
+          _queryParameters(queryParameters) {}
 
     HeuristicEstimator _heuristicCE;
 
@@ -116,14 +121,16 @@ private:
     const PartialSchemaSelHints& _pathHints;
     // Selectivity hints per PartialSchemaKey and IntervalReqExpr::Node.
     const PartialSchemaIntervalSelHints& _intervalHints;
+    const QueryParameterMap& _queryParameters;
 };
 
-CEType HintedEstimator::deriveCE(const Metadata& metadata,
-                                 const cascades::Memo& memo,
-                                 const properties::LogicalProps& logicalProps,
-                                 const ABT::reference_type logicalNodeRef) const {
+CERecord HintedEstimator::deriveCE(const Metadata& metadata,
+                                   const cascades::Memo& memo,
+                                   const properties::LogicalProps& logicalProps,
+                                   const QueryParameterMap& queryParameters,
+                                   const ABT::reference_type logicalNodeRef) const {
     return HintedTransport::derive(
-        metadata, memo, _pathHints, _intervalHints, logicalProps, logicalNodeRef);
+        metadata, memo, _pathHints, _intervalHints, logicalProps, queryParameters, logicalNodeRef);
 }
 
 }  // namespace mongo::optimizer::ce

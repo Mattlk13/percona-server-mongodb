@@ -49,7 +49,6 @@
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/query/collation/collation_index_key.h"
 #include "mongo/db/storage/snapshot.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/overloaded_visitor.h"  // IWYU pragma: keep
 #include "mongo/util/shared_buffer_fragment.h"
 
@@ -277,36 +276,10 @@ boost::optional<Value> SortKeyGenerator::extractKeyPart(
     Value plainKey;
     if (patternPart.fieldPath) {
         invariant(!patternPart.expression);
-        auto keyVariant = doc.getNestedFieldNonCaching(*patternPart.fieldPath);
-
-        auto key = stdx::visit(
-            OverloadedVisitor{
-                // In this case, the document has an array along the path given. This means the
-                // document is ineligible for taking the fast path for index key generation.
-                [](Document::TraversesArrayTag) -> boost::optional<Value> { return boost::none; },
-                // In this case the field was already in the cache (or may not have existed).
-                [](const Value& val) -> boost::optional<Value> {
-                    // The document may have an array at the given path.
-                    if (val.getType() == BSONType::Array) {
-                        return boost::none;
-                    }
-                    return val;
-                },
-                // In this case the field was in the backing BSON, and not in the cache.
-                [](BSONElement elt) -> boost::optional<Value> {
-                    // The document may have an array at the given path.
-                    if (elt.type() == BSONType::Array) {
-                        return boost::none;
-                    }
-                    return Value(elt);
-                },
-                [](stdx::monostate none) -> boost::optional<Value> { return Value(); },
-            },
-            keyVariant);
-
-        if (!key) {
+        auto key = doc.getNestedScalarFieldNonCaching(*patternPart.fieldPath);
+        if (!key)
             return boost::none;
-        }
+
         plainKey = std::move(*key);
     } else {
         invariant(patternPart.expression);
@@ -409,6 +382,9 @@ bool SortKeyGenerator::fastFillOutSortKeyPartsHelper(const BSONObj& bson,
             }
 
             if (childNode->part) {
+                tassert(8770401,
+                        "Expected partIdx to be less than the size of the output",
+                        childNode->partIdx < out->size());
                 (*out)[childNode->partIdx] = elt;
             }
 
@@ -451,7 +427,6 @@ void SortKeyGenerator::generateSortKeyComponentVector(const BSONObj& bson,
                 }
             }
         }
-
         // Fast path succeeded, we're done.
         return;
     }
@@ -464,11 +439,23 @@ void SortKeyGenerator::generateSortKeyComponentVector(const BSONObj& bson,
 
     Document outDoc(std::vector<std::pair<StringData, Value>>{{""_sd, sortKeyVal}});
     _localObjStorage = outDoc.toBson();
-    if (_localObjStorage.firstElement().type() == BSONType::Array) {
+    tassert(8770400,
+            "Expected BSONElement array to be the same size as the sortPattern",
+            eltsOut->size() == _sortPattern.size());
+    if (_sortPattern.size() > 1) {
+        tassert(8770404,
+                "If the sort pattern size is > 1, the sortKey should be an array",
+                _localObjStorage.firstElement().type() == BSONType::Array);
+        BSONObjIterator sortKeyIt(_localObjStorage.firstElement().embeddedObject());
         size_t i = 0;
-        for (auto& elt : _localObjStorage.firstElement().embeddedObject()) {
-            (*eltsOut)[i++] = elt;
+        while (i < eltsOut->size() && sortKeyIt.more()) {
+            (*eltsOut)[i++] = sortKeyIt.next();
         }
+        tassert(8770402,
+                "Expected the number of elements in the sort key to the equal to eltsOut.size()",
+                i == eltsOut->size());
+        tassert(
+            8770403, "Expected to exhaust the elements in the sort key array", !sortKeyIt.more());
     } else {
         (*eltsOut)[0] = _localObjStorage.firstElement();
     }

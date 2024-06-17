@@ -19,9 +19,10 @@ import {
     getQueryInfoAtTopLevelOrFirstStage,
     getSbePlanStages
 } from "jstests/libs/sbe_explain_helpers.js";
-import {checkSBEEnabled} from "jstests/libs/sbe_util.js";
+import {checkSbeFullyEnabled, checkSbeRestrictedOrFullyEnabled} from "jstests/libs/sbe_util.js";
 
-const isSBELookupEnabled = checkSBEEnabled(db);
+const isSBEFullyEnabled = checkSbeFullyEnabled(db);
+const isSBELookupEnabled = checkSbeRestrictedOrFullyEnabled(db);
 const testDB = db.getSiblingDB("lookup_query_stats");
 testDB.dropDatabase();
 
@@ -87,27 +88,34 @@ let getCurrentQueryExecutorStats = function() {
 
 let checkExplainOutputForVerLevel = function(
     explainOutput, expected, verbosityLevel, expectedQueryPlan, withUnwind) {
-    const lkpStages = getAggPlanStages(explainOutput, "$lookup");
-
     // Only make SBE specific assertions when we know that our $lookup has been pushed down.
-    if (isSBELookupEnabled && !withUnwind) {
-        // If the SBE lookup is enabled, the $lookup stage is pushed down to the SBE and it's
+    if (isSBEFullyEnabled || (isSBELookupEnabled && !withUnwind)) {
+        // If the SBE lookup is enabled, the "$lookup" stage is pushed down to the SBE and it's
         // not visible in 'stages' field of the explain output. Instead, 'queryPlan.stage' must be
-        // "EQ_LOOKUP".
-        assert.eq(lkpStages.length, 0, lkpStages, explainOutput);
+        // "EQ_LOOKUP" or "EQ_LOOKUP_UNWIND".
+        let lkpStages = getAggPlanStages(explainOutput, "EQ_LOOKUP", true);
+        if (lkpStages.length == 0) {
+            lkpStages = getAggPlanStages(explainOutput, "EQ_LOOKUP_UNWIND", true);
+        }
+        assert.eq(lkpStages.length, 1, lkpStages);
+        const lkpStage = lkpStages[0];
+
         const queryInfo = getQueryInfoAtTopLevelOrFirstStage(explainOutput);
         const planner = queryInfo.queryPlanner;
         assert(planner.hasOwnProperty("winningPlan") &&
                    planner.winningPlan.hasOwnProperty("queryPlan"),
                explainOutput);
         const plan = planner.winningPlan.queryPlan;
-        assert(plan.hasOwnProperty("stage") && plan.stage == "EQ_LOOKUP", explainOutput);
+
+        assert(lkpStage.hasOwnProperty("stage"), lkpStage);
+        assert(lkpStage.stage == "EQ_LOOKUP" || lkpStage.stage == "EQ_LOOKUP_UNWIND", lkpStage);
         assert(expectedQueryPlan.hasOwnProperty("strategy"), expectedQueryPlan);
-        assert(plan.hasOwnProperty("strategy") && plan.strategy == expectedQueryPlan.strategy,
-               explainOutput);
+        assert(
+            lkpStage.hasOwnProperty("strategy") && lkpStage.strategy == expectedQueryPlan.strategy,
+            lkpStage);
         if (expectedQueryPlan.strategy == "IndexedLoopJoin") {
-            assert(plan.hasOwnProperty("indexName"), expectedQueryPlan);
-            assert.eq(plan.indexName, expectedQueryPlan.indexName, explainOutput);
+            assert(lkpStage.hasOwnProperty("indexName"), lkpStage);
+            assert.eq(lkpStage.indexName, expectedQueryPlan.indexName);
         }
 
         const expectedTopLevelJoinStage =
@@ -139,6 +147,7 @@ let checkExplainOutputForVerLevel = function(
             assert.eq(sbeNljStages.length, 0, explainOutput);
         }
     } else {
+        const lkpStages = getAggPlanStages(explainOutput, "$lookup");
         assert.eq(lkpStages.length, 1, lkpStages);
         const lkpStage = lkpStages[0];
         assert.eq(
@@ -223,7 +232,7 @@ let testQueryExecutorStatsWithCollectionScan = function(params) {
     // There is no index in the collection.
     assert.eq(0, curScannedKeys);
 
-    if (isSBELookupEnabled && !params.withUnwind) {
+    if (isSBEFullyEnabled || (isSBELookupEnabled && !params.withUnwind)) {
         checkExplainOutputForAllVerbosityLevels(
             localColl,
             fromColl,
@@ -346,7 +355,7 @@ let testQueryExecutorStatsWithIndexScan = function(params) {
     // collection.
     assert.eq(localDocCount, curScannedKeys);
 
-    if (isSBELookupEnabled && !params.withUnwind) {
+    if (isSBEFullyEnabled || (isSBELookupEnabled && !params.withUnwind)) {
         checkExplainOutputForAllVerbosityLevels(
             localColl,
             fromColl,
@@ -394,6 +403,10 @@ insertDocumentToCollection(localColl, localDocCount, "localField");
 // This test might be called over an existing MongoD instance. We should populate
 // lastScannedObjects and lastScannedKeys with existing stats values in that case.
 getCurrentQueryExecutorStats();
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// TESTS
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 testQueryExecutorStatsWithCollectionScan({withUnwind: false});
 testQueryExecutorStatsWithHashLookup();

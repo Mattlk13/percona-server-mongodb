@@ -1,6 +1,10 @@
 /**
  * Tests adding standalones and replica sets as shards under a variety of configurations (setName,
  * valid and invalid hosts, shardName matching or not matching a setName, etc).
+ * @tags: [
+ *   # Test doesn't start enough mongods to have num_mongos routers
+ *   temp_disabled_embedded_router_num_routers,
+ * ]
  */
 import {removeShard} from "jstests/sharding/libs/remove_shard_util.js";
 
@@ -155,12 +159,12 @@ addShardRes = st.s.adminCommand({addShard: rst5.getURL()});
 assertAddShardSucceeded(addShardRes);
 
 // Ensure the write goes to the newly added shard.
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: 'test', primaryShard: addShardRes.shardAdded}));
 assert.commandWorked(st.s.getDB('test').runCommand({create: "foo"}));
 const res = st.s.getDB('config').getCollection('databases').findOne({_id: 'test'});
 assert.neq(null, res);
-if (res.primary != addShardRes.shardAdded) {
-    assert.commandWorked(st.s.adminCommand({movePrimary: 'test', to: addShardRes.shardAdded}));
-}
+assert.eq(res.primary, addShardRes.shardAdded);
 
 assert.commandWorked(st.s.getDB('test').foo.insert({x: 1}));
 assert.neq(null, rst5.getPrimary().getDB('test').foo.findOne());

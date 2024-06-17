@@ -401,7 +401,7 @@ void postVisitCommon(PathTreeNode<boost::optional<ProjectNode>>* node,
 
                 if (!spec->actions[i].isDrop()) {
                     auto typedSlot = ctx.slots->get(std::make_pair(PlanStageSlots::kField, name));
-                    funcArgs.emplace_back(typedSlot.slotId);
+                    funcArgs.emplace_back(typedSlot);
                 } else {
                     // If this field is a top-level drop, then we pass Nothing for the input field.
                     funcArgs.emplace_back(b.makeNothingConstant());
@@ -424,7 +424,7 @@ SbExpr evaluateProjection(StageBuilderState& state,
                           const PlanStageSlots* slots) {
     using Node = PathTreeNode<boost::optional<ProjectNode>>;
 
-    boost::optional<TypedSlot> rootSlot =
+    boost::optional<SbSlot> rootSlot =
         slots ? slots->getIfExists(PlanStageSlots::kResult) : boost::none;
 
     auto tree = buildPathTree<boost::optional<ProjectNode>>(
@@ -442,7 +442,7 @@ SbExpr evaluateProjection(StageBuilderState& state,
                 context.pushKeepOrDrop(node->value->getBool());
             } else if (node->value->isExpr()) {
                 context.pushValueArg(
-                    generateExpression(state, node->value->getExpr(), rootSlot, context.slots));
+                    generateExpression(state, node->value->getExpr(), rootSlot, *context.slots));
             } else if (node->value->isSbExpr()) {
                 context.pushValueArg(node->value->extractSbExpr());
             } else if (node->value->isSlice()) {

@@ -37,15 +37,15 @@ hazard_grow(WT_SESSION_IMPL *session)
      * original to be freed.
      */
     old_hazard = session->hazards.arr;
-    WT_PUBLISH(session->hazards.arr, new_hazard);
+    WT_RELEASE_WRITE_WITH_BARRIER(session->hazards.arr, new_hazard);
 
     /*
      * Our larger hazard array means we can use larger indices for reading/writing hazard pointers.
      * However, if these larger indices become visible to other threads before the new hazard array
-     * we can have out of bounds accesses to the old hazard array. Set a write barrier here to
+     * we can have out of bounds accesses to the old hazard array. Set a release barrier here to
      * ensure the array pointer is always visible first.
      */
-    WT_WRITE_BARRIER();
+    WT_RELEASE_BARRIER();
 
     session->hazards.size = (uint32_t)(size * 2);
 
@@ -85,7 +85,7 @@ __wt_hazard_set_func(WT_SESSION_IMPL *session, WT_REF *ref, bool *busyp
      * If there isn't a valid page, we're done. This read can race with eviction and splits, we
      * re-check it after a barrier to make sure we have a valid reference.
      */
-    current_state = ref->state;
+    current_state = WT_REF_GET_STATE(ref);
     if (current_state != WT_REF_MEM) {
         *busyp = true;
         return (0);
@@ -109,7 +109,7 @@ __wt_hazard_set_func(WT_SESSION_IMPL *session, WT_REF *ref, bool *busyp
         /*
          * If we've grown the hazard array the inuse counter can be incremented beyond the size of
          * the old hazard array. We need to ensure the new hazard array pointer is visible before
-         * this increment of the inuse counter and do so with a write barrier in the hazard grow
+         * this increment of the inuse counter and do so with a release barrier in the hazard grow
          * logic.
          */
         hp = &session->hazards.arr[session->hazards.inuse++];
@@ -156,7 +156,7 @@ __wt_hazard_set_func(WT_SESSION_IMPL *session, WT_REF *ref, bool *busyp
     /*
      * Check if the page state is still valid, where valid means a state of WT_REF_MEM.
      */
-    current_state = ref->state;
+    current_state = WT_REF_GET_STATE(ref);
     if (current_state == WT_REF_MEM) {
         ++session->hazards.num_active;
 
@@ -164,7 +164,7 @@ __wt_hazard_set_func(WT_SESSION_IMPL *session, WT_REF *ref, bool *busyp
          * Callers require a barrier here so operations holding the hazard pointer see consistent
          * data.
          */
-        WT_READ_BARRIER();
+        WT_ACQUIRE_BARRIER();
         return (0);
     }
 
@@ -173,9 +173,6 @@ __wt_hazard_set_func(WT_SESSION_IMPL *session, WT_REF *ref, bool *busyp
      * know). If the eviction server sees our hazard pointer before evicting the page, it will
      * return the page to use, no harm done, if it doesn't, it will go ahead and complete the
      * eviction.
-     *
-     * We don't bother publishing this update: the worst case is we prevent some random page from
-     * being evicted.
      */
     hp->ref = NULL;
     *busyp = true;
@@ -201,11 +198,11 @@ __wt_hazard_clear(WT_SESSION_IMPL *session, WT_REF *ref)
     for (hp = session->hazards.arr + session->hazards.inuse - 1; hp >= session->hazards.arr; --hp)
         if (hp->ref == ref) {
             /*
-             * We don't publish the hazard pointer clear in the general case. It's not required for
-             * correctness; it gives an eviction thread faster access to the page were the page
-             * selected for eviction.
+             * Release write the hazard pointer. We want to ensure that all operations performed on
+             * the page, be it writes or reads, occur while we are holding the hazard pointer and
+             * thus preventing the page from being freed.
              */
-            hp->ref = NULL;
+            WT_RELEASE_WRITE(hp->ref, NULL);
 
             /*
              * If this was the last hazard pointer in the session, reset the size so that checks can
@@ -215,7 +212,7 @@ __wt_hazard_clear(WT_SESSION_IMPL *session, WT_REF *ref)
              * active references can never be less than the number of in-use slots.
              */
             if (--session->hazards.num_active == 0)
-                WT_PUBLISH(session->hazards.inuse, 0);
+                WT_RELEASE_WRITE_WITH_BARRIER(session->hazards.inuse, 0);
             return (0);
         }
 
@@ -281,7 +278,7 @@ __wt_hazard_close(WT_SESSION_IMPL *session)
  * hazard_get_reference --
  *     Return a consistent reference to a hazard pointer array.
  */
-static inline void
+static WT_INLINE void
 hazard_get_reference(WT_SESSION_IMPL *session, WT_HAZARD **hazardp, uint32_t *hazard_inusep)
 {
     /*
@@ -293,8 +290,47 @@ hazard_get_reference(WT_SESSION_IMPL *session, WT_HAZARD **hazardp, uint32_t *ha
      * Use a barrier instead of marking the fields volatile because we don't want to slow down the
      * rest of the hazard pointer functions that don't need special treatment.
      */
-    WT_ORDERED_READ(*hazard_inusep, session->hazards.inuse);
-    WT_ORDERED_READ(*hazardp, session->hazards.arr);
+    WT_ACQUIRE_READ_WITH_BARRIER(*hazard_inusep, session->hazards.inuse);
+    WT_ACQUIRE_READ_WITH_BARRIER(*hazardp, session->hazards.arr);
+}
+
+/*
+ * __hazard_check_callback --
+ *     Check if a session holds a hazard pointer on a given ref. If it does return both the session
+ *     and the hazard pointer. Callback from the session array walk.
+ */
+static int
+__hazard_check_callback(
+  WT_SESSION_IMPL *session, WT_SESSION_IMPL *array_session, bool *exit_walkp, void *cookiep)
+{
+    WT_HAZARD_COOKIE *cookie;
+    uint32_t i, hazard_inuse;
+
+    cookie = (WT_HAZARD_COOKIE *)cookiep;
+    hazard_get_reference(array_session, &cookie->ret_hp, &hazard_inuse);
+
+    if (hazard_inuse > cookie->max) {
+        cookie->max = hazard_inuse;
+        WT_STAT_CONN_SET(session, cache_hazard_max, cookie->max);
+    }
+
+    for (i = 0; i < hazard_inuse; ++cookie->ret_hp, ++i) {
+        ++cookie->walk_cnt;
+        if (cookie->ret_hp->ref == cookie->search_ref) {
+            WT_STAT_CONN_INCRV(session, cache_hazard_walks, cookie->walk_cnt);
+            if (cookie->ret_session != NULL)
+                *cookie->ret_session = array_session;
+            *exit_walkp = true;
+            return (0);
+        }
+    }
+
+    /*
+     * We didn't find a hazard pointer. Clear this field so we don't accidentally report the last
+     * iterated hazard pointer
+     */
+    cookie->ret_hp = NULL;
+    return (0);
 }
 
 /*
@@ -304,62 +340,35 @@ hazard_get_reference(WT_SESSION_IMPL *session, WT_HAZARD **hazardp, uint32_t *ha
 WT_HAZARD *
 __wt_hazard_check(WT_SESSION_IMPL *session, WT_REF *ref, WT_SESSION_IMPL **sessionp)
 {
-    WT_CONNECTION_IMPL *conn;
-    WT_HAZARD *hp;
-    WT_SESSION_IMPL *s;
-    uint32_t i, j, hazard_inuse, max, session_cnt, walk_cnt;
+    WT_HAZARD_COOKIE cookie;
+
+    WT_CLEAR(cookie);
+    cookie.ret_session = sessionp;
+    cookie.search_ref = ref;
 
     /* If a file can never be evicted, hazard pointers aren't required. */
     if (F_ISSET(S2BT(session), WT_BTREE_IN_MEMORY))
         return (NULL);
 
-    conn = S2C(session);
-
     WT_STAT_CONN_INCR(session, cache_hazard_checks);
-
     /*
      * Hazard pointer arrays might grow and be freed underneath us; enter the current hazard
      * resource generation for the duration of the walk to ensure that doesn't happen.
      */
     __wt_session_gen_enter(session, WT_GEN_HAZARD);
+    WT_IGNORE_RET(__wt_session_array_walk(session, __hazard_check_callback, false, &cookie));
 
-    /*
-     * No lock is required because the session array is fixed size, but it may contain inactive
-     * entries. We must review any active session that might contain a hazard pointer, so insert a
-     * read barrier after reading the active session count. That way, no matter what sessions come
-     * or go, we'll check the slots for all of the sessions that could have been active when we
-     * started our check.
-     */
-    WT_ORDERED_READ(session_cnt, conn->session_cnt);
-    for (s = conn->sessions, i = max = walk_cnt = 0; i < session_cnt; ++s, ++i) {
-        if (!s->active)
-            continue;
+    if (cookie.ret_hp == NULL)
+        /*
+         * We increment this stat inside the walk logic when we find a hazard pointer. Since we
+         * didn't find one increment here instead.
+         */
+        WT_STAT_CONN_INCRV(session, cache_hazard_walks, cookie.walk_cnt);
 
-        hazard_get_reference(s, &hp, &hazard_inuse);
-
-        if (hazard_inuse > max) {
-            max = hazard_inuse;
-            WT_STAT_CONN_SET(session, cache_hazard_max, max);
-        }
-
-        for (j = 0; j < hazard_inuse; ++hp, ++j) {
-            ++walk_cnt;
-            if (hp->ref == ref) {
-                WT_STAT_CONN_INCRV(session, cache_hazard_walks, walk_cnt);
-                if (sessionp != NULL)
-                    *sessionp = s;
-                goto done;
-            }
-        }
-    }
-    WT_STAT_CONN_INCRV(session, cache_hazard_walks, walk_cnt);
-    hp = NULL;
-
-done:
     /* Leave the current resource generation. */
     __wt_session_gen_leave(session, WT_GEN_HAZARD);
 
-    return (hp);
+    return (cookie.ret_hp);
 }
 
 /*

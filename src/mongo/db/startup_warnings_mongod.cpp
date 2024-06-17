@@ -28,145 +28,46 @@
  */
 
 
-#include <boost/filesystem/operations.hpp>
-#include <cstddef>
-#include <fstream>  // IWYU pragma: keep
-
 #include <boost/filesystem/exception.hpp>
+#include <boost/filesystem/operations.hpp>
 #include <boost/filesystem/path.hpp>
 #include <boost/move/utility_core.hpp>
+#include <cstddef>
+#include <fstream>  // IWYU pragma: keep
 // IWYU pragma: no_include "boost/system/detail/error_code.hpp"
 
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
+#include "mongo/config.h"
 #include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/startup_warnings_common.h"
 #include "mongo/db/startup_warnings_mongod.h"
+#include "mongo/db/storage/storage_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
 #include "mongo/logv2/log_tag.h"
+#include "mongo/transport/session_manager.h"
+#include "mongo/transport/transport_layer_manager.h"
 #include "mongo/util/errno_util.h"
+#include "mongo/util/processinfo.h"
+#include "mongo/util/str.h"
+
 #ifndef _WIN32
 #include <sys/resource.h>
 #endif
-
-#include "mongo/db/server_options.h"
-#include "mongo/db/startup_warnings_common.h"
-#include "mongo/db/storage/storage_options.h"
-#include "mongo/logv2/log.h"
-#include "mongo/transport/session_manager.h"
-#include "mongo/transport/transport_layer_manager.h"
-#include "mongo/util/processinfo.h"
-#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 
 namespace mongo {
-namespace {
-
-#define TRANSPARENT_HUGE_PAGES_DIR "/sys/kernel/mm/transparent_hugepage"
-
-}  // namespace
 
 using std::ios_base;
 using std::string;
+using namespace fmt::literals;
 
-// static
-StatusWith<std::string> StartupWarningsMongod::readTransparentHugePagesParameter(
-    const std::string& parameter) {
-    return readTransparentHugePagesParameter(parameter, TRANSPARENT_HUGE_PAGES_DIR);
-}
-
-// static
-StatusWith<std::string> StartupWarningsMongod::readTransparentHugePagesParameter(
-    const std::string& parameter, const std::string& directory) {
-    std::string opMode;
-    try {
-        boost::filesystem::path directoryPath(directory);
-        if (!boost::filesystem::exists(directoryPath)) {
-            return StatusWith<std::string>(
-                ErrorCodes::NonExistentPath,
-                str::stream() << "Unable to read non-existent transparent Huge Pages directory: "
-                              << directory);
-        }
-
-        boost::filesystem::path parameterPath(directoryPath / parameter);
-        if (!boost::filesystem::exists(parameterPath)) {
-            return StatusWith<std::string>(
-                ErrorCodes::NonExistentPath,
-                str::stream() << "Unable to read non-existent transparent Huge Pages file: "
-                              << parameterPath.string());
-        }
-
-        std::string filename(parameterPath.string());
-        std::ifstream ifs(filename.c_str());
-        if (!ifs) {
-            return StatusWith<std::string>(
-                ErrorCodes::FileNotOpen,
-                str::stream() << "Unable to open transparent Huge Pages file " << filename);
-        }
-
-        std::string line;
-        if (!std::getline(ifs, line)) {
-            auto ec = lastSystemError();
-            return StatusWith<std::string>(ErrorCodes::FileStreamFailed,
-                                           str::stream()
-                                               << "failed to read from " << filename << ": "
-                                               << ((ifs.eof()) ? "EOF" : errorMessage(ec)));
-        }
-
-        std::string::size_type posBegin = line.find('[');
-        std::string::size_type posEnd = line.find(']');
-        if (posBegin == string::npos || posEnd == string::npos || posBegin >= posEnd) {
-            return StatusWith<std::string>(ErrorCodes::FailedToParse,
-                                           str::stream() << "cannot parse line: '" << line << "'");
-        }
-
-        opMode = line.substr(posBegin + 1, posEnd - posBegin - 1);
-        if (opMode.empty()) {
-            return StatusWith<std::string>(ErrorCodes::BadValue,
-                                           str::stream() << "invalid mode in " << filename << ": '"
-                                                         << line << "'");
-        }
-
-        // Check against acceptable values of opMode.
-        if (opMode != "always" && opMode != "madvise" && opMode != "never") {
-            return StatusWith<std::string>(
-                ErrorCodes::BadValue,
-                str::stream()
-                    << "** WARNING: unrecognized transparent Huge Pages mode of operation in "
-                    << filename << ": '" << opMode << "''");
-        }
-    } catch (const boost::filesystem::filesystem_error& err) {
-        return StatusWith<std::string>(ErrorCodes::UnknownError,
-                                       str::stream() << "Failed to probe \"" << err.path1().string()
-                                                     << "\": " << err.code().message());
-    }
-
-    return StatusWith<std::string>(opMode);
-}
-
-void logMongodStartupWarnings(const StorageGlobalParams& storageParams,
-                              const ServerGlobalParams& serverParams,
-                              ServiceContext* svcCtx) {
-    logCommonStartupWarnings(serverParams);
-
-    if (sizeof(int*) == 4) {
-        LOGV2_WARNING_OPTIONS(
-            22152,
-            {logv2::LogTag::kStartupWarnings},
-            "This is a 32 bit MongoDB binary. 32 bit builds are limited to less than 2GB "
-            "of data. See http://dochub.mongodb.org/core/32bit");
-    }
-
-#ifdef __linux__
-    if (boost::filesystem::exists("/proc/vz") && !boost::filesystem::exists("/proc/bc")) {
-        LOGV2_OPTIONS(22161,
-                      {logv2::LogTag::kStartupWarnings},
-                      "You are running in OpenVZ which can cause issues on versions of RHEL older "
-                      "than RHEL6");
-    }
-
+void checkMultipleNumaNodes() {
     bool hasMultipleNumaNodes = false;
     try {
         hasMultipleNumaNodes = boost::filesystem::exists("/sys/devices/system/node/node1");
@@ -190,7 +91,8 @@ void logMongodStartupWarnings(const StorageGlobalParams& storageParams,
         // $ numactl --interleave=all cat /proc/self/numa_maps
         // 00400000 interleave:0-7 file=/bin/cat mapped=6 N4=6
 
-        std::ifstream f("/proc/self/numa_maps", std::ifstream::in);
+        auto numaPath = "/proc/self/numa_maps";
+        std::ifstream f(numaPath, std::ifstream::in);
         if (f.is_open()) {
             std::string line;  // we only need the first line
             std::getline(f, line);
@@ -198,7 +100,8 @@ void logMongodStartupWarnings(const StorageGlobalParams& storageParams,
                 auto ec = lastSystemError();
                 LOGV2_WARNING_OPTIONS(22200,
                                       {logv2::LogTag::kStartupWarnings},
-                                      "Failed to read from /proc/self/numa_maps",
+                                      "Failed to read file",
+                                      "filepath"_attr = numaPath,
                                       "error"_attr = errorMessage(ec));
             } else {
                 // skip over pointer
@@ -221,74 +124,189 @@ void logMongodStartupWarnings(const StorageGlobalParams& storageParams,
             }
         }
     }
+}
 
-    std::fstream f("/proc/sys/vm/overcommit_memory", ios_base::in);
+#ifdef __linux__
+void checkTHPSettings() {
+    auto thpParameterPath = [](StringData parameter) -> std::string {
+        return "{}/{}"_format(ProcessInfo::kTranparentHugepageDirectory, parameter);
+    };
+
+    // Transparent Hugepages checks
+    StatusWith<std::string> transparentHugePagesEnabledResult =
+        ProcessInfo::readTransparentHugePagesParameter("enabled");
+    bool shouldWarnAboutDefrag = true;
+    if (transparentHugePagesEnabledResult.isOK()) {
+        StringData thpEnabledValue = transparentHugePagesEnabledResult.getValue();
+
+#ifdef MONGO_CONFIG_TCMALLOC_GOOGLE
+        if (thpEnabledValue != "always") {
+            LOGV2_WARNING_OPTIONS(8640300,
+                                  {logv2::LogTag::kStartupWarnings},
+                                  "For customers running the tcmalloc-google memory allocator, we "
+                                  "suggest setting the contents of sysfsFile to 'always'",
+                                  "sysfsFile"_attr = thpParameterPath("enabled"),
+                                  "currentValue"_attr = thpEnabledValue);
+        }
+#else   //  #ifdef MONGO_CONFIG_TCMALLOC_GOOGLE
+        if (thpEnabledValue == "always") {
+            LOGV2_WARNING_OPTIONS(22178,
+                                  {logv2::LogTag::kStartupWarnings},
+                                  "For customers running the tcmalloc-gperftools memory allocator, "
+                                  "we suggest setting the contents of sysfsFile to 'never'",
+                                  "sysfsFile"_attr = thpParameterPath("enabled"),
+                                  "currentValue"_attr = thpEnabledValue);
+        } else {
+            // If we do not have hugepages enabled and we do not want to have it enabled, we don't
+            // need to warn about its features.
+            shouldWarnAboutDefrag = false;
+        }
+#endif  // #ifdef MONGO_CONFIG_TCMALLOC_GOOGLE
+    } else if (transparentHugePagesEnabledResult.getStatus().code() !=
+               ErrorCodes::NonExistentPath) {
+        LOGV2_WARNING_OPTIONS(22202,
+                              {logv2::LogTag::kStartupWarnings},
+                              "Failed to read file",
+                              "filepath"_attr = thpParameterPath("enabled"),
+                              "error"_attr = transparentHugePagesEnabledResult.getStatus());
+    }
+
+    if (shouldWarnAboutDefrag) {
+        StatusWith<std::string> transparentHugePagesDefragResult =
+            ProcessInfo::readTransparentHugePagesParameter("defrag");
+        if (transparentHugePagesDefragResult.isOK()) {
+            auto defragValue = transparentHugePagesDefragResult.getValue();
+#ifdef MONGO_CONFIG_TCMALLOC_GOOGLE
+            if (defragValue != "defer+madvise") {
+                LOGV2_WARNING_OPTIONS(
+                    8640301,
+                    {logv2::LogTag::kStartupWarnings},
+                    "For customers running the updated tcmalloc-google memory allocator, we "
+                    "suggest setting the contents of sysfsFile to 'defer+madvise'",
+                    "sysfsFile"_attr = thpParameterPath("defrag"),
+                    "currentValue"_attr = defragValue);
+            }
+#else   // #ifdef MONGO_CONFIG_TCMALLOC_GOOGLE
+            if (defragValue == "always") {
+                LOGV2_WARNING_OPTIONS(
+                    22181,
+                    {logv2::LogTag::kStartupWarnings},
+                    "For customers running the older tcmalloc-gperftools memory "
+                    "allocator, we suggest setting the contents of sysfsFile to 'never'",
+                    "sysfsFile"_attr = thpParameterPath("defrag"),
+                    "currentValue"_attr = defragValue);
+            }
+#endif  // #ifdef MONGO_CONFIG_TCMALLOC_GOOGLE
+        } else if (transparentHugePagesDefragResult.getStatus().code() !=
+                   ErrorCodes::NonExistentPath) {
+            LOGV2_WARNING_OPTIONS(22204,
+                                  {logv2::LogTag::kStartupWarnings},
+                                  "Failed to read file",
+                                  "filepath"_attr = thpParameterPath("defrag"),
+                                  "error"_attr = transparentHugePagesDefragResult.getStatus());
+        }
+    }
+
+#ifdef MONGO_CONFIG_TCMALLOC_GOOGLE
+    auto maxPtesNonePath = thpParameterPath("khugepaged/max_ptes_none");
+    std::fstream f(maxPtesNonePath, ios_base::in);
+    unsigned maxPtesNoneValue;
+    f >> maxPtesNoneValue;
+
+    if (maxPtesNoneValue > 0) {
+        LOGV2_WARNING_OPTIONS(8640302,
+                              {logv2::LogTag::kStartupWarnings},
+                              "We suggest setting the contents of sysfsFile to 0.",
+                              "sysfsFile"_attr = maxPtesNonePath,
+                              "currentValue"_attr = maxPtesNoneValue);
+    }
+#endif  // MONGO_CONFIG_TCMALLOC_GOOGLE
+}
+#endif  // __linux__
+
+void logMongodStartupWarnings(const StorageGlobalParams& storageParams,
+                              const ServerGlobalParams& serverParams,
+                              ServiceContext* svcCtx) {
+    logCommonStartupWarnings(serverParams);
+
+    if (sizeof(int*) == 4) {
+        LOGV2_WARNING_OPTIONS(
+            22152,
+            {logv2::LogTag::kStartupWarnings},
+            "This is a 32 bit MongoDB binary. 32 bit builds are limited to less than 2GB "
+            "of data. See http://dochub.mongodb.org/core/32bit");
+    }
+
+#ifdef __linux__
+    if (boost::filesystem::exists("/proc/vz") && !boost::filesystem::exists("/proc/bc")) {
+        LOGV2_OPTIONS(22161,
+                      {logv2::LogTag::kStartupWarnings},
+                      "You are running in OpenVZ which can cause issues on versions of RHEL older "
+                      "than RHEL6");
+    }
+
+    checkMultipleNumaNodes();
+
+    auto overcommitMemoryPath = "/proc/sys/vm/overcommit_memory";
+    std::fstream f(overcommitMemoryPath, ios_base::in);
     unsigned val;
     f >> val;
 
     if (val == 2) {
         LOGV2_OPTIONS(22171,
                       {logv2::LogTag::kStartupWarnings},
-                      "Journaling works best if /proc/sys/vm/overcommit_memory is set to 0 or 1",
+                      "Journaling and memory allocation work best if overcommit_memory is set to 1",
+                      "sysfsFile"_attr = overcommitMemoryPath,
                       "currentValue"_attr = val);
     }
 
-    if (boost::filesystem::exists("/proc/sys/vm/zone_reclaim_mode")) {
-        std::fstream f("/proc/sys/vm/zone_reclaim_mode", ios_base::in);
+    auto zoneReclaimModePath = "/proc/sys/vm/zone_reclaim_mode";
+    if (boost::filesystem::exists(zoneReclaimModePath)) {
+        std::fstream f(zoneReclaimModePath, ios_base::in);
         unsigned val;
         f >> val;
 
         if (val != 0) {
             LOGV2_OPTIONS(22174,
                           {logv2::LogTag::kStartupWarnings},
-                          "We suggest setting /proc/sys/vm/zone_reclaim_mode to 0. See "
+                          "We suggest setting zone_reclaim_mode to 0. See "
                           "http://www.kernel.org/doc/Documentation/sysctl/vm.txt",
+                          "sysfsFile"_attr = zoneReclaimModePath,
                           "currentValue"_attr = val);
         }
     }
 
-    // Transparent Hugepages checks
-    StatusWith<std::string> transparentHugePagesEnabledResult =
-        StartupWarningsMongod::readTransparentHugePagesParameter("enabled");
-    bool shouldWarnAboutDefragAlways = false;
-    if (transparentHugePagesEnabledResult.isOK()) {
-        if (transparentHugePagesEnabledResult.getValue() == "always") {
-            // If we do not have hugepages enabled, we don't need to warn about its features
-            shouldWarnAboutDefragAlways = true;
+    checkTHPSettings();
 
-            LOGV2_WARNING_OPTIONS(22178,
-                                  {logv2::LogTag::kStartupWarnings},
-                                  TRANSPARENT_HUGE_PAGES_DIR
-                                  "/enabled is 'always'. We suggest setting it to 'never'");
-        }
-    } else if (transparentHugePagesEnabledResult.getStatus().code() !=
-               ErrorCodes::NonExistentPath) {
-        LOGV2_WARNING_OPTIONS(22202,
-                              {logv2::LogTag::kStartupWarnings},
-                              "Failed to read " TRANSPARENT_HUGE_PAGES_DIR "/enabled",
-                              "error"_attr =
-                                  transparentHugePagesEnabledResult.getStatus().reason());
+#if defined(MONGO_CONFIG_TCMALLOC_GOOGLE) && defined(MONGO_CONFIG_GLIBC_RSEQ)
+    if (auto res = ProcessInfo::checkGlibcRseqTunable(); !res) {
+        LOGV2_WARNING_OPTIONS(
+            8718500,
+            {logv2::LogTag::kStartupWarnings},
+            "Your system has glibc support for rseq built in, which is not yet supported by "
+            "tcmalloc-google and has critical performance implications. Please set the "
+            "environment variable GLIBC_TUNABLES=glibc.pthread.rseq=0");
     }
-
-    StatusWith<std::string> transparentHugePagesDefragResult =
-        StartupWarningsMongod::readTransparentHugePagesParameter("defrag");
-    if (transparentHugePagesDefragResult.isOK()) {
-        if (shouldWarnAboutDefragAlways &&
-            transparentHugePagesDefragResult.getValue() == "always") {
-            LOGV2_WARNING_OPTIONS(22181,
-                                  {logv2::LogTag::kStartupWarnings},
-                                  TRANSPARENT_HUGE_PAGES_DIR
-                                  "/defrag is 'always'. We suggest setting it to 'never'");
-        }
-    } else if (transparentHugePagesDefragResult.getStatus().code() != ErrorCodes::NonExistentPath) {
-        LOGV2_WARNING_OPTIONS(22204,
-                              {logv2::LogTag::kStartupWarnings},
-                              "Failed to read " TRANSPARENT_HUGE_PAGES_DIR "/defrag",
-                              "error"_attr = transparentHugePagesDefragResult.getStatus().reason());
-    }
+#endif
 
     if (auto tlm = svcCtx->getTransportLayerManager()) {
         tlm->checkMaxOpenSessionsAtStartup();
+    }
+
+    // Check that swappiness is at a minimum (either 0 or 1)
+    auto swappinessPath = "/proc/sys/vm/swappiness";
+    if (boost::filesystem::exists(swappinessPath)) {
+        std::fstream f(swappinessPath, ios_base::in);
+        unsigned val;
+        f >> val;
+        if (val > 1) {
+            LOGV2_WARNING_OPTIONS(8386700,
+                                  {logv2::LogTag::kStartupWarnings},
+                                  "We suggest setting swappiness to 0 or 1, as swapping can cause "
+                                  "performance problems.",
+                                  "sysfsFile"_attr = swappinessPath,
+                                  "currentValue"_attr = val);
+        }
     }
 #endif  // __linux__
 
@@ -313,8 +331,6 @@ void logMongodStartupWarnings(const StorageGlobalParams& storageParams,
                               "error"_attr = errorMessage(ec));
     }
 
-// Solaris does not have RLIMIT_MEMLOCK, these are exposed via getrctl(2) instead
-#ifndef __sun
     // Check we can lock at least 16 pages for the SecureAllocator
     const unsigned int minLockedPages = 16;
 
@@ -336,8 +352,7 @@ void logMongodStartupWarnings(const StorageGlobalParams& storageParams,
                               "getrlimit failed",
                               "error"_attr = errorMessage(ec));
     }
-#endif
-#endif
+#endif  // #ifndef _WIN32
 
 #ifdef _WIN32
     ProcessInfo p;

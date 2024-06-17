@@ -121,7 +121,7 @@ struct MockMongoInterface final : public StubMongoProcessInterface {
     MockMongoInterface(std::vector<Document> documentsForLookup = {})
         : _documentsForLookup{std::move(documentsForLookup)} {}
 
-    BSONObj getCollectionOptions(OperationContext* opCtx, const NamespaceString& nss) {
+    BSONObj getCollectionOptions(OperationContext* opCtx, const NamespaceString& nss) override {
         static const UUID* oplog_uuid = new UUID(UUID::gen());
         return BSON("uuid" << *oplog_uuid);
     }
@@ -388,7 +388,7 @@ TEST_F(FindAndModifyImageLookupTest, ShouldForgeImageEntryWhenMatchingImageDocIs
             nss, uuid, BSON("_id" << 0 << "a" << 0), BSON("_id" << 0));
         auto updateOp = repl::MutableOplogEntry::makeUpdateOperation(
             nss, uuid, BSON("$set" << BSON("a" << 1)), BSON("_id" << 1));
-        updateOp.setStatementIds({{stmtId}});
+        updateOp.setStatementIds({stmtId});
         updateOp.setNeedsRetryImage(imageType);
         BSONObjBuilder applyOpsBuilder;
         applyOpsBuilder.append("applyOps", BSON_ARRAY(insertOp.toBSON() << updateOp.toBSON()));
@@ -496,7 +496,7 @@ TEST_F(FindAndModifyImageLookupTest,
         nss, uuid, BSON("_id" << 0 << "a" << 0), BSON("_id" << 0));
     auto updateOp = repl::MutableOplogEntry::makeUpdateOperation(
         nss, uuid, BSON("$set" << BSON("a" << 1)), BSON("_id" << 1));
-    updateOp.setStatementIds({{stmtId}});
+    updateOp.setStatementIds({stmtId});
     updateOp.setNeedsRetryImage(repl::RetryImageEnum::kPreImage);
     BSONObjBuilder applyOpsBuilder;
     applyOpsBuilder.append("applyOps", BSON_ARRAY(insertOp.toBSON() << updateOp.toBSON()));
@@ -526,7 +526,7 @@ TEST_F(FindAndModifyImageLookupTest,
 
     auto updateOpWithoutNeedsRetryImage = repl::MutableOplogEntry::makeUpdateOperation(
         nss, uuid, BSON("$set" << BSON("a" << 1)), BSON("_id" << 1));
-    updateOpWithoutNeedsRetryImage.setStatementIds({{stmtId}});
+    updateOpWithoutNeedsRetryImage.setStatementIds({stmtId});
     BSONObjBuilder applyOpsWithoutNeedsRetryImageBuilder;
     applyOpsWithoutNeedsRetryImageBuilder.append(
         "applyOps", BSON_ARRAY(insertOp.toBSON() << updateOpWithoutNeedsRetryImage.toBSON()));

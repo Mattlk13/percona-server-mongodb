@@ -43,15 +43,18 @@ server_parameters:
         description: "Comma separated list of LDAP servers"
         set_at: runtime
         cpp_class: LDAPServersParameter
+        redact: false
     ldapTimeoutMS:
         description: "Timeout to wait for response from LDAP server in millisecons. Default is 10000"
         set_at: runtime
         cpp_varname: "ldapGlobalParams.ldapTimeoutMS"
         default: 10000
+        redact: false
     ldapQueryUser:
         description: "LDAP user used to connect or query LDAP server"
         set_at: runtime
         cpp_varname: "ldapGlobalParams.ldapQueryUser"
+        redact: false
     ldapQueryPassword:
         description: "Password used with queryUser to bind to an LDAP server"
         set_at: runtime
@@ -64,25 +67,30 @@ server_parameters:
         default: "[{match: \"(.+)\", substitution: \"{0}\"}]"
         validator:
             callback: validateLDAPUserToDNMappingServerParam
+        redact: false
     ldapUseConnectionPool:
         description: ""
         set_at: startup
         cpp_varname: "ldapGlobalParams.ldapUseConnectionPool"
+        redact: false
     ldapUserCacheInvalidationInterval:
         description: ""
         set_at: [startup, runtime]
         cpp_varname: "ldapGlobalParams.ldapUserCacheInvalidationInterval"
         default: 30
+        redact: false
     ldapDebug:
         description: "Print debug information for LDAP connections"
         set_at: [startup, runtime]
         cpp_varname: "ldapGlobalParams.ldapDebug"
         default: false
+        redact: false
     ldapFollowReferrals:
         description: "Automatically follow LDAP referrals with the same bind credentials"
         set_at: [startup, runtime]
         cpp_varname: "ldapGlobalParams.ldapFollowReferrals"
         default: false
+        redact: false
     ldapConnectionPoolSizePerHost:
         description: "Maximum number of connections in the LDAP connection pool"
         set_at: [startup, runtime]
@@ -90,6 +98,7 @@ server_parameters:
         default: 2
         validator:
           gt: 0
+        redact: false
 
 configs:
     'security.ldap.servers':

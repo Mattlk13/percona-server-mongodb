@@ -61,7 +61,6 @@
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/tenant_id.h"
 #include "mongo/db/write_concern_options.h"
@@ -72,6 +71,7 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/merge_chunk_request_gen.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/database_name_util.h"
 #include "mongo/util/namespace_string_util.h"
@@ -121,8 +121,6 @@ void mergeChunks(OperationContext* opCtx,
     // Check that the preconditions for merge chunks are met and throw StaleShardVersion otherwise.
     const auto metadataBeforeMerge = [&]() {
         onCollectionPlacementVersionMismatch(opCtx, nss, boost::none);
-        OperationShardingState::unsetShardRoleForLegacyDDLOperationsSentWithShardVersionIfNeeded(
-            opCtx, nss);
         const auto [metadata, indexInfo] =
             checkCollectionIdentity(opCtx, nss, expectedEpoch, expectedTimestamp);
         checkShardKeyPattern(opCtx, nss, metadata, indexInfo, chunkRange);
@@ -195,7 +193,7 @@ public:
                    const BSONObj& cmdObj,
                    std::string& errmsg,
                    BSONObjBuilder& result) override {
-        uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
+        ShardingState::get(opCtx)->assertCanAcceptShardedCommands();
 
         const NamespaceString nss(parseNs(dbName, cmdObj));
 
@@ -224,6 +222,11 @@ public:
 
         if (maxKey.isEmpty()) {
             errmsg = "no max key specified";
+            return false;
+        }
+
+        if (SimpleBSONObjComparator::kInstance.evaluate(minKey >= maxKey)) {
+            errmsg = "the specified max bound must be greater than the specified min bound";
             return false;
         }
 

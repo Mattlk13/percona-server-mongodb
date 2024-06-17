@@ -104,7 +104,8 @@ public:
             uassert(
                 5356100,
                 "donorStartMigration not available while upgrading or downgrading the donor FCV",
-                !serverGlobalParams.featureCompatibility.isUpgradingOrDowngrading());
+                !serverGlobalParams.featureCompatibility.acquireFCVSnapshot()
+                     .isUpgradingOrDowngrading());
 
             uassert(ErrorCodes::IllegalOperation,
                     "tenant migrations are only available if --serverless is enabled",
@@ -190,12 +191,12 @@ public:
         bool supportsWriteConcern() const override {
             return false;
         }
-        NamespaceString ns() const {
+        NamespaceString ns() const override {
             return NamespaceString(request().getDbName());
         }
     };
 
-    std::string help() const {
+    std::string help() const override {
         return "Start migrating databases whose names match the specified prefix to the specified "
                "replica set.";
     }
@@ -270,7 +271,7 @@ public:
         bool supportsWriteConcern() const override {
             return false;
         }
-        NamespaceString ns() const {
+        NamespaceString ns() const override {
             return NamespaceString(request().getDbName());
         }
     };
@@ -360,7 +361,7 @@ public:
         bool supportsWriteConcern() const override {
             return false;
         }
-        NamespaceString ns() const {
+        NamespaceString ns() const override {
             return NamespaceString(request().getDbName());
         }
     };

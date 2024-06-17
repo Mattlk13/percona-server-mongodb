@@ -37,36 +37,24 @@
 #include <utility>
 #include <vector>
 
-#include <absl/container/inlined_vector.h>
 #include <boost/optional/optional.hpp>
 
-#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/sbe/expressions/expression.h"
-#include "mongo/db/exec/sbe/stages/plan_stats.h"
+#include "mongo/db/exec/sbe/stages/lookup_hash_table.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
-#include "mongo/db/exec/sbe/util/debug_print.h"
-#include "mongo/db/exec/sbe/util/spilling.h"
 #include "mongo/db/exec/sbe/values/row.h"
 #include "mongo/db/exec/sbe/values/slot.h"
 #include "mongo/db/exec/sbe/values/value.h"
-#include "mongo/db/exec/sbe/vm/vm.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/collation/collator_interface.h"
-#include "mongo/db/query/query_knobs_gen.h"
-#include "mongo/db/query/stage_types.h"
-#include "mongo/db/record_id.h"
-#include "mongo/db/storage/key_string.h"
-#include "mongo/db/storage/record_store.h"
-#include "mongo/db/storage/temporary_record_store.h"
-#include "mongo/platform/atomic_word.h"
 
 namespace mongo::sbe {
 /**
- * Performs a multi-key hash lookup, that is a combination of left join and wind operations.
- * Rows from 'inner' and 'outer' sides can be associated with multiple keys. 'inner' and 'outer'
- * rows are considered matching, if they match on at least one of the associated keys. The result of
- * a lookup is each 'outer' paired paired with an array containing all matched 'inner' rows for that
- * 'outer' row. If no 'inner' rows match, Nothing value will be used instead of array.
+ * Performs a multi-key hash lookup, that is a combination of left join and wind operations. Rows
+ * from 'inner' and 'outer' sides can be associated with multiple keys. 'inner' and 'outer' rows are
+ * considered matching, if they match on at least one of the associated keys. The result of a lookup
+ * is each 'outer' paired with an array containing all matched 'inner' rows for that 'outer' row. If
+ * no 'inner' rows match, Nothing value will be used instead of array.
  *
  * All rows from the 'inner' side are used to construct a hash table. Each 'inner' row can be
  * associated with multiple hash table entries. To avoid space amplification, each 'inner' row is
@@ -77,19 +65,20 @@ namespace mongo::sbe {
  * This is _not_ the case for the 'outer' side, since it can stream data as it probes the hash
  * table. This stage preserves all slots and order of the 'outer' side.
  *
- * The 'outerCond' specifies the slot that contains match keys for the 'outer' row. If the
- * 'outerCond' slot contains an array, the array items will be used as match keys, otherwise the
+ * The 'outerKeySlot' specifies the slot that contains match keys for the 'outer' row. If the
+ * 'outerKeySlot' slot contains an array, the array items will be used as match keys, otherwise the
  * slot value itself will be used a single match key.
  *
- * The 'innerCond' specifies the slot that contains match keys for the 'inner' row. If the
- * 'innerCond' slot contains an array, the array items will be used as match keys, otherwise the
+ * The 'innerKeySlot' specifies the slot that contains match keys for the 'inner' row. If the
+ * 'innerKeySlot' slot contains an array, the array items will be used as match keys, otherwise the
  * slot value itself will be used as a single match key.
  *
- * The 'innerProjects' specifies the slots that contains the projected values of the 'inner' row.
- * These values will be buffered and made visible to 'innerAggs' expressions.
+ * The 'innerProjectSlot' specifies the slot that contains the projected inner row value. This will
+ * be buffered and made visible to the 'innerAgg' expression.
  *
- * The 'innerAggs' specifies an aggregate expressions SlotMap that will be used to compute the
- * aggregation results for each outer row. Those slots are accessible outside of this stage.
+ * The 'innerAgg' specifies a SlotId and expression that will be used to compute the aggregation
+ * result (i.e. the $lookup's output "as" array) for each outer row. This slot is accessible outside
+ * of this stage.
  *
  * An optional 'collatorSlot' can be provided to make the match predicate use a special definition
  * for string equality. For example, this can be used to perform a case-insensitive matching on
@@ -97,18 +86,18 @@ namespace mongo::sbe {
  *
  * Debug string representation:
  *
- *   hash_lookup [slot_1 = expr_1, ..., slot_n = expr_n] collatorSlot?
- *     outer outerCond outerStage
- *     inner innerCond [innerProjects] innerStage
+ *   hash_lookup [innerAggSlot = expr] collatorSlot?
+ *     outer outerKeySlot outerStage
+ *     inner innerKeySlot innerProject innerStage
  */
 class HashLookupStage final : public PlanStage {
 public:
     HashLookupStage(std::unique_ptr<PlanStage> outer,
                     std::unique_ptr<PlanStage> inner,
-                    value::SlotId outerCond,
-                    value::SlotId innerCond,
-                    value::SlotVector innerProjects,
-                    SlotExprPairVector innerAggs,
+                    value::SlotId outerKeySlot,
+                    value::SlotId innerKeySlot,
+                    value::SlotId innerProjectSlot,
+                    SlotExprPair innerAgg,
                     boost::optional<value::SlotId> collatorSlot,
                     PlanNodeId planNodeId,
                     bool participateInTrialRunTracking = true);
@@ -133,6 +122,9 @@ protected:
         return idx == 0;
     }
 
+    void doAttachToOperationContext(OperationContext* opCtx) override;
+    void doDetachFromOperationContext() override;
+
     void doSaveState(bool relinquishCursor) override;
     void doRestoreState(bool relinquishCursor) override;
 
@@ -141,67 +133,24 @@ private:
                                              std::vector<size_t>,
                                              value::MaterializedRowHasher,
                                              value::MaterializedRowEq>;
-
     using BufferType = std::vector<value::MaterializedRow>;
-
     using HashKeyAccessor = value::MaterializedRowKeyAccessor<HashTableType::iterator>;
     using BufferAccessor = value::MaterializedRowAccessor<BufferType>;
 
-    void reset();
-    template <typename C>
-    void accumulateFromValueIndices(const C& projectIndices);
+    // Resets state of the hash table and miscellany. 'fromClose' == true indicates the call is from
+    // the stage's close() method, so it should also try to shrink its memory footprint.
+    void reset(bool fromClose);
 
-    // Spilling helpers.
-    void addHashTableEntry(value::SlotAccessor* keyAccessor, size_t valueIndex);
-    void spillBufferedValueToDisk(OperationContext* opCtx,
-                                  SpillingStore* rs,
-                                  size_t bufferIdx,
-                                  const value::MaterializedRow&);
-    size_t bufferValueOrSpill(value::MaterializedRow& value);
-    void setInnerProjectSwitchAccessor(int idx);
-
-    boost::optional<std::vector<size_t>> readIndicesFromRecordStore(SpillingStore* rs,
-                                                                    value::TypeTags tagKey,
-                                                                    value::Value valKey);
-
-    void writeIndicesToRecordStore(SpillingStore* rs,
-                                   value::TypeTags tagKey,
-                                   value::Value valKey,
-                                   const std::vector<size_t>& value,
-                                   bool update);
-
-    void spillIndicesToRecordStore(SpillingStore* rs,
-                                   value::TypeTags tagKey,
-                                   value::Value valKey,
-                                   const std::vector<size_t>& value);
-    /**
-     * Constructs a RecordId for a value index. It must be shifted by 1 since a valid RecordId
-     * with the value 0 is invalid.
-     */
-    RecordId getValueRecordId(size_t index) {
-        return RecordId(static_cast<int64_t>(index) + 1);
-    }
-
-    bool hasSpilledHtToDisk() {
-        return _recordStoreHt != nullptr;
-    }
-
-    bool hasSpilledBufToDisk() {
-        return _recordStoreBuf != nullptr;
-    }
-
-    void makeTemporaryRecordStore();
-
-    std::pair<RecordId, key_string::TypeBits> serializeKeyForRecordStore(
-        const value::MaterializedRow& key) const;
+    template <typename Container>
+    void accumulateFromValueIndices(const Container* bufferIndices);
 
     /**
-     * Normalizes a string if _collatorSlot is pouplated and returns a third parameter to let the
-     * caller know if it should own the tag and value.
+     * Visits the RecordIndexCollection std::variant to pass the concrete container of indices to
+     * its delegate, accumulateFromValueIndices().
      */
-    std::tuple<bool, value::TypeTags, value::Value> normalizeStringIfCollator(value::TypeTags tag,
-                                                                              value::Value val);
-
+    inline void accumulateFromValueIndicesVariant(const RecordIndexCollection variant) {
+        std::visit([this](auto&& bufIdxs) { this->accumulateFromValueIndices(bufIdxs); }, variant);
+    }
 
     PlanStage* outerChild() const {
         return _children[0].get();
@@ -210,63 +159,39 @@ private:
         return _children[1].get();
     }
 
-    const value::SlotId _outerCond;
-    const value::SlotId _innerCond;
-    const value::SlotVector _innerProjects;
-    const SlotExprPairVector _innerAggs;
-    const boost::optional<value::SlotId> _collatorSlot;
-    CollatorInterface* _collator{nullptr};
+    const value::SlotId _outerKeySlot;
+    const value::SlotId _innerKeySlot;
 
-    value::SlotAccessorMap _outAccessorMap;
-    value::SlotAccessorMap _outInnerProjectAccessorMap;
+    // Overloaded slot ID: Inside the VM it refers to '_outInnerProjectAccessor', which is where the
+    // VM reads the inner match doc from. Outside the VM it refers to '_inInnerProjectAccessor'.
+    const value::SlotId _innerProjectSlot;
+
+    const SlotExprPair _innerAgg;
+    const value::SlotId _lookupStageOutputSlot;
+    const boost::optional<value::SlotId> _collatorSlot;
 
     value::SlotAccessor* _inOuterMatchAccessor{nullptr};
-
     value::SlotAccessor* _inInnerMatchAccessor{nullptr};
-    std::vector<value::SlotAccessor*> _inInnerProjectAccessors;
-    std::vector<value::SwitchAccessor> _outInnerProjectAccessors;
-    std::vector<value::MaterializedSingleRowAccessor> _outResultAggAccessors;
-    std::vector<std::unique_ptr<vm::CodeFragment>> _aggCodes;
+    value::SlotAccessor* _inInnerProjectAccessor{nullptr};
 
-    // The accessor for the '_ht' agg value.
-    std::vector<value::MaterializedSingleRowAccessor> _outAggAccessors;
+    // Temporary location of next inner match to be copied by the VM into '_lookupStageOutput'.
+    value::MaterializedRow _outInnerProject;
+    value::MaterializedSingleRowAccessor _outInnerProjectAccessor{_outInnerProject, 0 /* column */};
 
-    // Accessor for the buffered value stored in the '_recordStore' when data is spilled to
-    // disk.
-    value::MaterializedRow _bufValueRecordStore{0};
-    std::vector<value::MaterializedSingleRowAccessor> _outInnerBufValueRecordStoreAccessors;
-    std::vector<BufferAccessor> _outInnerBufferProjectAccessors;
+    // Output row of one column containing the lookup's "as" result. Produced by the VM.
+    value::MaterializedRow _lookupStageOutput;
+    value::MaterializedSingleRowAccessor _lookupStageOutputAccessor{_lookupStageOutput,
+                                                                    0 /* column */};
+
+    // Compiled expression to aggregate all inner matches into a single $lookup "as" output array.
+    std::unique_ptr<vm::CodeFragment> _aggCode;
+    bool _compileInnerAgg{false};
+    vm::ByteCode _bytecode;
 
     // Accessor for collator. Only set if collatorSlot provided during construction.
     value::SlotAccessor* _collatorAccessor{nullptr};
 
-    // Key used to probe inside the hash table.
-    value::MaterializedRow _probeKey;
-
-    // Result aggregate row;
-    value::MaterializedRow _resultAggRow;
-
-    BufferType _buffer;
-    size_t _bufferIt{0};
-    long long _valueId{0};
-    boost::optional<HashTableType> _ht;
-
-    vm::ByteCode _bytecode;
-
-    bool _compileInnerAgg{false};
-
-    // Memory tracking and spilling to disk.
-    long long _memoryUseInBytesBeforeSpill =
-        internalQuerySBELookupApproxMemoryUseInBytesBeforeSpill.load();
-    int _currentSwitchIdx = 0;
-
-    // This counter tracks an exact size for the '_ht' and an approximate size for the buffered
-    // rows in '_buffer'.
-    long long _computedTotalMemUsage = 0;
-
-    std::unique_ptr<SpillingStore> _recordStoreHt;
-    std::unique_ptr<SpillingStore> _recordStoreBuf;
-
-    HashLookupStats _specificStats;
-};
+    // LookupHashTable instance holding the inner collection.
+    LookupHashTable _hashTable;
+};  // class HashLookupStage
 }  // namespace mongo::sbe

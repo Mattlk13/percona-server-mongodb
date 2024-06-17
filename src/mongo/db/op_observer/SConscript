@@ -15,6 +15,36 @@ env.Library(
     ],
 )
 
+env.Benchmark(
+    target='op_observer_bm',
+    source=[
+        'op_observer_bm.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/auth/auth_op_observer',
+        '$BUILD_DIR/mongo/db/auth/authserver',
+        '$BUILD_DIR/mongo/db/repl/primary_only_service',
+        '$BUILD_DIR/mongo/db/repl/replmocks',
+        '$BUILD_DIR/mongo/db/repl/shard_merge_recipient_service',
+        '$BUILD_DIR/mongo/db/repl/tenant_migration_donor_service',
+        '$BUILD_DIR/mongo/db/repl/tenant_migration_recipient_service',
+        '$BUILD_DIR/mongo/db/s/sharding_runtime_d',
+        '$BUILD_DIR/mongo/db/serverless/shard_split_donor_service',
+        '$BUILD_DIR/mongo/db/service_context_d',
+        '$BUILD_DIR/mongo/db/timeseries/timeseries_op_observer',
+        '$BUILD_DIR/mongo/idl/cluster_server_parameter_op_observer',
+        'change_stream_pre_images_op_observer',
+        'fallback_op_observer',
+        'fcv_op_observer',
+        'find_and_modify_images_op_observer',
+        'op_observer',
+        'op_observer_impl',
+        'operation_logger_impl',
+        'operation_logger_transaction_proxy',
+        'user_write_block_mode_op_observer',
+    ],
+)
+
 env.Library(
     target='op_observer_util',
     source=[
@@ -31,9 +61,9 @@ env.Library(
 )
 
 env.Library(
-    target='oplog_writer_impl',
+    target='operation_logger_impl',
     source=[
-        'oplog_writer_impl.cpp',
+        'operation_logger_impl.cpp',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/base',
@@ -42,9 +72,9 @@ env.Library(
 )
 
 env.Library(
-    target='oplog_writer_transaction_proxy',
+    target='operation_logger_transaction_proxy',
     source=[
-        'oplog_writer_transaction_proxy.cpp',
+        'operation_logger_transaction_proxy.cpp',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/base',
@@ -56,11 +86,7 @@ env.Library(
     source=[
         'op_observer_impl.cpp',
     ],
-    LIBDEPS=[
-        'op_observer',
-    ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/catalog/collection_catalog',
         '$BUILD_DIR/mongo/db/catalog/collection_options',
         '$BUILD_DIR/mongo/db/catalog/commit_quorum_options',
@@ -74,12 +100,14 @@ env.Library(
         '$BUILD_DIR/mongo/db/read_write_concern_defaults',
         '$BUILD_DIR/mongo/db/repl/repl_server_parameters',
         '$BUILD_DIR/mongo/db/repl/tenant_migration_access_blocker',
+        '$BUILD_DIR/mongo/db/server_base',
         '$BUILD_DIR/mongo/db/server_feature_flags',
         '$BUILD_DIR/mongo/db/session/session_catalog_mongod',
+        '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/mongo/db/transaction/transaction',
         '$BUILD_DIR/mongo/db/transaction/transaction_operations',
-        '$BUILD_DIR/mongo/s/coreshard',
         '$BUILD_DIR/mongo/s/grid',
+        'op_observer',
         'op_observer_util',
     ],
 )
@@ -90,11 +118,11 @@ env.Library(
         'change_stream_pre_images_op_observer.cpp',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/change_stream_pre_images_collection_manager',
         '$BUILD_DIR/mongo/db/pipeline/change_stream_preimage',
         '$BUILD_DIR/mongo/db/repl/optime',
         '$BUILD_DIR/mongo/db/repl/tenant_migration_decoration',
+        '$BUILD_DIR/mongo/db/server_base',
         '$BUILD_DIR/mongo/db/transaction/transaction_operations',
         'op_observer',
     ],
@@ -142,7 +170,6 @@ env.Library(
         'op_observer',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/s/user_writes_recoverable_critical_section',
         '$BUILD_DIR/mongo/db/shard_role_api',
     ],
@@ -178,14 +205,16 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/session/session_catalog_mongod',
         '$BUILD_DIR/mongo/db/shard_role',
         '$BUILD_DIR/mongo/db/storage/recovery_unit_base',
+        '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/mongo/db/transaction/transaction',
         '$BUILD_DIR/mongo/db/transaction/transaction_operations',
         '$BUILD_DIR/mongo/db/write_block_bypass',
         'change_stream_pre_images_op_observer',
         'find_and_modify_images_op_observer',
+        'op_observer',
         'op_observer_impl',
         'op_observer_util',
-        'oplog_writer_impl',
+        'operation_logger_impl',
         'user_write_block_mode_op_observer',
     ],
 )
@@ -202,7 +231,9 @@ env.Library(
         '$BUILD_DIR/mongo/db/catalog/collection_catalog',
         '$BUILD_DIR/mongo/db/read_write_concern_defaults',
         '$BUILD_DIR/mongo/db/session/session_catalog_mongod',
+        '$BUILD_DIR/mongo/db/shard_role_api',
         '$BUILD_DIR/mongo/db/transaction/transaction',
+        '$BUILD_DIR/mongo/db/vector_clock',
         '$BUILD_DIR/mongo/db/views/view_catalog_helpers',
         'op_observer_util',
     ],

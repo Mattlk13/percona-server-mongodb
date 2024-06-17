@@ -301,7 +301,7 @@ protected:
         }
     }
 
-    void assertCommandSentAndRespondWith(const StringData& commandName,
+    void assertCommandSentAndRespondWith(StringData commandName,
                                          const StatusWith<BSONObj>& response,
                                          boost::optional<BSONObj> expectedWriteConcern) {
         onCommand([&](const executor::RemoteCommandRequest& request) {
@@ -326,7 +326,9 @@ protected:
             StaticCatalogClient() = default;
 
             StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
-                OperationContext* opCtx, repl::ReadConcernLevel readConcern) override {
+                OperationContext* opCtx,
+                repl::ReadConcernLevel readConcern,
+                bool excludeDraining) override {
                 std::vector<ShardType> shardTypes;
                 for (const auto& shardId : makeThreeShardIdsList()) {
                     const ConnectionString cs = ConnectionString::forReplicaSet(

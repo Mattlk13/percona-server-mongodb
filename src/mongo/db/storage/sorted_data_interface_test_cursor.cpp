@@ -134,9 +134,7 @@ TEST(SortedDataInterface, ExhaustCursor) {
         Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
         for (int i = 0; i < nToInsert; i++) {
-            auto entry = i == 0
-                ? cursor->seek(makeKeyStringForSeek(sorted.get(), BSONObj(), true, true))
-                : cursor->next();
+            auto entry = cursor->next();
             ASSERT_EQ(entry, IndexKeyEntry(BSON("" << i), RecordId(42, i * 2)));
         }
         ASSERT(!cursor->next());
@@ -183,9 +181,7 @@ TEST(SortedDataInterface, ExhaustKeyStringCursor) {
         Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
         for (int i = 0; i < nToInsert; i++) {
-            auto entry = i == 0 ? cursor->seekForKeyString(
-                                      makeKeyStringForSeek(sorted.get(), BSONObj(), true, true))
-                                : cursor->nextKeyString();
+            auto entry = cursor->nextKeyString();
             ASSERT(entry);
             ASSERT_EQ(entry->keyString, keyStrings.at(i));
         }
@@ -193,6 +189,21 @@ TEST(SortedDataInterface, ExhaustKeyStringCursor) {
 
         // Cursor at EOF should remain at EOF when advanced
         ASSERT(!cursor->nextKeyString());
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
+        const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
+        for (int i = 0; i < nToInsert; i++) {
+            auto entry = cursor->nextKeyValueView();
+            ASSERT(!entry.isEmpty());
+            ASSERT_EQ(entry.getValueCopy(), keyStrings.at(i));
+        }
+        ASSERT(cursor->nextKeyValueView().isEmpty());
+
+        // Cursor at EOF should remain at EOF when advanced
+        ASSERT(cursor->nextKeyValueView().isEmpty());
     }
 }
 
@@ -233,9 +244,7 @@ TEST(SortedDataInterface, ExhaustCursorReversed) {
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
         for (int i = nToInsert - 1; i >= 0; i--) {
-            auto entry = (i == nToInsert - 1)
-                ? cursor->seek(makeKeyStringForSeek(sorted.get(), kMaxBSONKey, false, true))
-                : cursor->next();
+            auto entry = cursor->next();
             ASSERT_EQ(entry, IndexKeyEntry(BSON("" << i), RecordId(42, i * 2)));
         }
         ASSERT(!cursor->next());
@@ -283,9 +292,7 @@ TEST(SortedDataInterface, ExhaustKeyStringCursorReversed) {
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(
             sorted->newCursor(opCtx.get(), false));
         for (int i = nToInsert - 1; i >= 0; i--) {
-            auto entry = (i == nToInsert - 1) ? cursor->seekForKeyString(makeKeyStringForSeek(
-                                                    sorted.get(), kMaxBSONKey, false, true))
-                                              : cursor->nextKeyString();
+            auto entry = cursor->nextKeyString();
             ASSERT(entry);
             ASSERT_EQ(entry->keyString, keyStrings.at(i));
         }
@@ -293,6 +300,22 @@ TEST(SortedDataInterface, ExhaustKeyStringCursorReversed) {
 
         // Cursor at EOF should remain at EOF when advanced
         ASSERT(!cursor->nextKeyString());
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
+        const std::unique_ptr<SortedDataInterface::Cursor> cursor(
+            sorted->newCursor(opCtx.get(), false));
+        for (int i = nToInsert - 1; i >= 0; i--) {
+            auto entry = cursor->nextKeyValueView();
+            ASSERT(!entry.isEmpty());
+            ASSERT_EQ(entry.getValueCopy(), keyStrings.at(i));
+        }
+        ASSERT(cursor->nextKeyValueView().isEmpty());
+
+        // Cursor at EOF should remain at EOF when advanced
+        ASSERT(cursor->nextKeyValueView().isEmpty());
     }
 }
 
@@ -319,9 +342,7 @@ TEST(SortedDataInterface, CursorIterate1) {
         Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
         int n = 0;
-        for (auto entry = cursor->seek(makeKeyStringForSeek(sorted.get(), BSONObj(), true, true));
-             entry;
-             entry = cursor->next()) {
+        for (auto entry = cursor->next(); entry; entry = cursor->next()) {
             ASSERT_EQ(entry, IndexKeyEntry(BSON("" << n), RecordId(5, n * 2)));
             n++;
         }
@@ -351,9 +372,7 @@ TEST(SortedDataInterface, CursorIterate1WithSaveRestore) {
         Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
         int n = 0;
-        for (auto entry = cursor->seek(makeKeyStringForSeek(sorted.get(), BSONObj(), true, true));
-             entry;
-             entry = cursor->next()) {
+        for (auto entry = cursor->next(); entry; entry = cursor->next()) {
             ASSERT_EQ(entry, IndexKeyEntry(BSON("" << n), RecordId(5, n * 2)));
             n++;
             cursor->save();
@@ -386,9 +405,7 @@ TEST(SortedDataInterface, CursorIterateAllDupKeysWithSaveRestore) {
         Lock::GlobalLock globalLock(opCtx.get(), MODE_S);
         const std::unique_ptr<SortedDataInterface::Cursor> cursor(sorted->newCursor(opCtx.get()));
         int n = 0;
-        for (auto entry = cursor->seek(makeKeyStringForSeek(sorted.get(), BSONObj(), true, true));
-             entry;
-             entry = cursor->next()) {
+        for (auto entry = cursor->next(); entry; entry = cursor->next()) {
             ASSERT_EQ(entry, IndexKeyEntry(BSON("" << 5), RecordId(5, n * 2)));
             n++;
             cursor->save();
@@ -398,10 +415,16 @@ TEST(SortedDataInterface, CursorIterateAllDupKeysWithSaveRestore) {
     }
 }
 
-void testBoundaries(bool unique, bool forward, bool inclusive) {
+enum class IndexType { kId, kUnique, kNonUnique };
+void testBoundaries(IndexType type, bool forward, bool inclusive) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
-    const std::unique_ptr<SortedDataInterface> sorted(
-        harnessHelper->newSortedDataInterface(unique, /*partial=*/false));
+    std::unique_ptr<SortedDataInterface> sorted;
+    if (IndexType::kId == type) {
+        sorted = harnessHelper->newIdIndexSortedDataInterface();
+    } else {
+        sorted =
+            harnessHelper->newSortedDataInterface(IndexType::kUnique == type, /*partial=*/false);
+    }
 
     const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
     Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
@@ -412,7 +435,8 @@ void testBoundaries(bool unique, bool forward, bool inclusive) {
         WriteUnitOfWork uow(opCtx.get());
         BSONObj key = BSON("" << i);
         RecordId loc(42 + i * 2);
-        ASSERT_OK(sorted->insert(opCtx.get(), makeKeyString(sorted.get(), key, loc), true));
+        ASSERT_OK(sorted->insert(
+            opCtx.get(), makeKeyString(sorted.get(), key, loc), false /* dupsAllowed*/));
         uow.commit();
     }
 
@@ -445,35 +469,51 @@ void testBoundaries(bool unique, bool forward, bool inclusive) {
 }
 
 TEST(SortedDataInterfaceBoundaryTest, UniqueForwardWithNonInclusiveBoundaries) {
-    testBoundaries(/*unique*/ true, /*forward*/ true, /*inclusive*/ false);
+    testBoundaries(IndexType::kUnique, /*forward*/ true, /*inclusive*/ false);
 }
 
 TEST(SortedDataInterfaceBoundaryTest, NonUniqueForwardWithNonInclusiveBoundaries) {
-    testBoundaries(/*unique*/ false, /*forward*/ true, /*inclusive*/ false);
+    testBoundaries(IndexType::kNonUnique, /*forward*/ true, /*inclusive*/ false);
+}
+
+TEST(SortedDataInterfaceBoundaryTest, IdForwardWithNonInclusiveBoundaries) {
+    testBoundaries(IndexType::kId, /*forward*/ true, /*inclusive*/ false);
 }
 
 TEST(SortedDataInterfaceBoundaryTest, UniqueForwardWithInclusiveBoundaries) {
-    testBoundaries(/*unique*/ true, /*forward*/ true, /*inclusive*/ true);
+    testBoundaries(IndexType::kUnique, /*forward*/ true, /*inclusive*/ true);
 }
 
 TEST(SortedDataInterfaceBoundaryTest, NonUniqueForwardWithInclusiveBoundaries) {
-    testBoundaries(/*unique*/ false, /*forward*/ true, /*inclusive*/ true);
+    testBoundaries(IndexType::kNonUnique, /*forward*/ true, /*inclusive*/ true);
+}
+
+TEST(SortedDataInterfaceBoundaryTest, IdForwardWithInclusiveBoundaries) {
+    testBoundaries(IndexType::kId, /*forward*/ true, /*inclusive*/ true);
 }
 
 TEST(SortedDataInterfaceBoundaryTest, UniqueBackwardWithNonInclusiveBoundaries) {
-    testBoundaries(/*unique*/ true, /*forward*/ false, /*inclusive*/ false);
+    testBoundaries(IndexType::kUnique, /*forward*/ false, /*inclusive*/ false);
 }
 
 TEST(SortedDataInterfaceBoundaryTest, NonUniqueBackwardWithNonInclusiveBoundaries) {
-    testBoundaries(/*unique*/ false, /*forward*/ false, /*inclusive*/ false);
+    testBoundaries(IndexType::kNonUnique, /*forward*/ false, /*inclusive*/ false);
+}
+
+TEST(SortedDataInterfaceBoundaryTest, IdBackwardWithNonInclusiveBoundaries) {
+    testBoundaries(IndexType::kId, /*forward*/ false, /*inclusive*/ false);
 }
 
 TEST(SortedDataInterfaceBoundaryTest, UniqueBackwardWithInclusiveBoundaries) {
-    testBoundaries(/*unique*/ true, /*forward*/ false, /*inclusive*/ true);
+    testBoundaries(IndexType::kUnique, /*forward*/ false, /*inclusive*/ true);
 }
 
 TEST(SortedDataInterfaceBoundaryTest, NonUniqueBackwardWithInclusiveBoundaries) {
-    testBoundaries(/*unique*/ false, /*forward*/ false, /*inclusive*/ true);
+    testBoundaries(IndexType::kNonUnique, /*forward*/ false, /*inclusive*/ true);
+}
+
+TEST(SortedDataInterfaceBoundaryTest, IdBackwardWithInclusiveBoundaries) {
+    testBoundaries(IndexType::kId, /*forward*/ false, /*inclusive*/ true);
 }
 
 }  // namespace

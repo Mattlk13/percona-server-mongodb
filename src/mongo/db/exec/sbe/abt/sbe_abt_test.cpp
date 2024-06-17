@@ -43,6 +43,8 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/docval_to_sbeval.h"
 #include "mongo/db/exec/sbe/abt/abt_lower.h"
 #include "mongo/db/exec/sbe/abt/abt_lower_defs.h"
 #include "mongo/db/exec/sbe/abt/sbe_abt_test_util.h"
@@ -229,7 +231,7 @@ TEST_F(ABTSBE, Lower6) {
     bool changed = false;
     do {
         changed = false;
-        if (PathLowering{prefixId, env}.optimize(tree)) {
+        if (PathLowering{prefixId}.optimize(tree)) {
             changed = true;
             env.rebuild(tree);
         }
@@ -249,7 +251,7 @@ TEST_F(ABTSBE, Lower6) {
     auto [resultTag, resultVal] = runCompiledExpression(compiledExpr.get());
     sbe::value::ValueGuard guard(resultTag, resultVal);
 
-    ASSERT_EQ(sbe::value::TypeTags::Object, resultTag);
+    ASSERT(sbe::value::isObject(resultTag));
 }
 
 TEST_F(ABTSBE, Lower7) {
@@ -283,7 +285,7 @@ TEST_F(ABTSBE, Lower7) {
     bool changed = false;
     do {
         changed = false;
-        if (PathLowering{prefixId, env}.optimize(tree)) {
+        if (PathLowering{prefixId}.optimize(tree)) {
             changed = true;
         }
         if (ConstEval{env}.optimize(tree)) {
@@ -454,6 +456,120 @@ TEST_F(ABTSBE, LowerComparisonCollation) {
     checkCmp3w("AbX", "aBy", -1);
 }
 
+// The following nullability tests verify that ConstEval, which performs rewrites and
+// simplifications based on the nullability value of expressions, does not change the result of the
+// evaluation of And and Or. eval(E) == eval(constEval(E))
+
+TEST_F(ABTSBE, NonNullableLhsOrTrueConstFold) {
+    // E = non-nullable lhs (resolvable variable) || true
+    // eval(E) == eval(constEval(E))
+    auto tree = _binary("Or", _binary("Gt", "x"_var, "5"_cint32), _cbool(true))._n;
+    auto treeConstFold = constFold(tree);
+
+    auto var =
+        std::make_pair(ProjectionName{"x"_sd}, sbe::value::makeValue(mongo::Value((int32_t)1)));
+
+    auto res = evalExpr(tree, var);
+    auto resConstFold = evalExpr(treeConstFold, var);
+
+    assertEqualValues(res, resConstFold);
+}
+
+TEST_F(ABTSBE, NonNullableLhsOrFalseConstFold) {
+    // E = non-nullable lhs (resolvable variable) || false
+    // eval(E) == eval(constEval(E))
+    auto tree = _binary("Or", _binary("Gt", "x"_var, "5"_cint32), _cbool(false))._n;
+    auto treeConstFold = constFold(tree);
+
+    auto var =
+        std::make_pair(ProjectionName{"x"_sd}, sbe::value::makeValue(mongo::Value((int32_t)1)));
+
+    auto res = evalExpr(tree, var);
+    auto resConstFold = evalExpr(treeConstFold, var);
+
+    assertEqualValues(res, resConstFold);
+}
+
+TEST_F(ABTSBE, NullableLhsOrTrueConstFold) {
+    // E = nullable lhs (Nothing) || true
+    // eval(E) == eval(constEval(E))
+    auto tree = _binary("Or", _cnothing(), _cbool(true))._n;
+    auto treeConstFold = constFold(tree);
+
+    auto var = boost::none;
+    auto res = evalExpr(tree, var);
+    auto resConstFold = evalExpr(treeConstFold, var);
+
+    assertEqualValues(res, resConstFold);
+}
+
+TEST_F(ABTSBE, NullableLhsOrFalseConstFold) {
+    // E = nullable lhs (Nothing) || false
+    // eval(E) == eval(constEval(E))
+    auto tree = _binary("Or", _cnothing(), _cbool(false))._n;
+    auto treeConstFold = constFold(tree);
+
+    auto var = boost::none;
+    auto res = evalExpr(tree, var);
+    auto resConstFold = evalExpr(treeConstFold, var);
+
+    assertEqualValues(res, resConstFold);
+}
+
+TEST_F(ABTSBE, NonNullableLhsAndFalseConstFold) {
+    // E = non-nullable lhs (resolvable variable) && false
+    // eval(E) == eval(constEval(E))
+    auto tree = _binary("And", _binary("Gt", "x"_var, "5"_cint32), _cbool(false))._n;
+    auto treeConstFold = constFold(tree);
+
+    auto var =
+        std::make_pair(ProjectionName{"x"_sd}, sbe::value::makeValue(mongo::Value((int32_t)1)));
+    auto res = evalExpr(tree, var);
+    auto resConstFold = evalExpr(treeConstFold, var);
+
+    assertEqualValues(res, resConstFold);
+}
+
+TEST_F(ABTSBE, NonNullableLhsAndTrueConstFold) {
+    // E = non-nullable lhs (resolvable variable) && true
+    // eval(E) == eval(constEval(E))
+    auto tree = _binary("And", _binary("Gt", "x"_var, "5"_cint32), _cbool(true))._n;
+    auto treeConstFold = constFold(tree);
+
+    auto var =
+        std::make_pair(ProjectionName{"x"_sd}, sbe::value::makeValue(mongo::Value((int32_t)1)));
+    auto res = evalExpr(tree, var);
+    auto resConstFold = evalExpr(treeConstFold, var);
+
+    assertEqualValues(res, resConstFold);
+}
+
+TEST_F(ABTSBE, NullableLhsAndFalseConstFold) {
+    // E = nullable lhs (Nothing) && false
+    // eval(E) == eval(constEval(E))
+    auto tree = _binary("And", _cnothing(), _cbool(false))._n;
+    auto treeConstFold = constFold(tree);
+
+    auto var = boost::none;
+    auto res = evalExpr(tree, var);
+    auto resConstFold = evalExpr(treeConstFold, var);
+
+    assertEqualValues(res, resConstFold);
+}
+
+TEST_F(ABTSBE, NullableLhsAndTrueConstFold) {
+    // E = nullable lhs (Nothing) && true
+    // eval(E) == eval(constEval(E))
+    auto tree = _binary("And", _cnothing(), _cbool(true))._n;
+    auto treeConstFold = constFold(tree);
+
+    auto var = boost::none;
+    auto res = evalExpr(tree, var);
+    auto resConstFold = evalExpr(treeConstFold, var);
+
+    assertEqualValues(res, resConstFold);
+}
+
 TEST_F(NodeSBE, Lower1) {
     auto prefixId = PrefixId::createForTests();
     Metadata metadata{{}};
@@ -482,6 +598,7 @@ TEST_F(NodeSBE, Lower1) {
     ABT valueArray = make<Constant>(tag, val);
 
     const ProjectionName scanProjName = prefixId.getNextId("scan");
+    QueryParameterMap qp;
     ABT tree = translatePipelineToABT(metadata,
                                       *pipeline.get(),
                                       scanProjName,
@@ -489,7 +606,8 @@ TEST_F(NodeSBE, Lower1) {
                                                           boost::none,
                                                           std::move(valueArray),
                                                           true /*hasRID*/),
-                                      prefixId);
+                                      prefixId,
+                                      qp);
 
     auto phaseManager = makePhaseManager(OptPhaseManager::getAllProdRewrites(),
                                          prefixId,
@@ -505,13 +623,8 @@ TEST_F(NodeSBE, Lower1) {
     sbe::value::SlotIdGenerator ids;
     sbe::InputParamToSlotMap inputParamToSlotMap;
 
-    SBENodeLowering g{env,
-                      *runtimeEnv,
-                      ids,
-                      inputParamToSlotMap,
-                      phaseManager.getMetadata(),
-                      planAndProps._map,
-                      ScanOrder::Forward};
+    SBENodeLowering g{
+        env, *runtimeEnv, ids, inputParamToSlotMap, phaseManager.getMetadata(), planAndProps._map};
     auto sbePlan = g.optimize(planAndProps._node, map, ridSlot);
     ASSERT_EQ(1, map.size());
     ASSERT_FALSE(ridSlot);
@@ -647,6 +760,7 @@ TEST_F(NodeSBE, RequireRID) {
     }
     ABT valueArray = make<Constant>(tag, val);
 
+    QueryParameterMap qp;
     ABT tree =
         translatePipelineToABT(metadata,
                                *pipeline.get(),
@@ -655,7 +769,8 @@ TEST_F(NodeSBE, RequireRID) {
                                                    createInitialScanProps(scanProjName, "test"),
                                                    std::move(valueArray),
                                                    true /*hasRID*/),
-                               prefixId);
+                               prefixId,
+                               qp);
 
     auto phaseManager = makePhaseManagerRequireRID(OptPhaseManager::getAllProdRewrites(),
                                                    prefixId,
@@ -671,13 +786,8 @@ TEST_F(NodeSBE, RequireRID) {
     sbe::value::SlotIdGenerator ids;
     sbe::InputParamToSlotMap inputParamToSlotMap;
 
-    SBENodeLowering g{env,
-                      *runtimeEnv,
-                      ids,
-                      inputParamToSlotMap,
-                      phaseManager.getMetadata(),
-                      planAndProps._map,
-                      ScanOrder::Forward};
+    SBENodeLowering g{
+        env, *runtimeEnv, ids, inputParamToSlotMap, phaseManager.getMetadata(), planAndProps._map};
     auto sbePlan = g.optimize(planAndProps._node, map, ridSlot);
     ASSERT_EQ(1, map.size());
     ASSERT_TRUE(ridSlot);
@@ -730,17 +840,21 @@ TEST_F(NodeSBE, SamplingTest) {
         "[{$match: {a: 2}}]", NamespaceString::createNamespaceString_forTest("test"), opCtx.get());
 
     const ProjectionName scanProjName = prefixId.getNextId("scan");
-
+    QueryParameterMap qp;
+    OptimizerCounterInfo optCounterInfo;
     ABT tree = translatePipelineToABT(metadata,
                                       *pipeline.get(),
                                       scanProjName,
                                       make<ScanNode>(scanProjName, scanDefName),
-                                      prefixId);
+                                      prefixId,
+                                      qp);
 
     // We are not lowering the paths.
-    OptPhaseManager phaseManagerForSampling{{OptPhase::MemoSubstitutionPhase,
-                                             OptPhase::MemoExplorationPhase,
-                                             OptPhase::MemoImplementationPhase},
+    OptPhaseManager phaseManagerForSampling{{{OptPhase::MemoSubstitutionPhase,
+                                              OptPhase::MemoExplorationPhase,
+                                              OptPhase::MemoImplementationPhase},
+                                             kDefaultExplorationSet,
+                                             kDefaultSubstitutionSet},
                                             prefixId,
                                             false /*requireRID*/,
                                             metadata,
@@ -750,21 +864,27 @@ TEST_F(NodeSBE, SamplingTest) {
                                             defaultConvertPathToInterval,
                                             defaultConvertPathToInterval,
                                             DebugInfo::kDefaultForProd,
-                                            {._numSamplingChunks = 5}};
+                                            {._sqrtSampleSizeEnabled = false},
+                                            qp,
+                                            optCounterInfo};
 
     // Used to record the sampling plans.
     ABTVector nodes;
 
     // Not optimizing fully.
     OptPhaseManager phaseManager{
-        {OptPhase::MemoSubstitutionPhase,
-         OptPhase::MemoExplorationPhase,
-         OptPhase::MemoImplementationPhase},
+        {{OptPhase::MemoSubstitutionPhase,
+          OptPhase::MemoExplorationPhase,
+          OptPhase::MemoImplementationPhase},
+         kDefaultExplorationSet,
+         kDefaultSubstitutionSet},
         prefixId,
         false /*requireRID*/,
         metadata,
         std::make_unique<ce::SamplingEstimator>(std::move(phaseManagerForSampling),
                                                 1000 /*collectionSize*/,
+                                                DebugInfo::kDefaultForTests,
+                                                prefixId,
                                                 makeHeuristicCE(),
                                                 std::make_unique<ABTRecorder>(nodes)),
         makeHeuristicCE(),
@@ -772,7 +892,9 @@ TEST_F(NodeSBE, SamplingTest) {
         defaultConvertPathToInterval,
         ConstEval::constFold,
         DebugInfo::kDefaultForTests,
-        {} /*queryHints*/};
+        {} /*queryHints*/,
+        qp,
+        optCounterInfo};
 
     PlanAndProps planAndProps = phaseManager.optimizeAndReturnProps(std::move(tree));
 
@@ -788,16 +910,15 @@ TEST_F(NodeSBE, SamplingTest) {
         "|           Const [1]\n"
         "Filter []\n"
         "|   EvalFilter []\n"
-        "|   |   Variable [scan_0]\n"
-        "|   PathGet [a]\n"
+        "|   |   Variable [evalTemp_1]\n"
         "|   PathTraverse [1]\n"
         "|   PathCompare [Eq]\n"
         "|   Const [2]\n"
         "NestedLoopJoin [joinType: Inner, {rid_0}]\n"
         "|   |   Const [true]\n"
-        "|   LimitSkip [limit: 200, skip: 0]\n"
-        "|   Seek [ridProjection: rid_0, {'<root>': scan_0}, test]\n"
-        "LimitSkip [limit: 5, skip: 0]\n"
+        "|   LimitSkip [limit: 100, skip: 0]\n"
+        "|   Seek [ridProjection: rid_0, {'a': evalTemp_1}, test]\n"
+        "LimitSkip [limit: 10, skip: 0]\n"
         "PhysicalScan [{'<rid>': rid_0}, test]\n",
         nodes.front());
 }
@@ -895,8 +1016,7 @@ TEST_F(NodeSBE, SpoolFibonacci) {
     boost::optional<sbe::value::SlotId> ridSlot;
     sbe::value::SlotIdGenerator ids;
     sbe::InputParamToSlotMap inputParamToSlotMap;
-    SBENodeLowering g{
-        env, *runtimeEnv, ids, inputParamToSlotMap, metadata, props, ScanOrder::Forward};
+    SBENodeLowering g{env, *runtimeEnv, ids, inputParamToSlotMap, metadata, props};
     auto sbePlan = g.optimize(tree, map, ridSlot);
     ASSERT_EQ(1, map.size());
 

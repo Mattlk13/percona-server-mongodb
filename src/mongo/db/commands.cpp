@@ -52,7 +52,6 @@
 #include "mongo/db/client.h"
 #include "mongo/db/cluster_role.h"
 #include "mongo/db/commands/test_commands_enabled.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/error_labels.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/tenant_id.h"
@@ -83,35 +82,17 @@
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
-using namespace fmt::literals;
-
 namespace mongo {
 
 const std::set<std::string> kNoApiVersions = {};
 const std::set<std::string> kApiVersions1 = {"1"};
 
 namespace {
+using namespace fmt::literals;
 
 const int kFailedFindCommandDebugLevel = 3;
 
 const char kWriteConcernField[] = "writeConcern";
-
-CounterMetric unknowns{"commands.<UNKNOWN>"};
-
-/**
- * Transitionally, these are all also co-owned by a singleton pool to avoid
- * collisions between commands of the same name but in different cluster roles.
- * When we have metric trees separated by Service, these will be constructed
- * to live under the right tree.
- */
-std::shared_ptr<CounterMetric> getSingletonMetricPtr(StringData commandName, StringData stat) {
-    static StaticImmortal cacheStorage = StringMap<std::shared_ptr<CounterMetric>>{};
-    std::string path = "commands.{}.{}"_format(commandName, stat);
-    auto& metric = (*cacheStorage)[path];
-    if (!metric)
-        metric = std::make_shared<CounterMetric>(path);
-    return metric;
-}
 
 // Returns true if found to be authorized, false if undecided. Throws if unauthorized.
 bool checkAuthorizationImplPreParse(OperationContext* opCtx,
@@ -120,10 +101,6 @@ bool checkAuthorizationImplPreParse(OperationContext* opCtx,
     auto client = opCtx->getClient();
     if (client->isInDirectClient())
         return true;
-
-    uassert(ErrorCodes::Unauthorized,
-            str::stream() << command->getName() << " may only be run against the admin database.",
-            !command->adminOnly() || request.getDatabase() == DatabaseName::kAdmin.db());
 
     auto authzSession = AuthorizationSession::get(client);
     uassert(ErrorCodes::ReauthenticationRequired,
@@ -252,7 +229,7 @@ void CommandHelpers::auditLogAuthEvent(OperationContext* opCtx,
                 _nss = _invocation->ns();
                 _name = _invocation->definition()->getName();
             } else {
-                _nss = NamespaceString(request.getDbName());
+                _nss = NamespaceString(request.parseDbName());
                 _name = request.getCommandName().toString();
             }
         }
@@ -347,18 +324,17 @@ NamespaceStringOrUUID CommandHelpers::parseNsOrUUID(const DatabaseName& dbName,
         return {dbName, uassertStatusOK(UUID::parse(first))};
     } else {
         const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
-        ensureNsNotCommand(nss);
+        ensureValidCollectionName(nss);
         return nss;
     }
 }
 
-void CommandHelpers::ensureNsNotCommand(const NamespaceString& nss) {
-    // TODO SERVER-81638 this method needs to be simplified and more explicit.
+void CommandHelpers::ensureValidCollectionName(const NamespaceString& nss) {
     uassert(ErrorCodes::InvalidNamespace,
-            str::stream() << "Invalid collection name specified '" << nss.toStringForErrorMsg(),
-            !(NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()).find('$') !=
-                  std::string::npos &&
-              nss != NamespaceString::kLocalOplogDollarMain));
+            str::stream() << "Invalid collection name specified '" << nss.toStringForErrorMsg()
+                          << "'",
+            (NamespaceString::validCollectionName(nss.coll()) ||
+             nss == NamespaceString::kLocalOplogDollarMain));
 }
 
 NamespaceString CommandHelpers::parseNsFromCommand(const DatabaseName& dbName,
@@ -428,6 +404,21 @@ bool CommandHelpers::extractOrAppendOk(BSONObjBuilder& reply) {
     // Missing "ok" field is an implied success.
     reply.append("ok", 1.0);
     return true;
+}
+
+Status CommandHelpers::extractOrAppendOkAndGetStatus(BSONObjBuilder& reply) {
+    auto replyObj = reply.asTempObj();
+    auto okField = replyObj["ok"];
+    if (!okField) {
+        reply.append("ok", 1.0);
+        return Status::OK();
+    }
+
+    if (okField.trueValue()) {
+        return Status::OK();
+    }
+
+    return getErrorStatusFromCommandResult(replyObj);
 }
 
 void CommandHelpers::appendCommandWCStatus(BSONObjBuilder& result,
@@ -895,7 +886,7 @@ void CommandInvocation::set(OperationContext* opCtx,
     invocationForOpCtx(opCtx) = std::move(invocation);
 }
 
-std::shared_ptr<CommandInvocation> CommandInvocation::get(OperationContext* opCtx) {
+std::shared_ptr<CommandInvocation>& CommandInvocation::get(OperationContext* opCtx) {
     return invocationForOpCtx(opCtx);
 }
 
@@ -907,6 +898,11 @@ void CommandInvocation::checkAuthorization(OperationContext* opCtx,
     // Not using a scope guard because auditLogAuthEvent could conceivably throw.
     try {
         const Command* c = definition();
+
+        uassert(ErrorCodes::Unauthorized,
+                str::stream() << c->getName() << " may only be run against the admin database.",
+                !c->adminOnly() || db().isAdminDB());
+
         if (checkAuthorizationImplPreParse(opCtx, c, request)) {
             // Blanket authorization: don't need to check anything else.
         } else {
@@ -916,9 +912,8 @@ void CommandInvocation::checkAuthorization(OperationContext* opCtx,
                 namespace mmb = mutablebson;
                 mmb::Document cmdToLog(request.body, mmb::Document::kInPlaceDisabled);
                 c->snipForLogging(&cmdToLog);
-                auto dbName = request.getDbName();
                 uasserted(ErrorCodes::Unauthorized,
-                          str::stream() << "not authorized on " << dbName.toStringForErrorMsg()
+                          str::stream() << "not authorized on " << db().toStringForErrorMsg()
                                         << " to execute command " << redact(cmdToLog.getObject()));
             }
         }
@@ -944,11 +939,10 @@ public:
         : CommandInvocation(command),
           _command(command),
           _request(request),
-          _dbName(request.getDbName()) {}
+          _dbName(request.parseDbName()) {}
 
 private:
     void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) override {
-        opCtx->lockState()->setDebugInfo(redact(_request.body).toString());
         bool ok = _command->runWithReplyBuilder(opCtx, _dbName, _request.body, result);
         if (!ok) {
             BSONObjBuilder bob = result->getBodyBuilder();
@@ -976,6 +970,10 @@ private:
         return _command->parseNs(_dbName, cmdObj());
     }
 
+    const DatabaseName& db() const override {
+        return _dbName;
+    }
+
     bool supportsWriteConcern() const override {
         return _command->supportsWriteConcern(cmdObj());
     }
@@ -983,6 +981,10 @@ private:
     ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level,
                                                  bool isImplicitDefault) const override {
         return _command->supportsReadConcern(cmdObj(), level, isImplicitDefault);
+    }
+
+    bool isSubjectToIngressAdmissionControl() const override {
+        return _command->isSubjectToIngressAdmissionControl();
     }
 
     bool supportsReadMirroring() const override {
@@ -1044,10 +1046,17 @@ std::unique_ptr<CommandInvocation> BasicCommandWithReplyBuilderInterface::parse(
 }
 
 Command::Command(StringData name, std::vector<StringData> aliases)
-    : _name(name.toString()),
-      _aliases(std::move(aliases)),
-      _commandsExecuted(getSingletonMetricPtr(_name, "total")),
-      _commandsFailed(getSingletonMetricPtr(_name, "failed")) {}
+    : _name(name.toString()), _aliases(std::move(aliases)) {}
+
+void Command::initializeClusterRole(ClusterRole role) {
+    for (auto&& [ptr, stat] : {
+             std::pair{&_commandsExecuted, "total"},
+             std::pair{&_commandsFailed, "failed"},
+             std::pair{&_commandsRejected, "rejected"},
+         })
+        *ptr = &*MetricBuilder<Counter64>{"commands.{}.{}"_format(_name, stat)}.setRole(role);
+    doInitializeClusterRole(role);
+}
 
 const std::set<std::string>& Command::apiVersions() const {
     return kNoApiVersions;
@@ -1057,7 +1066,7 @@ const std::set<std::string>& Command::deprecatedApiVersions() const {
     return kNoApiVersions;
 }
 
-bool Command::hasAlias(const StringData& alias) const {
+bool Command::hasAlias(StringData alias) const {
     return getName() == alias ||
         std::find(_aliases.begin(), _aliases.end(), alias) != _aliases.end();
 }
@@ -1097,6 +1106,10 @@ CommandRegistry* getCommandRegistry(Service* service) {
     auto role = service->role();
     static auto makeReg = [](Service* service) {
         CommandRegistry reg;
+        // `reg` will be a singleton registry, so create a per-service unknowns
+        // counter for it.
+        auto unknowns = &*MetricBuilder<Counter64>{"commands.<UNKNOWN>"}.setRole(service->role());
+        reg.setOnUnknownCommandCallback([unknowns] { unknowns->increment(); });
         globalCommandConstructionPlan().execute(&reg, service);
         return reg;
     };
@@ -1152,10 +1165,6 @@ Command* CommandRegistry::findCommand(StringData name) const {
     return it->second;
 }
 
-void CommandRegistry::incrementUnknownCommands() {
-    unknowns.increment();
-}
-
 CommandConstructionPlan& globalCommandConstructionPlan() {
     static StaticImmortal<CommandConstructionPlan> obj{};
     return *obj;
@@ -1170,59 +1179,18 @@ BSONObj toBSON(const CommandConstructionPlan::Entry& e) {
     return bob.obj();
 }
 
-namespace {
-/**
- * All command registrations should be specifying at least one role,
- * and at least one of the roles owned by the active service context.
- */
-template <typename Entries>
-void warnOnUnexpectedRoles(Service* service, const Entries& entries) {
-    auto scRoles = [&] {
-        std::vector<ClusterRole> vec;
-        if (auto sc = service ? service->getServiceContext() : nullptr) {
-            for (ClusterRole r : {ClusterRole::ShardServer, ClusterRole::RouterServer})
-                if (sc->getService(r))
-                    vec.push_back(r);
-        }
-        return vec;
-    }();
-
-    // Flag an entry if it has no roles, or has roles that don't match any server roles.
-    std::vector<BSONObj> noRole;
-    std::vector<BSONObj> noRelevantRole;
-    std::vector<BSONObj> okEntries;
-    for (auto&& entry : entries) {
-        if (!entry->roles) {
-            noRole.push_back(toBSON(*entry));
-        } else if (!std::any_of(scRoles.begin(), scRoles.end(), [&](auto r) {
-                       return entry->roles->has(r);
-                   })) {
-            noRelevantRole.push_back(toBSON(*entry));
-        } else {
-            okEntries.push_back(toBSON(*entry));
-        }
-    }
-    if (!noRole.empty() || !noRelevantRole.empty())
-        LOGV2_WARNING_OPTIONS(8097100,
-                              {logv2::LogTruncation::Disabled},
-                              "Commands with unexpected role",
-                              "scRoles"_attr = scRoles,
-                              "noRole"_attr = noRole,
-                              "noRelevantRole"_attr = noRelevantRole);
-}
-}  // namespace
-
 void CommandConstructionPlan::execute(CommandRegistry* registry,
                                       Service* service,
                                       const std::function<bool(const Entry&)>& pred) const {
     LOGV2_DEBUG(8043400, 3, "Constructing Command objects from specs");
-    warnOnUnexpectedRoles(service, entries());
     for (auto&& entry : entries()) {
         if (entry->testOnly && !getTestCommandsEnabled()) {
             LOGV2_DEBUG(8043401, 3, "Skipping test-only command", "entry"_attr = *entry);
             continue;
         }
-        if (entry->featureFlag && !entry->featureFlag->isEnabledAndIgnoreFCVUnsafeAtStartup()) {
+        if (entry->featureFlag &&
+            !entry->featureFlag->isEnabledUseLatestFCVWhenUninitialized(
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
             LOGV2_DEBUG(8043402, 3, "Skipping FeatureFlag gated command", "entry"_attr = *entry);
             continue;
         }
@@ -1231,6 +1199,7 @@ void CommandConstructionPlan::execute(CommandRegistry* registry,
             continue;
         }
         auto c = entry->construct();
+        c->initializeClusterRole(service ? service->role() : ClusterRole{});
         LOGV2_DEBUG(8043404, 3, "Created", "command"_attr = c->getName(), "entry"_attr = *entry);
         registry->registerCommand(&*c);
 
@@ -1244,7 +1213,8 @@ void CommandConstructionPlan::execute(CommandRegistry* registry,
 
 void CommandConstructionPlan::execute(CommandRegistry* registry, Service* service) const {
     execute(registry, service, [r = service->role()](const auto& e) {
-        return !e.roles || e.roles->has(r);
+        invariant(e.roles, "All commands must have a role.");
+        return e.roles->has(r);
     });
 }
 

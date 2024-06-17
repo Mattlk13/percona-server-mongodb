@@ -186,6 +186,7 @@ StatusWith<WriteConcernOptions> WriteConcernOptions::extractWCFromCommand(const 
 }
 
 WriteConcernW deserializeWriteConcernW(BSONElement wEl) {
+    using namespace fmt::literals;
     if (wEl.isNumber()) {
         uassert(ErrorCodes::FailedToParse, "w cannot be NaN", !wEl.isNaN());
         auto wNum = wEl.safeNumberLong();
@@ -222,15 +223,14 @@ WriteConcernW deserializeWriteConcernW(BSONElement wEl) {
 }
 
 void serializeWriteConcernW(const WriteConcernW& w, StringData fieldName, BSONObjBuilder* builder) {
-    stdx::visit(OverloadedVisitor{[&](int64_t wNumNodes) {
-                                      builder->appendNumber(fieldName,
-                                                            static_cast<long long>(wNumNodes));
-                                  },
-                                  [&](std::string wMode) { builder->append(fieldName, wMode); },
-                                  [&](WTags wTags) {
-                                      builder->append(fieldName, wTags);
-                                  }},
-                w);
+    visit(OverloadedVisitor{[&](int64_t wNumNodes) {
+                                builder->appendNumber(fieldName, static_cast<long long>(wNumNodes));
+                            },
+                            [&](std::string wMode) { builder->append(fieldName, wMode); },
+                            [&](WTags wTags) {
+                                builder->append(fieldName, wTags);
+                            }},
+          w);
 }
 
 std::int64_t parseWTimeoutFromBSON(BSONElement element) {
@@ -270,8 +270,8 @@ BSONObj WriteConcernOptions::toBSON() const {
 }
 
 bool WriteConcernOptions::needToWaitForOtherNodes() const {
-    return stdx::holds_alternative<std::string>(w) || stdx::holds_alternative<WTags>(w) ||
-        (stdx::holds_alternative<std::int64_t>(w) && stdx::get<std::int64_t>(w) > 1);
+    return holds_alternative<std::string>(w) || holds_alternative<WTags>(w) ||
+        (holds_alternative<std::int64_t>(w) && get<std::int64_t>(w) > 1);
 }
 
 bool WriteConcernOptions::operator==(const WriteConcernOptions& other) const {

@@ -55,7 +55,7 @@ class ShardMergeRecipientOpObserver final : public OpObserverNoop {
 
 public:
     ShardMergeRecipientOpObserver() = default;
-    ~ShardMergeRecipientOpObserver() = default;
+    ~ShardMergeRecipientOpObserver() override = default;
 
     NamespaceFilters getNamespaceFilters() const final {
         return {NamespaceFilter::kConfig, NamespaceFilter::kConfig};
@@ -65,6 +65,7 @@ public:
                    const CollectionPtr& coll,
                    std::vector<InsertStatement>::const_iterator first,
                    std::vector<InsertStatement>::const_iterator last,
+                   const std::vector<RecordId>& recordIds,
                    std::vector<bool> fromMigrate,
                    bool defaultFromMigrate,
                    OpStateAccumulator* opAccumulator = nullptr) final;

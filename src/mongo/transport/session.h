@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <variant>
 
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
@@ -41,7 +42,6 @@
 #include "mongo/db/baton.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/rpc/message.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/transport/session_id.h"
 #include "mongo/util/decorable.h"
 #include "mongo/util/duration.h"
@@ -60,8 +60,9 @@ class SSLManagerInterface;
 
 namespace transport {
 
-class TransportLayer;
 class Session;
+class SessionManager;
+class TransportLayer;
 
 /**
  * This type contains data needed to associate Messages with connections
@@ -79,13 +80,23 @@ public:
 
     static const Status ClosedStatus;
 
-    virtual ~Session() = default;
+    ~Session() override;
 
     Id id() const {
         return _id;
     }
 
     virtual TransportLayer* getTransportLayer() const = 0;
+
+    /**
+     * Signals the Session that an OperationContext is/is-not active on the associated Client.
+     * This method is not thread safe and should only be called from the Client's thread.
+     *
+     * While this method is marked virtual, it is not actually meant to be overridden by
+     * child classes.  The use of virtual here is to resolve an otherwise circular linking
+     * by way of using the type erased vtable lookup at runtime.
+     */
+    virtual void setInOperation(bool state);
 
     /**
      * Ends this Session.
@@ -157,6 +168,12 @@ public:
     virtual bool isFromLoadBalancer() const = 0;
 
     /**
+     * Returns true if this session binds to the operation state, which implies open cursors and
+     * in-progress transactions should be killed upon client disconnection.
+     */
+    virtual bool bindsToOperationState() const = 0;
+
+    /**
      * Returns true if this session corresponds to a connection accepted from the router port.
      */
     virtual bool isFromRouterPort() const {
@@ -174,7 +191,7 @@ public:
     }
 
     virtual bool shouldOverrideMaxConns(
-        const std::vector<stdx::variant<CIDR, std::string>>& exemptions) const = 0;
+        const std::vector<std::variant<CIDR, std::string>>& exemptions) const = 0;
 
 #ifdef MONGO_CONFIG_SSL
     /**
@@ -190,6 +207,8 @@ protected:
 
 private:
     const Id _id;
+    bool _inOperation{false};
+    std::weak_ptr<SessionManager> _sessionManager;
 };
 
 }  // namespace transport

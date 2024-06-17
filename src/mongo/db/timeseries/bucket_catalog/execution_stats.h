@@ -33,6 +33,7 @@
 
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/util/tracked_types.h"
 
 namespace mongo::timeseries::bucket_catalog {
 
@@ -50,6 +51,8 @@ struct ExecutionStats {
     AtomicWord<long long> numBucketsClosedDueToReopening;
     AtomicWord<long long> numBucketsArchivedDueToMemoryThreshold;
     AtomicWord<long long> numBucketsArchivedDueToTimeBackward;
+    AtomicWord<long long> numBucketsFrozen;
+    AtomicWord<long long> numCompressedBucketsConvertedToUnsorted;
     AtomicWord<long long> numCommits;
     AtomicWord<long long> numMeasurementsGroupCommitted;
     AtomicWord<long long> numWaits;
@@ -62,13 +65,21 @@ struct ExecutionStats {
     AtomicWord<long long> numBucketQueriesFailed;
     AtomicWord<long long> numBucketReopeningsFailed;
     AtomicWord<long long> numDuplicateBucketsReopened;
+
+    // TODO SERVER-70605: Remove the metrics below.
+    AtomicWord<long long> numBytesUncompressed;
+    AtomicWord<long long> numBytesCompressed;
+    AtomicWord<long long> numSubObjCompressionRestart;
+    AtomicWord<long long> numCompressedBuckets;
+    AtomicWord<long long> numUncompressedBuckets;
+    AtomicWord<long long> numFailedDecompressBuckets;
 };
 
 class ExecutionStatsController {
 public:
-    ExecutionStatsController(const std::shared_ptr<ExecutionStats>& collectionStats,
+    ExecutionStatsController(const shared_tracked_ptr<ExecutionStats>& collectionStats,
                              ExecutionStats& globalStats)
-        : _collectionStats(collectionStats), _globalStats(globalStats) {}
+        : _collectionStats(collectionStats), _globalStats(&globalStats) {}
 
     ExecutionStatsController() = delete;
 
@@ -85,6 +96,8 @@ public:
     void incNumBucketsClosedDueToReopening(long long increment = 1);
     void incNumBucketsArchivedDueToMemoryThreshold(long long increment = 1);
     void incNumBucketsArchivedDueToTimeBackward(long long increment = 1);
+    void incNumBucketsFrozen(long long increment = 1);
+    void incNumCompressedBucketsConvertedToUnsorted(long long increment = 1);
     void incNumCommits(long long increment = 1);
     void incNumMeasurementsGroupCommitted(long long increment = 1);
     void incNumWaits(long long increment = 1);
@@ -97,10 +110,16 @@ public:
     void incNumBucketQueriesFailed(long long increment = 1);
     void incNumBucketReopeningsFailed(long long increment = 1);
     void incNumDuplicateBucketsReopened(long long increment = 1);
+    void incNumBytesUncompressed(long long increment = 1);
+    void incNumBytesCompressed(long long increment = 1);
+    void incNumSubObjCompressionRestart(long long increment = 1);
+    void incNumCompressedBuckets(long long increment = 1);
+    void incNumUncompressedBuckets(long long increment = 1);
+    void incNumFailedDecompressBuckets(long long increment = 1);
 
 private:
-    std::shared_ptr<ExecutionStats> _collectionStats;
-    ExecutionStats& _globalStats;
+    shared_tracked_ptr<ExecutionStats> _collectionStats;
+    ExecutionStats* _globalStats;
 };
 
 void appendExecutionStatsToBuilder(const ExecutionStats& stats, BSONObjBuilder& builder);

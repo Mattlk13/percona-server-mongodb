@@ -34,7 +34,6 @@
 #include <absl/container/flat_hash_set.h>
 #include <boost/optional.hpp>
 #include <fmt/format.h>
-#include <mutex>
 #include <ostream>
 #include <tuple>
 
@@ -50,23 +49,26 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/bson/util/builder_fwd.h"
 #include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/db/admission/execution_admission_context.h"
+#include "mongo/db/admission/execution_control_feature_flags_gen.h"
+#include "mongo/db/admission/ingress_admission_context.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/prepare_conflict_tracker.h"
 #include "mongo/db/profile_filter.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session/logical_session_id_gen.h"
 #include "mongo/db/stats/timer_stats.h"
 #include "mongo/db/storage/recovery_unit.h"
-#include "mongo/db/storage/storage_engine_feature_flags_gen.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/redaction.h"
@@ -75,13 +77,10 @@
 #include "mongo/rpc/metadata/impersonated_user_metadata.h"
 #include "mongo/rpc/metadata/impersonated_user_metadata_gen.h"
 #include "mongo/transport/service_executor.h"
-#include "mongo/transport/session.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/clock_source.h"
-#include "mongo/util/concurrency/admission_context.h"
 #include "mongo/util/database_name_util.h"
 #include "mongo/util/decorable.h"
-#include "mongo/util/diagnostic_info.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/hex.h"
@@ -95,9 +94,11 @@
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 namespace mongo {
-namespace {
 
-auto& oplogGetMoreStats = makeServerStatusMetric<TimerStats>("repl.network.oplogGetMoresProcessed");
+namespace {
+StringMap<std::function<AdmissionContext*(OperationContext*)>> gQueueMetricsRegistry;
+
+auto& oplogGetMoreStats = *MetricBuilder<TimerStats>("repl.network.oplogGetMoresProcessed");
 
 BSONObj serializeDollarDbInOpDescription(boost::optional<TenantId> tenantId,
                                          const BSONObj& cmdObj,
@@ -114,6 +115,14 @@ BSONObj serializeDollarDbInOpDescription(boost::optional<TenantId> tenantId,
     return newCmdObj;
 }
 
+MONGO_INITIALIZER(InitGlobalQueueLookupTable)(InitializerContext*) {
+    gQueueMetricsRegistry["ingress"] = [](OperationContext* opCtx) {
+        return &IngressAdmissionContext::get(opCtx);
+    };
+    gQueueMetricsRegistry["execution"] = [](OperationContext* opCtx) {
+        return &ExecutionAdmissionContext::get(opCtx);
+    };
+}
 }  // namespace
 
 /**
@@ -189,11 +198,12 @@ private:
         curOp->_parent = _top;
 
         // If `curOp` is a sub-operation, we store the snapshot of lock stats as the base lock stats
-        // of the current operation.
+        // of the current operation. Also store the current ticket wait time as the base ticket
+        // wait time.
         if (_top) {
-            if (auto lockerInfo = opCtx()->lockState()->getLockerInfo(boost::none)) {
-                curOp->_lockStatsBase = lockerInfo->stats;
-            }
+            auto locker = shard_role_details::getLocker(opCtx());
+            curOp->_lockStatsBase = locker->getLockerInfo(boost::none).stats;
+            curOp->_ticketWaitBase = locker->getTimeQueuedForTicketMicros();
         }
 
         _top = curOp;
@@ -232,7 +242,7 @@ void CurOp::reportCurrentOpForClient(const boost::intrusive_ptr<ExpressionContex
 
     infoBuilder->append("type", "op");
 
-    const std::string hostName = getHostNameCachedAndPort();
+    const std::string hostName = prettyHostNameAndPort(client->getLocalPort());
     infoBuilder->append("host", hostName);
 
     client->reportState(*infoBuilder);
@@ -268,10 +278,6 @@ void CurOp::reportCurrentOpForClient(const boost::intrusive_ptr<ExpressionContex
 
         if (maybeImpersonationData->getUser()) {
             maybeImpersonationData->getUser()->serializeToBSON(&users);
-        } else if (maybeImpersonationData->getUsers()) {
-            for (const auto& user : maybeImpersonationData->getUsers().get()) {
-                user.serializeToBSON(&users);
-            }
         }
 
         users.doneFast();
@@ -283,7 +289,7 @@ void CurOp::reportCurrentOpForClient(const boost::intrusive_ptr<ExpressionContex
     infoBuilder->appendBool("isFromUserConnection", client->isFromUserConnection());
 
     if (const auto seCtx = transport::ServiceExecutorContext::get(client)) {
-        infoBuilder->append("threaded"_sd, seCtx->usesDedicatedThread());
+        infoBuilder->append("threaded"_sd, true);
     }
 
     if (clientOpCtx) {
@@ -310,6 +316,16 @@ void CurOp::reportCurrentOpForClient(const boost::intrusive_ptr<ExpressionContex
         // reportState is used to generate a command reply
         auto sc = SerializationContext::stateCommandReply(expCtx->serializationCtxt);
         CurOp::get(clientOpCtx)->reportState(infoBuilder, sc, truncateOps);
+
+        if (const auto& queryShapeHash = CurOp::get(clientOpCtx)->getQueryShapeHash()) {
+            infoBuilder->append("queryShapeHash", queryShapeHash->toHexString());
+        }
+    }
+
+    if (expCtx->opCtx->routedByReplicaSetEndpoint()) {
+        // On the replica set endpoint, currentOp reports both router and shard operations so it
+        // should label each op with its associated role.
+        infoBuilder->append("role", toString(client->getService()->role()));
     }
 
 #ifndef MONGO_CONFIG_USE_RAW_LATCHES
@@ -366,9 +382,10 @@ void CurOp::setGenericOpRequestDetails(NamespaceString nss,
                                        const Command* command,
                                        BSONObj cmdObj,
                                        NetworkOp op) {
-    // Set the _isCommand flags based on network op only. For legacy writes on mongoS, we resolve
-    // them to OpMsgRequests and then pass them into the Commands path, so having a valid Command*
-    // here does not guarantee that the op was issued from the client using a command protocol.
+    // Set the _isCommand flags based on network op only. For legacy writes on mongoS, we
+    // resolve them to OpMsgRequests and then pass them into the Commands path, so having a
+    // valid Command* here does not guarantee that the op was issued from the client using a
+    // command protocol.
     const bool isCommand = (op == dbMsg || (op == dbQuery && nss.isCommand()));
     auto logicalOp = (command ? command->getLogicalOp() : networkOpToLogicalOp(op));
 
@@ -383,21 +400,21 @@ void CurOp::setGenericOpRequestDetails(NamespaceString nss,
 
 void CurOp::setEndOfOpMetrics(long long nreturned) {
     _debug.additiveMetrics.nreturned = nreturned;
-    // A non-null queryStats store key indicates the current query is being tracked for queryStats
+    // A non-none queryStatsInfo.keyHash indicates the current query is being tracked for queryStats
     // and therefore the executionTime needs to be recorded as part of that effort. executionTime is
     // set with the final executionTime in completeAndLogOperation, but for query stats collection
     // we want it set before incrementing cursor metrics using OpDebug's AdditiveMetrics. The value
     // set here will be overwritten later in completeAndLogOperation.
-    if (_debug.queryStatsKeyHash) {
+    if (_debug.queryStatsInfo.keyHash) {
         _debug.additiveMetrics.executionTime = elapsedTimeExcludingPauses();
     }
 }
 
 void CurOp::setMessage_inlock(StringData message) {
-    if (_progressMeter.isActive()) {
+    if (_progressMeter && _progressMeter->isActive()) {
         LOGV2_ERROR(
             20527, "Updating message", "old"_attr = redact(_message), "new"_attr = redact(message));
-        MONGO_verify(!_progressMeter.isActive());
+        MONGO_verify(!_progressMeter->isActive());
     }
     _message = message.toString();  // copy
 }
@@ -406,9 +423,39 @@ ProgressMeter& CurOp::setProgress_inlock(StringData message,
                                          unsigned long long progressMeterTotal,
                                          int secondsBetween) {
     setMessage_inlock(message);
-    _progressMeter.reset(progressMeterTotal, secondsBetween);
-    _progressMeter.setName(message);
-    return _progressMeter;
+    if (_progressMeter) {
+        _progressMeter->reset(progressMeterTotal, secondsBetween);
+        _progressMeter->setName(message);
+    } else {
+        _progressMeter.emplace(progressMeterTotal, secondsBetween, 100, "", message.toString());
+    }
+
+    return _progressMeter.value();
+}
+
+void CurOp::updateStatsOnTransactionUnstash() {
+    // Store lock stats and ticket wait times from the locker after unstashing. These stats have
+    // accrued outside of this CurOp instance so we will ignore/subtract them when reporting on this
+    // operation.
+    auto locker = shard_role_details::getLocker(opCtx());
+    _lockStatsBase = locker->getLockerInfo(boost::none).stats;
+    _ticketWaitBase = locker->getTimeQueuedForTicketMicros() +
+        Microseconds(locker->getFlowControlStats().timeAcquiringMicros);
+}
+
+void CurOp::updateStatsOnTransactionStash() {
+    // Store lock stats and ticket wait times that happened during this operation before locker is
+    // stashed. We take the delta of locker stats before stashing and the base stats which includes
+    // the snapshot of locker stats when it was unstashed. This stats delta on stashing is added
+    // when reporting on this operation.
+    auto locker = shard_role_details::getLocker(opCtx());
+
+    _lockStatsOnceStashed = locker->getLockerInfo(_lockStatsBase).stats;
+    _lockStatsBase = boost::none;
+
+    _ticketWaitWhenStashed = locker->getTimeQueuedForTicketMicros() +
+        Microseconds(locker->getFlowControlStats().timeAcquiringMicros) - _ticketWaitBase;
+    _ticketWaitBase = Microseconds(0);
 }
 
 void CurOp::setNS_inlock(NamespaceString nss) {
@@ -431,10 +478,15 @@ TickSource::Tick CurOp::startTime() {
         _cpuTimer->start();
     }
 
+    _debug.waitForTicketDurationMillis = duration_cast<Milliseconds>(
+        shard_role_details::getLocker(opCtx())->getTimeQueuedForTicketMicros() - _ticketWaitBase +
+        _ticketWaitWhenStashed);
+    _blockedTimeAtStart = _sumBlockedTimeTotal();
+
     // The '_start' value is initialized to 0 and gets assigned on demand the first time it gets
-    // accessed. The above thread ownership requirement ensures that there will never be concurrent
-    // calls to this '_start' assignment, but we use compare-exchange anyway as an additional check
-    // that writes to '_start' never race.
+    // accessed. The above thread ownership requirement ensures that there will never be
+    // concurrent calls to this '_start' assignment, but we use compare-exchange anyway as an
+    // additional check that writes to '_start' never race.
     TickSource::Tick unassignedStart = 0;
     invariant(_start.compare_exchange_strong(unassignedStart, _tickSource->getTicks()));
     return _start.load();
@@ -445,7 +497,7 @@ void CurOp::done() {
 }
 
 void CurOp::calculateCpuTime() {
-    if (_cpuTimer && _debug.cpuTime == Nanoseconds::zero()) {
+    if (_cpuTimer && _debug.cpuTime < Nanoseconds::zero()) {
         _debug.cpuTime = _cpuTimer->getElapsed();
     }
 }
@@ -460,6 +512,23 @@ Microseconds CurOp::computeElapsedTimeTotal(TickSource::Tick startTime,
     }
 
     return _tickSource->ticksTo<Microseconds>(endTime - startTime);
+}
+
+Milliseconds CurOp::_sumBlockedTimeTotal() {
+    auto locker = shard_role_details::getLocker(opCtx());
+    auto lockStats = locker->getLockerInfo(_lockStatsBase).stats;
+
+    auto waitForTickets = _debug.waitForTicketDurationMillis +
+        duration_cast<Milliseconds>(
+                              Microseconds(locker->getFlowControlStats().timeAcquiringMicros));
+
+    if (_lockStatsOnceStashed)
+        lockStats.append(_lockStatsOnceStashed.get());
+
+    auto waitForLocks =
+        duration_cast<Milliseconds>(Microseconds(lockStats.getCumulativeWaitTimeMicros()));
+
+    return waitForTickets + waitForLocks;
 }
 
 void CurOp::enter_inlock(NamespaceString nss, int dbProfileLevel) {
@@ -519,6 +588,19 @@ bool CurOp::completeAndLogOperation(const logv2::LogOptions& logOptions,
         oplogGetMoreStats.recordMillis(executionTimeMillis);
     }
 
+    // The ticket wait time from the locker reports wait times from preceding operations in the
+    // CurOpStack. The precise time queued for tickets of a sub-operation is the ticket wait time
+    // from the locker minus the ticket wait time taken when this operation started.
+    _debug.waitForTicketDurationMillis = duration_cast<Milliseconds>(
+        shard_role_details::getLocker(opCtx)->getTimeQueuedForTicketMicros() - _ticketWaitBase +
+        _ticketWaitWhenStashed);
+
+    auto totalBlockedTime = _sumBlockedTimeTotal() - _blockedTimeAtStart;
+    auto workingMillis = Milliseconds(executionTimeMillis) - totalBlockedTime;
+    // Round up to zero if necessary to allow precision errors from FastClockSource used by flow
+    // control ticketholder.
+    _debug.workingTimeMillis = (workingMillis < Milliseconds(0) ? Milliseconds(0) : workingMillis);
+
     bool shouldLogSlowOp, shouldProfileAtLevel1;
 
     if (filter) {
@@ -538,42 +620,51 @@ bool CurOp::completeAndLogOperation(const logv2::LogOptions& logOptions,
         // settings.
         bool shouldSample;
         std::tie(shouldLogSlowOp, shouldSample) = shouldLogSlowOpWithSampling(
-            opCtx, logOptions.component(), Milliseconds(executionTimeMillis), Milliseconds(slowMs));
+            opCtx,
+            logOptions.component(),
+            (gFeatureFlagLogSlowOpsBasedOnTimeWorking.isEnabled(
+                 serverGlobalParams.featureCompatibility.acquireFCVSnapshot())
+                 ? _debug.workingTimeMillis
+                 : Milliseconds(executionTimeMillis)),
+            Milliseconds(slowMs));
 
         shouldProfileAtLevel1 = shouldLogSlowOp && shouldSample;
     }
 
     // Defer calculating the CPU time until we know that we actually are going to write it to
-    // the logs or profiler. The CPU time may have been determined earlier if it was a dependency
-    // of 'filter' in which case this is a no-op.
+    // the logs or profiler. The CPU time may have been determined earlier if it was a
+    // dependency of 'filter' in which case this is a no-op.
     if (forceLog || shouldLogSlowOp || _dbprofile >= 2) {
         calculateCpuTime();
     }
 
     if (forceLog || shouldLogSlowOp) {
-        auto lockerInfo = opCtx->lockState()->getLockerInfo(_lockStatsBase);
-        if (_debug.storageStats == nullptr && opCtx->lockState()->wasGlobalLockTaken() &&
+        auto lockerInfo = shard_role_details::getLocker(opCtx)->getLockerInfo(_lockStatsBase);
+        if (_lockStatsOnceStashed)
+            lockerInfo.stats.append(_lockStatsOnceStashed.get());
+        if (_debug.storageStats == nullptr &&
+            shard_role_details::getLocker(opCtx)->wasGlobalLockTaken() &&
             opCtx->getServiceContext()->getStorageEngine()) {
-            // Do not fetch operation statistics again if we have already got them (for instance,
-            // as a part of stashing the transaction).
-            // Take a lock before calling into the storage engine to prevent racing against a
-            // shutdown. Any operation that used a storage engine would have at-least held a
-            // global lock at one point, hence we limit our lock acquisition to such operations.
-            // We can get here and our lock acquisition be timed out or interrupted, log a
-            // message if that happens.
+            // Do not fetch operation statistics again if we have already got them (for
+            // instance, as a part of stashing the transaction). Take a lock before calling into
+            // the storage engine to prevent racing against a shutdown. Any operation that used
+            // a storage engine would have at-least held a global lock at one point, hence we
+            // limit our lock acquisition to such operations. We can get here and our lock
+            // acquisition be timed out or interrupted, log a message if that happens.
             try {
                 // Slow query logs are critical for observability and should not wait for ticket
-                // acquisition. Slow queries can happen for various reasons; however, if queries are
-                // slower due to ticket exhaustion, queueing in order to log can compound the issue.
-                ScopedAdmissionPriorityForLock skipAdmissionControl(
-                    opCtx->lockState(), AdmissionContext::Priority::kImmediate);
+                // acquisition. Slow queries can happen for various reasons; however, if queries
+                // are slower due to ticket exhaustion, queueing in order to log can compound
+                // the issue.
+                ScopedAdmissionPriority<ExecutionAdmissionContext> skipAdmissionControl(
+                    opCtx, AdmissionContext::Priority::kExempt);
                 Lock::GlobalLock lk(opCtx,
                                     MODE_IS,
                                     Date_t::now() + Milliseconds(500),
                                     Lock::InterruptBehavior::kThrow,
                                     Lock::GlobalLockSkipOptions{.skipRSTLLock = true});
-                _debug.storageStats =
-                    opCtx->recoveryUnit()->computeOperationStatisticsSinceLastCall();
+                _debug.storageStats = shard_role_details::getRecoveryUnit(opCtx)
+                                          ->computeOperationStatisticsSinceLastCall();
             } catch (const DBException& ex) {
                 LOGV2_WARNING_OPTIONS(20526,
                                       logOptions,
@@ -598,8 +689,7 @@ bool CurOp::completeAndLogOperation(const logv2::LogOptions& logOptions,
         }();
 
         logv2::DynamicAttributes attr;
-        _debug.report(
-            opCtx, (lockerInfo ? &lockerInfo->stats : nullptr), operationMetricsPtr, &attr);
+        _debug.report(opCtx, &lockerInfo.stats, operationMetricsPtr, &attr);
 
         LOGV2_OPTIONS(51803, logOptions, "Slow query", attr);
 
@@ -674,9 +764,9 @@ BSONObj appendCommentField(OperationContext* opCtx, const BSONObj& cmdObj) {
 }
 
 /**
- * Appends {<name>: obj} to the provided builder.  If obj is greater than maxSize, appends a string
- * summary of obj as { <name>: { $truncated: "obj" } }. If a comment parameter is present, add it to
- * the truncation object.
+ * Appends {<name>: obj} to the provided builder.  If obj is greater than maxSize, appends a
+ * string summary of obj as { <name>: { $truncated: "obj" } }. If a comment parameter is
+ * present, add it to the truncation object.
  */
 void appendAsObjOrString(StringData name,
                          const BSONObj& obj,
@@ -707,8 +797,9 @@ void appendAsObjOrString(StringData name,
 
         StringData truncation = StringData(objToString).substr(0, *maxSize);
 
-        // Append the truncated representation of the object to the builder. If a comment parameter
-        // is present, write it to the object alongside the truncated op. This object will appear as
+        // Append the truncated representation of the object to the builder. If a comment
+        // parameter is present, write it to the object alongside the truncated op. This object
+        // will appear as
         // {$truncated: "{find: \"collection\", filter: {x: 1, ...", comment: "comment text" }
         BSONObjBuilder truncatedBuilder(builder->subobjStart(name));
         truncatedBuilder.append("$truncated", truncation);
@@ -734,8 +825,8 @@ BSONObj CurOp::truncateAndSerializeGenericCursor(GenericCursor* cursor,
         auto originatingCommand = tempObj.done().getObjectField("truncatedObj");
         cursor->setOriginatingCommand(originatingCommand.getOwned());
     }
-    // lsid, ns, and planSummary exist in the top level curop object, so they need to be temporarily
-    // removed from the cursor object to avoid duplicating information.
+    // lsid, ns, and planSummary exist in the top level curop object, so they need to be
+    // temporarily removed from the cursor object to avoid duplicating information.
     auto lsid = cursor->getLsid();
     auto ns = cursor->getNs();
     auto originalPlanSummary(cursor->getPlanSummary() ? boost::optional<std::string>(
@@ -771,15 +862,22 @@ void CurOp::reportState(BSONObjBuilder* builder,
     bool omitAndRedactInformation = getShouldOmitDiagnosticInformation();
     builder->append("redacted", omitAndRedactInformation);
 
-    // When the currentOp command is run, it returns a single response object containing all current
-    // operations; this request will fail if the response exceeds the 16MB document limit. By
-    // contrast, the $currentOp aggregation stage does not have this restriction. If 'truncateOps'
-    // is true, limit the size of each op to 1000 bytes. Otherwise, do not truncate.
+    // When the currentOp command is run, it returns a single response object containing all
+    // current operations; this request will fail if the response exceeds the 16MB document
+    // limit. By contrast, the $currentOp aggregation stage does not have this restriction. If
+    // 'truncateOps' is true, limit the size of each op to 1000 bytes. Otherwise, do not
+    // truncate.
     const boost::optional<size_t> maxQuerySize{truncateOps, 1000};
 
-    auto opDescription =
-        serializeDollarDbInOpDescription(_nss.tenantId(), _opDescription, serializationContext);
-    auto obj = appendCommentField(opCtx, opDescription);
+    auto obj = [&]() {
+        if (!gMultitenancySupport) {
+            return appendCommentField(opCtx, _opDescription);
+        } else {
+            return appendCommentField(opCtx,
+                                      serializeDollarDbInOpDescription(
+                                          _nss.tenantId(), _opDescription, serializationContext));
+        }
+    }();
 
     // If flag is true, add command field to builder without sensitive information.
     if (omitAndRedactInformation) {
@@ -832,13 +930,13 @@ void CurOp::reportState(BSONObjBuilder* builder,
     }
 
     if (!_message.empty()) {
-        if (_progressMeter.isActive()) {
+        if (_progressMeter && _progressMeter->isActive()) {
             StringBuilder buf;
-            buf << _message << " " << _progressMeter.toString();
+            buf << _message << " " << _progressMeter->toString();
             builder->append("msg", buf.str());
             BSONObjBuilder sub(builder->subobjStart("progress"));
-            sub.appendNumber("done", (long long)_progressMeter.done());
-            sub.appendNumber("total", (long long)_progressMeter.total());
+            sub.appendNumber("done", (long long)_progressMeter->done());
+            sub.appendNumber("total", (long long)_progressMeter->total());
             sub.done();
         } else {
             builder->append("msg", _message);
@@ -869,12 +967,12 @@ void CurOp::reportState(BSONObjBuilder* builder,
         builder->append("dataThroughputAverage", *_debug.dataThroughputAverage);
     }
 
-    // (Ignore FCV check): This feature flag is used to initialize ticketing during storage engine
-    // initialization and FCV checking is ignored there, so here we also need to ignore FCV to keep
-    // consistent behavior.
+    // (Ignore FCV check): This feature flag is used to initialize ticketing during storage
+    // engine initialization and FCV checking is ignored there, so here we also need to ignore
+    // FCV to keep consistent behavior.
     if (feature_flags::gFeatureFlagDeprioritizeLowPriorityOperations
             .isEnabledAndIgnoreFCVUnsafe()) {
-        auto admissionPriority = opCtx->lockState()->getAdmissionPriority();
+        auto admissionPriority = ExecutionAdmissionContext::get(opCtx).getPriority();
         if (admissionPriority < AdmissionContext::Priority::kNormal) {
             builder->append("admissionPriority", toString(admissionPriority));
         }
@@ -886,6 +984,40 @@ void CurOp::reportState(BSONObjBuilder* builder,
         elapsedTimeTotal += duration_cast<Milliseconds>(computeElapsedTimeTotal(start, end));
         builder->append("waitForWriteConcernDurationMillis",
                         durationCount<Milliseconds>(elapsedTimeTotal));
+    }
+
+    // (Ignore FCV check): This feature flag is not FCV gated (shouldBeFCVGated is false)
+    if (gFeatureFlagIngressAdmissionControl.isEnabledAndIgnoreFCVUnsafe()) {
+        boost::optional<std::tuple<std::string, Microseconds>> currentQueue;
+        BSONObjBuilder queuesBuilder(builder->subobjStart("queues"));
+        for (auto&& [queueName, lookup] : gQueueMetricsRegistry) {
+            AdmissionContext* admCtx = lookup(opCtx);
+            Microseconds totalTimeQueuedMicros = admCtx->totalTimeQueuedMicros();
+
+            if (auto startQueueingTime = admCtx->startQueueingTime()) {
+                Microseconds currentQueueTimeQueuedMicros = computeElapsedTimeTotal(
+                    *startQueueingTime, opCtx->getServiceContext()->getTickSource()->getTicks());
+                totalTimeQueuedMicros += currentQueueTimeQueuedMicros;
+                currentQueue = std::make_tuple(queueName, currentQueueTimeQueuedMicros);
+            }
+
+            BSONObjBuilder queueMetricsBuilder(queuesBuilder.subobjStart(queueName));
+            queueMetricsBuilder.append("admissions", admCtx->getAdmissions());
+            queueMetricsBuilder.append("totalTimeQueuedMicros",
+                                       durationCount<Microseconds>(totalTimeQueuedMicros));
+            queueMetricsBuilder.done();
+        }
+        queuesBuilder.done();
+
+        if (currentQueue) {
+            BSONObjBuilder currentQueueBuilder(builder->subobjStart("currentQueue"));
+            currentQueueBuilder.append("name", std::get<0>(*currentQueue));
+            currentQueueBuilder.append("timeQueuedMicros",
+                                       durationCount<Microseconds>(std::get<1>(*currentQueue)));
+            currentQueueBuilder.done();
+        } else {
+            builder->appendNull("currentQueue");
+        }
     }
 }
 
@@ -940,9 +1072,10 @@ StringData getProtoString(int op) {
 #define OPDEBUG_TOATTR_HELP(x) \
     if (x >= 0)                \
     pAttrs->add(#x, x)
-#define OPDEBUG_TOATTR_HELP_BOOL(x) \
-    if (x)                          \
-    pAttrs->add(#x, x)
+#define OPDEBUG_TOATTR_HELP_BOOL_NAMED(name, x) \
+    if (x)                                      \
+    pAttrs->add(name, x)
+#define OPDEBUG_TOATTR_HELP_BOOL(x) OPDEBUG_TOATTR_HELP_BOOL_NAMED(#x, x)
 #define OPDEBUG_TOATTR_HELP_ATOMIC(x, y) \
     if (auto __y = y.load(); __y > 0)    \
     pAttrs->add(x, __y)
@@ -956,7 +1089,7 @@ void OpDebug::report(OperationContext* opCtx,
                      logv2::DynamicAttributes* pAttrs) const {
     Client* client = opCtx->getClient();
     auto& curop = *CurOp::get(opCtx);
-    auto flowControlStats = opCtx->lockState()->getFlowControlStats();
+    auto flowControlStats = shard_role_details::getLocker(opCtx)->getFlowControlStats();
 
     if (iscommand) {
         pAttrs->add("type", "command");
@@ -979,6 +1112,9 @@ void OpDebug::report(OperationContext* opCtx,
 
     auto query = appendCommentField(opCtx, curop.opDescription());
     if (!query.isEmpty()) {
+        if (const auto shapeHash = CurOp::get(opCtx)->getQueryShapeHash()) {
+            pAttrs->addDeepCopy("queryShapeHash", shapeHash->toHexString());
+        }
         if (iscommand) {
             const Command* curCommand = curop.getCommand();
             if (curCommand) {
@@ -1008,6 +1144,14 @@ void OpDebug::report(OperationContext* opCtx,
 
     if (planningTime > Microseconds::zero()) {
         pAttrs->add("planningTimeMicros", durationCount<Microseconds>(planningTime));
+    }
+
+    if (estimatedCost) {
+        pAttrs->add("estimatedCost", *estimatedCost);
+    }
+
+    if (estimatedCardinality) {
+        pAttrs->add("estimatedCardinality", *estimatedCardinality);
     }
 
     if (prepareConflictDurationMillis > Milliseconds::zero()) {
@@ -1059,10 +1203,11 @@ void OpDebug::report(OperationContext* opCtx,
 
     OPDEBUG_TOATTR_HELP_OPTIONAL("keysExamined", additiveMetrics.keysExamined);
     OPDEBUG_TOATTR_HELP_OPTIONAL("docsExamined", additiveMetrics.docsExamined);
-    OPDEBUG_TOATTR_HELP_BOOL(hasSortStage);
-    OPDEBUG_TOATTR_HELP_BOOL(usedDisk);
-    OPDEBUG_TOATTR_HELP_BOOL(fromMultiPlanner);
-    OPDEBUG_TOATTR_HELP_BOOL(fromPlanCache);
+
+    OPDEBUG_TOATTR_HELP_BOOL_NAMED("hasSortStage", additiveMetrics.hasSortStage);
+    OPDEBUG_TOATTR_HELP_BOOL_NAMED("usedDisk", additiveMetrics.usedDisk);
+    OPDEBUG_TOATTR_HELP_BOOL_NAMED("fromMultiPlanner", additiveMetrics.fromMultiPlanner);
+    OPDEBUG_TOATTR_HELP_BOOL_NAMED("fromPlanCache", additiveMetrics.fromPlanCache.value_or(false));
     if (replanReason) {
         bool replanned = true;
         OPDEBUG_TOATTR_HELP_BOOL(replanned);
@@ -1122,15 +1267,21 @@ void OpDebug::report(OperationContext* opCtx,
         pAttrs->add("reslen", responseLength);
     }
 
-    // (Ignore FCV check): This feature flag is used to initialize ticketing during storage engine
-    // initialization and FCV checking is ignored there, so here we also need to ignore FCV to keep
-    // consistent behavior.
+    // (Ignore FCV check): This feature flag is used to initialize ticketing during storage
+    // engine initialization and FCV checking is ignored there, so here we also need to ignore
+    // FCV to keep consistent behavior.
     if (feature_flags::gFeatureFlagDeprioritizeLowPriorityOperations
             .isEnabledAndIgnoreFCVUnsafe()) {
-        auto admissionPriority = opCtx->lockState()->getAdmissionPriority();
+        auto admissionPriority = ExecutionAdmissionContext::get(opCtx).getPriority();
         if (admissionPriority < AdmissionContext::Priority::kNormal) {
             pAttrs->add("admissionPriority", admissionPriority);
         }
+    }
+
+    if (gFeatureFlagLogSlowOpsBasedOnTimeWorking.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) &&
+        waitForTicketDurationMillis > Milliseconds::zero()) {
+        pAttrs->add("ticketWaitMillis", waitForTicketDurationMillis.count());
     }
 
     if (lockStats) {
@@ -1184,7 +1335,9 @@ void OpDebug::report(OperationContext* opCtx,
         pAttrs->add("operationMetrics", builder.obj());
     }
 
-    if (cpuTime > Nanoseconds::zero()) {
+    // Always report cpuNanos in rare cases that it is zero to facilitate testing that expects this
+    // field to always exist.
+    if (cpuTime >= Nanoseconds::zero()) {
         pAttrs->add("cpuNanos", durationCount<Nanoseconds>(cpuTime));
     }
 
@@ -1206,10 +1359,37 @@ void OpDebug::report(OperationContext* opCtx,
         pAttrs->add("remoteOpWaitMillis", durationCount<Milliseconds>(*remoteOpWaitTime));
     }
 
+    if (gFeatureFlagLogSlowOpsBasedOnTimeWorking.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+        // workingMillis should always be present for any operation
+        pAttrs->add("workingMillis", workingTimeMillis.count());
+    }
+
     // durationMillis should always be present for any operation
     pAttrs->add(
         "durationMillis",
         durationCount<Milliseconds>(additiveMetrics.executionTime.value_or(Microseconds{0})));
+
+    // (Ignore FCV check): This feature flag is not FCV gated (shouldBeFCVGated is false)
+    if (gFeatureFlagIngressAdmissionControl.isEnabledAndIgnoreFCVUnsafe()) {
+        BSONObjBuilder queuesBuilder;
+        for (auto&& [queueName, lookup] : gQueueMetricsRegistry) {
+            AdmissionContext* admCtx = lookup(opCtx);
+            BSONObjBuilder bb;
+            bb.append("admissions", admCtx->getAdmissions());
+            bb.append("totalTimeQueuedMicros",
+                      durationCount<Microseconds>(admCtx->totalTimeQueuedMicros()));
+            queuesBuilder.append(queueName, bb.obj());
+        }
+
+        pAttrs->add("queues", queuesBuilder.obj());
+    }
+}
+
+void OpDebug::reportStorageStats(logv2::DynamicAttributes* pAttrs) const {
+    if (storageStats) {
+        pAttrs->add("storage", storageStats->toBSON());
+    }
 }
 
 #define OPDEBUG_APPEND_NUMBER2(b, x, y) \
@@ -1260,10 +1440,11 @@ void OpDebug::append(OperationContext* opCtx,
 
     OPDEBUG_APPEND_OPTIONAL(b, "keysExamined", additiveMetrics.keysExamined);
     OPDEBUG_APPEND_OPTIONAL(b, "docsExamined", additiveMetrics.docsExamined);
-    OPDEBUG_APPEND_BOOL(b, hasSortStage);
-    OPDEBUG_APPEND_BOOL(b, usedDisk);
-    OPDEBUG_APPEND_BOOL(b, fromMultiPlanner);
-    OPDEBUG_APPEND_BOOL(b, fromPlanCache);
+
+    OPDEBUG_APPEND_BOOL2(b, "hasSortStage", additiveMetrics.hasSortStage);
+    OPDEBUG_APPEND_BOOL2(b, "usedDisk", additiveMetrics.usedDisk);
+    OPDEBUG_APPEND_BOOL2(b, "fromMultiPlanner", additiveMetrics.fromMultiPlanner);
+    OPDEBUG_APPEND_BOOL2(b, "fromPlanCache", additiveMetrics.fromPlanCache.value_or(false));
     if (replanReason) {
         bool replanned = true;
         OPDEBUG_APPEND_BOOL(b, replanned);
@@ -1295,6 +1476,9 @@ void OpDebug::append(OperationContext* opCtx,
     }
     if (planCacheKey) {
         b.append("planCacheKey", zeroPaddedHex(*planCacheKey));
+    }
+    if (const auto shapeHash = CurOp::get(opCtx)->getQueryShapeHash()) {
+        b.append("queryShapeHash", shapeHash->toHexString());
     }
 
     switch (queryFramework) {
@@ -1377,7 +1561,9 @@ void OpDebug::append(OperationContext* opCtx,
         b.append("remoteOpWaitMillis", durationCount<Milliseconds>(*remoteOpWaitTime));
     }
 
-    if (cpuTime > Nanoseconds::zero()) {
+    // Always log cpuNanos in rare cases that it is zero to facilitate testing that expects this
+    // field to always exist.
+    if (cpuTime >= Nanoseconds::zero()) {
         b.appendNumber("cpuNanos", durationCount<Nanoseconds>(cpuTime));
     }
 
@@ -1399,6 +1585,10 @@ void OpDebug::append(OperationContext* opCtx,
     if (planningTime > Microseconds::zero()) {
         b.appendNumber("planningTimeMicros", durationCount<Microseconds>(planningTime));
     }
+
+    OPDEBUG_APPEND_OPTIONAL(b, "estimatedCost", estimatedCost);
+
+    OPDEBUG_APPEND_OPTIONAL(b, "estimatedCardinality", estimatedCardinality);
 
     if (totalOplogSlotDurationMicros > Microseconds::zero()) {
         b.appendNumber("totalOplogSlotDurationMicros",
@@ -1428,8 +1618,8 @@ void OpDebug::appendUserInfo(const CurOp& c,
 std::function<BSONObj(ProfileFilter::Args)> OpDebug::appendStaged(StringSet requestedFields,
                                                                   bool needWholeDocument) {
     // This function is analogous to OpDebug::append. The main difference is that append() does
-    // the work of building BSON right away, while appendStaged() stages the work to be done later.
-    // It returns a std::function that builds BSON when called.
+    // the work of building BSON right away, while appendStaged() stages the work to be done
+    // later. It returns a std::function that builds BSON when called.
 
     // The other difference is that appendStaged can avoid building BSON for unneeded fields.
     // requestedFields is a set of top-level field names; any fields beyond this list may be
@@ -1521,16 +1711,16 @@ std::function<BSONObj(ProfileFilter::Args)> OpDebug::appendStaged(StringSet requ
         OPDEBUG_APPEND_OPTIONAL(b, field, args.op.additiveMetrics.docsExamined);
     });
     addIfNeeded("hasSortStage", [](auto field, auto args, auto& b) {
-        OPDEBUG_APPEND_BOOL2(b, field, args.op.hasSortStage);
+        OPDEBUG_APPEND_BOOL2(b, field, args.op.additiveMetrics.hasSortStage);
     });
     addIfNeeded("usedDisk", [](auto field, auto args, auto& b) {
-        OPDEBUG_APPEND_BOOL2(b, field, args.op.usedDisk);
+        OPDEBUG_APPEND_BOOL2(b, field, args.op.additiveMetrics.usedDisk);
     });
     addIfNeeded("fromMultiPlanner", [](auto field, auto args, auto& b) {
-        OPDEBUG_APPEND_BOOL2(b, field, args.op.fromMultiPlanner);
+        OPDEBUG_APPEND_BOOL2(b, field, args.op.additiveMetrics.fromMultiPlanner);
     });
     addIfNeeded("fromPlanCache", [](auto field, auto args, auto& b) {
-        OPDEBUG_APPEND_BOOL2(b, field, args.op.fromPlanCache);
+        OPDEBUG_APPEND_BOOL2(b, field, args.op.additiveMetrics.fromPlanCache.value_or(false));
     });
     addIfNeeded("replanned", [](auto field, auto args, auto& b) {
         if (args.op.replanReason) {
@@ -1604,6 +1794,11 @@ std::function<BSONObj(ProfileFilter::Args)> OpDebug::appendStaged(StringSet requ
             b.append(field, zeroPaddedHex(*args.op.planCacheKey));
         }
     });
+    addIfNeeded("queryShapeHash", [](auto field, auto args, auto& b) {
+        if (auto hash = args.curop.getQueryShapeHash()) {
+            b.append(field, hash->toHexString());
+        }
+    });
 
     addIfNeeded("queryFramework", [](auto field, auto args, auto& b) {
         switch (args.op.queryFramework) {
@@ -1624,11 +1819,11 @@ std::function<BSONObj(ProfileFilter::Args)> OpDebug::appendStaged(StringSet requ
     });
 
     addIfNeeded("locks", [](auto field, auto args, auto& b) {
-        if (auto lockerInfo =
-                args.opCtx->lockState()->getLockerInfo(args.curop.getLockStatsBase())) {
-            BSONObjBuilder locks(b.subobjStart(field));
-            lockerInfo->stats.report(&locks);
-        }
+        auto lockerInfo =
+            shard_role_details::getLocker(args.opCtx)->getLockerInfo(args.curop.getLockStatsBase());
+        // TODO SERVER-88195: Account for _lockStatsOnceStashed
+        BSONObjBuilder locks(b.subobjStart(field));
+        lockerInfo.stats.report(&locks);
     });
 
     addIfNeeded("authorization", [](auto field, auto args, auto& b) {
@@ -1649,7 +1844,7 @@ std::function<BSONObj(ProfileFilter::Args)> OpDebug::appendStaged(StringSet requ
 
     addIfNeeded("flowControl", [](auto field, auto args, auto& b) {
         BSONObj flowControlMetrics =
-            makeFlowControlObject(args.opCtx->lockState()->getFlowControlStats());
+            makeFlowControlObject(shard_role_details::getLocker(args.opCtx)->getFlowControlStats());
         BSONObjBuilder flowControlBuilder(b.subobjStart(field));
         flowControlBuilder.appendElements(flowControlMetrics);
     });
@@ -1702,7 +1897,9 @@ std::function<BSONObj(ProfileFilter::Args)> OpDebug::appendStaged(StringSet requ
     });
 
     addIfNeeded("cpuNanos", [](auto field, auto args, auto& b) {
-        if (args.op.cpuTime > Nanoseconds::zero()) {
+        // Always report cpuNanos in rare cases that it is zero to facilitate testing that expects
+        // this field to always exist.
+        if (args.op.cpuTime >= Nanoseconds::zero()) {
             b.appendNumber(field, durationCount<Nanoseconds>(args.op.cpuTime));
         }
     });
@@ -1737,6 +1934,14 @@ std::function<BSONObj(ProfileFilter::Args)> OpDebug::appendStaged(StringSet requ
 
     addIfNeeded("planningTimeMicros", [](auto field, auto args, auto& b) {
         b.appendNumber(field, durationCount<Microseconds>(args.op.planningTime));
+    });
+
+    addIfNeeded("estimatedCost", [](auto field, auto args, auto& b) {
+        OPDEBUG_APPEND_OPTIONAL(b, field, args.op.estimatedCost);
+    });
+
+    addIfNeeded("estimatedCardinality", [](auto field, auto args, auto& b) {
+        OPDEBUG_APPEND_OPTIONAL(b, field, args.op.estimatedCardinality);
     });
 
     addIfNeeded("totalOplogSlotDurationMicros", [](auto field, auto args, auto& b) {
@@ -1781,16 +1986,33 @@ std::function<BSONObj(ProfileFilter::Args)> OpDebug::appendStaged(StringSet requ
 }
 
 void OpDebug::setPlanSummaryMetrics(const PlanSummaryStats& planSummaryStats) {
-    additiveMetrics.keysExamined = planSummaryStats.totalKeysExamined;
-    additiveMetrics.docsExamined = planSummaryStats.totalDocsExamined;
-    hasSortStage = planSummaryStats.hasSortStage;
-    usedDisk = planSummaryStats.usedDisk;
+    // Data-bearing node metrics need to be aggregated here rather than just assigned.
+    // Certain operations like $mergeCursors may have already accumulated metrics from remote
+    // data-bearing nodes, and we need to add in the work done locally.
+    additiveMetrics.keysExamined =
+        additiveMetrics.keysExamined.value_or(0) + planSummaryStats.totalKeysExamined;
+    additiveMetrics.docsExamined =
+        additiveMetrics.docsExamined.value_or(0) + planSummaryStats.totalDocsExamined;
+    additiveMetrics.hasSortStage = additiveMetrics.hasSortStage || planSummaryStats.hasSortStage;
+    additiveMetrics.usedDisk = additiveMetrics.usedDisk || planSummaryStats.usedDisk;
+    additiveMetrics.fromMultiPlanner =
+        additiveMetrics.fromMultiPlanner || planSummaryStats.fromMultiPlanner;
+    // Note that fromPlanCache is an AND of all operations rather than an OR like the other metrics.
+    // This is to ensure we register when any part of the query _missed_ the cache, which is thought
+    // to be the more interesting event.
+    if (!additiveMetrics.fromPlanCache.has_value()) {
+        additiveMetrics.fromPlanCache = true;
+    }
+    *additiveMetrics.fromPlanCache =
+        *additiveMetrics.fromPlanCache && planSummaryStats.fromPlanCache;
+
     sortSpills = planSummaryStats.sortSpills;
     sortTotalDataSizeBytes = planSummaryStats.sortTotalDataSizeBytes;
     keysSorted = planSummaryStats.keysSorted;
-    fromMultiPlanner = planSummaryStats.fromMultiPlanner;
-    fromPlanCache = planSummaryStats.fromPlanCache;
     replanReason = planSummaryStats.replanReason;
+    collectionScans = planSummaryStats.collectionScans;
+    collectionScansNonTailable = planSummaryStats.collectionScansNonTailable;
+    indexesUsed = planSummaryStats.indexesUsed;
 }
 
 BSONObj OpDebug::makeFlowControlObject(FlowControlTicketholder::CurOp stats) {
@@ -1820,6 +2042,9 @@ BSONObj OpDebug::makeMongotDebugStatsObject() const {
     cursorBuilder.append("batchNum", mongotBatchNum);
     if (!mongotCountVal.isEmpty()) {
         cursorBuilder.append("resultCount", mongotCountVal);
+    }
+    if (!mongotSlowQueryLog.isEmpty()) {
+        cursorBuilder.appendElements(mongotSlowQueryLog);
     }
     return cursorBuilder.obj();
 }
@@ -1861,6 +2086,20 @@ static void appendResolvedViewsInfoImpl(
 
         resolvedViewsArr.append(redact(aView.done()));
     }
+}
+
+CursorMetrics OpDebug::getCursorMetrics() const {
+    CursorMetrics metrics;
+
+    metrics.setKeysExamined(additiveMetrics.keysExamined.value_or(0));
+    metrics.setDocsExamined(additiveMetrics.docsExamined.value_or(0));
+
+    metrics.setHasSortStage(additiveMetrics.hasSortStage);
+    metrics.setUsedDisk(additiveMetrics.usedDisk);
+    metrics.setFromMultiPlanner(additiveMetrics.fromMultiPlanner);
+    metrics.setFromPlanCache(additiveMetrics.fromPlanCache.value_or(false));
+
+    return metrics;
 }
 
 BSONArray OpDebug::getResolvedViewsInfo() const {
@@ -1949,6 +2188,50 @@ void OpDebug::AdditiveMetrics::add(const AdditiveMetrics& otherMetrics) {
     writeConflicts.fetchAndAdd(otherMetrics.writeConflicts.load());
     temporarilyUnavailableErrors.fetchAndAdd(otherMetrics.temporarilyUnavailableErrors.load());
     executionTime = addOptionals(executionTime, otherMetrics.executionTime);
+
+    hasSortStage = hasSortStage || otherMetrics.hasSortStage;
+    usedDisk = usedDisk || otherMetrics.usedDisk;
+    fromMultiPlanner = fromMultiPlanner || otherMetrics.fromMultiPlanner;
+    // Note that fromPlanCache is an AND of all operations rather than an OR like the other metrics.
+    // This is to ensure we register when any part of the query _missed_ the cache, which is thought
+    // to be the more interesting event.
+    if (!fromPlanCache.has_value()) {
+        fromPlanCache = true;
+    }
+    *fromPlanCache = *fromPlanCache && otherMetrics.fromPlanCache.value_or(true);
+}
+
+void OpDebug::AdditiveMetrics::aggregateDataBearingNodeMetrics(
+    const query_stats::DataBearingNodeMetrics& metrics) {
+    keysExamined = keysExamined.value_or(0) + metrics.keysExamined;
+    docsExamined = docsExamined.value_or(0) + metrics.docsExamined;
+    hasSortStage = hasSortStage || metrics.hasSortStage;
+    usedDisk = usedDisk || metrics.usedDisk;
+    fromMultiPlanner = fromMultiPlanner || metrics.fromMultiPlanner;
+    // Note that fromPlanCache is an AND of all operations rather than an OR like the other metrics.
+    // This is to ensure we register when any part of the query _missed_ the cache, which is thought
+    // to be the more interesting event.
+    if (!fromPlanCache.has_value()) {
+        fromPlanCache = true;
+    }
+    *fromPlanCache = *fromPlanCache && metrics.fromPlanCache;
+}
+
+void OpDebug::AdditiveMetrics::aggregateDataBearingNodeMetrics(
+    const boost::optional<query_stats::DataBearingNodeMetrics>& metrics) {
+    if (metrics) {
+        aggregateDataBearingNodeMetrics(*metrics);
+    }
+}
+
+void OpDebug::AdditiveMetrics::aggregateCursorMetrics(const CursorMetrics& metrics) {
+    aggregateDataBearingNodeMetrics(
+        query_stats::DataBearingNodeMetrics{static_cast<uint64_t>(metrics.getKeysExamined()),
+                                            static_cast<uint64_t>(metrics.getDocsExamined()),
+                                            metrics.getHasSortStage(),
+                                            metrics.getUsedDisk(),
+                                            metrics.getFromMultiPlanner(),
+                                            metrics.getFromPlanCache()});
 }
 
 void OpDebug::AdditiveMetrics::reset() {

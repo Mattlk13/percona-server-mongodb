@@ -76,7 +76,7 @@ public:
 
     explicit TenantMigrationDonorService(ServiceContext* const serviceContext)
         : PrimaryOnlyService(serviceContext), _serviceContext(serviceContext) {}
-    ~TenantMigrationDonorService() = default;
+    ~TenantMigrationDonorService() override = default;
 
     StringData getServiceName() const override {
         return kServiceName;
@@ -118,7 +118,7 @@ public:
                           const TenantMigrationDonorService* donorService,
                           const BSONObj& initialState);
 
-        ~Instance();
+        ~Instance() override;
 
         SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                              const CancellationToken& token) noexcept override;
@@ -184,6 +184,11 @@ public:
         const MigrationProtocolEnum& getProtocol() const {
             return _protocol;
         }
+
+        /**
+         * Returns the instance state document.
+         */
+        TenantMigrationDonorDocument getStateDoc() const;
 
     private:
         const NamespaceString _stateDocumentsNS = NamespaceString::kTenantMigrationDonorsNamespace;

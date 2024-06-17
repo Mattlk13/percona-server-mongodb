@@ -8,7 +8,12 @@
  */
 import {ConfigShardUtil} from "jstests/libs/config_shard_util.js";
 import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 import {Thread} from "jstests/libs/parallelTester.js";
+import {
+    moveDatabaseAndUnshardedColls
+} from "jstests/sharding/libs/move_database_and_unsharded_coll_helper.js";
 
 const dbName = "foo";
 const collName = "bar";
@@ -97,6 +102,7 @@ const newShardName =
     //
     assert.commandWorked(
         st.s.getCollection(ns).insert({readFromSecondary: 1, skey: -1}, {writeConcern: {w: 3}}));
+    FixtureHelpers.awaitReplication(st.s.getDB(dbName));
     let secondaryRes = assert.commandWorked(st.s.getDB(dbName).runCommand({
         find: collName,
         filter: {readFromSecondary: 1, skey: -1},
@@ -175,10 +181,11 @@ const newShardName =
 
     // Create a sharded and unsharded timeseries collection and verify they and their buckets
     // collections are correctly dropped. This provides coverage for views and sharded views.
+    assert.commandWorked(
+        st.s.adminCommand({enableSharding: timeseriesDbName, primaryShard: configShardName}));
     const timeseriesDB = st.s.getDB(timeseriesDbName);
     assert.commandWorked(timeseriesDB.createCollection(timeseriesUnshardedCollName,
                                                        {timeseries: {timeField: "time"}}));
-    assert.commandWorked(st.s.adminCommand({movePrimary: timeseriesDbName, to: configShardName}));
     assert.commandWorked(timeseriesDB.createCollection(timeseriesShardedCollName,
                                                        {timeseries: {timeField: "time"}}));
     assert.commandWorked(st.s.adminCommand({shardCollection: timeseriesShardedNs, key: {time: 1}}));
@@ -193,8 +200,8 @@ const newShardName =
 
     // Use write concern to verify the commands support them. Any values weaker than the default
     // sharding metadata write concerns will be upgraded.
-    let removeRes = assert.commandWorked(
-        st.s0.adminCommand({transitionToDedicatedConfigServer: 1, writeConcern: {wtimeout: 100}}));
+    let removeRes = assert.commandWorked(st.s0.adminCommand(
+        {transitionToDedicatedConfigServer: 1, writeConcern: {wtimeout: 1000 * 60 * 60 * 24}}));
     assert.eq("started", removeRes.state);
 
     // The removal won't complete until all chunks and dbs are moved off the config shard.
@@ -216,12 +223,16 @@ const newShardName =
     // Blocked because of the sharded and unsharded databases and the remaining chunk.
     removeRes = assert.commandWorked(st.s0.adminCommand({transitionToDedicatedConfigServer: 1}));
     assert.eq("ongoing", removeRes.state);
-    assert.eq(1, removeRes.remaining.chunks);
+    // TODO SERVER-77915 remove feature flag and set remaining chunks to 2 (before track unsharded,
+    // only sharded collection had associated chunks)
+    const isTrackUnshardedUponCreationEnabled = FeatureFlagUtil.isPresentAndEnabled(
+        st.s.getDB('admin'), "TrackUnshardedCollectionsUponCreation");
+    assert.eq(isTrackUnshardedUponCreationEnabled ? 2 : 1, removeRes.remaining.chunks);
     assert.eq(3, removeRes.remaining.dbs);
 
-    assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: newShardName}));
-    assert.commandWorked(st.s.adminCommand({movePrimary: unshardedDbName, to: newShardName}));
-    assert.commandWorked(st.s.adminCommand({movePrimary: timeseriesDbName, to: newShardName}));
+    moveDatabaseAndUnshardedColls(st.s.getDB(dbName), newShardName);
+    moveDatabaseAndUnshardedColls(st.s.getDB(unshardedDbName), newShardName);
+    moveDatabaseAndUnshardedColls(st.s.getDB(timeseriesDbName), newShardName);
 
     // The draining sharded collections should not have been locally dropped yet.
     assert(configPrimary.getCollection(ns).exists());
@@ -324,8 +335,8 @@ const newShardName =
 
     // Use write concern to verify the command support them. Any values weaker than the default
     // sharding metadata write concerns will be upgraded.
-    assert.commandWorked(
-        st.s.adminCommand({transitionFromDedicatedConfigServer: 1, writeConcern: {wtimeout: 100}}));
+    assert.commandWorked(st.s.adminCommand(
+        {transitionFromDedicatedConfigServer: 1, writeConcern: {wtimeout: 1000 * 60 * 60 * 24}}));
 
     // Basic CRUD and sharded DDL work.
     basicCRUD(st.s);

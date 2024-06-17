@@ -43,11 +43,11 @@
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/variables.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/s/analyze_shard_key_util.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/shard_id.h"
 #include "mongo/idl/idl_parser.h"
 #include "mongo/s/analyze_shard_key_common_gen.h"
-#include "mongo/s/analyze_shard_key_util.h"
 #include "mongo/s/collection_routing_info_targeter.h"
 #include "mongo/s/shard_key_pattern_query_util.h"
 #include "mongo/util/intrusive_counter.h"
@@ -268,7 +268,7 @@ void WriteDistributionMetricsCalculator::_addUpdateQuery(
         // shard key is not supported or when the query targets an exact id value.
         if (isReplacementUpdate &&
             (!feature_flags::gFeatureFlagUpdateOneWithoutShardKey.isEnabled(
-                 serverGlobalParams.featureCompatibility) ||
+                 serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) ||
              isExactIdQuery())) {
             auto filter =
                 _getShardKeyPattern().extractShardKeyFromDoc(updateMod.getUpdateReplacement());

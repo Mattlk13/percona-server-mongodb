@@ -84,10 +84,22 @@ struct BucketDocument {
 };
 
 /**
+ * Constructs a BSONColumn DocDiff entry.
+ *
+ * {
+ *     o(ffset): Number,    // Offset into existing BSONColumn
+ *     d(ata):   BinData    // Binary data to copy to existing BSONColumn
+ * }
+ */
+BSONObj makeBSONColumnDocDiff(const TrackedBSONColumnBuilder::BinaryDiff& binaryDiff);
+
+/**
  * Returns the document for writing a new bucket with a write batch.
  */
 BucketDocument makeNewDocumentForWrite(
-    std::shared_ptr<timeseries::bucket_catalog::WriteBatch> batch, const BSONObj& metadata);
+    const NamespaceString& nss,
+    std::shared_ptr<timeseries::bucket_catalog::WriteBatch> batch,
+    const BSONObj& metadata);
 
 /**
  * Returns the document for writing a new bucket with 'measurements'. Calculates the min and max
@@ -97,6 +109,7 @@ BucketDocument makeNewDocumentForWrite(
  */
 BucketDocument makeNewDocumentForWrite(
     const NamespaceString& nss,
+    const UUID& collectionUUID,
     const OID& bucketId,
     const std::vector<BSONObj>& measurements,
     const BSONObj& metadata,
@@ -111,6 +124,7 @@ BucketDocument makeNewDocumentForWrite(
  */
 BSONObj makeBucketDocument(const std::vector<BSONObj>& measurements,
                            const NamespaceString& nss,
+                           const UUID& collectionUUID,
                            const TimeseriesOptions& options,
                            const StringDataComparator* comparator);
 
@@ -118,7 +132,7 @@ BSONObj makeBucketDocument(const std::vector<BSONObj>& measurements,
  * Returns an update request to the bucket when the 'measurements' is non-empty. Otherwise, returns
  * a delete request to the bucket.
  */
-stdx::variant<write_ops::UpdateCommandRequest, write_ops::DeleteCommandRequest> makeModificationOp(
+std::variant<write_ops::UpdateCommandRequest, write_ops::DeleteCommandRequest> makeModificationOp(
     const OID& bucketId, const CollectionPtr& coll, const std::vector<BSONObj>& measurements);
 
 using TimeseriesBatches = std::vector<std::shared_ptr<bucket_catalog::WriteBatch>>;
@@ -159,14 +173,22 @@ write_ops::UpdateCommandRequest makeTimeseriesUpdateOp(
     std::vector<StmtId>&& stmtIds = {});
 
 /**
- * Builds the decompress and update command request from a time-series insert write batch.
+ * Builds the DocDiff update command request from a time-series insert write batch.
+ * Assumes min/max in WriteBatch have already been updated to reflect new measurements in batch.
  */
-write_ops::UpdateCommandRequest makeTimeseriesDecompressAndUpdateOp(
+write_ops::UpdateCommandRequest makeTimeseriesCompressedDiffUpdateOp(
     OperationContext* opCtx,
     std::shared_ptr<timeseries::bucket_catalog::WriteBatch> batch,
     const NamespaceString& bucketsNs,
-    const BSONObj& metadata,
     std::vector<StmtId>&& stmtIds = {});
+
+enum class BucketReopeningPermittance {
+    kAllowed,
+    kDisallowed,
+};
+
+using CompressAndWriteBucketFunc = std::function<void(
+    OperationContext*, const OID&, const NamespaceString&, const UUID&, StringData)>;
 
 /**
  * Attempts to insert a measurement doc into a bucket in the bucket catalog and retries
@@ -178,12 +200,12 @@ write_ops::UpdateCommandRequest makeTimeseriesDecompressAndUpdateOp(
 StatusWith<timeseries::bucket_catalog::InsertResult> attemptInsertIntoBucket(
     OperationContext* opCtx,
     bucket_catalog::BucketCatalog& bucketCatalog,
-    const NamespaceString& viewNs,
     const Collection* bucketsColl,
     TimeseriesOptions& timeSeriesOptions,
     const BSONObj& measurementDoc,
+    BucketReopeningPermittance,
     bucket_catalog::CombineWithInsertsFromOtherClients combine,
-    bool fromUpdates = false);
+    const CompressAndWriteBucketFunc& compressAndWriteBucketFunc);
 
 /**
  * Prepares the final write batches needed for performing the writes to storage.
@@ -232,8 +254,8 @@ void performAtomicWrites(
     OperationContext* opCtx,
     const CollectionPtr& coll,
     const RecordId& recordId,
-    const boost::optional<stdx::variant<write_ops::UpdateCommandRequest,
-                                        write_ops::DeleteCommandRequest>>& modificationOp,
+    const boost::optional<std::variant<write_ops::UpdateCommandRequest,
+                                       write_ops::DeleteCommandRequest>>& modificationOp,
     const std::vector<write_ops::InsertCommandRequest>& insertOps,
     const std::vector<write_ops::UpdateCommandRequest>& updateOps,
     bool fromMigrate,
@@ -263,7 +285,8 @@ void performAtomicWritesForUpdate(
     bucket_catalog::BucketCatalog& sideBucketCatalog,
     bool fromMigrate,
     StmtId stmtId,
-    std::set<OID>* bucketIds);
+    std::set<OID>* bucketIds,
+    const CompressAndWriteBucketFunc& compressAndWriteBucketFunc);
 
 /**
  * Change the bucket namespace to time-series view namespace for time-series command.
@@ -305,4 +328,24 @@ void deleteRequestCheckFunction(DeleteRequest* request, const TimeseriesOptions&
  * Function that performs checks on an update request being performed on a timeseries collection.
  */
 void updateRequestCheckFunction(UpdateRequest* request, const TimeseriesOptions& options);
+
+
+namespace details {
+/**
+ * Helper for measurement sorting.
+ * timeField: {"<timeField>": "2022-06-06T15:34:30.000Z"}
+ * dataFields: [{"<timefield>": 2022-06-06T15:34:30.000Z}, {"a": 1}, {"b": 2}]
+ */
+struct Measurement {
+    BSONElement timeField;
+    std::vector<BSONElement> dataFields;
+};
+
+/**
+ * Returns collection of measurements sorted on time field.
+ * Filters out meta field from input and does not include it in output.
+ */
+std::vector<Measurement> sortMeasurementsOnTimeField(
+    std::shared_ptr<bucket_catalog::WriteBatch> batch);
+}  // namespace details
 }  // namespace mongo::timeseries

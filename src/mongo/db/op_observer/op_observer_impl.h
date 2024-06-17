@@ -44,7 +44,7 @@
 #include "mongo/db/database_name.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer/op_observer.h"
-#include "mongo/db/op_observer/oplog_writer.h"
+#include "mongo/db/op_observer/operation_logger.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_entry.h"
@@ -63,15 +63,13 @@ class ReplOperation;
 
 }  // namespace repl
 
-class ShardingWriteRouter;
-
 class OpObserverImpl : public OpObserver {
     OpObserverImpl(const OpObserverImpl&) = delete;
     OpObserverImpl& operator=(const OpObserverImpl&) = delete;
 
 public:
-    OpObserverImpl(std::unique_ptr<OplogWriter> oplogWriter);
-    virtual ~OpObserverImpl() = default;
+    OpObserverImpl(std::unique_ptr<OperationLogger> operationLogger);
+    ~OpObserverImpl() override = default;
 
     NamespaceFilters getNamespaceFilters() const final {
         return {NamespaceFilter::kAll, NamespaceFilter::kAll};
@@ -125,6 +123,7 @@ public:
                    const CollectionPtr& coll,
                    std::vector<InsertStatement>::const_iterator first,
                    std::vector<InsertStatement>::const_iterator last,
+                   const std::vector<RecordId>& recordIds,
                    std::vector<bool> fromMigrate,
                    bool defaultFromMigrate,
                    OpStateAccumulator* opAccumulator = nullptr) final;
@@ -230,7 +229,9 @@ public:
         const ApplyOpsOplogSlotAndOperationAssignment& applyOpsOperationAssignment,
         OpStateAccumulator* opAccumulator = nullptr) final;
     void onBatchedWriteStart(OperationContext* opCtx) final;
-    void onBatchedWriteCommit(OperationContext* opCtx) final;
+    void onBatchedWriteCommit(OperationContext* opCtx,
+                              WriteUnitOfWork::OplogEntryGroupType oplogGroupingFormat,
+                              OpStateAccumulator* opAccumulator = nullptr) final;
     void onBatchedWriteAbort(OperationContext* opCtx) final;
     void onPreparedTransactionCommit(
         OperationContext* opCtx,
@@ -269,7 +270,7 @@ public:
                                      const repl::OpTime& newCommitPoint) final {}
 
 private:
-    std::unique_ptr<OplogWriter> _oplogWriter;
+    std::unique_ptr<OperationLogger> _operationLogger;
 };
 
 }  // namespace mongo

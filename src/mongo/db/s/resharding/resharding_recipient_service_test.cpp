@@ -51,6 +51,7 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/index_builds_coordinator_mock.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/op_observer/op_observer_registry.h"
@@ -89,6 +90,7 @@
 #include "mongo/s/database_version.h"
 #include "mongo/s/index_version.h"
 #include "mongo/s/sharding_index_catalog_cache.h"
+#include "mongo/s/sharding_test_fixture_common.h"
 #include "mongo/s/type_collection_common_types_gen.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/unittest/bson_test_util.h"
@@ -152,10 +154,11 @@ public:
                 "randomKey_1", BSON("randomKey" << 1), BSONObj(), Timestamp(1, 0), _sourceUUID));
 
         return CollectionRoutingInfo{
-            ChunkManager(_someDonorId,
-                         DatabaseVersion(UUID::gen(), Timestamp(1, 1)),
-                         _makeStandaloneRoutingTableHistory(std::move(rt)),
-                         boost::none /* clusterTime */),
+            ChunkManager(
+                _someDonorId,
+                DatabaseVersion(UUID::gen(), Timestamp(1, 1)),
+                ShardingTestFixtureCommon::makeStandaloneRoutingTableHistory(std::move(rt)),
+                boost::none /* clusterTime */),
             ShardingIndexesCatalogCache(CollectionIndexes(_sourceUUID, Timestamp(1, 0)),
                                         std::move(shardingIndexesCatalogMap))};
     }
@@ -181,7 +184,7 @@ public:
     }
 
     boost::optional<ShardingIndexesCatalogCache> getCollectionIndexInfoWithRefresh(
-        OperationContext* opCtx, const NamespaceString& nss) {
+        OperationContext* opCtx, const NamespaceString& nss) override {
         return boost::none;
     }
 
@@ -201,13 +204,6 @@ public:
                                 const NamespaceString& tempReshardingNss) override {}
 
 private:
-    RoutingTableHistoryValueHandle _makeStandaloneRoutingTableHistory(RoutingTableHistory rt) {
-        const auto version = rt.getVersion();
-        return RoutingTableHistoryValueHandle(
-            std::make_shared<RoutingTableHistory>(std::move(rt)),
-            ComparableChunkVersion::makeComparableChunkVersion(version));
-    }
-
     const StringData _currentShardKey = "oldKey";
 
     const NamespaceString _sourceNss =
@@ -270,6 +266,11 @@ class ReshardingRecipientServiceTest : public repl::PrimaryOnlyServiceMongoDTest
 public:
     using RecipientStateMachine = ReshardingRecipientService::RecipientStateMachine;
 
+    ReshardingRecipientServiceTest()
+        : repl::PrimaryOnlyServiceMongoDTest(
+              Options{}.useIndexBuildsCoordinator(std::make_unique<IndexBuildsCoordinatorMock>())) {
+    }
+
     std::unique_ptr<repl::PrimaryOnlyService> makeService(ServiceContext* serviceContext) override {
         return std::make_unique<ReshardingRecipientServiceForTest>(serviceContext);
     }
@@ -317,7 +318,7 @@ public:
             UUID::gen(),
             sourceNss,
             sourceUUID,
-            resharding::constructTemporaryReshardingNss(sourceNss.db_forTest(), sourceUUID),
+            resharding::constructTemporaryReshardingNss(sourceNss, sourceUUID),
             newShardKeyPattern());
         commonMetadata.setStartTime(getServiceContext()->getFastClockSource()->now());
 
@@ -371,6 +372,23 @@ public:
         return ReshardingRecipientDocument::parse(errCtx, doc);
     }
 
+    ReshardingRecipientDocument getPersistedRecipientDocument(OperationContext* opCtx,
+                                                              UUID reshardingUUID) {
+        boost::optional<ReshardingRecipientDocument> persistedRecipientDocument;
+        PersistentTaskStore<ReshardingRecipientDocument> store(
+            NamespaceString::kRecipientReshardingOperationsNamespace);
+        store.forEach(opCtx,
+                      BSON(ReshardingRecipientDocument::kReshardingUUIDFieldName << reshardingUUID),
+                      [&](const auto& recipientDocument) {
+                          persistedRecipientDocument.emplace(recipientDocument);
+                          return false;
+                      });
+
+        ASSERT(persistedRecipientDocument);
+
+        return persistedRecipientDocument.get();
+    }
+
 private:
     TypeCollectionRecipientFields _makeRecipientFields(
         const ReshardingRecipientDocument& recipientDoc) {
@@ -410,9 +428,6 @@ private:
 };
 
 TEST_F(ReshardingRecipientServiceTest, CanTransitionThroughEachStateToCompletion) {
-    // TODO(SERVER-80519): Turn feature flag on and fix test.
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagReshardingImprovements",
-                                                               false);
     for (bool isAlsoDonor : {false, true}) {
         LOGV2(5551105,
               "Running case",
@@ -442,6 +457,12 @@ TEST_F(ReshardingRecipientServiceTest, CanTransitionThroughEachStateToCompletion
         Date_t copyEnd = recipient->getMetrics()
                              .getEndFor(ReshardingMetrics::TimedPhase::kCloning)
                              .value_or(Date_t::min());
+        Date_t buildIndexBegin = recipient->getMetrics()
+                                     .getStartFor(ReshardingMetrics::TimedPhase::kBuildingIndex)
+                                     .value_or(Date_t::min());
+        Date_t buildIndexEnd = recipient->getMetrics()
+                                   .getEndFor(ReshardingMetrics::TimedPhase::kBuildingIndex)
+                                   .value_or(Date_t::min());
         Date_t applyBegin = recipient->getMetrics()
                                 .getStartFor(ReshardingMetrics::TimedPhase::kApplying)
                                 .value_or(Date_t::min());
@@ -451,6 +472,10 @@ TEST_F(ReshardingRecipientServiceTest, CanTransitionThroughEachStateToCompletion
 
         auto copyBeginDoc = persistedRecipientDocument.getMetrics()->getDocumentCopy()->getStart();
         auto copyEndDoc = persistedRecipientDocument.getMetrics()->getDocumentCopy()->getStop();
+        auto buildIndexBeginDoc =
+            persistedRecipientDocument.getMetrics()->getIndexBuildTime()->getStart();
+        auto buildIndexEndDoc =
+            persistedRecipientDocument.getMetrics()->getIndexBuildTime()->getStop();
         auto applyBeginDoc =
             persistedRecipientDocument.getMetrics()->getOplogApplication()->getStart();
         auto applyEndDoc =
@@ -458,9 +483,12 @@ TEST_F(ReshardingRecipientServiceTest, CanTransitionThroughEachStateToCompletion
 
         ASSERT_NE(copyBegin, Date_t::min());
         ASSERT_NE(copyEnd, Date_t::min());
+        ASSERT_NE(buildIndexBegin, Date_t::min());
+        ASSERT_NE(buildIndexEnd, Date_t::min());
         ASSERT_NE(applyBegin, Date_t::min());
         ASSERT_NE(applyEnd, Date_t::min());
         ASSERT_LTE(copyBegin, copyEnd);
+        ASSERT_LTE(buildIndexBegin, buildIndexEnd);
         ASSERT_LTE(applyBegin, applyEnd);
 
         ASSERT_TRUE(copyBeginDoc.has_value());
@@ -468,6 +496,12 @@ TEST_F(ReshardingRecipientServiceTest, CanTransitionThroughEachStateToCompletion
 
         ASSERT_TRUE(copyEndDoc.has_value());
         ASSERT_EQ(copyEnd, copyEndDoc.get());
+
+        ASSERT_TRUE(buildIndexBeginDoc.has_value());
+        ASSERT_EQ(buildIndexBegin, buildIndexBeginDoc.get());
+
+        ASSERT_TRUE(buildIndexEndDoc.has_value());
+        ASSERT_EQ(buildIndexEnd, buildIndexEndDoc.get());
 
         ASSERT_TRUE(applyBeginDoc.has_value());
         ASSERT_EQ(applyBegin, applyBeginDoc.get());
@@ -482,11 +516,9 @@ TEST_F(ReshardingRecipientServiceTest, CanTransitionThroughEachStateToCompletion
 }
 
 TEST_F(ReshardingRecipientServiceTest, StepDownStepUpEachTransition) {
-    // TODO(SERVER-80519): Turn feature flag on and fix test.
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagReshardingImprovements",
-                                                               false);
     const std::vector<RecipientStateEnum> recipientStates{RecipientStateEnum::kCreatingCollection,
                                                           RecipientStateEnum::kCloning,
+                                                          RecipientStateEnum::kBuildingIndex,
                                                           RecipientStateEnum::kApplying,
                                                           RecipientStateEnum::kStrictConsistency,
                                                           RecipientStateEnum::kDone};
@@ -578,9 +610,6 @@ TEST_F(ReshardingRecipientServiceTest, StepDownStepUpEachTransition) {
 }
 
 TEST_F(ReshardingRecipientServiceTest, OpCtxKilledWhileRestoringMetrics) {
-    // TODO(SERVER-80519): Turn feature flag on and fix test.
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagReshardingImprovements",
-                                                               false);
     for (bool isAlsoDonor : {false, true}) {
         LOGV2(5992701,
               "Running case",
@@ -626,9 +655,6 @@ TEST_F(ReshardingRecipientServiceTest, OpCtxKilledWhileRestoringMetrics) {
 }
 
 DEATH_TEST_REGEX_F(ReshardingRecipientServiceTest, CommitFn, "4457001.*tripwire") {
-    // TODO(SERVER-80519): Turn feature flag on and fix test.
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagReshardingImprovements",
-                                                               false);
     auto doc = makeStateDocument(false /* isAlsoDonor */);
     auto opCtx = makeOperationContext();
     RecipientStateMachine::insertStateDocument(opCtx.get(), doc);
@@ -644,9 +670,6 @@ DEATH_TEST_REGEX_F(ReshardingRecipientServiceTest, CommitFn, "4457001.*tripwire"
 }
 
 TEST_F(ReshardingRecipientServiceTest, DropsTemporaryReshardingCollectionOnAbort) {
-    // TODO(SERVER-80519): Turn feature flag on and fix test.
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagReshardingImprovements",
-                                                               false);
     for (bool isAlsoDonor : {false, true}) {
         LOGV2(5551107,
               "Running case",
@@ -710,9 +733,6 @@ TEST_F(ReshardingRecipientServiceTest, DropsTemporaryReshardingCollectionOnAbort
 }
 
 TEST_F(ReshardingRecipientServiceTest, RenamesTemporaryReshardingCollectionWhenDone) {
-    // TODO(SERVER-80519): Turn feature flag on and fix test.
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagReshardingImprovements",
-                                                               false);
     // The temporary collection is renamed by the donor service when the shard is also a donor. Only
     // on non-donor shards will the recipient service rename the temporary collection.
     bool isAlsoDonor = false;
@@ -750,9 +770,6 @@ TEST_F(ReshardingRecipientServiceTest, RenamesTemporaryReshardingCollectionWhenD
 }
 
 TEST_F(ReshardingRecipientServiceTest, WritesNoopOplogEntryOnReshardDoneCatchUp) {
-    // TODO(SERVER-80519): Turn feature flag on and fix test.
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagReshardingImprovements",
-                                                               false);
     boost::optional<PauseDuringStateTransitions> doneTransitionGuard;
     doneTransitionGuard.emplace(controller(), RecipientStateEnum::kDone);
 
@@ -773,7 +790,7 @@ TEST_F(ReshardingRecipientServiceTest, WritesNoopOplogEntryOnReshardDoneCatchUp)
 
     DBDirectClient client(opCtx.get());
     NamespaceString sourceNss =
-        resharding::constructTemporaryReshardingNss("sourcedb", doc.getSourceUUID());
+        resharding::constructTemporaryReshardingNss(doc.getSourceNss(), doc.getSourceUUID());
 
     FindCommandRequest findRequest{NamespaceString::kRsOplogNamespace};
     findRequest.setFilter(BSON("ns" << sourceNss.toString_forTest() << "o2.reshardDoneCatchUp"
@@ -799,9 +816,6 @@ TEST_F(ReshardingRecipientServiceTest, WritesNoopOplogEntryOnReshardDoneCatchUp)
 }
 
 TEST_F(ReshardingRecipientServiceTest, WritesNoopOplogEntryForImplicitShardCollection) {
-    // TODO(SERVER-80519): Turn feature flag on and fix test.
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagReshardingImprovements",
-                                                               false);
     boost::optional<PauseDuringStateTransitions> doneTransitionGuard;
     doneTransitionGuard.emplace(controller(), RecipientStateEnum::kDone);
 
@@ -822,7 +836,7 @@ TEST_F(ReshardingRecipientServiceTest, WritesNoopOplogEntryForImplicitShardColle
 
     DBDirectClient client(opCtx.get());
     NamespaceString sourceNss =
-        resharding::constructTemporaryReshardingNss("sourcedb", doc.getSourceUUID());
+        resharding::constructTemporaryReshardingNss(doc.getSourceNss(), doc.getSourceUUID());
 
     FindCommandRequest findRequest{NamespaceString::kRsOplogNamespace};
     findRequest.setFilter(BSON("ns" << sourceNss.toString_forTest() << "o2.shardCollection"
@@ -847,9 +861,6 @@ TEST_F(ReshardingRecipientServiceTest, WritesNoopOplogEntryForImplicitShardColle
 }
 
 TEST_F(ReshardingRecipientServiceTest, TruncatesXLErrorOnRecipientDocument) {
-    // TODO(SERVER-80519): Turn feature flag on and fix test.
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagReshardingImprovements",
-                                                               false);
     for (bool isAlsoDonor : {false, true}) {
         LOGV2(5568600,
               "Running case",
@@ -874,20 +885,10 @@ TEST_F(ReshardingRecipientServiceTest, TruncatesXLErrorOnRecipientDocument) {
         // errored locally. It is therefore safe to check its local state document until
         // RecipientStateMachine::abort() is called.
         {
-            boost::optional<ReshardingRecipientDocument> persistedRecipientDocument;
-            PersistentTaskStore<ReshardingRecipientDocument> store(
-                NamespaceString::kRecipientReshardingOperationsNamespace);
-            store.forEach(opCtx.get(),
-                          BSON(ReshardingRecipientDocument::kReshardingUUIDFieldName
-                               << doc.getReshardingUUID()),
-                          [&](const auto& recipientDocument) {
-                              persistedRecipientDocument.emplace(recipientDocument);
-                              return false;
-                          });
-
-            ASSERT(persistedRecipientDocument);
+            auto persistedRecipientDocument =
+                getPersistedRecipientDocument(opCtx.get(), doc.getReshardingUUID());
             auto persistedAbortReasonBSON =
-                persistedRecipientDocument->getMutableState().getAbortReason();
+                persistedRecipientDocument.getMutableState().getAbortReason();
             ASSERT(persistedAbortReasonBSON);
             // The actual abortReason will be slightly larger than kReshardErrorMaxBytes bytes due
             // to the primitive truncation algorithm - Check that the total size is less than
@@ -905,9 +906,6 @@ TEST_F(ReshardingRecipientServiceTest, TruncatesXLErrorOnRecipientDocument) {
 }
 
 TEST_F(ReshardingRecipientServiceTest, MetricsSuccessfullyShutDownOnUserCancelation) {
-    // TODO(SERVER-80519): Turn feature flag on and fix test.
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagReshardingImprovements",
-                                                               false);
     auto doc = makeStateDocument(false);
     auto opCtx = makeOperationContext();
     RecipientStateMachine::insertStateDocument(opCtx.get(), doc);
@@ -923,11 +921,9 @@ TEST_F(ReshardingRecipientServiceTest, MetricsSuccessfullyShutDownOnUserCancelat
 }
 
 TEST_F(ReshardingRecipientServiceTest, RestoreMetricsAfterStepUp) {
-    // TODO(SERVER-80519): Turn feature flag on and fix test.
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagReshardingImprovements",
-                                                               false);
     const std::vector<RecipientStateEnum> recipientStates{RecipientStateEnum::kCreatingCollection,
                                                           RecipientStateEnum::kCloning,
+                                                          RecipientStateEnum::kBuildingIndex,
                                                           RecipientStateEnum::kApplying,
                                                           RecipientStateEnum::kStrictConsistency,
                                                           RecipientStateEnum::kDone};
@@ -1016,7 +1012,14 @@ TEST_F(ReshardingRecipientServiceTest, RestoreMetricsAfterStepUp) {
         }
         // Step down before the transition to state can complete.
         stateTransitionsGuard.wait(state);
-        if (state == RecipientStateEnum::kStrictConsistency) {
+        {
+            auto currOp = recipient
+                              ->reportForCurrentOp(
+                                  MongoProcessInterface::CurrentOpConnectionsMode::kExcludeIdle,
+                                  MongoProcessInterface::CurrentOpSessionsMode::kExcludeIdle)
+                              .value();
+        }
+        if (state == RecipientStateEnum::kApplying) {
             auto currOp = recipient
                               ->reportForCurrentOp(
                                   MongoProcessInterface::CurrentOpConnectionsMode::kExcludeIdle,
@@ -1026,7 +1029,7 @@ TEST_F(ReshardingRecipientServiceTest, RestoreMetricsAfterStepUp) {
             ASSERT_EQ(currOp.getField("documentsCopied").numberLong(), 1L);
             ASSERT_EQ(currOp.getField("bytesCopied").numberLong(), (long)reshardedDoc.objsize());
             ASSERT_EQ(currOp.getStringField("recipientState"),
-                      RecipientState_serializer(RecipientStateEnum::kApplying));
+                      RecipientState_serializer(RecipientStateEnum::kBuildingIndex));
         } else if (state == RecipientStateEnum::kDone) {
             auto currOp = recipient
                               ->reportForCurrentOp(
@@ -1062,9 +1065,6 @@ TEST_F(ReshardingRecipientServiceTest, RestoreMetricsAfterStepUp) {
 }
 
 TEST_F(ReshardingRecipientServiceTest, RestoreMetricsAfterStepUpWithMissingProgressDoc) {
-    // TODO(SERVER-80519): Turn feature flag on and fix test.
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagReshardingImprovements",
-                                                               false);
     auto doc = makeStateDocument(false);
     auto instanceId =
         BSON(ReshardingRecipientDocument::kReshardingUUIDFieldName << doc.getReshardingUUID());
@@ -1113,6 +1113,65 @@ TEST_F(ReshardingRecipientServiceTest, RestoreMetricsAfterStepUpWithMissingProgr
     auto recipient = RecipientStateMachine::getOrCreate(opCtx.get(), _service, doc.toBSON());
     notifyReshardingCommitting(opCtx.get(), *recipient, doc);
     ASSERT_OK(recipient->getCompletionFuture().getNoThrow());
+}
+
+TEST_F(ReshardingRecipientServiceTest, AbortAfterStepUpWithAbortReasonFromCoordinator) {
+    const auto abortErrMsg = "Recieved abort from the resharding coordinator";
+
+    for (bool isAlsoDonor : {false, true}) {
+        LOGV2(8743301,
+              "Running case",
+              "test"_attr = _agent.getTestName(),
+              "isAlsoDonor"_attr = isAlsoDonor);
+
+        auto removeRecipientDocFailpoint =
+            globalFailPointRegistry().find("removeRecipientDocFailpoint");
+        auto timesEnteredFailPoint = removeRecipientDocFailpoint->setMode(FailPoint::alwaysOn);
+
+        auto doc = makeStateDocument(isAlsoDonor);
+        auto instanceId =
+            BSON(ReshardingRecipientDocument::kReshardingUUIDFieldName << doc.getReshardingUUID());
+
+        auto opCtx = makeOperationContext();
+        if (isAlsoDonor) {
+            createSourceCollection(opCtx.get(), doc);
+        }
+
+        RecipientStateMachine::insertStateDocument(opCtx.get(), doc);
+        auto recipient = RecipientStateMachine::getOrCreate(opCtx.get(), _service, doc.toBSON());
+
+        recipient->abort(false);
+        removeRecipientDocFailpoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+
+        // Ensure the node is aborting with abortReason from coordinator.
+        {
+            auto persistedRecipientDocument =
+                getPersistedRecipientDocument(opCtx.get(), doc.getReshardingUUID());
+            auto state = persistedRecipientDocument.getMutableState().getState();
+            ASSERT_EQ(state, RecipientStateEnum::kDone);
+
+            auto abortReason = persistedRecipientDocument.getMutableState().getAbortReason();
+            ASSERT(abortReason);
+            ASSERT_EQ(abortReason->getIntField("code"), ErrorCodes::ReshardCollectionAborted);
+            ASSERT_EQ(abortReason->getStringField("errmsg").toString(), abortErrMsg);
+        }
+
+        stepDown();
+        ASSERT_EQ(recipient->getCompletionFuture().getNoThrow(), ErrorCodes::CallbackCanceled);
+        recipient.reset();
+
+        removeRecipientDocFailpoint->setMode(FailPoint::off);
+        stepUp(opCtx.get());
+
+        auto [maybeRecipient, isPausedOrShutdown] =
+            RecipientStateMachine::lookup(opCtx.get(), _service, instanceId);
+        ASSERT_TRUE(maybeRecipient);
+        ASSERT_FALSE(isPausedOrShutdown);
+        recipient = *maybeRecipient;
+
+        ASSERT_OK(recipient->getCompletionFuture().getNoThrow());
+        checkStateDocumentRemoved(opCtx.get());
+    }
 }
 
 }  // namespace

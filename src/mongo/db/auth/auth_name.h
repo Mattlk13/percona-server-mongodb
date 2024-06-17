@@ -49,8 +49,6 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/tenant_id.h"
-#include "mongo/stdx/variant.h"
-#include "mongo/util/database_name_util.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -95,7 +93,7 @@ public:
     /**
      * These methods support parsing usernames from IDL
      */
-    static T parseFromVariant(const stdx::variant<std::string, mongo::BSONObj>& name,
+    static T parseFromVariant(const std::variant<std::string, mongo::BSONObj>& name,
                               const boost::optional<TenantId>& tenant = boost::none);
     static T parseFromBSONObj(const BSONObj& obj,
                               const boost::optional<TenantId>& tenant = boost::none);
@@ -123,8 +121,7 @@ public:
     }
 
     DatabaseName getDatabaseName() const {
-        return DatabaseNameUtil::deserialize(
-            _tenant, _db, SerializationContext::stateAuthPrevalidated());
+        return DatabaseName(std::move(_tenant), _db);
     }
 
     /**

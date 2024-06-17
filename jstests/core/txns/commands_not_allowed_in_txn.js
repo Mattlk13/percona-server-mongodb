@@ -3,14 +3,14 @@
 // @tags: [
 //   # The test runs commands that are not allowed with security token: applyOps, endSession,
 //   # mapReduce.
-//   not_allowed_with_security_token,
+//   not_allowed_with_signed_security_token,
 //   uses_snapshot_read_concern,
 //   uses_transactions,
 //   # Tenant migrations don't support applyOps.
 //   tenant_migration_incompatible,
 // ]
 
-// TODO (SERVER-39704): Remove the following load after SERVER-397074 is completed
+// TODO (SERVER-39704): Remove the following load after SERVER-39704 is completed
 import {retryOnceOnTransientOnMongos} from "jstests/libs/auto_retry_transaction_in_sharding.js";
 
 const dbName = "test";
@@ -27,7 +27,7 @@ const sessionOptions = {
 const session = db.getMongo().startSession(sessionOptions);
 const sessionDb = session.getDatabase(dbName);
 
-const runningOnMongos = assert.commandWorked(db.runCommand("hello")).msg === "isdbgrid";
+const runningOnMongos = session.getClient().isMongos() || TestData.testingReplicaSetEndpoint;
 
 assert.commandWorked(testDB.createCollection(testColl.getName(), {writeConcern: {w: "majority"}}));
 assert.commandWorked(testDB.runCommand({

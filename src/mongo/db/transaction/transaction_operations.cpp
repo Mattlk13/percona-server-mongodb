@@ -160,15 +160,22 @@ void TransactionOperations::clear() {
 
 Status TransactionOperations::addOperation(const TransactionOperation& operation,
                                            boost::optional<std::size_t> transactionSizeLimitBytes) {
-    auto stmtIdsToInsert = operation.getStatementIds();
-    auto newTransactionStmtIds = _transactionStmtIds;
-    for (auto stmtId : stmtIdsToInsert) {
-        auto [_, inserted] = newTransactionStmtIds.insert(stmtId);
-        if (inserted) {
-            continue;
+    const auto& stmtIdsToInsert = operation.getStatementIds();
+    auto nextStmtIdToInsert = stmtIdsToInsert.begin();
+
+    // If the addOperation fails, we need to remove any statement IDs inserted.
+    ScopeGuard stmtIdRemover([&] {
+        for (auto iter = stmtIdsToInsert.begin(); iter != nextStmtIdToInsert; iter++)
+            _transactionStmtIds.erase(*iter);
+    });
+
+    for (; nextStmtIdToInsert != stmtIdsToInsert.end(); ++nextStmtIdToInsert) {
+        auto stmtId = *nextStmtIdToInsert;
+        auto [_, inserted] = _transactionStmtIds.insert(stmtId);
+        if (!inserted) {
+            return Status(ErrorCodes::Error(5875600),
+                          fmt::format("Found two operations using the same stmtId of {}", stmtId));
         }
-        return Status(static_cast<ErrorCodes::Error>(5875600),
-                      fmt::format("Found two operations using the same stmtId of {}", stmtId));
     }
 
     auto opSize = repl::DurableOplogEntry::getDurableReplOperationSize(operation);
@@ -198,9 +205,9 @@ Status TransactionOperations::addOperation(const TransactionOperation& operation
     }
 
     _transactionOperations.push_back(operation);
-    _transactionStmtIds = std::move(newTransactionStmtIds);
     _totalOperationBytes += opSize;
     _numberOfPrePostImagesToWrite += numberOfPrePostImagesToWrite;
+    stmtIdRemover.dismiss();
 
     return Status::OK();
 }
@@ -284,6 +291,7 @@ std::size_t TransactionOperations::logOplogEntries(
     const std::vector<OplogSlot>& oplogSlots,
     const ApplyOpsInfo& applyOpsOperationAssignment,
     Date_t wallClockTime,
+    WriteUnitOfWork::OplogEntryGroupType oplogGroupingFormat,
     LogApplyOpsFn logApplyOpsFn,
     boost::optional<TransactionOperation::ImageBundle>* prePostImageToWriteToImageCollection)
     const {
@@ -306,7 +314,9 @@ std::size_t TransactionOperations::logOplogEntries(
     // termination condition.
     auto stmtsIter = _transactionOperations.begin();
     auto applyOpsIter = applyOpsOperationAssignment.applyOpsEntries.begin();
-    auto prepare = applyOpsOperationAssignment.prepare;
+    const bool prepare = applyOpsOperationAssignment.prepare;
+    const bool applyOpsAppliedSeparately =
+        oplogGroupingFormat == WriteUnitOfWork::kGroupForPossiblyRetryableOperations;
     while (stmtsIter != _transactionOperations.end()) {
         tassert(6278509,
                 "Not enough \"applyOps\" entries",
@@ -329,7 +339,7 @@ std::size_t TransactionOperations::logOplogEntries(
         auto lastOp = nextStmt == _transactionOperations.end();
 
         auto implicitPrepare = lastOp && prepare;
-        auto isPartialTxn = !lastOp;
+        auto isPartialTxn = !lastOp && !applyOpsAppliedSeparately;
 
         if (imageToWrite) {
             uassert(6054002,
@@ -358,7 +368,7 @@ std::size_t TransactionOperations::logOplogEntries(
         // the number of operations can be derived from the length of the array in the
         // 'applyOps' field.
         // See SERVER-40676 and SERVER-40678.
-        if (lastOp && !firstOp) {
+        if (lastOp && !firstOp && !applyOpsAppliedSeparately) {
             applyOpsBuilder.append("count", static_cast<long long>(_transactionOperations.size()));
         }
 
@@ -378,7 +388,9 @@ std::size_t TransactionOperations::logOplogEntries(
             logApplyOpsFn(&oplogEntry,
                           firstOp,
                           lastOp,
-                          (lastOp ? std::move(stmtIdsWritten) : std::vector<StmtId>{}));
+                          (lastOp || applyOpsAppliedSeparately ? std::move(stmtIdsWritten)
+                                                               : std::vector<StmtId>{}),
+                          oplogGroupingFormat);
 
         hangAfterLoggingApplyOpsForTransaction.pauseWhileSet();
 

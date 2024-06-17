@@ -97,7 +97,7 @@ BSONObj findOneOplogEntry(OperationContext* opCtx,
                                               .allowedFeatures =
                                                   MatchExpressionParser::kBanAllSpecialFeatures},
     });
-    boost::optional<AutoGetOplog> oplogRead;
+    boost::optional<AutoGetOplogFastPath> oplogRead;
     boost::optional<AutoGetChangeCollection> changeCollectionRead;
     const CollectionPtr* collPtr;
     if (tenantId) {
@@ -118,8 +118,10 @@ BSONObj findOneOplogEntry(OperationContext* opCtx,
                                   CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(dbName),
                                   Date_t::max());
 
-    auto exec = uassertStatusOK(getExecutorFind(
-        opCtx, collPtr, std::move(cq), nullptr /*extractAndAttachPipelineStages */, permitYield));
+    const auto yieldPolicy = permitYield ? PlanYieldPolicy::YieldPolicy::YIELD_AUTO
+                                         : PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY;
+    auto exec = uassertStatusOK(
+        getExecutorFind(opCtx, MultipleCollectionAccessor{collPtr}, std::move(cq), yieldPolicy));
 
     PlanExecutor::ExecState getNextResult;
     try {

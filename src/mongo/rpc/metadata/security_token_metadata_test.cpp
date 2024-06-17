@@ -44,7 +44,7 @@
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/oid.h"
 #include "mongo/db/auth/user_name.h"
-#include "mongo/db/auth/validated_tenancy_scope.h"
+#include "mongo/db/auth/validated_tenancy_scope_factory.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/db/tenant_id.h"
@@ -64,8 +64,11 @@ namespace {
 constexpr auto kPingFieldName = "ping"_sd;
 
 std::string makeSecurityToken(const UserName& userName) {
-    using VTS = auth::ValidatedTenancyScope;
-    return VTS(userName, "secret"_sd, VTS::TenantProtocol::kDefault, VTS::TokenForTestingTag{})
+    return auth::ValidatedTenancyScopeFactory::create(
+               userName,
+               "secret"_sd,
+               auth::ValidatedTenancyScope::TenantProtocol::kDefault,
+               auth::ValidatedTenancyScopeFactory::TokenForTestingTag{})
         .getOriginalToken()
         .toString();
 }

@@ -139,7 +139,6 @@ public:
     }
 
     const std::vector<BSONElement>& getElements() {
-        sortAndDedupElements();
         return _elements;
     }
 
@@ -152,8 +151,6 @@ public:
         if (!(getBSONTypeMask(e.type()) & _typeMask)) {
             return false;
         }
-
-        sortAndDedupElements();
 
         // Use binary search.
         auto elemLt = InListElemLessThan(_collator);
@@ -253,19 +250,11 @@ public:
     }
 
     bool isBSONOwned() const {
-        return !_elementsInitialized || (_arr.has_value() && _arr->isOwned());
+        return _arr.has_value() && _arr->isOwned();
     }
 
     bool isPrepared() const {
         return _prepared;
-    }
-
-    // This method will sort and de-dup the BSONElements in '_elements' if they haven't already
-    // been sorted and de-duped.
-    inline void sortAndDedupElements() {
-        if (!_sortedAndDeduped) {
-            sortAndDedupElementsImpl();
-        }
     }
 
     // If '_arr.has_value() && !_arr->isOwned()' is true, this method will make a copy of the BSON
@@ -279,6 +268,11 @@ public:
     // prepare() is called on an InListData, it can no longer be modified.
     void prepare();
 
+    const BSONObj& getOwnedBSONStorage() const {
+        tassert(8558800, "Expected BSON storage to be owned", isBSONOwned());
+        return *_arr;
+    }
+
 private:
     InListData(const InListData& other);
 
@@ -290,7 +284,9 @@ private:
 
     void updateSbeTagMasks();
 
-    void sortAndDedupElementsImpl();
+    // This method will sort and de-dup the BSONElements in '_elements' if they haven't already
+    // been sorted and de-duped.
+    void sortAndDedupElements();
 
     void buildHashSet();
 

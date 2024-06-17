@@ -58,6 +58,7 @@ namespace mongo {
 
 namespace {
 const std::string kInMemoryEngineName = "inMemory";
+std::once_flag initializeServerStatusSectionFlag;
 
 class InMemoryFactory : public StorageEngine::Factory {
 public:
@@ -70,8 +71,7 @@ public:
         size_t cacheMB = WiredTigerUtil::getCacheSizeMB(wiredTigerGlobalOptions.cacheSizeGB);
         const bool ephemeral = true;
         auto kv =
-            std::make_unique<WiredTigerKVEngine>(opCtx,
-                                                 getCanonicalName().toString(),
+            std::make_unique<WiredTigerKVEngine>(getCanonicalName().toString(),
                                                  params.dbpath,
                                                  getGlobalServiceContext()->getFastClockSource(),
                                                  wiredTigerGlobalOptions.engineConfig,
@@ -82,20 +82,14 @@ public:
         kv->setRecordStoreExtraOptions(wiredTigerGlobalOptions.collectionConfig);
         kv->setSortedDataInterfaceExtraOptions(wiredTigerGlobalOptions.indexConfig);
 
-        // We must only add the server parameters to the global registry once during unit testing.
-        static int setupCountForUnitTests = 0;
-        if (setupCountForUnitTests == 0) {
-            ++setupCountForUnitTests;
 
-            // Intentionally leaked.
-            [[maybe_unused]] auto leakedSection =
-                new WiredTigerServerStatusSection(kInMemoryEngineName);
-
-            // This allows unit tests to run this code without encountering memory leaks
-#if __has_feature(address_sanitizer)
-            __lsan_ignore_object(leakedSection);
-#endif
-        }
+        // Register the ServerStatusSection for the in-memory storage engine
+        // and do that only once.
+        std::call_once(initializeServerStatusSectionFlag, [] {
+            *ServerStatusSectionBuilder<WiredTigerServerStatusSection>(
+                 std::string{kInMemoryEngineName})
+                 .forShard();
+        });
 
         StorageEngineOptions options;
         options.directoryPerDB = params.directoryperdb;

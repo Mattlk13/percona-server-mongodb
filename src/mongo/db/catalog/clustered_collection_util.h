@@ -35,6 +35,7 @@
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/clustered_collection_options_gen.h"
+#include "mongo/db/commands/create_gen.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 
@@ -61,14 +62,6 @@ ClusteredCollectionInfo makeCanonicalClusteredInfo(ClusteredIndexSpec indexSpec)
 boost::optional<ClusteredCollectionInfo> parseClusteredInfo(const BSONElement& elem);
 
 /**
- * Commands like createIndex() can implicitly create collections. If the index specifies the
- * 'clustered' field, then generate ClusteredCollectionInfo for the collection. Throws if invalid
- * specs are provided.
- */
-boost::optional<ClusteredCollectionInfo> createClusteredInfoForNewCollection(
-    const BSONObj& indexSpec);
-
-/**
  * Returns true if legacy format is required for the namespace.
  */
 bool requiresLegacyFormat(const NamespaceString& nss);
@@ -79,7 +72,8 @@ bool requiresLegacyFormat(const NamespaceString& nss);
  * collection has the 'simple' collation this expects an empty BSONObj.
  */
 BSONObj formatClusterKeyForListIndexes(const ClusteredCollectionInfo& collInfo,
-                                       const BSONObj& collation);
+                                       const BSONObj& collation,
+                                       const boost::optional<int64_t>& expireAfterSeconds);
 
 /**
  * Returns true if the BSON object matches the collection's cluster key. Caller's should ensure
@@ -102,6 +96,11 @@ StringData getClusterKeyFieldName(const ClusteredIndexSpec& indexSpec);
  * Returns the sort pattern and directions for use by the planner
  */
 BSONObj getSortPattern(const ClusteredIndexSpec& collInfo);
+
+/**
+ * Throws if the collection creation options are not compatible with a clustered collection.
+ */
+void checkCreationOptions(const CreateCommand&);
 
 }  // namespace clustered_util
 }  // namespace mongo

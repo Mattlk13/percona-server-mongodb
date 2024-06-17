@@ -205,7 +205,8 @@ void statsToBSON(const PlanStageStats& stats,
                  ExplainOptions::Verbosity verbosity,
                  const boost::optional<size_t> planIdx,
                  BSONObjBuilder* bob,
-                 BSONObjBuilder* topLevelBob) {
+                 BSONObjBuilder* topLevelBob,
+                 boost::optional<bool> isCached = boost::none) {
     invariant(bob);
     invariant(topLevelBob);
 
@@ -218,8 +219,12 @@ void statsToBSON(const PlanStageStats& stats,
     if (STAGE_MULTI_PLAN == stats.stageType) {
         tassert(3420003, "Invalid child plan index", planIdx && planIdx < stats.children.size());
         const PlanStageStats* childStage = stats.children[*planIdx].get();
-        statsToBSON(*childStage, verbosity, planIdx, bob, topLevelBob);
+        statsToBSON(*childStage, verbosity, planIdx, bob, topLevelBob, isCached);
         return;
+    }
+
+    if (isCached) {
+        bob->append("isCached", *isCached);
     }
 
     // Stage name.
@@ -233,10 +238,21 @@ void statsToBSON(const PlanStageStats& stats,
     // Some top-level exec stats get pulled out of the root stage.
     if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
         bob->appendNumber("nReturned", static_cast<long long>(stats.common.advanced));
-        // Include executionTimeMillis if it was recorded.
-        if (stats.common.executionTime) {
-            bob->appendNumber("executionTimeMillisEstimate",
-                              durationCount<Milliseconds>(*stats.common.executionTime));
+        // Include the execution time if it was recorded.
+        if (stats.common.executionTime.precision == QueryExecTimerPrecision::kMillis) {
+            bob->appendNumber(
+                "executionTimeMillisEstimate",
+                durationCount<Milliseconds>(stats.common.executionTime.executionTimeEstimate));
+        } else if (stats.common.executionTime.precision == QueryExecTimerPrecision::kNanos) {
+            bob->appendNumber(
+                "executionTimeMillisEstimate",
+                durationCount<Milliseconds>(stats.common.executionTime.executionTimeEstimate));
+            bob->appendNumber(
+                "executionTimeMicros",
+                durationCount<Microseconds>(stats.common.executionTime.executionTimeEstimate));
+            bob->appendNumber(
+                "executionTimeNanos",
+                durationCount<Nanoseconds>(stats.common.executionTime.executionTimeEstimate));
         }
 
         bob->appendNumber("works", static_cast<long long>(stats.common.works));
@@ -577,6 +593,7 @@ void statsToBSON(const PlanStageStats& stats,
     }
     childrenBob.doneFast();
 }
+}  // namespace
 
 PlanSummaryStats collectExecutionStatsSummary(const PlanStageStats* stats,
                                               const boost::optional<size_t> planIdx) {
@@ -589,11 +606,7 @@ PlanSummaryStats collectExecutionStatsSummary(const PlanStageStats* stats,
 
     PlanSummaryStats summary;
     summary.nReturned = stats->common.advanced;
-
-    if (stats->common.executionTime) {
-        summary.executionTime.executionTimeEstimate = *stats->common.executionTime;
-        summary.executionTime.precision = QueryExecTimerPrecision::kMillis;
-    }
+    summary.executionTime = stats->common.executionTime;
 
     // Flatten the stats tree into a list.
     std::vector<const PlanStageStats*> statsNodes;
@@ -613,7 +626,6 @@ PlanSummaryStats collectExecutionStatsSummary(const PlanStageStats* stats,
 
     return summary;
 }
-}  // namespace
 
 void appendMultikeyPaths(const BSONObj& keyPattern,
                          const MultikeyPaths& multikeyPaths,
@@ -733,66 +745,95 @@ void PlanExplainerImpl::getSummaryStats(PlanSummaryStats* statsOut) const {
     statsOut->collectionScansNonTailable = 0;
 
     for (size_t i = 0; i < stages.size(); i++) {
-        statsOut->totalKeysExamined +=
-            getKeysExamined(stages[i]->stageType(), stages[i]->getSpecificStats());
-        statsOut->totalDocsExamined +=
-            getDocsExamined(stages[i]->stageType(), stages[i]->getSpecificStats());
+        auto stageType = stages[i]->stageType();
+        statsOut->totalKeysExamined += getKeysExamined(stageType, stages[i]->getSpecificStats());
+        statsOut->totalDocsExamined += getDocsExamined(stageType, stages[i]->getSpecificStats());
 
-        if (isSortStageType(stages[i]->stageType())) {
-            auto sortStage = static_cast<const SortStage*>(stages[i]);
-            auto sortStats = static_cast<const SortStats*>(sortStage->getSpecificStats());
-            PlanSummaryStatsVisitor(*statsOut).visit(sortStats);
-        }
-
-        if (STAGE_IXSCAN == stages[i]->stageType()) {
-            const IndexScan* ixscan = static_cast<const IndexScan*>(stages[i]);
-            const IndexScanStats* ixscanStats =
-                static_cast<const IndexScanStats*>(ixscan->getSpecificStats());
-            statsOut->indexesUsed.insert(ixscanStats->indexName);
-        } else if (STAGE_COUNT_SCAN == stages[i]->stageType()) {
-            const CountScan* countScan = static_cast<const CountScan*>(stages[i]);
-            const CountScanStats* countScanStats =
-                static_cast<const CountScanStats*>(countScan->getSpecificStats());
-            statsOut->indexesUsed.insert(countScanStats->indexName);
-        } else if (STAGE_IDHACK == stages[i]->stageType()) {
-            const IDHackStage* idHackStage = static_cast<const IDHackStage*>(stages[i]);
-            const IDHackStats* idHackStats =
-                static_cast<const IDHackStats*>(idHackStage->getSpecificStats());
-            statsOut->indexesUsed.insert(idHackStats->indexName);
-        } else if (STAGE_DISTINCT_SCAN == stages[i]->stageType()) {
-            const DistinctScan* distinctScan = static_cast<const DistinctScan*>(stages[i]);
-            const DistinctScanStats* distinctScanStats =
-                static_cast<const DistinctScanStats*>(distinctScan->getSpecificStats());
-            statsOut->indexesUsed.insert(distinctScanStats->indexName);
-        } else if (STAGE_TEXT_MATCH == stages[i]->stageType()) {
-            const TextMatchStage* textStage = static_cast<const TextMatchStage*>(stages[i]);
-            const TextMatchStats* textStats =
-                static_cast<const TextMatchStats*>(textStage->getSpecificStats());
-            statsOut->indexesUsed.insert(textStats->indexName);
-        } else if (STAGE_GEO_NEAR_2D == stages[i]->stageType() ||
-                   STAGE_GEO_NEAR_2DSPHERE == stages[i]->stageType()) {
-            const NearStage* nearStage = static_cast<const NearStage*>(stages[i]);
-            const NearStats* nearStats =
-                static_cast<const NearStats*>(nearStage->getSpecificStats());
-            statsOut->indexesUsed.insert(nearStats->indexName);
-        } else if (STAGE_CACHED_PLAN == stages[i]->stageType()) {
-            const CachedPlanStage* cachedPlan = static_cast<const CachedPlanStage*>(stages[i]);
-            const CachedPlanStats* cachedStats =
-                static_cast<const CachedPlanStats*>(cachedPlan->getSpecificStats());
-            statsOut->replanReason = cachedStats->replanReason;
-            // Nonnull replanReason indicates cached plan was less effecient than expected and an
-            // alternative plan was chosen.
-            statsOut->replanReason ? statsOut->fromPlanCache = false
-                                   : statsOut->fromPlanCache = true;
-        } else if (STAGE_MULTI_PLAN == stages[i]->stageType()) {
-            statsOut->fromMultiPlanner = true;
-        } else if (STAGE_COLLSCAN == stages[i]->stageType()) {
-            statsOut->collectionScans++;
-            const auto collScan = static_cast<const CollectionScan*>(stages[i]);
-            const auto collScanStats =
-                static_cast<const CollectionScanStats*>(collScan->getSpecificStats());
-            if (!collScanStats->tailable)
-                statsOut->collectionScansNonTailable++;
+        switch (stageType) {
+            case STAGE_SORT_DEFAULT:
+            case STAGE_SORT_SIMPLE: {
+                auto sortStage = static_cast<const SortStage*>(stages[i]);
+                auto sortStats = static_cast<const SortStats*>(sortStage->getSpecificStats());
+                PlanSummaryStatsVisitor(*statsOut).visit(sortStats);
+                break;
+            }
+            case STAGE_IXSCAN: {
+                const IndexScan* ixscan = static_cast<const IndexScan*>(stages[i]);
+                const IndexScanStats* ixscanStats =
+                    static_cast<const IndexScanStats*>(ixscan->getSpecificStats());
+                statsOut->indexesUsed.insert(ixscanStats->indexName);
+                break;
+            }
+            case STAGE_COUNT_SCAN: {
+                const CountScan* countScan = static_cast<const CountScan*>(stages[i]);
+                const CountScanStats* countScanStats =
+                    static_cast<const CountScanStats*>(countScan->getSpecificStats());
+                statsOut->indexesUsed.insert(countScanStats->indexName);
+                break;
+            }
+            case STAGE_IDHACK: {
+                const IDHackStage* idHackStage = static_cast<const IDHackStage*>(stages[i]);
+                const IDHackStats* idHackStats =
+                    static_cast<const IDHackStats*>(idHackStage->getSpecificStats());
+                statsOut->indexesUsed.insert(idHackStats->indexName);
+                break;
+            }
+            case STAGE_DISTINCT_SCAN: {
+                const DistinctScan* distinctScan = static_cast<const DistinctScan*>(stages[i]);
+                const DistinctScanStats* distinctScanStats =
+                    static_cast<const DistinctScanStats*>(distinctScan->getSpecificStats());
+                statsOut->indexesUsed.insert(distinctScanStats->indexName);
+                break;
+            }
+            case STAGE_TEXT_MATCH: {
+                const TextMatchStage* textStage = static_cast<const TextMatchStage*>(stages[i]);
+                const TextMatchStats* textStats =
+                    static_cast<const TextMatchStats*>(textStage->getSpecificStats());
+                statsOut->indexesUsed.insert(textStats->indexName);
+                break;
+            }
+            case STAGE_GEO_NEAR_2D:
+            case STAGE_GEO_NEAR_2DSPHERE: {
+                const NearStage* nearStage = static_cast<const NearStage*>(stages[i]);
+                const NearStats* nearStats =
+                    static_cast<const NearStats*>(nearStage->getSpecificStats());
+                statsOut->indexesUsed.insert(nearStats->indexName);
+                break;
+            }
+            case STAGE_CACHED_PLAN: {
+                const CachedPlanStage* cachedPlan = static_cast<const CachedPlanStage*>(stages[i]);
+                const CachedPlanStats* cachedStats =
+                    static_cast<const CachedPlanStats*>(cachedPlan->getSpecificStats());
+                statsOut->replanReason = cachedStats->replanReason;
+                // Nonnull replanReason indicates cached plan was less effecient than expected and
+                // an alternative plan was chosen.
+                statsOut->replanReason ? statsOut->fromPlanCache = false
+                                       : statsOut->fromPlanCache = true;
+                break;
+            }
+            case STAGE_MULTI_PLAN: {
+                const MultiPlanStage* multiPlan = static_cast<const MultiPlanStage*>(stages[i]);
+                const MultiPlanStats* multiPlanStats =
+                    static_cast<const MultiPlanStats*>(multiPlan->getSpecificStats());
+                tassert(8737700,
+                        "Replan reason has to be consistent if it already exists",
+                        !statsOut->replanReason ||
+                            statsOut->replanReason == multiPlanStats->replanReason);
+                statsOut->replanReason = multiPlanStats->replanReason;
+                statsOut->fromMultiPlanner = true;
+                break;
+            }
+            case STAGE_COLLSCAN: {
+                statsOut->collectionScans++;
+                const auto collScan = static_cast<const CollectionScan*>(stages[i]);
+                const auto collScanStats =
+                    static_cast<const CollectionScanStats*>(collScan->getSpecificStats());
+                if (!collScanStats->tailable)
+                    statsOut->collectionScansNonTailable++;
+                break;
+            }
+            default:
+                break;
         }
     }
 }
@@ -814,9 +855,15 @@ PlanExplainer::PlanStatsDetails PlanExplainerImpl::getWinningPlanStats(
         return {std::move(stats), boost::none};
     }();
 
+
+    bool isCached = _cachedPlanHash && _solution && (*_cachedPlanHash == _solution->hash());
     BSONObjBuilder bob;
-    statsToBSON(*stats, verbosity, winningPlanIdx, &bob, &bob);
+    statsToBSON(*stats, verbosity, winningPlanIdx, &bob, &bob, isCached);
     return {bob.obj(), std::move(summary)};
+}
+
+BSONObj PlanExplainerImpl::getOptimizerDebugInfo() const {
+    return {};
 }
 
 PlanExplainer::PlanStatsDetails PlanExplainerImpl::getWinningPlanTrialStats() const {
@@ -838,9 +885,12 @@ std::vector<PlanExplainer::PlanStatsDetails> PlanExplainerImpl::getRejectedPlans
     // Get the stats from the trial period for all the plans.
     for (size_t i = 0; i < mpsStats->children.size(); ++i) {
         if (i != *bestPlanIdx) {
+            const auto& candidate = mps->getCandidate(i);
+            bool isCached = _cachedPlanHash && (*_cachedPlanHash == candidate.solution->hash());
+
             BSONObjBuilder bob;
             auto stats = _root->getStats();
-            statsToBSON(*stats, verbosity, i, &bob, &bob);
+            statsToBSON(*stats, verbosity, i, &bob, &bob, isCached);
             auto summary = [&]() -> boost::optional<PlanSummaryStats> {
                 if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
                     auto summary = collectExecutionStatsSummary(stats.get(), i);

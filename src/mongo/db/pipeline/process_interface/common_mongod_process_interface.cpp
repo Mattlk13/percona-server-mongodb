@@ -57,9 +57,9 @@
 #include "mongo/db/collection_index_usage_tracker.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/exception_util.h"
+#include "mongo/db/concurrency/fill_locker_info.h"
 #include "mongo/db/concurrency/flow_control_ticketholder.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
@@ -69,9 +69,10 @@
 #include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
+#include "mongo/db/pipeline/initialize_auto_get_helper.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/pipeline_d.h"
-#include "mongo/db/pipeline/search_helper.h"
+#include "mongo/db/pipeline/search/search_helper.h"
 #include "mongo/db/pipeline/stage_constraints.h"
 #include "mongo/db/pipeline/variables.h"
 #include "mongo/db/query/collection_index_usage_tracker_decoration.h"
@@ -82,14 +83,12 @@
 #include "mongo/db/query/sbe_plan_cache.h"
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/s/query_analysis_writer.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/transaction_coordinator_curop.h"
 #include "mongo/db/s/transaction_coordinator_worker_curop_repository.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session/kill_sessions.h"
 #include "mongo/db/session/session_catalog.h"
 #include "mongo/db/shard_id.h"
-#include "mongo/db/stats/fill_locker_info.h"
 #include "mongo/db/stats/storage_stats.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/db/storage/backup_cursor_hooks.h"
@@ -102,6 +101,7 @@
 #include "mongo/db/transaction/transaction_history_iterator.h"
 #include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/db/transaction/transaction_participant_resource_yielder.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/views/view.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
@@ -111,6 +111,7 @@
 #include "mongo/s/analyze_shard_key_role.h"
 #include "mongo/s/query_analysis_sample_tracker.h"
 #include "mongo/s/query_analysis_sampler_util.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/util/database_name_util.h"
 #include "mongo/util/future.h"
 #include "mongo/util/namespace_string_util.h"
@@ -156,7 +157,7 @@ void assertIgnorePrepareConflictsBehavior(const boost::intrusive_ptr<ExpressionC
     tassert(5996900,
             "Expected operation to either be blocking on prepare conflicts or ignoring prepare "
             "conflicts and allowing writes",
-            expCtx->opCtx->recoveryUnit()->getPrepareConflictBehavior() !=
+            shard_role_details::getRecoveryUnit(expCtx->opCtx)->getPrepareConflictBehavior() !=
                 PrepareConflictBehavior::kIgnoreConflicts);
 }
 
@@ -485,8 +486,7 @@ CommonMongodProcessInterface::attachCursorSourceToPipelineForLocalRead(
     if (!skipRequiresInputDocSourceCheck && firstStage &&
         !(*firstStage)->constraints().requiresInputDocSource) {
         // There's no need to attach a cursor here.
-        getSearchHelpers(expCtx->opCtx->getServiceContext())
-            ->prepareSearchForNestedPipeline(pipeline.get());
+        search_helpers::prepareSearchForNestedPipelineLegacyExecutor(pipeline.get());
         return pipeline;
     }
 
@@ -509,23 +509,34 @@ CommonMongodProcessInterface::attachCursorSourceToPipelineForLocalRead(
     // when constructing our query executor.
     auto lpp = LiteParsedPipeline(expCtx->ns, pipeline->serializeToBson());
     std::vector<NamespaceStringOrUUID> secondaryNamespaces = lpp.getForeignExecutionNamespaces();
+    auto* opCtx = expCtx->opCtx;
 
-    AutoGetCollectionForReadCommandMaybeLockFree autoColl(
-        expCtx->opCtx,
-        expCtx->ns,
-        AutoGetCollection::Options{}.secondaryNssOrUUIDs(secondaryNamespaces.cbegin(),
-                                                         secondaryNamespaces.cend()),
-        AutoStatsTracker::LogMode::kUpdateTop);
+    boost::optional<AutoGetCollectionForReadCommandMaybeLockFree> autoColl = boost::none;
+    auto initAutoGetCallback = [&]() {
+        autoColl.emplace(opCtx,
+                         expCtx->ns,
+                         AutoGetCollection::Options{}.secondaryNssOrUUIDs(
+                             secondaryNamespaces.cbegin(), secondaryNamespaces.cend()),
+                         AutoStatsTracker::LogMode::kUpdateTop);
+    };
 
+    bool isAnySecondaryCollectionNotLocal =
+        intializeAutoGet(opCtx, expCtx->ns, secondaryNamespaces, initAutoGetCallback);
+
+    tassert(8322002,
+            "Should have initialized AutoGet* after calling 'initializeAutoGet'",
+            autoColl.has_value());
     uassert(ErrorCodes::NamespaceNotFound,
             fmt::format("collection '{}' does not match the expected uuid",
                         expCtx->ns.toStringForErrorMsg()),
-            !expCtx->uuid || (autoColl && autoColl->uuid() == expCtx->uuid));
+            !expCtx->uuid ||
+                (autoColl->getCollection() && autoColl->getCollection()->uuid() == expCtx->uuid));
 
     MultipleCollectionAccessor holder{expCtx->opCtx,
-                                      &autoColl.getCollection(),
-                                      autoColl.getNss(),
-                                      autoColl.isAnySecondaryNamespaceAViewOrSharded(),
+                                      &autoColl->getCollection(),
+                                      autoColl->getNss(),
+                                      autoColl->isAnySecondaryNamespaceAView() ||
+                                          isAnySecondaryCollectionNotLocal,
                                       secondaryNamespaces};
     auto resolvedAggRequest = aggRequest ? &aggRequest.get() : nullptr;
     PipelineD::buildAndAttachInnerQueryExecutorToPipeline(
@@ -535,11 +546,19 @@ CommonMongodProcessInterface::attachCursorSourceToPipelineForLocalRead(
 }
 
 std::string CommonMongodProcessInterface::getShardName(OperationContext* opCtx) const {
-    if (ShardingState::get(opCtx)->enabled()) {
-        return ShardingState::get(opCtx)->shardId().toString();
+    if (auto shardId = getShardId(opCtx)) {
+        return shardId->toString();
     }
 
     return std::string();
+}
+
+boost::optional<ShardId> CommonMongodProcessInterface::getShardId(OperationContext* opCtx) const {
+    if (ShardingState::get(opCtx)->enabled()) {
+        return ShardingState::get(opCtx)->shardId();
+    }
+
+    return {};
 }
 
 bool CommonMongodProcessInterface::inShardedEnvironment(OperationContext* opCtx) const {
@@ -720,16 +739,16 @@ BSONObj CommonMongodProcessInterface::_reportCurrentOpForClient(
         }
 
         // Append lock stats before returning.
-        if (auto lockerInfo = clientOpCtx->lockState()->getLockerInfo(
-                CurOp::get(*clientOpCtx)->getLockStatsBase())) {
-            fillLockerInfo(*lockerInfo, builder);
-        }
+        auto lockerInfo = shard_role_details::getLocker(clientOpCtx)
+                              ->getLockerInfo(CurOp::get(*clientOpCtx)->getLockStatsBase());
+        fillLockerInfo(lockerInfo, builder);
+
 
         if (auto tcWorkerRepo = getTransactionCoordinatorWorkerCurOpRepository()) {
             tcWorkerRepo->reportState(clientOpCtx, &builder);
         }
 
-        auto flowControlStats = clientOpCtx->lockState()->getFlowControlStats();
+        auto flowControlStats = shard_role_details::getLocker(clientOpCtx)->getFlowControlStats();
         flowControlStats.writeToBuilder(builder);
     }
 
@@ -805,12 +824,6 @@ std::unique_ptr<CollatorInterface> CommonMongodProcessInterface::_getCollectionD
     auto& collator = it->second;
     return collator ? collator->clone() : nullptr;
 }
-
-std::unique_ptr<ResourceYielder> CommonMongodProcessInterface::getResourceYielder(
-    StringData cmdName) const {
-    return TransactionParticipantResourceYielder::make(cmdName);
-}
-
 
 std::pair<std::set<FieldPath>, boost::optional<ChunkVersion>>
 CommonMongodProcessInterface::ensureFieldsUniqueOrResolveDocumentKey(

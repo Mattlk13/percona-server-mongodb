@@ -59,7 +59,7 @@ SessionKiller::Result killSessionsLocalKillOps(OperationContext* opCtx,
     for (ServiceContext::LockedClientsCursor cursor(opCtx->getClient()->getServiceContext());
          Client* client = cursor.next();) {
         invariant(client);
-        stdx::unique_lock<Client> lk(*client);
+        ClientLock lk(client);
 
         OperationContext* opCtxToKill = client->getOperationContext();
         if (opCtxToKill) {
@@ -111,7 +111,7 @@ void killSessionsReport(OperationContext* opCtx, const BSONObj& cmdObj) {
 
     auto client = opCtx->getClient();
     if (client) {
-        if (AuthorizationManager::get(client->getServiceContext())->isAuthEnabled()) {
+        if (AuthorizationManager::get(client->getService())->isAuthEnabled()) {
             if (auto user = AuthorizationSession::get(client)->getAuthenticatedUserName()) {
                 attr.add("user", BSON_ARRAY(user->toBSON()));
             } else {

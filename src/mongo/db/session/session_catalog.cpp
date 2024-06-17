@@ -41,10 +41,10 @@
 #include <boost/move/utility_core.hpp>
 #include <boost/optional/optional.hpp>
 
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session/logical_session_id_helpers.h"
 #include "mongo/db/session/session_catalog.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -149,8 +149,8 @@ SessionCatalog::ScopedCheckedOutSession SessionCatalog::_checkOutSession(Operati
     // deadlock
     invariant(opCtx->getLogicalSessionId());
     invariant(!operationSessionDecoration(opCtx));
-    invariant(!opCtx->lockState()->inAWriteUnitOfWork());
-    invariant(!opCtx->lockState()->isLocked());
+    invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
+    invariant(!shard_role_details::getLocker(opCtx)->isLocked());
 
     auto lsid = *opCtx->getLogicalSessionId();
     return _checkOutSessionInner(opCtx, lsid, boost::none /* killToken */);
@@ -288,6 +288,14 @@ SessionCatalog::KillToken SessionCatalog::killSession(const LogicalSessionId& ls
 size_t SessionCatalog::size() const {
     stdx::lock_guard<Latch> lg(_mutex);
     return _sessions.size();
+}
+
+void SessionCatalog::setDisallowNewTransactions() {
+    _disallowNewTransactions.store(true);
+}
+
+bool SessionCatalog::getDisallowNewTransactions() {
+    return _disallowNewTransactions.load();
 }
 
 SessionCatalog::SessionRuntimeInfo* SessionCatalog::_getSessionRuntimeInfo(
@@ -430,7 +438,6 @@ SessionCatalog::KillToken ObservableSession::kill(ErrorCodes::Error reason) cons
     ++_sri->killsRequested;
 
     if (firstKiller && hasCurrentOperation()) {
-        invariant(_clientLock.owns_lock());
         const auto serviceContext = _sri->checkoutOpCtx->getServiceContext();
         serviceContext->killOperation(_clientLock, _sri->checkoutOpCtx, reason);
     }

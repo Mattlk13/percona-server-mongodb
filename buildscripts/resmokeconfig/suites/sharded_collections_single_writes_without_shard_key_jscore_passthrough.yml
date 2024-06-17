@@ -14,7 +14,6 @@ selector:
   - jstests/core/**/compact_keeps_indexes.js  # compact.
   - jstests/core/**/currentop.js  # uses fsync.
   - jstests/core/**/dbhash.js  # dbhash.
-  - jstests/core/**/dbhash2.js  # dbhash.
   - jstests/core/**/fsync.js  # uses fsync.
   - jstests/core/**/geo_s2cursorlimitskip.js  # profiling.
   - jstests/core/**/geo_update_btree2.js  # notablescan.
@@ -33,7 +32,6 @@ selector:
   - jstests/core/**/long_index_rename.js # renameCollection.
   # The following tests fail because mongos behaves differently from mongod when testing certain
   # functionality. The differences are in a comment next to the failing test.
-  - jstests/core/**/explain_missing_database.js  # Behavior with no db different on mongos, SERVER-18047.
   - jstests/core/**/geo_2d_explain.js  # executionSuccess in different spot in explain().
   - jstests/core/**/geo_s2explain.js  # inputStage in different spot in explain().
   - jstests/core/**/geo_s2sparse.js  # keysPerIndex in different spot in validate().
@@ -47,12 +45,6 @@ selector:
   - jstests/core/**/list_indexes_non_existent_ns.js
   - jstests/core/**/mr_preserve_indexes.js
 
-  # The following tests fail because they expect no databases to be created. However a DB is created
-  # automatically when we shard a collection.
-  - jstests/core/**/dbcase.js
-  - jstests/core/**/dbcase2.js
-  - jstests/core/**/no_db_created.js
-  - jstests/core/**/killop_drop_collection.js # Uses fsyncLock.
   # These tests fail because sharded clusters do not clean up correctly after failed index builds.
   # See SERVER-33207 as an example.
   - jstests/core/**/geo_borders.js
@@ -175,9 +167,6 @@ selector:
   # Aggregation pipeline does not support the use of sharded collections as the output collection.
   - jstests/core/**/explain_agg_write_concern.js
 
-  # Can't shard collection with invalid dbName.
-  - jstests/core/**/invalid_db_name.js
-
   # Cannot output to a non-sharded collection because sharded collection exists already.
   - jstests/core/**/mr_bigobject_replace.js
   - jstests/core/**/mr_merge.js
@@ -191,13 +180,6 @@ selector:
   # Cannot implicitly shard accessed collections because the "limit" option to the "mapReduce"
   # command cannot be used on a sharded collection.
   - jstests/core/**/mr_sort.js
-
-  # This test expects a function stored in the system.js collection to be available for an operation
-  # which may not be the case if it is implicitly sharded in a passthrough.
-  - jstests/core/**/mr_stored.js
-  - jstests/core/**/where_system_js.js
-  - jstests/core/**/system_js_access.js
-  - jstests/core/**/system_js_drop.js
 
   # Test expects failure, but two phase write protocol exits early with OK status if there are no
   # matching documents.
@@ -251,7 +233,7 @@ selector:
   - jstests/core/txns/transactions_profiling_with_drops.js
 
   # Implicitly creates a database through a collection rename, which does not work in a sharded
-  # cluster.
+  # cluster. TODO SERVER-84330
   - jstests/core/txns/transactions_block_ddl.js
 
   # Set the transactionLifetimeLimitSeconds parameter, which is not on mongos.
@@ -282,6 +264,9 @@ selector:
   - assumes_unsharded_collection
   - assumes_standalone_mongod
   - assumes_against_mongod_not_mongos
+  # This passthrough implicitly shards the accessed collections. Do not run tests where collections
+  # can't be created on `getCollection` call.
+  - assumes_no_implicit_collection_creation_on_get_collection
   # Tests tagged with the following will fail because they assume collections are not sharded.
   - assumes_no_implicit_collection_creation_after_drop
   - assumes_no_implicit_index_creation
@@ -292,6 +277,9 @@ selector:
   - requires_capped
   # Prepare is not a command on mongos.
   - uses_prepare_transaction
+  # Tests with this tag use system.js stored functions and expect that collection to be available
+  # for an operation, which may not be the case if it is implicitly sharded in a passthrough.
+  - requires_system_dot_js_stored_functions
 
 executor:
   archive:

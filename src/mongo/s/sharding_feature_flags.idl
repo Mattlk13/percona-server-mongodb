@@ -43,24 +43,24 @@ feature_flags:
     default: true
     version: 6.3
     shouldBeFCVGated: true
-  # TODO (SERVER-70396): Remove once 7.0 becomes last LTS
-  featureFlagCheckMetadataConsistency:
-    description: "Feature flag for checking metadata consistency in the cluster, database or collection"
-    cpp_varname: feature_flags::gCheckMetadataConsistency
-    default: true
-    version: 7.0
-    shouldBeFCVGated: true
   featureFlagCheckForDirectShardOperations:
     description: "Feature flag for checking for direct shard operations."
     cpp_varname: feature_flags::gCheckForDirectShardOperations
-    default: false
+    default: true
+    version: 7.0
     shouldBeFCVGated: true
-  # TODO (SERVER-73632): Remove once 8.0 becomes last LTS.
-  featureFlagEmbeddedRouter:
-    description: "Feature flag to enable shard to double as router"
-    cpp_varname: feature_flags::gEmbeddedRouter
+  # TODO (SERVER-73632): Remove once 9.0 becomes last LTS.
+  featureFlagRouterPort:
+    description: "Feature flag to open the router port."
+    cpp_varname: feature_flags::gRouterPort
     default: false
-    shouldBeFCVGated: true
+    shouldBeFCVGated: false
+  # TODO (SERVER-88107): Remove once 8.0 becomes last LTS.
+  featureFlagMultiServiceLogAndFTDCFormat:
+    description: "Feature flag to enable multi-service format of the log and FTDC data files."
+    cpp_varname: feature_flags::gMultiServiceLogAndFTDCFormat
+    default: true
+    shouldBeFCVGated: false
   # TODO SERVER-79064: Remove once 8.0 becomes last LTS.
   featureFlagAuthoritativeRefineCollectionShardKey:
     description: "Feature flag for enabling the authoritative version of the refine collection shard key."
@@ -68,10 +68,10 @@ feature_flags:
     default: true
     version: 7.1
     shouldBeFCVGated: true
-  # TODO (SERVER-77915): Remove once 8.0 becomes last LTS.
-  featureFlagTrackUnshardedCollectionsOnShardingCatalog:
-    description: "Feature flag for enabling the tracking of user unsharded collection by turning them into a fixed-1-chunk sharded collections"
-    cpp_varname: feature_flags::gTrackUnshardedCollectionsOnShardingCatalog
+  # TODO (SERVER-87189): Remove once 9.0 becomes last LTS.
+  featureFlagTrackUnshardedCollectionsUponCreation:
+    description: "Feature flag for enabling the tracking of user unsharded collection on creation"
+    cpp_varname: feature_flags::gTrackUnshardedCollectionsUponCreation
     default: false
     shouldBeFCVGated: true
   # TODO (SERVER-68132): Remove once 8.0 becomes last LTS.
@@ -81,10 +81,12 @@ feature_flags:
     default: true
     version: 7.1
     shouldBeFCVGated: true
+  # TODO (SERVER-79304): Remove once 8.0 becomes last LTS.
   featureFlagAuthoritativeShardCollection:
     description: "Feature flag for enabling the authoritative version of the shardCollection DDL operation."
     cpp_varname: feature_flags::gAuthoritativeShardCollection
-    default: false
+    default: true
+    version: 8.0
     shouldBeFCVGated: true
   # TODO (SERVER-76436): Remove once 8.0 becomes last LTS.
   featureFlagBalanceUnshardedCollections:
@@ -103,5 +105,84 @@ feature_flags:
   featureFlagUpdateOneWithIdWithoutShardKey:
     description: "Feature flag for updateOne and deleteOne with _id equality without shard key correctness during chunk migrations."
     cpp_varname: feature_flags::gUpdateOneWithIdWithoutShardKey
+    default: true
+    version: 8.0
+    shouldBeFCVGated: true
+  # TODO (SERVER-83264): Remove once 8.0 becomes last LTS.
+  featureFlagBalancerSettingsSchema:
+    description: "Feature flag for updating the config settings schema to enforce balancer settings"
+    cpp_varname: feature_flags::gBalancerSettingsSchema
+    default: true
+    version: 7.3
+    shouldBeFCVGated: true
+  # TODO (SERVER-83704): Remove once 8.0 becomes last LTS.
+  featureFlagPlacementHistoryPostFCV73 :
+    description: "Feature flag that marks a version change in the logic that generates config.placementHistory;
+                  it causes such a collection to be reinitialized on FCV upgrade and placement history queries
+                  to be redirected to config.shards prior to the reinitialization."
+    cpp_varname: feature_flags::gPlacementHistoryPostFCV3
+    default: true
+    version: 7.3
+    shouldBeFCVGated: true
+  featureFlagShardedAggregationCatalogCacheGossiping:
+    description: "Feature flag that makes routers executing distributed aggregations that involve
+                  secondary collections request the shards to gossip back the catalog cache versions
+                  for these collections."
+    cpp_varname: feature_flags::gShardedAggregationCatalogCacheGossiping
+    default: true
+    version: 8.0
+    shouldBeFCVGated: true
+  featureFlagConvertToCappedCoordinator:
+    description: "Feature flag used for deciding how to serve _shardsvrConvertToCapped commands sent by the router
+                 (new coordinator in case of latest FCV, legacy path otherwise)."
+    cpp_varname: feature_flags::gConvertToCappedCoordinator
+    default: true
+    version: 8.0
+    shouldBeFCVGated: true
+  # TODO (SERVER-81037): enable this feature flag once it's possible to detect prepare conflicts on the catalog
+  featureFlagCreateCollectionInPreparedTransactions:
+    description: "Feature flag protecting the codepath allowing to create collections in prepared transactions "
+    cpp_varname: feature_flags::gCreateCollectionInPreparedTransactions
     default: false
+    shouldBeFCVGated: true
+  # TODO (SERVER-77915): Remove once 8.0 becomes last LTS.
+  featureFlagTrackUnshardedCollectionsUponMoveCollection:
+    description: "Feature flag for enabling the tracking of user unsharded collection upon moveCollection"
+    cpp_varname: feature_flags::gTrackUnshardedCollectionsUponMoveCollection
+    default: true
+    version: 8.0
+    shouldBeFCVGated: true
+  featureFlagReplicaSetEndpoint:
+    description: When enabled, allows users to connect to a single-shard cluster with no dedicated config
+                 server using a replica set connection string.
+    cpp_varname: feature_flags::gFeatureFlagReplicaSetEndpoint
+    default: false
+    shouldBeFCVGated: true
+  featureFlagRSEndpointClusterCardinalityParameter:
+    description: >-
+        When enabled, this feature flag will allow the cluster cardinality cluster parameter to
+        reset its value to false when the second shard is removed from a cluster. This feature
+        flag should be enabled at the same time as the replica set endpoint feature flag.
+    cpp_varname: feature_flags::gFeatureFlagRSEndpointClusterCardinalityParameter
+    default: false
+    shouldBeFCVGated: true
+  featureFlag80CollectionCreationPath:
+    description: "Feature flag protecting all codepaths that rely on the 8.0 way of collection creation in a
+                  sharded cluster. Namely, no implicit creations by the shards and no usage of the
+                  storage-level create command."
+    cpp_varname: feature_flags::g80CollectionCreationPath
+    default: true
+    version: 8.0
+    shouldBeFCVGated: true
+  featureFlagFailOnDirectShardOperations:
+    description: "Feature flag for erroring when a direct shard operation is detected."
+    cpp_varname: feature_flags::gFailOnDirectShardOperations
+    default: false
+    shouldBeFCVGated: true
+  # TODO (SERVER-87196): remove the flag below after 8.0 is released
+  featureFlagEnforceRoutingByNamespace:
+    description: "Bans routing by UUID"
+    cpp_varname: feature_flags::gEnforceRoutingByNamespace
+    default: true
+    version: 8.0
     shouldBeFCVGated: true

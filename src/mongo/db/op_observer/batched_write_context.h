@@ -41,7 +41,8 @@ namespace mongo {
 /**
  * This class is a decoration on the OperationContext holding context of writes that are logically
  * related with each other. It can be used to stage writes belonging to the same WriteUnitOfWork or
- * multi-document transaction. Currently only supports batching deletes in a WriteUnitOfWork.
+ * multi-document transaction. Currently only supports batching a single type of operation, which
+ * must be 'insert' or 'delete' in a WriteUnitOfWork.
  */
 class BatchedWriteContext {
 public:
@@ -61,6 +62,11 @@ public:
     bool writesAreBatched() const;
     void setWritesAreBatched(bool batched);
 
+    void setDefaultFromMigrate(bool defaultFromMigrate);
+    bool getDefaultFromMigrate() const {
+        return _defaultFromMigrate;
+    }
+
     /**
      * Adds a stored operation to the list of stored operations for the current WUOW.
      * It is illegal to add operations outside of a WUOW.
@@ -78,6 +84,9 @@ public:
 private:
     // Whether batching writes is enabled.
     bool _batchWrites = false;
+    // Whether all operations in this batch are from migration.  If any batch operation in a
+    // writeUnitOfWork has _defaultFromMigrate set, all of them must.
+    bool _defaultFromMigrate = false;
 
     /**
      * Holds oplog data for operations which have been applied in the current batched

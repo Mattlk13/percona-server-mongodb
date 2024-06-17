@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#include "mongo/db/s/shard_key_util.h"
+
 #include <absl/container/node_hash_map.h>
 #include <boost/container/small_vector.hpp>
 // IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
@@ -61,10 +63,12 @@
 #include "mongo/db/field_ref.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/list_indexes_gen.h"
 #include "mongo/db/query/collation/collation_spec.h"
 #include "mongo/db/s/migration_destination_manager.h"
 #include "mongo/db/s/shard_key_index_util.h"
-#include "mongo/db/s/shard_key_util.h"
+#include "mongo/db/timeseries/timeseries_constants.h"
+#include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/chunk_manager.h"
@@ -85,20 +89,39 @@ constexpr StringData kCheckShardingIndexCmdName = "checkShardingIndex"_sd;
 constexpr StringData kKeyPatternField = "keyPattern"_sd;
 
 /**
- * Create an index specification used for create index command.
+ * Create an index specification used for create index command. It is the responsibility of the
+ * caller to ensure the index key, namespace, and parameters passed in are valid.
  */
 BSONObj makeIndexSpec(const NamespaceString& nss,
                       const BSONObj& keys,
                       const BSONObj& collation,
-                      bool unique) {
+                      bool unique,
+                      boost::optional<TimeseriesOptions> tsOpts) {
     BSONObjBuilder index;
 
     // Required fields for an index.
     index.append("key", keys);
 
     StringBuilder indexName;
+    auto keysToIterate = keys;
+
+    // Time-series indexes are named using the meta and timeFields defined by the user and not the
+    // field names of the buckets collection. To match unsharded time-series collections, the index
+    // name must be generated using the index key for the view namespace.
+    //
+    // Unsharded collections can appear with the key '{_id:1}'. We will return the key as is in
+    // that case.
+    if (tsOpts && !(keys.hasField(timeseries::kBucketIdFieldName))) {
+        boost::optional<BSONObj> bucketKeysForName =
+            timeseries::createTimeseriesIndexFromBucketsIndexSpec(*tsOpts, keys);
+        tassert(7711204,
+                str::stream() << "Invalid index backing a shard key on a time-series collection: "
+                              << keys,
+                bucketKeysForName.has_value());
+        keysToIterate = bucketKeysForName->getOwned();
+    }
     bool isFirstKey = true;
-    for (BSONObjIterator keyIter(keys); keyIter.more();) {
+    for (BSONObjIterator keyIter(keysToIterate); keyIter.more();) {
         BSONElement currentKey = keyIter.next();
 
         if (isFirstKey) {
@@ -137,8 +160,9 @@ BSONObj makeIndexSpec(const NamespaceString& nss,
 BSONObj makeCreateIndexesCmd(const NamespaceString& nss,
                              const BSONObj& keys,
                              const BSONObj& collation,
-                             bool unique) {
-    auto indexSpec = makeIndexSpec(nss, keys, collation, unique);
+                             bool unique,
+                             boost::optional<TimeseriesOptions> tsOpts) {
+    auto indexSpec = makeIndexSpec(nss, keys, collation, unique, tsOpts);
     // The outer createIndexes command.
     BSONObjBuilder createIndexes;
     createIndexes.append("createIndexes", nss.coll());
@@ -258,7 +282,9 @@ bool validateShardKeyIndexExistsOrCreateIfPossible(OperationContext* opCtx,
                                                    const boost::optional<BSONObj>& defaultCollation,
                                                    bool unique,
                                                    bool enforceUniquenessCheck,
-                                                   const ShardKeyValidationBehaviors& behaviors) {
+                                                   const ShardKeyValidationBehaviors& behaviors,
+                                                   boost::optional<TimeseriesOptions> tsOpts,
+                                                   bool updatedToHandleTimeseriesIndex) {
     std::string errMsg;
     if (validShardKeyIndexExists(opCtx,
                                  nss,
@@ -273,11 +299,40 @@ bool validateShardKeyIndexExistsOrCreateIfPossible(OperationContext* opCtx,
     // 4. If no useful index, verify we can create one.
     behaviors.verifyCanCreateShardKeyIndex(nss, &errMsg);
 
-    // 5. If no useful index exists and we can create one, create one on proposedKey. Only need
-    //    to call ensureIndex on primary shard, since indexes get copied to receiving shard
-    //    whenever a migrate occurs. If the collection has a default collation, explicitly send
-    //    the simple collation as part of the createIndex request.
-    behaviors.createShardKeyIndex(nss, shardKeyPattern.toBSON(), defaultCollation, unique);
+    // 5. If the shard key index is on a buckets namespace, we need to convert the shard key index.
+    // We only do this if the DDL coordinator is running on FCV > 7.3. Previous versions should fall
+    // back on the original index created.
+    //
+    // TODO (SERVER-79304): Remove 'updatedToHandleTimeseriesIndex' once 8.0 becomes last LTS, or
+    // update the ticket number to when the parameter can be removed.
+    auto indexKeyPatternBSON = shardKeyPattern.toBSON();
+    if (updatedToHandleTimeseriesIndex && tsOpts.has_value()) {
+        // 'createBucketsShardKeyIndexFromTimeseriesShardKeySpec' expects the shard key to be
+        // already "buckets-encoded". For example, shard keys on the timeField should already be
+        // changed to use the "control.min.<timeField>". If the shard key is not buckets
+        // encoded, the function will return 'boost::none'.
+        boost::optional<BSONObj> bucketShardKeyIndexPattern =
+            timeseries::createBucketsShardKeyIndexFromBucketsShardKeySpec(*tsOpts,
+                                                                          shardKeyPattern.toBSON());
+        tassert(7711202,
+                str::stream() << "Invalid index backing a shard key on a time-series collection:  "
+                              << indexKeyPatternBSON,
+                bucketShardKeyIndexPattern.has_value());
+        indexKeyPatternBSON = bucketShardKeyIndexPattern->getOwned();
+    }
+
+    // 6. If no useful index exists and we can create one based on the proposed shard key. We only
+    // need to call ensureIndex on primary shard, since indexes get copied to receiving shard
+    // whenever a migrate occurs. If the collection has a default collation, explicitly send the
+    // simple collation as part of the createIndex request.
+
+    // We will only pass 'tsOpts' if 'updatedToHandleTimeseriesIndex' is true, and thus we are
+    // making the updated time-series index for the sharding DDL commands.
+    behaviors.createShardKeyIndex(nss,
+                                  indexKeyPatternBSON,
+                                  defaultCollation,
+                                  unique,
+                                  updatedToHandleTimeseriesIndex ? tsOpts : boost::none);
     return true;
 }
 
@@ -335,33 +390,46 @@ std::vector<BSONObj> ValidationBehaviorsShardCollection::loadIndexes(
 
 void ValidationBehaviorsShardCollection::verifyUsefulNonMultiKeyIndex(
     const NamespaceString& nss, const BSONObj& proposedKey) const {
-    BSONObj res;
-    auto success = _localClient->runCommand(
+    auto res = Shard::CommandResponse::getEffectiveStatus(_dataShard->runCommand(
+        _opCtx,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
         DatabaseName::kAdmin,
         BSON(kCheckShardingIndexCmdName
              << NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault())
              << kKeyPatternField << proposedKey),
-        res);
-    uassert(ErrorCodes::InvalidOptions, res["errmsg"].str(), success);
+        Shard::RetryPolicy::kIdempotent));
+    uassert(ErrorCodes::InvalidOptions, res.reason(), res.isOK());
 }
 
 void ValidationBehaviorsShardCollection::verifyCanCreateShardKeyIndex(const NamespaceString& nss,
                                                                       std::string* errMsg) const {
+    repl::ReadConcernArgs readConcern =
+        repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
+    FindCommandRequest findCommand(nss);
+    findCommand.setLimit(1);
+    findCommand.setReadConcern(readConcern.toBSONInner());
+    Shard::QueryResponse response = uassertStatusOK(
+        _dataShard->runExhaustiveCursorCommand(_opCtx,
+                                               ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                                               nss.dbName(),
+                                               findCommand.toBSON(BSONObj()),
+                                               Milliseconds(-1)));
     uassert(ErrorCodes::InvalidOptions,
             str::stream() << "Please create an index that starts with the proposed shard key before"
                              " sharding the collection. "
                           << *errMsg,
-            _localClient->findOne(nss, BSONObj{}).isEmpty());
+            response.docs.empty());
 }
 
 void ValidationBehaviorsShardCollection::createShardKeyIndex(
     const NamespaceString& nss,
     const BSONObj& proposedKey,
     const boost::optional<BSONObj>& defaultCollation,
-    bool unique) const {
+    bool unique,
+    boost::optional<TimeseriesOptions> tsOpts) const {
     BSONObj collation =
         defaultCollation && !defaultCollation->isEmpty() ? CollationSpec::kSimpleSpec : BSONObj();
-    auto createIndexesCmd = makeCreateIndexesCmd(nss, proposedKey, collation, unique);
+    auto createIndexesCmd = makeCreateIndexesCmd(nss, proposedKey, collation, unique, tsOpts);
     BSONObj res;
     _localClient->runCommand(nss.dbName(), createIndexesCmd, res);
     uassertStatusOK(getStatusFromCommandResult(res));
@@ -425,7 +493,8 @@ void ValidationBehaviorsRefineShardKey::createShardKeyIndex(
     const NamespaceString& nss,
     const BSONObj& proposedKey,
     const boost::optional<BSONObj>& defaultCollation,
-    bool unique) const {
+    bool unique,
+    boost::optional<TimeseriesOptions> tsOpts) const {
     MONGO_UNREACHABLE;
 }
 
@@ -471,7 +540,8 @@ void ValidationBehaviorsLocalRefineShardKey::createShardKeyIndex(
     const NamespaceString& nss,
     const BSONObj& proposedKey,
     const boost::optional<BSONObj>& defaultCollation,
-    bool unique) const {
+    bool unique,
+    boost::optional<TimeseriesOptions> tsOpts) const {
     MONGO_UNREACHABLE;
 }
 
@@ -481,7 +551,13 @@ ValidationBehaviorsReshardingBulkIndex::ValidationBehaviorsReshardingBulkIndex()
 std::vector<BSONObj> ValidationBehaviorsReshardingBulkIndex::loadIndexes(
     const NamespaceString& nss) const {
     invariant(_opCtx);
-    auto catalogCache = Grid::get(_opCtx)->catalogCache();
+    auto grid = Grid::get(_opCtx);
+    // This is a hack to make this code work in resharding_recipient_service_test. In real
+    // deployment, grid and catalogCache should always exist.
+    if (!grid->isInitialized() || !grid->catalogCache()) {
+        return std::vector<BSONObj>();
+    }
+    auto catalogCache = grid->catalogCache();
     auto cri = catalogCache->getTrackedCollectionRoutingInfo(_opCtx, nss);
     auto [indexSpecs, _] = MigrationDestinationManager::getCollectionIndexes(
         _opCtx, nss, cri.cm.getMinKeyShardIdWithSimpleCollation(), cri, _cloneTimestamp);
@@ -521,10 +597,16 @@ void ValidationBehaviorsReshardingBulkIndex::createShardKeyIndex(
     const NamespaceString& nss,
     const BSONObj& proposedKey,
     const boost::optional<BSONObj>& defaultCollation,
-    bool unique) const {
+    bool unique,
+    boost::optional<TimeseriesOptions> tsOpts) const {
+    tassert(7711203,
+            "Resharding isn't supported on time-series collection, so 'tsOpts' should never hold a "
+            "value",
+            !tsOpts);
+
     BSONObj collation =
         defaultCollation && !defaultCollation->isEmpty() ? CollationSpec::kSimpleSpec : BSONObj();
-    _shardKeyIndexSpec = makeIndexSpec(nss, proposedKey, collation, unique);
+    _shardKeyIndexSpec = makeIndexSpec(nss, proposedKey, collation, unique, tsOpts);
 }
 
 void ValidationBehaviorsReshardingBulkIndex::setOpCtxAndCloneTimestamp(OperationContext* opCtx,

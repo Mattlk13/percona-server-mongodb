@@ -57,7 +57,6 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/write_stage_common.h"
 #include "mongo/db/feature_flag.h"
@@ -74,6 +73,7 @@
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -114,6 +114,13 @@ MONGO_FAIL_POINT_DEFINE(hangAfterCollectionInserts);
 // This fail point introduces corruption to documents during insert.
 MONGO_FAIL_POINT_DEFINE(corruptDocumentOnInsert);
 
+// This fail point manually forces the RecordId to be of a given value during insert.
+MONGO_FAIL_POINT_DEFINE(explicitlySetRecordIdOnInsert);
+
+// This fail point skips deletion of the record, so that the deletion call would only delete the
+// index keys.
+MONGO_FAIL_POINT_DEFINE(skipDeleteRecord);
+
 bool compareSafeContentElem(const BSONObj& oldDoc, const BSONObj& newDoc) {
     if (newDoc.hasField(kSafeContent) != oldDoc.hasField(kSafeContent)) {
         return false;
@@ -137,7 +144,8 @@ std::vector<OplogSlot> reserveOplogSlotsForRetryableFindAndModify(OperationConte
     // entries and set the timestamp for these synthetic entries to be TS - 1.
     auto oplogInfo = LocalOplogInfo::get(opCtx);
     auto slots = oplogInfo->getNextOpTimes(opCtx, 2);
-    uassertStatusOK(opCtx->recoveryUnit()->setTimestamp(slots.back().getTimestamp()));
+    uassertStatusOK(
+        shard_role_details::getRecoveryUnit(opCtx)->setTimestamp(slots.back().getTimestamp()));
     return slots;
 }
 
@@ -204,11 +212,11 @@ Status insertDocumentsImpl(OperationContext* opCtx,
                            bool fromMigrate) {
     const auto& nss = collection->ns();
 
-    dassert(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_IX) ||
-            (nss.isOplog() && opCtx->lockState()->isWriteLocked()) ||
+    dassert(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(nss, MODE_IX) ||
+            (nss.isOplog() && shard_role_details::getLocker(opCtx)->isWriteLocked()) ||
             (nss.isChangeCollection() && nss.tenantId() &&
-             opCtx->lockState()->isLockHeldForMode({ResourceType::RESOURCE_TENANT, *nss.tenantId()},
-                                                   MODE_IX)));
+             shard_role_details::getLocker(opCtx)->isLockHeldForMode(
+                 {ResourceType::RESOURCE_TENANT, *nss.tenantId()}, MODE_IX)));
 
     const size_t count = std::distance(begin, end);
 
@@ -258,6 +266,10 @@ Status insertDocumentsImpl(OperationContext* opCtx,
                 record_id_helpers::keyForDoc(doc,
                                              collection->getClusteredInfo()->getIndexSpec(),
                                              collection->getDefaultCollator()));
+        } else if (!it->replicatedRecordId.isNull()) {
+            // The 'replicatedRecordId' being set indicates that this insert belongs to a replicated
+            // recordId collection, and we need to use the given recordId while inserting.
+            recordId = it->replicatedRecordId;
         } else if (!it->recordId.isNull()) {
             // This case would only normally be called in a testing circumstance to avoid
             // automatically generating record ids for capped collections.
@@ -274,11 +286,22 @@ Status insertDocumentsImpl(OperationContext* opCtx,
             continue;
         }
 
+        explicitlySetRecordIdOnInsert.execute([&](const BSONObj& data) {
+            const auto docToMatch = data["doc"].Obj();
+            if (doc.woCompare(docToMatch) == 0) {
+                {
+                    auto ridValue = data["rid"].safeNumberInt();
+                    recordId = RecordId(ridValue);
+                }
+            }
+        });
+
         records.emplace_back(Record{std::move(recordId), RecordData(doc.objdata(), doc.objsize())});
         timestamps.emplace_back(it->oplogSlot.getTimestamp());
     }
 
     Status status = collection->getRecordStore()->insertRecords(opCtx, &records, timestamps);
+
     if (!status.isOK()) {
         if (auto extraInfo = status.extraInfo<DuplicateKeyErrorInfo>();
             extraInfo && collection->isClustered()) {
@@ -301,6 +324,7 @@ Status insertDocumentsImpl(OperationContext* opCtx,
         }
         return status;
     }
+
     std::vector<BsonRecord> bsonRecords;
     bsonRecords.reserve(count);
     int recordIndex = 0;
@@ -316,6 +340,16 @@ Status insertDocumentsImpl(OperationContext* opCtx,
         bsonRecords.emplace_back(std::move(bsonRecord));
     }
 
+    // An empty vector of recordIds is ignored by the OpObserver. When non-empty,
+    // the OpObserver will add recordIds to the generated oplog entries.
+    std::vector<RecordId> recordIds;
+    if (collection->areRecordIdsReplicated()) {
+        recordIds.reserve(count);
+        for (const auto& r : records) {
+            recordIds.push_back(r.id);
+        }
+    }
+
     int64_t keysInserted = 0;
     status =
         collection->getIndexCatalog()->indexRecords(opCtx, collection, bsonRecords, &keysInserted);
@@ -327,9 +361,10 @@ Status insertDocumentsImpl(OperationContext* opCtx,
         opDebug->additiveMetrics.incrementKeysInserted(keysInserted);
         // 'opDebug' may be deleted at rollback time in case of multi-document transaction.
         if (!opCtx->inMultiDocumentTransaction()) {
-            opCtx->recoveryUnit()->onRollback([opDebug, keysInserted](OperationContext*) {
-                opDebug->additiveMetrics.incrementKeysInserted(-keysInserted);
-            });
+            shard_role_details::getRecoveryUnit(opCtx)->onRollback(
+                [opDebug, keysInserted](OperationContext*) {
+                    opDebug->additiveMetrics.incrementKeysInserted(-keysInserted);
+                });
         }
     }
 
@@ -339,6 +374,7 @@ Status insertDocumentsImpl(OperationContext* opCtx,
             collection,
             begin,
             end,
+            recordIds,
             /*fromMigrate=*/makeFromMigrateForInserts(opCtx, nss, begin, end, fromMigrate),
             /*defaultFromMigrate=*/fromMigrate);
     }
@@ -353,6 +389,7 @@ Status insertDocumentsImpl(OperationContext* opCtx,
 Status insertDocumentForBulkLoader(OperationContext* opCtx,
                                    const CollectionPtr& collection,
                                    const BSONObj& doc,
+                                   RecordId replicatedRecordId,
                                    const OnRecordInsertedFn& onRecordInserted) {
     const auto& nss = collection->ns();
 
@@ -366,10 +403,17 @@ Status insertDocumentForBulkLoader(OperationContext* opCtx,
         return status;
     }
 
-    dassert(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_IX) ||
-            (nss.isOplog() && opCtx->lockState()->isWriteLocked()));
+    dassert(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(nss, MODE_IX) ||
+            (nss.isOplog() && shard_role_details::getLocker(opCtx)->isWriteLocked()));
 
-    RecordId recordId;
+    // The replicatedRecordId must be provided if the collection has recordIdsReplicated:true and it
+    // must not be provided if the collection has recordIdsReplicated:false
+    invariant(collection->areRecordIdsReplicated() != replicatedRecordId.isNull(),
+              str::stream() << "Unexpected recordId value for collection with ns: '"
+                            << collection->ns().toStringForErrorMsg() << "', uuid: '"
+                            << collection->uuid());
+
+    RecordId recordId = replicatedRecordId;
     if (collection->isClustered()) {
         invariant(collection->getRecordStore()->keyFormat() == KeyFormat::String);
         recordId = uassertStatusOK(record_id_helpers::keyForDoc(
@@ -405,11 +449,14 @@ Status insertDocumentForBulkLoader(OperationContext* opCtx,
     }
     inserts.emplace_back(kUninitializedStmtId, doc, slot);
 
+    // During initial sync, there are no recordIds to be passed to the OpObserver to
+    // include in oplog entries, as we don't generate oplog entries.
     opCtx->getServiceContext()->getOpObserver()->onInserts(
         opCtx,
         collection,
         inserts.begin(),
         inserts.end(),
+        /*recordIds=*/{},
         /*fromMigrate=*/std::vector<bool>(inserts.size(), false),
         /*defaultFromMigrate=*/false);
 
@@ -418,10 +465,11 @@ Status insertDocumentForBulkLoader(OperationContext* opCtx,
     // Capture the recordStore here instead of the CollectionPtr object itself, because the record
     // store's lifetime is controlled by the collection IX lock held on the write paths, whereas the
     // CollectionPtr is just a front to the collection and its lifetime is shorter
-    opCtx->recoveryUnit()->onCommit([recordStore = collection->getRecordStore()](
-                                        OperationContext*, boost::optional<Timestamp>) {
-        recordStore->notifyCappedWaitersIfNeeded();
-    });
+    shard_role_details::getRecoveryUnit(opCtx)->onCommit(
+        [recordStore = collection->getRecordStore()](OperationContext*,
+                                                     boost::optional<Timestamp>) {
+            recordStore->notifyCappedWaitersIfNeeded();
+        });
 
     return loc.getStatus();
 }
@@ -468,21 +516,22 @@ Status insertDocuments(OperationContext* opCtx,
         }
     }
 
-    const SnapshotId sid = opCtx->recoveryUnit()->getSnapshotId();
+    const SnapshotId sid = shard_role_details::getRecoveryUnit(opCtx)->getSnapshotId();
 
     status = insertDocumentsImpl(opCtx, collection, begin, end, opDebug, fromMigrate);
     if (!status.isOK()) {
         return status;
     }
-    invariant(sid == opCtx->recoveryUnit()->getSnapshotId());
+    invariant(sid == shard_role_details::getRecoveryUnit(opCtx)->getSnapshotId());
 
     // Capture the recordStore here instead of the CollectionPtr object itself, because the record
     // store's lifetime is controlled by the collection IX lock held on the write paths, whereas the
     // CollectionPtr is just a front to the collection and its lifetime is shorter
-    opCtx->recoveryUnit()->onCommit([recordStore = collection->getRecordStore()](
-                                        OperationContext*, boost::optional<Timestamp>) {
-        recordStore->notifyCappedWaitersIfNeeded();
-    });
+    shard_role_details::getRecoveryUnit(opCtx)->onCommit(
+        [recordStore = collection->getRecordStore()](OperationContext*,
+                                                     boost::optional<Timestamp>) {
+            recordStore->notifyCappedWaitersIfNeeded();
+        });
 
     hangAfterCollectionInserts.executeIf(
         [&](const BSONObj& data) {
@@ -581,8 +630,9 @@ void updateDocument(OperationContext* opCtx,
                 compareSafeContentElem(oldDoc.value(), newDoc));
     }
 
-    dassert(opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_IX));
-    invariant(oldDoc.snapshotId() == opCtx->recoveryUnit()->getSnapshotId());
+    dassert(
+        shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(collection->ns(), MODE_IX));
+    invariant(oldDoc.snapshotId() == shard_role_details::getRecoveryUnit(opCtx)->getSnapshotId());
     invariant(newDoc.isOwned());
 
     if (collection->needsCappedLock()) {
@@ -590,7 +640,7 @@ void updateDocument(OperationContext* opCtx,
             opCtx, ResourceId(RESOURCE_METADATA, collection->ns()), MODE_X};
     }
 
-    SnapshotId sid = opCtx->recoveryUnit()->getSnapshotId();
+    SnapshotId sid = shard_role_details::getRecoveryUnit(opCtx)->getSnapshotId();
 
     BSONElement oldId = oldDoc.value()["_id"];
     // We accept equivalent _id according to the collation defined in the collection. 'foo' and
@@ -603,6 +653,10 @@ void updateDocument(OperationContext* opCtx,
 
     args->changeStreamPreAndPostImagesEnabledForCollection =
         collection->isChangeStreamPreAndPostImagesEnabled();
+
+    if (collection->areRecordIdsReplicated()) {
+        args->replicatedRecordId = oldLocation;
+    }
 
     OplogUpdateEntryArgs onUpdateArgs(args, collection);
     const bool setNeedsRetryImageOplogField =
@@ -650,7 +704,7 @@ void updateDocument(OperationContext* opCtx,
             opDebug->additiveMetrics.incrementKeysDeleted(keysDeleted);
             // 'opDebug' may be deleted at rollback time in case of multi-document transaction.
             if (!opCtx->inMultiDocumentTransaction()) {
-                opCtx->recoveryUnit()->onRollback(
+                shard_role_details::getRecoveryUnit(opCtx)->onRollback(
                     [opDebug, keysInserted, keysDeleted](OperationContext*) {
                         opDebug->additiveMetrics.incrementKeysInserted(-keysInserted);
                         opDebug->additiveMetrics.incrementKeysDeleted(-keysDeleted);
@@ -659,7 +713,7 @@ void updateDocument(OperationContext* opCtx,
         }
     }
 
-    invariant(sid == opCtx->recoveryUnit()->getSnapshotId());
+    invariant(sid == shard_role_details::getRecoveryUnit(opCtx)->getSnapshotId());
     args->updatedDoc = newDoc;
 
     opCtx->getServiceContext()->getOpObserver()->onUpdate(opCtx, onUpdateArgs);
@@ -675,9 +729,14 @@ StatusWith<BSONObj> updateDocumentWithDamages(OperationContext* opCtx,
                                               bool* indexesAffected,
                                               OpDebug* opDebug,
                                               CollectionUpdateArgs* args) {
-    dassert(opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_IX));
-    invariant(oldDoc.snapshotId() == opCtx->recoveryUnit()->getSnapshotId());
+    dassert(
+        shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(collection->ns(), MODE_IX));
+    invariant(oldDoc.snapshotId() == shard_role_details::getRecoveryUnit(opCtx)->getSnapshotId());
     invariant(collection->updateWithDamagesSupported());
+
+    if (collection->areRecordIdsReplicated()) {
+        args->replicatedRecordId = loc;
+    }
 
     OplogUpdateEntryArgs onUpdateArgs(args, collection);
     const bool setNeedsRetryImageOplogField =
@@ -733,7 +792,7 @@ StatusWith<BSONObj> updateDocumentWithDamages(OperationContext* opCtx,
             opDebug->additiveMetrics.incrementKeysDeleted(keysDeleted);
             // 'opDebug' may be deleted at rollback time in case of multi-document transaction.
             if (!opCtx->inMultiDocumentTransaction()) {
-                opCtx->recoveryUnit()->onRollback(
+                shard_role_details::getRecoveryUnit(opCtx)->onRollback(
                     [opDebug, keysInserted, keysDeleted](OperationContext*) {
                         opDebug->additiveMetrics.incrementKeysInserted(-keysInserted);
                         opDebug->additiveMetrics.incrementKeysDeleted(-keysDeleted);
@@ -792,6 +851,9 @@ void deleteDocument(OperationContext* opCtx,
     }
 
     OplogDeleteEntryArgs deleteArgs;
+    if (collection->areRecordIdsReplicated()) {
+        deleteArgs.replicatedRecordId = loc;
+    }
 
     // TODO(SERVER-80956): remove this call.
     opCtx->getServiceContext()->getOpObserver()->aboutToDelete(
@@ -816,7 +878,16 @@ void deleteDocument(OperationContext* opCtx,
     int64_t keysDeleted = 0;
     collection->getIndexCatalog()->unindexRecord(
         opCtx, collection, doc.value(), loc, noWarn, &keysDeleted, checkRecordId);
-    collection->getRecordStore()->deleteRecord(opCtx, loc);
+
+    if (MONGO_unlikely(skipDeleteRecord.shouldFail())) {
+        LOGV2_DEBUG(8096000,
+                    3,
+                    "Skipping deleting record in deleteDocument",
+                    "recordId"_attr = loc,
+                    "doc"_attr = doc.value().toString());
+    } else {
+        collection->getRecordStore()->deleteRecord(opCtx, loc);
+    }
 
     opCtx->getServiceContext()->getOpObserver()->onDelete(
         opCtx, collection, stmtId, doc.value(), deleteArgs);
@@ -825,9 +896,10 @@ void deleteDocument(OperationContext* opCtx,
         opDebug->additiveMetrics.incrementKeysDeleted(keysDeleted);
         // 'opDebug' may be deleted at rollback time in case of multi-document transaction.
         if (!opCtx->inMultiDocumentTransaction()) {
-            opCtx->recoveryUnit()->onRollback([opDebug, keysDeleted](OperationContext*) {
-                opDebug->additiveMetrics.incrementKeysDeleted(-keysDeleted);
-            });
+            shard_role_details::getRecoveryUnit(opCtx)->onRollback(
+                [opDebug, keysDeleted](OperationContext*) {
+                    opDebug->additiveMetrics.incrementKeysDeleted(-keysDeleted);
+                });
         }
     }
 }

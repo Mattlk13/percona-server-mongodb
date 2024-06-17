@@ -1,6 +1,6 @@
 // @tags: [
 //   # The test runs commands that are not allowed with security token: mapReduce.
-//   not_allowed_with_security_token,
+//   not_allowed_with_signed_security_token,
 //   does_not_support_stepdowns,
 //   requires_fastcount,
 //   requires_getmore,
@@ -19,8 +19,9 @@ db.getCollection("mrOutput").drop();
 
 coll.createIndex({a: 1, c: 1});
 coll.createIndex({b: 1, c: 1});
-coll.createIndex({a: 1});
-coll.createIndex({b: 1});
+// Use descending indexes to avoid index deduplication.
+coll.createIndex({a: -1});
+coll.createIndex({b: -1});
 
 assert.commandWorked(coll.insert({a: 2}));
 assert.commandWorked(coll.insert({b: 3}));

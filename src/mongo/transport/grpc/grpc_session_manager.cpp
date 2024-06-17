@@ -29,20 +29,70 @@
 
 #include "mongo/transport/grpc/grpc_session_manager.h"
 
+#include "mongo/db/commands/server_status.h"
+#include "mongo/db/server_options.h"
 #include "mongo/logv2/log.h"
+#include "mongo/transport/grpc/grpc_feature_flag_gen.h"
 #include "mongo/transport/grpc/grpc_session.h"
+#include "mongo/transport/hello_metrics.h"
 #include "mongo/transport/service_executor.h"
+#include "mongo/transport/transport_layer_manager.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 namespace mongo::transport::grpc {
+namespace {
+class GRPCSection : public ServerStatusSection {
+public:
+    using ServerStatusSection::ServerStatusSection;
+
+    bool includeByDefault() const override {
+        return feature_flags::gFeatureFlagGRPC.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
+    }
+
+    BSONObj generateSection(OperationContext* opCtx, const BSONElement&) const override {
+        bool grpcSeen = false;
+        BSONObjBuilder bb;
+        if (auto tlm = opCtx->getServiceContext()->getTransportLayerManager()) {
+            tlm->forEach([&](TransportLayer* tl) {
+                if (auto sm = dynamic_cast<GRPCSessionManager*>(tl->getSessionManager())) {
+                    massert(8076901, "Multiple GRPCSessionManagers", !grpcSeen);
+                    grpcSeen = true;
+                    sm->appendStats(&bb);
+                }
+            });
+        }
+        return bb.obj();
+    }
+};
+
+auto& grpcSection = *ServerStatusSectionBuilder<GRPCSection>("gRPC");
+
+void appendI64(BSONObjBuilder* b, StringData n, auto v) {
+    b->append(n, static_cast<std::int64_t>(v));
+}
+
+GRPCSessionManager* getSessionManager(Client* client) {
+    if (!client || !client->session())
+        return nullptr;
+
+    auto* tl = client->session()->getTransportLayer();
+    if (!tl || !tl->getSessionManager())
+        return nullptr;
+
+    return dynamic_cast<GRPCSessionManager*>(tl->getSessionManager());
+}
+
+}  // namespace
 
 std::string GRPCSessionManager::getClientThreadName(const Session& session) const {
-    const auto* s = checked_cast<const GRPCSession*>(&session);
-    if (auto id = s->clientId()) {
-        return "grpc{}-{}"_format(id->toString(), session.id());
+    using namespace fmt::literals;
+    const auto* s = checked_cast<const IngressSession*>(&session);
+    if (auto id = s->getRemoteClientId()) {
+        return "grpc-{}-{}"_format(id->toString(), session.id());
     } else {
-        return "grpc{}"_format(session.id());
+        return "grpc-{}"_format(session.id());
     }
 }
 
@@ -55,8 +105,44 @@ void GRPCSessionManager::configureServiceExecutorContext(mongo::Client* client,
 }
 
 void GRPCSessionManager::appendStats(BSONObjBuilder* bob) const {
-    // TODO SERVER-80769 GRPCSessionManager metrics
-    SessionManagerCommon::appendStats(bob);
+    {
+        BSONObjBuilder streams(bob->subobjStart("streams"_sd));
+
+        const auto current = numOpenSessions();
+        appendI64(&streams, "current"_sd, current);
+        appendI64(&streams, "available"_sd, maxOpenSessions() - current);
+        appendI64(&streams, "total"_sd, numCreatedSessions());
+        appendI64(&streams, "successful"_sd, _successfulSessions.load());
+
+        helloMetrics.serialize(&streams);
+
+        streams.doneFast();
+    }
+
+    {
+        const auto totalOps = getTotalOperations();
+        const auto completedOps = getCompletedOperations();
+        BSONObjBuilder ops(bob->subobjStart("operations"_sd));
+        appendI64(&ops, "active"_sd, totalOps - completedOps);
+        appendI64(&ops, "total"_sd, totalOps);
+        ops.doneFast();
+    }
+
+    appendI64(bob, "uniqueClientsSeen"_sd, _clientCache->getUniqueClientsSeen());
+}
+
+void GRPCSessionManager::endSessionByClient(mongo::Client* client) {
+    SessionManagerCommon::endSessionByClient(client);
+
+    auto session = dynamic_cast<IngressSession*>(client->session().get());
+    massert(8076902,
+            "GRPCSessionManager::endSessionByClient handling non grpc::IngressSession instance",
+            session);
+
+    auto optStatus = session->terminationStatus();
+    invariant(optStatus);
+    if (optStatus->isOK())
+        _successfulSessions.fetchAndAddRelaxed(1);
 }
 
 }  // namespace mongo::transport::grpc

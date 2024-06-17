@@ -4,6 +4,9 @@
  *
  * Checking UUID and index consistency involves talking to config servers through mongos, but mongos
  * is blackholed from the config servers in this test.
+ * @tags: [
+ *   temp_disabled_embedded_router_mongo_bridge,
+ * ]
  */
 
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
@@ -11,6 +14,7 @@ TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
 TestData.skipCheckRoutingTableConsistency = true;
 TestData.skipCheckShardFilteringMetadata = true;
+TestData.skipCheckMetadataConsistency = true;
 
 var st = new ShardingTest({
     shards: 2,

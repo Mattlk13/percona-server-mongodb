@@ -39,10 +39,15 @@
 namespace mongo {
 class InListData;
 class StringListSet;
+class PlanYieldPolicySBE;
+class AccumulationStatement;
+struct WindowFunctionStatement;
 
 namespace stage_builder {
 struct Environment;
 struct PlanStageStaticData;
+
+static constexpr auto kNothingEnvSlotName = "nothing"_sd;
 
 /**
  * Common parameters to SBE stage builder functions extracted into separate class to simplify
@@ -51,16 +56,19 @@ struct PlanStageStaticData;
 struct StageBuilderState {
     using InListsSet = absl::flat_hash_set<InListData*>;
     using CollatorsMap = absl::flat_hash_map<const CollatorInterface*, const CollatorInterface*>;
+    using SortSpecMap = absl::flat_hash_map<const void*, sbe::value::SlotId>;
 
     StageBuilderState(OperationContext* opCtx,
                       Environment& env,
                       PlanStageStaticData* data,
                       const Variables& variables,
+                      PlanYieldPolicySBE* yieldPolicy,
                       sbe::value::SlotIdGenerator* slotIdGenerator,
                       sbe::value::FrameIdGenerator* frameIdGenerator,
                       sbe::value::SpoolIdGenerator* spoolIdGenerator,
                       InListsSet* inListsSet,
                       CollatorsMap* collatorsMap,
+                      SortSpecMap* sortSpecMap,
                       boost::intrusive_ptr<ExpressionContext> expCtx,
                       bool needsMerge,
                       bool allowDiskUse)
@@ -69,10 +77,12 @@ struct StageBuilderState {
           spoolIdGenerator{spoolIdGenerator},
           inListsSet{inListsSet},
           collatorsMap{collatorsMap},
+          sortSpecMap{sortSpecMap},
           opCtx{opCtx},
           env{env},
           data{data},
           variables{variables},
+          yieldPolicy{yieldPolicy},
           expCtx{expCtx},
           needsMerge{needsMerge},
           allowDiskUse{allowDiskUse} {}
@@ -93,10 +103,16 @@ struct StageBuilderState {
         return spoolIdGenerator->generate();
     }
 
+    sbe::value::SlotId getNothingSlot();
+    sbe::value::SlotId getSortSpecSlot(const AccumulationStatement* sortPattern);
+    sbe::value::SlotId getSortSpecSlot(const WindowFunctionStatement* sortPattern);
+
     boost::optional<sbe::value::SlotId> getTimeZoneDBSlot();
     boost::optional<sbe::value::SlotId> getCollatorSlot();
     boost::optional<sbe::value::SlotId> getOplogTsSlot();
     boost::optional<sbe::value::SlotId> getBuiltinVarSlot(Variables::Id id);
+
+    bool isNothingSlot(sbe::value::SlotId slot);
 
     /**
      * Given a CollatorInterface, returns a copy of the CollatorInterface that is owned by the
@@ -124,14 +140,17 @@ struct StageBuilderState {
     sbe::value::FrameIdGenerator* const frameIdGenerator;
     sbe::value::SpoolIdGenerator* const spoolIdGenerator;
 
-    absl::flat_hash_set<InListData*>* const inListsSet;
-    absl::flat_hash_map<const CollatorInterface*, const CollatorInterface*>* const collatorsMap;
+    InListsSet* const inListsSet;
+    CollatorsMap* const collatorsMap;
+    SortSpecMap* const sortSpecMap;
 
     OperationContext* const opCtx;
     Environment& env;
     PlanStageStaticData* const data;
 
     const Variables& variables;
+
+    PlanYieldPolicySBE* const yieldPolicy{nullptr};
 
     boost::intrusive_ptr<ExpressionContext> expCtx;
 

@@ -47,7 +47,7 @@ public:
          */
         std::vector<HostAndPort> addresses;
         size_t maxThreads;
-        StringData tlsPEMKeyFile;
+        StringData tlsCertificateKeyFile;
         boost::optional<StringData> tlsCAFile;
         bool tlsAllowConnectionsWithoutCertificates;
         bool tlsAllowInvalidCertificates;
@@ -78,10 +78,21 @@ public:
     void start();
 
     /**
+     * Return the list of addresses this server is bound to and listening on.
+     * This must not be called before the server has been started.
+     */
+    const std::vector<HostAndPort>& getListeningAddresses() const;
+
+    /**
      * Initiates shutting down of the gRPC server, blocking until all pending RPCs and their
      * associated handlers have been completed.
      */
     void shutdown();
+
+    /**
+     * Stop accepting new sessions, but allow existing ones to complete.
+     */
+    void stopAcceptingRequests();
 
     bool isRunning() const;
 

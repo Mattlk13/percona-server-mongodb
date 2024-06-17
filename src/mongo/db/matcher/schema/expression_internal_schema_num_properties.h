@@ -60,7 +60,7 @@ public:
           _numProperties(numProperties),
           _name(name) {}
 
-    virtual ~InternalSchemaNumPropertiesMatchExpression() {}
+    ~InternalSchemaNumPropertiesMatchExpression() override {}
 
     size_t numChildren() const final {
         return 0;
@@ -90,9 +90,12 @@ public:
         return MatchCategory::kOther;
     }
 
-protected:
     long long numProperties() const {
         return _numProperties;
+    }
+
+    StringData getName() const {
+        return _name;
     }
 
 private:

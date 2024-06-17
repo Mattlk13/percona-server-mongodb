@@ -55,15 +55,53 @@
 namespace mongo {
 namespace bulk_write_exec {
 
+class BulkWriteExecStats {
+public:
+    void noteTargetedShard(const BulkWriteCommandRequest& clientRequest,
+                           const TargetedWriteBatch& targetedBatch);
+    void noteNumShardsOwningChunks(size_t nsIdx, int nShardsOwningChunks);
+    void noteTwoPhaseWriteProtocol(const BulkWriteCommandRequest& clientRequest,
+                                   const TargetedWriteBatch& targetedBatch,
+                                   size_t nsIdx,
+                                   int nShardsOwningChunks);
+
+    boost::optional<int> getNumShardsOwningChunks(size_t nsIdx) const;
+
+    void updateMetrics(OperationContext* opCtx,
+                       const std::vector<std::unique_ptr<NSTargeter>>& targeters,
+                       bool updatedShardKey);
+
+private:
+    // Indexed by the namespace index.
+    stdx::unordered_map<size_t, int> _numShardsOwningChunks;
+    stdx::unordered_set<ShardId> _targetedShards;
+    stdx::unordered_map<
+        size_t,
+        stdx::unordered_map<BatchedCommandRequest::BatchType, stdx::unordered_set<ShardId>>>
+        _targetedShardsPerNsAndBatchType;
+};
+
 /**
- * Contains replies for individual bulk write ops along with a count of how many replies in the
- * vector are errors.
+ * Contains counters which aggregate all the individual bulk write responses.
+ */
+struct SummaryFields {
+    int nErrors = 0;
+    int nInserted = 0;
+    int nMatched = 0;
+    int nModified = 0;
+    int nUpserted = 0;
+    int nDeleted = 0;
+};
+
+/**
+ * Contains replies for individual bulk write ops along with the summary fields for all responses.
  */
 struct BulkWriteReplyInfo {
     std::vector<BulkWriteReplyItem> replyItems;
-    int numErrors = 0;
+    SummaryFields summaryFields;
     boost::optional<BulkWriteWriteConcernError> wcErrors;
     boost::optional<std::vector<StmtId>> retriedStmtIds;
+    BulkWriteExecStats execStats;
 };
 
 /**
@@ -76,6 +114,15 @@ std::pair<FLEBatchResult, BulkWriteReplyInfo> attemptExecuteFLE(
     OperationContext* opCtx, const BulkWriteCommandRequest& clientRequest);
 
 /**
+ * Processes a response from an FLE insert/update/delete command and converts it to equivalent
+ * BulkWriteReplyInfo.
+ */
+BulkWriteReplyInfo processFLEResponse(const BatchedCommandRequest& request,
+                                      const BulkWriteCRUDOp::OpType& firstOpType,
+                                      bool errorsOnly,
+                                      const BatchedCommandResponse& response);
+
+/**
  * Executes a client bulkWrite request by sending child batches to several shard endpoints, and
  * returns a vector of BulkWriteReplyItem (each of which is a reply for an individual op) along
  * with a count of how many of those replies are errors.
@@ -85,6 +132,11 @@ std::pair<FLEBatchResult, BulkWriteReplyInfo> attemptExecuteFLE(
 BulkWriteReplyInfo execute(OperationContext* opCtx,
                            const std::vector<std::unique_ptr<NSTargeter>>& targeters,
                            const BulkWriteCommandRequest& clientRequest);
+
+
+BulkWriteCommandReply createEmulatedErrorReply(const Status& error,
+                                               int errorCount,
+                                               const boost::optional<TenantId>& tenantId);
 
 /**
  * The BulkWriteOp class manages the lifecycle of a bulkWrite request received by mongos. Each op in
@@ -157,6 +209,18 @@ public:
      */
     bool isFinished() const;
 
+    /**
+     * Returns true if the current approximate size of the bulkWrite is above the maximum allowed
+     * size.
+     */
+    bool aboveBulkWriteRepliesMaxSize() const;
+
+    /**
+     * Store a memory exceeded error in the first non-completed write op and abort the bulkWrite to
+     * avoid any other writes being executed.
+     */
+    void abortDueToMaxSizeError();
+
     const WriteOp& getWriteOp_forTest(int i) const;
 
     int numWriteOpsIn(WriteOpState opState) const;
@@ -165,7 +229,9 @@ public:
      * Saves all the write concern errors received from all the shards so that they can
      * be concatenated into a single error when mongos responds to the client.
      */
-    void saveWriteConcernError(ShardId shardId, BulkWriteWriteConcernError wcError);
+    void saveWriteConcernError(ShardId shardId,
+                               BulkWriteWriteConcernError wcError,
+                               const TargetedWriteBatch& writeBatch);
     void saveWriteConcernError(ShardWCError shardWCError);
     std::vector<ShardWCError> getWriteConcernErrors() const {
         return _wcErrors;
@@ -187,13 +253,21 @@ public:
     void noteErrorForRemainingWrites(const Status& status);
 
     /**
+     * Notes the response for a single write op.
+     */
+    void noteWriteOpResponse(const std::unique_ptr<TargetedWrite>& targetedWrite,
+                             WriteOp& op,
+                             const BulkWriteCommandReply& commandReply,
+                             size_t numOps,
+                             boost::optional<const BulkWriteReplyItem&> replyItem);
+
+    /**
      * Processes the response to a TargetedWriteBatch. Sharding related errors are then grouped
      * by namespace and captured in the map passed in.
      */
     void noteChildBatchResponse(
         const TargetedWriteBatch& targetedBatch,
-        const std::vector<BulkWriteReplyItem>& replyItems,
-        const boost::optional<std::vector<StmtId>>& retriedStmtIds,
+        const BulkWriteCommandReply& commandReply,
         boost::optional<stdx::unordered_map<NamespaceString, TrackedErrors>&> errorsPerNamespace);
 
 
@@ -236,7 +310,8 @@ public:
      * those operations are processed individually with the use of internal transactions.
      */
     void noteWriteOpFinalResponse(size_t opIdx,
-                                  const BulkWriteReplyItem& reply,
+                                  const boost::optional<BulkWriteReplyItem>& reply,
+                                  const BulkWriteCommandReply& response,
                                   const ShardWCError& shardWCError,
                                   const boost::optional<std::vector<StmtId>>& retriedStmtIds);
 
@@ -251,7 +326,7 @@ public:
      * Returns a vector of BulkWriteReplyItem based on the end state of each individual write in
      * this bulkWrite operation, along with the number of error replies contained in the vector.
      */
-    BulkWriteReplyInfo generateReplyInfo(bool errorsOnly);
+    BulkWriteReplyInfo generateReplyInfo();
 
     /**
      * Creates a BulkWriteWriteConcernError object which combines write concern errors
@@ -268,6 +343,38 @@ public:
 
     const BulkWriteCommandRequest& getClientRequest() const {
         return _clientRequest;
+    }
+
+    bool getAborted_forTest() const {
+        return _aborted;
+    }
+
+    /**
+     * Indicates whether the current round of executing child batches should be terminated.
+     * See _shouldStopCurrentRound for details.
+     */
+    bool shouldStopCurrentRound() const {
+        return _shouldStopCurrentRound;
+    }
+
+    /**
+     * Finalizes/resets state after executing (or attempting to execute) a write without shard key
+     * with _id.
+     */
+    void finishExecutingWriteWithoutShardKeyWithId();
+
+    void noteTargetedShard(const TargetedWriteBatch& targetedBatch);
+    void noteNumShardsOwningChunks(size_t nsIdx, int nShardsOwningChunks);
+    void noteTwoPhaseWriteProtocol(const TargetedWriteBatch& targetedBatch,
+                                   size_t nsIdx,
+                                   int nShardsOwningChunks);
+
+    void setTargeterHasStaleShardResponse(bool targeterHasStaleShardResponse) {
+        _targeterHasStaleShardResponse = targeterHasStaleShardResponse;
+    }
+
+    bool targeterHasStaleShardResponse() const {
+        return _targeterHasStaleShardResponse;
     }
 
 private:
@@ -288,9 +395,36 @@ private:
     // A list of write concern errors from all shards.
     std::vector<ShardWCError> _wcErrors;
 
+    // Optionally stores a map of write concern errors from all shards encountered during
+    // the current round of execution. This is used only in the specific case where we are
+    // processing a write of type WriteType::WriteWithoutShardKeyWithId, and is necessary because
+    // if we see a staleness error we restart the broadcasting protocol and do not care about
+    // results or WC errors from previous rounds of the protocol. Thus we temporarily save the
+    // errors here, and at the end of each round of execution we check if the operation specified
+    // by the opIdx has reached a terminal state. If so, these errors are final and will be moved
+    // to _wcErrors. If the op is not in a terminal state, we must be restarting the protocol and
+    // therefore we discard the errors.
+    boost::optional<stdx::unordered_map<int /* opIdx */, std::vector<ShardWCError>>>
+        _deferredWCErrors;
+
+    // Optionally stores a vector of TargetedWriteBatch, BulkWriteCommandReply and
+    // BulkWriteReplyItem tuple for writes of type WithoutShardKeyWithId in a targeted batch to
+    // defer updating batch stats until we are sure that there is no retry of such writes is needed.
+    // This is necessary for responses that have n > 0 in a given round because we do not want to
+    // increment the batch stats multiple times for retried statements.
+    boost::optional<std::vector<std::tuple<const TargetedWriteBatch*,
+                                           const BulkWriteCommandReply,
+                                           boost::optional<const BulkWriteReplyItem>>>>
+        _deferredResponses;
+
+    bool _targeterHasStaleShardResponse = false;
+
     // Statement ids for the ops that had already been executed, thus were not executed in this
     // bulkWrite.
-    boost::optional<std::vector<StmtId>> _retriedStmtIds;
+    // Using an unordered_set to avoid tracking duplicate statement Ids for
+    // WriteType::WithoutShardKeyWithId, which may be retried multiple times and thus have their
+    // statement IDs appear in multiple responses from shards.
+    boost::optional<stdx::unordered_set<StmtId>> _retriedStmtIds;
 
     // Set to true if this write is part of a transaction.
     const bool _inTransaction{false};
@@ -299,9 +433,29 @@ private:
     // Set to true if we encountered an error that prevents us from executing the rest of the
     // bulkWrite. Note this does *not* include cases where we saw an error for an individual
     // statement in an ordered bulkWrite, but instead covers these cases:
-    // - Any error encountered while in a transaction.
+    // - Any error encountered while in a transaction besides WouldChangeOwningShard.
     // - A local error indicating that this process is shutting down.
     bool _aborted = false;
+
+    // Set to true if we encounter some condition that means we should stop the current round of
+    // targeting/executing write(s) in this request. This is currently used in the case where we are
+    // broadcasting a multi:false update/delete without shard key with _id and we receive a response
+    // indicating a document was updated on one shard, and therefore as an optimization we do not
+    // need to wait to hear back from any other shards.
+    bool _shouldStopCurrentRound = false;
+
+    // Summary fields.
+    int _nInserted = 0;
+    int _nMatched = 0;
+    int _nModified = 0;
+    int _nUpserted = 0;
+    int _nDeleted = 0;
+
+    // The approximate size of replyItems we are tracking. Used to keep mongos from
+    // using too much memory on this command.
+    int32_t _approximateSize = 0;
+
+    BulkWriteExecStats _stats;
 };
 
 /**

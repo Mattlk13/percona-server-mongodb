@@ -29,7 +29,6 @@
 
 #pragma once
 
-#include <fmt/format.h>
 #include <string>
 
 #include <boost/optional/optional.hpp>
@@ -44,7 +43,24 @@
 
 namespace mongo {
 
-using namespace fmt::literals;
+/**
+ * This utility class is only meant to be use for pattern-matching case in Authentication. For this
+ * use case incomplete types (ex: NS with a coll and tenant ID but no DB) might be created and this
+ * class allows it.
+ *
+ * All other use-cases should use NamespaceStringUtil to avoid breaking tenant isolation.
+ */
+class AuthNamespaceStringUtil {
+public:
+    /**
+     * Wrapper for the NamespaceString constructor without validation on "db". It should only
+     * be used in specific auth use-cases. Does not expect "db" to be prefixed when multitenancy is
+     * on.
+     */
+    static NamespaceString deserialize(const boost::optional<TenantId>& tenantId,
+                                       StringData db,
+                                       StringData coll);
+};
 
 class NamespaceStringUtil {
 public:
@@ -121,6 +137,17 @@ public:
                                        const SerializationContext& context);
 
     /**
+     * Deserializes StringData ns to a NamespaceString object for catalog code.
+     *
+     * Always includes the tenantId prefix for the catalog deserialization.
+     * eg. deserializeForCatalog(tenantID, "foo.bar") -> "tenantID_foo.bar"
+     *
+     * MUST only be used for deserializing a NamespaceString object for catalog.
+     */
+    static NamespaceString deserializeForCatalog(const boost::optional<TenantId>& tenantId,
+                                                 StringData ns);
+
+    /**
      * Constructs a NamespaceString from the string 'ns'. Should only be used when reading a
      * namespace from disk. 'ns' is expected to contain a tenantId when running in Serverless mode.
      */
@@ -145,20 +172,17 @@ private:
     static std::string serializeForCommands(const NamespaceString& ns,
                                             const SerializationContext& context);
 
-    static std::string serializeForAuthPrevalidated(const NamespaceString& ns,
-                                                    const SerializationContext& context);
-
     static NamespaceString deserializeForStorage(boost::optional<TenantId> tenantId,
-                                                 StringData ns,
-                                                 const SerializationContext& context);
+                                                 StringData db,
+                                                 StringData coll);
 
     static NamespaceString deserializeForCommands(boost::optional<TenantId> tenantId,
-                                                  StringData ns,
+                                                  StringData db,
+                                                  StringData coll,
                                                   const SerializationContext& context);
 
-    static NamespaceString deserializeForAuthPrevalidated(boost::optional<TenantId> tenantId,
-                                                          StringData ns,
-                                                          const SerializationContext& context);
+    static NamespaceString parseFromStringExpectTenantIdInMultitenancyMode(StringData db,
+                                                                           StringData coll);
 };
 
 }  // namespace mongo

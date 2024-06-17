@@ -53,21 +53,21 @@ namespace mongo::sbe {
  * Runs a trial period in order to evaluate the cost of a cached plan. If the cost is unexpectedly
  * high, the plan cache entry is deactivated and we use multi-planning to select an entirely new
  * winning plan. This process is called "replanning".
- *
- * TODO: refresh the list of indexes in 'queryParams' during replanning.
  */
 class CachedSolutionPlanner final : public BaseRuntimePlanner {
 public:
     CachedSolutionPlanner(OperationContext* opCtx,
                           const MultipleCollectionAccessor& collections,
                           CanonicalQuery& cq,
-                          const QueryPlannerParams& queryParams,
                           boost::optional<size_t> decisionReads,
-                          PlanYieldPolicySBE* yieldPolicy)
-        : BaseRuntimePlanner{opCtx, collections, cq, queryParams, yieldPolicy},
-          _decisionReads{decisionReads} {}
+                          PlanYieldPolicySBE* yieldPolicy,
+                          RemoteCursorMap* remoteCursors)
+        : BaseRuntimePlanner{opCtx, collections, cq, yieldPolicy},
+          _decisionReads{decisionReads},
+          _remoteCursors(remoteCursors) {}
 
     CandidatePlans plan(
+        const QueryPlannerParams& plannerParams,
         std::vector<std::unique_ptr<QuerySolution>> solutions,
         std::vector<std::pair<std::unique_ptr<PlanStage>, stage_builder::PlanStageData>> roots)
         final;
@@ -107,10 +107,14 @@ private:
      * indicate the reason for replanning, which can be included, for example, into plan stats
      * summary.
      */
-    CandidatePlans replan(bool shouldCache, std::string reason) const;
+    CandidatePlans replan(const QueryPlannerParams& plannerParams,
+                          bool shouldCache,
+                          std::string reason,
+                          RemoteCursorMap* remoteCursors = nullptr) const;
 
     // The number of physical reads taken to decide on a winning plan when the plan was first
     // cached. boost::none in case planing will not be based on the trial run logic.
     const boost::optional<size_t> _decisionReads;
+    RemoteCursorMap* _remoteCursors;
 };
 }  // namespace mongo::sbe

@@ -210,8 +210,10 @@ struct BaseCandidatePlan {
     // If the candidate plan has failed in a recoverable fashion during the trial run, contains a
     // non-OK status.
     Status status{Status::OK()};
-    // Indicates whether this candidate plan was retrieved from the cache.
-    bool isCachedCandidate{false};
+    // Indicates whether this candidate plan was retrieved from the cache. During explain, we do not
+    // fetch plans from the cache, so it may be the case that a plan matches a cache entry even when
+    // it is not fetched from the cache.
+    bool fromPlanCache{false};
     // Any results produced during the plan's execution prior to scoring are retained here.
     std::deque<ResultType> results;
     // This is used to track the original plan with clean PlanStage tree and the auxiliary data.

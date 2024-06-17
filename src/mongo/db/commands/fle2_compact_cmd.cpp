@@ -68,7 +68,6 @@
 #include "mongo/db/fle_crud.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_parameter.h"
 #include "mongo/db/server_parameter_with_storage.h"
 #include "mongo/db/service_context.h"
@@ -78,6 +77,7 @@
 #include "mongo/logv2/log_component.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/rpc/op_msg.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/str.h"
@@ -190,7 +190,7 @@ CompactStats compactEncryptedCompactionCollection(OperationContext* opCtx,
         mongo::ClusteredIndexSpec clusterIdxSpec(BSON("_id" << 1), true);
         CreateCollectionRequest request;
         request.setClusteredIndex(
-            stdx::variant<bool, mongo::ClusteredIndexSpec>(std::move(clusterIdxSpec)));
+            std::variant<bool, mongo::ClusteredIndexSpec>(std::move(clusterIdxSpec)));
         createCmd.setCreateCollectionRequest(std::move(request));
         auto status = createCollection(opCtx, createCmd);
         if (!status.isOK()) {

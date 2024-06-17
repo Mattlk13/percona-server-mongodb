@@ -45,7 +45,6 @@ selector:
   - jstests/core/**/compact_keeps_indexes.js
   - jstests/core/**/currentop.js
   - jstests/core/**/dbhash.js
-  - jstests/core/**/dbhash2.js
   - jstests/core/**/fsync.js
   - jstests/core/**/geo_s2cursorlimitskip.js
   - jstests/core/**/geo_update_btree2.js
@@ -57,7 +56,6 @@ selector:
   - jstests/core/**/tailable_getmore_batch_size.js
   - jstests/core/**/tailable_skip_limit.js
   - jstests/core/**/top.js
-  - jstests/core/**/explain_missing_database.js
   - jstests/core/**/geo_2d_explain.js
   - jstests/core/**/geo_s2explain.js
   - jstests/core/**/geo_s2sparse.js
@@ -67,10 +65,6 @@ selector:
   - jstests/core/**/create_indexes.js
   - jstests/core/**/list_indexes_non_existent_ns.js
   - jstests/core/**/mr_preserve_indexes.js
-  - jstests/core/**/dbcase.js
-  - jstests/core/**/dbcase2.js
-  - jstests/core/**/no_db_created.js
-  - jstests/core/**/killop_drop_collection.js
   - jstests/core/**/geo_borders.js
   - jstests/core/**/distinct_index1.js
   - jstests/core/**/explain1.js
@@ -91,23 +85,26 @@ selector:
   - jstests/core/write/update/batch_write_command_update.js
   - jstests/core/write/delete/batch_write_command_delete.js
   - jstests/core/failcommand_failpoint.js
-  - jstests/core/version_api_v1_command_coverage.js
   - jstests/core/write/write_commands_reject_unknown_fields.js
-  - jstests/core/txns/api_params_transaction.js
+  - jstests/core/query/explain/explain_uuid.js
+  - jstests/core/query/explain/explain_includes_command.js
   - jstests/core/txns/transactions_profiling.js
   - jstests/core/txns/currentop_blocked_operations.js
   - jstests/core/txns/transactions_profiling_with_drops.js
   - jstests/core/txns/multi_statement_transaction_write_error.js
   - src/mongo/db/modules/enterprise/jstests/fle2/basic_update.js
   - src/mongo/db/modules/enterprise/jstests/fle2/basic_delete.js
+  - src/mongo/db/modules/enterprise/jstests/fle2/query/explain*.js
   exclude_with_any_tags:
   - assumes_standalone_mongod
   - assumes_against_mongod_not_mongos
+  - assumes_no_implicit_collection_creation_on_get_collection
   - assumes_no_implicit_collection_creation_after_drop
   - assumes_no_implicit_index_creation
   - assumes_unsharded_collection
   - cannot_create_unique_index_when_using_hashed_shard_key
   - requires_profiling
+  - requires_capped
   roots:
   - jstests/core/**/*.js
   - jstests/fle2/**/*.js

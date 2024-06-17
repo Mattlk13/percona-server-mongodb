@@ -98,7 +98,7 @@ public:
             return NamespaceString(request().getDbName());
         }
 
-        Reply typedRun(OperationContext* opCtx);
+        Reply typedRun(OperationContext* opCtx) override;
     };
 
     std::string help() const final {
@@ -137,7 +137,7 @@ public:
             return NamespaceString(request().getDbName());
         }
 
-        Reply typedRun(OperationContext* opCtx);
+        Reply typedRun(OperationContext* opCtx) override;
     };
 
     std::string help() const final {
@@ -225,7 +225,7 @@ SaslReply doSaslStart(OperationContext* opCtx,
                       AuthenticationSession* session,
                       const SaslStartCommand& request) {
     auto mechanism = uassertStatusOK(
-        SASLServerMechanismRegistry::get(opCtx->getServiceContext())
+        SASLServerMechanismRegistry::get(opCtx->getService())
             .getServerMechanism(request.getMechanism(),
                                 DatabaseNameUtil::serialize(request.getDbName(),
                                                             request.getSerializationContext())));

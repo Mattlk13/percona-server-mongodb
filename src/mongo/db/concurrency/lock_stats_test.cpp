@@ -38,7 +38,7 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/concurrency/lock_stats.h"
-#include "mongo/db/concurrency/locker_impl.h"
+#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context_test_fixture.h"
@@ -62,7 +62,7 @@ TEST_F(LockStatsTest, NoWait) {
     resetGlobalLockStats();
 
     auto opCtx = makeOperationContext();
-    LockerImpl locker(getServiceContext());
+    Locker locker(getServiceContext());
     locker.lockGlobal(opCtx.get(), MODE_IX);
     ON_BLOCK_EXIT([&] { locker.unlockGlobal(); });
     locker.lock(opCtx.get(), resId, MODE_X);
@@ -85,14 +85,14 @@ TEST_F(LockStatsTest, Wait) {
     resetGlobalLockStats();
 
     auto opCtx = makeOperationContext();
-    LockerImpl locker(getServiceContext());
+    Locker locker(getServiceContext());
     locker.lockGlobal(opCtx.get(), MODE_IX);
     ON_BLOCK_EXIT([&] { locker.unlockGlobal(); });
     locker.lock(opCtx.get(), resId, MODE_X);
 
     {
         // This will block
-        LockerImpl lockerConflict(getServiceContext());
+        Locker lockerConflict(getServiceContext());
         lockerConflict.lockGlobal(opCtx.get(), MODE_IX);
         ON_BLOCK_EXIT([&] { lockerConflict.unlockGlobal(); });
         ASSERT_EQUALS(LOCK_WAITING, lockerConflict.lockBeginForTest(opCtx.get(), resId, MODE_S));
@@ -125,7 +125,7 @@ TEST_F(LockStatsTest, Reporting) {
     resetGlobalLockStats();
 
     auto opCtx = makeOperationContext();
-    LockerImpl locker(getServiceContext());
+    Locker locker(getServiceContext());
     locker.lockGlobal(opCtx.get(), MODE_IX);
     ON_BLOCK_EXIT([&] { locker.unlockGlobal(); });
     locker.lock(opCtx.get(), resId, MODE_X);
@@ -147,13 +147,13 @@ TEST_F(LockStatsTest, Subtraction) {
     resetGlobalLockStats();
 
     auto opCtx = makeOperationContext();
-    LockerImpl locker(getServiceContext());
+    Locker locker(getServiceContext());
     locker.lockGlobal(opCtx.get(), MODE_IX);
     ON_BLOCK_EXIT([&] { locker.unlockGlobal(); });
     locker.lock(opCtx.get(), resId, MODE_X);
 
     {
-        LockerImpl lockerConflict(getServiceContext());
+        Locker lockerConflict(getServiceContext());
         lockerConflict.lockGlobal(opCtx.get(), MODE_IX);
         ON_BLOCK_EXIT([&] { lockerConflict.unlockGlobal(); });
         ASSERT_THROWS_CODE(
@@ -169,7 +169,7 @@ TEST_F(LockStatsTest, Subtraction) {
     ASSERT_GREATER_THAN(stats.get(resId, MODE_S).combinedWaitTimeMicros, 0);
 
     {
-        LockerImpl lockerConflict(getServiceContext());
+        Locker lockerConflict(getServiceContext());
         lockerConflict.lockGlobal(opCtx.get(), MODE_IX);
         ON_BLOCK_EXIT([&] { lockerConflict.unlockGlobal(); });
         ASSERT_THROWS_CODE(
@@ -203,7 +203,7 @@ void assertGlobalAcquisitionStats(OperationContext* opCtx, ResourceId rid) {
     reportGlobalLockingStats(&stats);
     ASSERT_EQUALS(0, stats.get(rid, LockMode::MODE_IX).numAcquisitions);
 
-    LockerImpl locker(opCtx->getServiceContext());
+    Locker locker(opCtx->getServiceContext());
     if (rid == resourceIdGlobal) {
         locker.lockGlobal(opCtx, LockMode::MODE_IX);
     } else {
@@ -243,7 +243,7 @@ TEST_F(LockStatsTest, ServerStatus) {
 
     // Take the global and RSTL locks in MODE_IX to create acquisition stats for them.
     auto opCtx = makeOperationContext();
-    LockerImpl locker(opCtx->getServiceContext());
+    Locker locker(opCtx->getServiceContext());
     locker.lockGlobal(opCtx.get(), LockMode::MODE_IX);
     locker.lock(opCtx.get(), resourceIdReplicationStateTransitionLock, LockMode::MODE_IX);
 
@@ -261,6 +261,49 @@ TEST_F(LockStatsTest, ServerStatus) {
                   lockingStats.getObjectField("ReplicationStateTransition")
                       .getObjectField("acquireCount")
                       .getIntField("w"));
+}
+
+TEST_F(LockStatsTest, CumulativeWaitTime) {
+    const ResourceId resId1(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "LockStats.Wait1"));
+    const ResourceId resId2(
+        RESOURCE_DATABASE,
+        NamespaceString::createNamespaceString_forTest(boost::none, "LockStats.Wait2"));
+
+    auto opCtx = makeOperationContext();
+    Locker locker(getServiceContext());
+
+    resetGlobalLockStats();
+    locker.lockGlobal(opCtx.get(), MODE_IX);
+    ON_BLOCK_EXIT([&] { locker.unlockGlobal(); });
+    locker.lock(opCtx.get(), resId1, MODE_X);
+    locker.lock(opCtx.get(), resId2, MODE_X);
+
+    {
+        Locker lockerConflict(getServiceContext());
+        lockerConflict.lockGlobal(opCtx.get(), MODE_IX);
+        ON_BLOCK_EXIT([&] { lockerConflict.unlockGlobal(); });
+
+        ASSERT_THROWS_CODE(
+            lockerConflict.lock(opCtx.get(), resId1, MODE_S, Date_t::now() + Milliseconds(5)),
+            AssertionException,
+            ErrorCodes::LockTimeout);
+
+        ASSERT_THROWS_CODE(
+            lockerConflict.lock(opCtx.get(), resId2, MODE_S, Date_t::now() + Milliseconds(5)),
+            AssertionException,
+            ErrorCodes::LockTimeout);
+    }
+
+    SingleThreadedLockStats stats;
+    reportGlobalLockingStats(&stats);
+
+    auto wait1 = stats.get(resId1, MODE_S).combinedWaitTimeMicros;
+    auto wait2 = stats.get(resId2, MODE_S).combinedWaitTimeMicros;
+    ASSERT_GREATER_THAN(wait1, 0);
+    ASSERT_GREATER_THAN(wait2, 0);
+    ASSERT_EQ(stats.getCumulativeWaitTimeMicros(), wait1 + wait2);
 }
 
 }  // namespace

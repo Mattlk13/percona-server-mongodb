@@ -67,6 +67,11 @@
 namespace mongo {
 namespace {
 
+REGISTER_INTERNAL_DOCUMENT_SOURCE(_internalChangeStreamHandleTopologyChange,
+                                  LiteParsedDocumentSourceChangeStreamInternal::parse,
+                                  DocumentSourceChangeStreamHandleTopologyChange::createFromBson,
+                                  true);
+
 // Failpoint to throw an exception when the 'kNewShardDetected' event is observed.
 MONGO_FAIL_POINT_DEFINE(throwChangeStreamTopologyChangeExceptionToClient);
 
@@ -103,7 +108,8 @@ bool isShardConfigEvent(const Document& eventDoc) {
     // Check whether this event occurred on the config.shards collection.
     auto nsObj = eventDoc[DocumentSourceChangeStream::kNamespaceField];
     const bool isConfigDotShardsEvent = nsObj["db"_sd].getType() == BSONType::String &&
-        nsObj["db"_sd].getStringData() == NamespaceString::kConfigsvrShardsNamespace.db() &&
+        nsObj["db"_sd].getStringData() ==
+            NamespaceString::kConfigsvrShardsNamespace.db(omitTenant) &&
         nsObj["coll"_sd].getType() == BSONType::String &&
         nsObj["coll"_sd].getStringData() == NamespaceString::kConfigsvrShardsNamespace.coll();
 
@@ -131,6 +137,15 @@ bool isShardConfigEvent(const Document& eventDoc) {
 }  // namespace
 
 boost::intrusive_ptr<DocumentSourceChangeStreamHandleTopologyChange>
+DocumentSourceChangeStreamHandleTopologyChange::createFromBson(
+    const BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    uassert(8131300,
+            str::stream() << "the '" << kStageName << "' spec must be an empty object",
+            elem.type() == Object && elem.Obj().isEmpty());
+    return new DocumentSourceChangeStreamHandleTopologyChange(expCtx);
+}
+
+boost::intrusive_ptr<DocumentSourceChangeStreamHandleTopologyChange>
 DocumentSourceChangeStreamHandleTopologyChange::create(
     const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     return new DocumentSourceChangeStreamHandleTopologyChange(expCtx);
@@ -152,11 +167,11 @@ StageConstraints DocumentSourceChangeStreamHandleTopologyChange::constraints(
                                  UnionRequirement::kNotAllowed,
                                  ChangeStreamRequirement::kChangeStreamStage};
 
-    // Can be swapped with the '$match' and 'DocumentSourceSingleDocumentTransformation' stages and
-    // ensures that they get pushed down to the shards, as this stage bisects the change streams
-    // pipeline.
+    // Can be swapped with the '$match', '$redact', and 'DocumentSourceSingleDocumentTransformation'
+    // stages and ensures that they get pushed down to the shards, as this stage bisects the change
+    // streams pipeline.
     constraints.canSwapWithMatch = true;
-    constraints.canSwapWithSingleDocTransform = true;
+    constraints.canSwapWithSingleDocTransformOrRedact = true;
 
     return constraints;
 }

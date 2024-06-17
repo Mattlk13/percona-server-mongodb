@@ -58,7 +58,7 @@ void LiteParsedDocumentSource::registerParser(const std::string& name,
                                               AllowedWithClientType allowedWithClientType) {
     parserMap[name] = {parser, allowedWithApiStrict, allowedWithClientType};
     // Initialize a counter for this document source to track how many times it is used.
-    aggStageCounters.stageCounterMap[name] = std::make_unique<AggStageCounters::StageCounter>(name);
+    aggStageCounters.addMetric(name);
 }
 
 std::unique_ptr<LiteParsedDocumentSource> LiteParsedDocumentSource::parse(
@@ -117,7 +117,7 @@ LiteParsedDocumentSourceNestedPipelines::getInvolvedNamespaces() const {
         involvedNamespaces.insert(*_foreignNss);
 
     for (auto&& pipeline : _pipelines) {
-        auto involvedInSubPipe = pipeline.getInvolvedNamespaces();
+        const auto& involvedInSubPipe = pipeline.getInvolvedNamespaces();
         involvedNamespaces.insert(involvedInSubPipe.begin(), involvedInSubPipe.end());
     }
     return involvedNamespaces;
@@ -137,7 +137,7 @@ void LiteParsedDocumentSourceNestedPipelines::getForeignExecutionNamespaces(
 }
 
 Status LiteParsedDocumentSourceNestedPipelines::checkShardedForeignCollAllowed(
-    NamespaceString nss, bool inMultiDocumentTransaction) const {
+    const NamespaceString& nss, bool inMultiDocumentTransaction) const {
     for (auto&& pipeline : _pipelines) {
         if (auto status = pipeline.checkShardedForeignCollAllowed(nss, inMultiDocumentTransaction);
             !status.isOK()) {

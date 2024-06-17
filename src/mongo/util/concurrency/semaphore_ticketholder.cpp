@@ -29,24 +29,6 @@
 
 #include "mongo/util/concurrency/semaphore_ticketholder.h"
 
-#include <boost/move/utility_core.hpp>
-#include <boost/none.hpp>
-#include <cerrno>
-#include <ctime>
-#include <string>
-
-#include <boost/optional/optional.hpp>
-
-#include "mongo/db/service_context.h"
-#include "mongo/logv2/log.h"
-#include "mongo/logv2/log_attr.h"
-#include "mongo/logv2/log_component.h"
-#include "mongo/util/concurrency/ticketholder.h"
-#include "mongo/util/duration.h"
-#include "mongo/util/errno_util.h"
-
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
-
 namespace mongo {
 
 int64_t SemaphoreTicketHolder::numFinishedProcessing() const {
@@ -54,188 +36,74 @@ int64_t SemaphoreTicketHolder::numFinishedProcessing() const {
 }
 
 void SemaphoreTicketHolder::_appendImplStats(BSONObjBuilder& b) const {
-    _appendCommonQueueImplStats(b, _semaphoreStats);
-}
-#if defined(__linux__)
-namespace {
-
-/**
- * Accepts an errno code, prints its error message, and exits.
- */
-void failWithErrno(int err) {
-    LOGV2_FATAL(28604,
-                "error in Ticketholder: {errnoWithDescription_err}",
-                "errnoWithDescription_err"_attr = errorMessage(posixError(err)));
-}
-
-/*
- * Checks the return value from a Linux semaphore function call, and fails with the set errno if the
- * call was unsucessful.
- */
-void check(int ret) {
-    if (ret == 0)
-        return;
-    failWithErrno(errno);
-}
-
-/**
- * Takes a Date_t deadline and sets the appropriate values in a timespec structure.
- */
-void tsFromDate(const Date_t& deadline, struct timespec& ts) {
-    ts.tv_sec = deadline.toTimeT();
-    ts.tv_nsec = (deadline.toMillisSinceEpoch() % 1000) * 1'000'000;
-}
-}  // namespace
-
-SemaphoreTicketHolder::SemaphoreTicketHolder(int numTickets, ServiceContext* serviceContext)
-    : TicketHolder(numTickets, serviceContext) {
-    check(sem_init(&_sem, 0, numTickets));
-}
-
-SemaphoreTicketHolder::~SemaphoreTicketHolder() {
-    check(sem_destroy(&_sem));
-}
-
-boost::optional<Ticket> SemaphoreTicketHolder::_tryAcquireImpl(AdmissionContext* admCtx) {
-    while (0 != sem_trywait(&_sem)) {
-        if (errno == EAGAIN)
-            return boost::none;
-        if (errno != EINTR)
-            failWithErrno(errno);
-    }
-    return Ticket{this, admCtx};
-}
-
-boost::optional<Ticket> SemaphoreTicketHolder::_waitForTicketUntilImpl(OperationContext* opCtx,
-                                                                       AdmissionContext* admCtx,
-                                                                       Date_t until) {
-    const Milliseconds intervalMs(500);
-    struct timespec ts;
-
-    // To support interrupting ticket acquisition while still benefiting from semaphores, we do a
-    // timed wait on an interval to periodically check for interrupts.
-    // The wait period interval is the smaller of the default interval and the provided
-    // deadline.
-    Date_t deadline = std::min(until, Date_t::now() + intervalMs);
-    tsFromDate(deadline, ts);
-
-    while (0 != sem_timedwait(&_sem, &ts)) {
-        if (errno == ETIMEDOUT) {
-            // If we reached the deadline without being interrupted, we have completely timed out.
-            if (deadline == until)
-                return boost::none;
-
-            deadline = std::min(until, Date_t::now() + intervalMs);
-            tsFromDate(deadline, ts);
-        } else if (errno != EINTR) {
-            failWithErrno(errno);
-        }
-
-        // To correctly handle errors from sem_timedwait, we should check for interrupts last.
-        // It is possible to unset 'errno' after a call to checkForInterrupt().
-        if (opCtx)
-            opCtx->checkForInterrupt();
-    }
-    return Ticket{this, admCtx};
-}
-
-void SemaphoreTicketHolder::_releaseToTicketPoolImpl(AdmissionContext* admCtx) noexcept {
-    check(sem_post(&_sem));
-}
-
-int32_t SemaphoreTicketHolder::available() const {
-    int val = 0;
-    check(sem_getvalue(&_sem, &val));
-    return val;
-}
-
-void SemaphoreTicketHolder::_resize(int32_t newSize, int32_t oldSize) noexcept {
-    auto difference = newSize - oldSize;
-
-    if (difference > 0) {
-        for (int32_t i = 0; i < difference; i++) {
-            check(sem_post(&_sem));
-        }
-    } else if (difference < 0) {
-        for (int32_t i = 0; i < -difference; i++) {
-            check(sem_wait(&_sem));
-        }
-    }
-}
-
-#else
-
-SemaphoreTicketHolder::SemaphoreTicketHolder(int32_t numTickets, ServiceContext* svcCtx)
-    : TicketHolder(numTickets, svcCtx), _numTickets(numTickets) {}
-
-SemaphoreTicketHolder::~SemaphoreTicketHolder() = default;
-
-boost::optional<Ticket> SemaphoreTicketHolder::_tryAcquireImpl(AdmissionContext* admCtx) {
-    stdx::lock_guard<Latch> lk(_mutex);
-    if (!_tryAcquire()) {
-        return boost::none;
-    }
-    return Ticket{this, admCtx};
-}
-
-boost::optional<Ticket> SemaphoreTicketHolder::_waitForTicketUntilImpl(OperationContext* opCtx,
-                                                                       AdmissionContext* admCtx,
-                                                                       Date_t until) {
-    stdx::unique_lock<Latch> lk(_mutex);
-
-    bool taken = [&] {
-        if (opCtx) {
-            return opCtx->waitForConditionOrInterruptUntil(
-                _newTicket, lk, until, [this] { return _tryAcquire(); });
-        } else {
-            if (until == Date_t::max()) {
-                _newTicket.wait(lk, [this] { return _tryAcquire(); });
-                return true;
-            } else {
-                return _newTicket.wait_until(
-                    lk, until.toSystemTimePoint(), [this] { return _tryAcquire(); });
-            }
-        }
-    }();
-    if (!taken) {
-        return boost::none;
-    }
-    return Ticket{this, admCtx};
-}
-
-void SemaphoreTicketHolder::_releaseToTicketPoolImpl(AdmissionContext* admCtx) noexcept {
     {
-        stdx::lock_guard<Latch> lk(_mutex);
-        _numTickets++;
+        BSONObjBuilder bb(b.subobjStart("normalPriority"));
+        _appendCommonQueueImplStats(bb, _semaphoreStats);
+        bb.done();
     }
-    _newTicket.notify_one();
+}
+
+SemaphoreTicketHolder::SemaphoreTicketHolder(ServiceContext* serviceContext,
+                                             int numTickets,
+                                             bool trackPeakUsed)
+    : TicketHolder(serviceContext, numTickets, trackPeakUsed), _tickets(numTickets) {}
+
+boost::optional<Ticket> SemaphoreTicketHolder::_tryAcquireImpl(AdmissionContext* admCtx) {
+    uint32_t available = _tickets.load();
+    while (true) {
+        if (available == 0) {
+            return boost::none;
+        }
+
+        if (_tickets.compareAndSwap(&available, available - 1)) {
+            return Ticket{this, admCtx};
+        }
+    }
+}
+
+boost::optional<Ticket> SemaphoreTicketHolder::_waitForTicketUntilImpl(Interruptible& interruptible,
+                                                                       AdmissionContext* admCtx,
+                                                                       Date_t until) {
+    auto nextDeadline = [&]() {
+        // Timed waits can be problematic if we have a large number of waiters, since each time we
+        // check for interrupt we risk waking up all waiting threads at the same time. We introduce
+        // some jitter here to try to reduce the impact of a thundering herd of waiters woken at
+        // the same time.
+        static int32_t baseIntervalMs = 500;
+        static double jitterFactor = 0.2;
+        static thread_local XorShift128 urbg(SecureRandom().nextInt64());
+        int32_t offset = std::uniform_int_distribution<int32_t>(
+            -jitterFactor * baseIntervalMs, baseIntervalMs * jitterFactor)(urbg);
+        return std::min(until, Date_t::now() + Milliseconds{baseIntervalMs + offset});
+    };
+
+    Date_t deadline = nextDeadline();
+    while (true) {
+        while (!_tickets.waitUntil(0, deadline)) {
+            if (deadline == until) {
+                return boost::none;
+            }
+
+            deadline = nextDeadline();
+            interruptible.checkForInterrupt();
+        }
+
+        uint32_t available = _tickets.load();
+        if (available > 0 && _tickets.compareAndSwap(&available, available - 1)) {
+            Ticket ticket{this, admCtx};
+            interruptible.checkForInterrupt();
+            return std::move(ticket);
+        }
+    }
+}
+
+void SemaphoreTicketHolder::_releaseToTicketPoolImpl(AdmissionContext* admCtx) noexcept {
+    _tickets.fetchAndAdd(1);
+    _tickets.notifyOne();
 }
 
 int32_t SemaphoreTicketHolder::available() const {
-    return _numTickets;
+    return _tickets.load();
 }
 
-bool SemaphoreTicketHolder::_tryAcquire() {
-    if (_numTickets <= 0) {
-        return false;
-    }
-    _numTickets--;
-    return true;
-}
-
-void SemaphoreTicketHolder::_resize(int32_t newSize, int32_t oldSize) noexcept {
-    auto difference = newSize - oldSize;
-
-    stdx::lock_guard<Latch> lk(_mutex);
-    _numTickets += difference;
-
-    if (difference > 0) {
-        for (int32_t i = 0; i < difference; i++) {
-            _newTicket.notify_one();
-        }
-    }
-    // No need to do anything in the other cases as the number of tickets being <= 0 implies they'll
-    // have to wait until the current ticket holders release their tickets.
-}
-#endif
 }  // namespace mongo

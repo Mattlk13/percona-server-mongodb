@@ -52,9 +52,12 @@ class ClusterExplain {
 public:
     /**
      * Returns an explain command request wrapping the passed in command at the given verbosity
-     * level, propagating generic top-level command arguments.
+     * level, propagating generic top-level command arguments. Additionally passed command is
+     * appended with query settings.
      */
-    static BSONObj wrapAsExplain(const BSONObj& cmdObj, ExplainOptions::Verbosity verbosity);
+    static BSONObj wrapAsExplain(const BSONObj& cmdObj,
+                                 ExplainOptions::Verbosity verbosity,
+                                 const BSONObj& querySettings = BSONObj());
 
     /**
      * Determines the kind of "execution stage" that mongos would use in order to collect the
@@ -64,13 +67,21 @@ public:
     static const char* getStageNameForReadOp(size_t numShards, const BSONObj& explainObj);
 
     /**
+     * When a database is not found, use this method to construct an EOF plan explain() response.
+     */
+    static void buildEOFExplainResult(OperationContext* opCtx,
+                                      const CanonicalQuery* cq,
+                                      const BSONObj& command,
+                                      BSONObjBuilder* out);
+
+    /**
      * Command implementations on mongos use this method to construct the sharded explain
      * output format based on the responses from the shards in 'shardResponses'.
      *
      * On success, the output is added to the BSONObj builder 'out'.
      */
     static Status buildExplainResult(
-        OperationContext* opCtx,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const std::vector<AsyncRequestsSender::Response>& shardResponses,
         const char* mongosStageName,
         long long millisElapsed,

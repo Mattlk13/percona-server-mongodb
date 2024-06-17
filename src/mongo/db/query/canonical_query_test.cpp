@@ -263,6 +263,8 @@ TEST(CanonicalQueryTest, NormalizeQuerySort) {
 TEST(CanonicalQueryTest, NormalizeQueryTree) {
     // Single-child $or elimination.
     testNormalizeQuery("{$or: [{b: 1}]}", "{b: 1}");
+    // $or deduplication for same-path children.
+    testNormalizeQuery("{$or: [{b: 1}, {b: 1}]}", "{b: 1}");
     // Single-child $and elimination.
     testNormalizeQuery("{$or: [{$and: [{a: 1}]}, {b: 1}]}", "{$or: [{a: 1}, {b: 1}]}");
     // Single-child $_internalSchemaXor elimination.
@@ -279,11 +281,13 @@ TEST(CanonicalQueryTest, NormalizeQueryTree) {
         "{$_internalSchemaXor: [{$and: [{a: 1}, {b:1}]}, {$_internalSchemaXor: [{c: 1}, {d: "
         "1}]}]}",
         /*skipHashTest*/ true);
+    // $in with 0 arguments is alwaysFalse
+    testNormalizeQuery("{a: {$in: []}}", "{$alwaysFalse: 1}");
     // $in with one argument is rewritten as an equality or regex predicate.
     testNormalizeQuery("{a: {$in: [1]}}", "{a: {$eq: 1}}");
     testNormalizeQuery("{a: {$in: [/./]}}", "{a: {$regex: '.'}}");
-    // $in with 0 or more than 1 argument is not modified.
-    testNormalizeQuery("{a: {$in: []}}", "{a: {$in: []}}");
+    // $in with two or more args is not rewritten
+    testNormalizeQuery("{a: {$in: [/foo/, /bar/]}}", "{a: {$in: [/foo/, /bar/]}}");
     testNormalizeQuery("{a: {$in: [/./, 3]}}", "{a: {$in: [/./, 3]}}");
     // Child of $elemMatch object expression is normalized.
     testNormalizeQuery("{a: {$elemMatch: {$or: [{b: 1}]}}}", "{a: {$elemMatch: {b: 1}}}");
@@ -303,18 +307,19 @@ TEST(CanonicalQueryTest, CanonicalizeFromBaseQuery) {
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
-    const bool isExplain = true;
     const std::string cmdStr =
         "{find:'bogusns', filter:{$or:[{a:1,b:1},{a:1,c:1}]}, projection:{a:1}, sort:{b:1}, '$db': "
         "'test'}";
     auto findCommand = query_request_helper::makeFromFindCommandForTests(fromjson(cmdStr));
-    auto baseCq = std::make_unique<CanonicalQuery>(
-        CanonicalQueryParams{.expCtx = makeExpressionContext(opCtx.get(), *findCommand),
-                             .parsedFind = ParsedFindCommandParams{std::move(findCommand)},
-                             .explain = isExplain});
+    auto expCtx = makeExpressionContext(opCtx.get(), *findCommand);
+    expCtx->explain = explain::VerbosityEnum::kQueryPlanner;
+    auto baseCq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = std::move(expCtx),
+        .parsedFind = ParsedFindCommandParams{std::move(findCommand)},
+    });
 
     MatchExpression* firstClauseExpr = baseCq->getPrimaryMatchExpression()->getChild(0);
-    auto childCq = std::make_unique<CanonicalQuery>(opCtx.get(), *baseCq, firstClauseExpr);
+    auto childCq = std::make_unique<CanonicalQuery>(opCtx.get(), *baseCq, 0);
 
     ASSERT_BSONOBJ_EQ(childCq->getFindCommandRequest().getFilter(), firstClauseExpr->serialize());
 
@@ -330,8 +335,6 @@ TEST(CanonicalQueryTest, CanonicalizeFromBaseQueryWithSpecialFeature) {
     // meant to reproduce SERVER-XYZ.
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
-
-    const bool isExplain = true;
     const std::string cmdStr = R"({
         find:'bogusns',
         filter: {
@@ -345,18 +348,20 @@ TEST(CanonicalQueryTest, CanonicalizeFromBaseQueryWithSpecialFeature) {
         $db: 'test'
     })";
     auto findCommand = query_request_helper::makeFromFindCommandForTests(fromjson(cmdStr));
+    auto expCtx = makeExpressionContext(opCtx.get(), *findCommand);
+    expCtx->explain = explain::VerbosityEnum::kQueryPlanner;
     auto baseCq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
-        .expCtx = makeExpressionContext(opCtx.get(), *findCommand),
+        .expCtx = std::move(expCtx),
         .parsedFind = ParsedFindCommandParams{.findCommand = std::move(findCommand),
                                               .allowedFeatures =
                                                   MatchExpressionParser::kAllowAllSpecialFeatures},
-        .explain = isExplain});
+    });
 
     // Note: be sure to use the second child to get $text, since we 'normalize' and sort the
     // MatchExpression tree as part of canonicalization. This will put the text search clause
     // second.
     MatchExpression* secondClauseExpr = baseCq->getPrimaryMatchExpression()->getChild(1);
-    auto childCq = std::make_unique<CanonicalQuery>(opCtx.get(), *baseCq, secondClauseExpr);
+    auto childCq = std::make_unique<CanonicalQuery>(opCtx.get(), *baseCq, 1);
 
     ASSERT_BSONOBJ_EQ(childCq->getFindCommandRequest().getFilter(), secondClauseExpr->serialize());
 
@@ -401,8 +406,7 @@ TEST(CanonicalQueryTest, CanonicalQueryFromBaseQueryWithNoCollation) {
     auto baseCq = std::make_unique<CanonicalQuery>(
         CanonicalQueryParams{.expCtx = makeExpressionContext(opCtx.get(), *findCommand),
                              .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
-    MatchExpression* firstClauseExpr = baseCq->getPrimaryMatchExpression()->getChild(0);
-    auto childCq = std::make_unique<CanonicalQuery>(opCtx.get(), *baseCq, firstClauseExpr);
+    auto childCq = std::make_unique<CanonicalQuery>(opCtx.get(), *baseCq, 0);
     ASSERT_TRUE(baseCq->getCollator() == nullptr);
     ASSERT_TRUE(childCq->getCollator() == nullptr);
 }
@@ -418,8 +422,7 @@ TEST(CanonicalQueryTest, CanonicalQueryFromBaseQueryWithCollation) {
     auto baseCq = std::make_unique<CanonicalQuery>(
         CanonicalQueryParams{.expCtx = makeExpressionContext(opCtx.get(), *findCommand),
                              .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
-    MatchExpression* firstClauseExpr = baseCq->getPrimaryMatchExpression()->getChild(0);
-    auto childCq = std::make_unique<CanonicalQuery>(opCtx.get(), *baseCq, firstClauseExpr);
+    auto childCq = std::make_unique<CanonicalQuery>(opCtx.get(), *baseCq, 0);
     ASSERT(baseCq->getCollator());
     ASSERT(childCq->getCollator());
     ASSERT_TRUE(*(childCq->getCollator()) == *(baseCq->getCollator()));

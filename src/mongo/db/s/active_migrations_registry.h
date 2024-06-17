@@ -40,12 +40,12 @@
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/s/migration_session_id.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/shard_id.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/request_types/move_range_request_gen.h"
@@ -250,8 +250,9 @@ public:
         : _registry(ActiveMigrationsRegistry::get(opCtx)), _reason(std::move(reason)) {
         // Ensure any thread attempting to use a MigrationBlockingGuard will be interrupted by
         // a stepdown.
-        invariant(opCtx->lockState()->wasGlobalLockTakenInModeConflictingWithWrites() ||
-                  opCtx->shouldAlwaysInterruptAtStepDownOrUp());
+        invariant(
+            shard_role_details::getLocker(opCtx)->wasGlobalLockTakenInModeConflictingWithWrites() ||
+            opCtx->shouldAlwaysInterruptAtStepDownOrUp());
         _registry.lock(opCtx, _reason);
     }
 

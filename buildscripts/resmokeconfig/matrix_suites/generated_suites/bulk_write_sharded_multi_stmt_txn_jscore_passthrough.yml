@@ -53,7 +53,6 @@ selector:
   - jstests/core/**/compact_keeps_indexes.js
   - jstests/core/**/currentop.js
   - jstests/core/**/dbhash.js
-  - jstests/core/**/dbhash2.js
   - jstests/core/**/fsync.js
   - jstests/core/**/geo_s2cursorlimitskip.js
   - jstests/core/**/geo_update_btree2.js
@@ -62,12 +61,10 @@ selector:
   - jstests/core/**/stages*.js
   - jstests/core/**/startup_log.js
   - jstests/core/**/top.js
-  - jstests/core/**/explain_missing_database.js
   - jstests/core/**/geo_2d_explain.js
   - jstests/core/**/geo_s2explain.js
   - jstests/core/**/geo_s2sparse.js
   - jstests/core/**/operation_latency_histogram.js
-  - jstests/core/**/killop_drop_collection.js
   - jstests/core/**/explain_upsert.js
   - jstests/core/views/views_drop.js
   - jstests/core/**/api_params_getmore.js
@@ -191,7 +188,6 @@ selector:
   - jstests/core/**/find_and_modify_concurrent_update.js
   - jstests/core/**/fsync.js
   - jstests/core/**/geo_update_btree.js
-  - jstests/core/**/killop_drop_collection.js
   - jstests/core/**/loadserverscripts.js
   - jstests/core/**/mr_killop.js
   - jstests/core/**/removeb.js
@@ -211,15 +207,16 @@ selector:
   - jstests/core/write/update/batch_write_command_update.js
   - jstests/core/write/delete/batch_write_command_delete.js
   - jstests/core/failcommand_failpoint.js
-  - jstests/core/version_api_v1_command_coverage.js
   - jstests/core/write/write_commands_reject_unknown_fields.js
-  - jstests/core/txns/api_params_transaction.js
+  - jstests/core/query/explain/explain_uuid.js
+  - jstests/core/query/explain/explain_includes_command.js
   - jstests/core/txns/transactions_profiling.js
   - jstests/core/txns/currentop_blocked_operations.js
   - jstests/core/txns/transactions_profiling_with_drops.js
   - jstests/core/txns/multi_statement_transaction_write_error.js
   - src/mongo/db/modules/enterprise/jstests/fle2/basic_update.js
   - src/mongo/db/modules/enterprise/jstests/fle2/basic_delete.js
+  - src/mongo/db/modules/enterprise/jstests/fle2/query/explain*.js
   exclude_with_any_tags:
   - assumes_read_concern_unchanged
   - assumes_unsharded_collection
@@ -236,4 +233,5 @@ selector:
   - requires_timeseries
   roots:
   - jstests/core/**/*.js
+  - jstests/core_sharding/**/*.js
 test_kind: multi_stmt_txn_passthrough

@@ -49,6 +49,7 @@
 #include "mongo/db/s/range_deleter_service.h"
 #include "mongo/db/s/range_deletion_task_gen.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/update/update_oplog_entry_serialization.h"
 #include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
@@ -65,12 +66,12 @@
 
 namespace mongo {
 namespace {
-// Small hack used to be able to retrieve the full removed document in the `onDelete` method
-const auto deletedDocumentDecoration = OplogDeleteEntryArgs::declareDecoration<BSONObj>();
+
 void registerTaskWithOngoingQueriesOnOpLogEntryCommit(OperationContext* opCtx,
                                                       const RangeDeletionTask& rdt) {
 
-    opCtx->recoveryUnit()->onCommit([rdt](OperationContext* opCtx, boost::optional<Timestamp>) {
+    shard_role_details::getRecoveryUnit(opCtx)->onCommit([rdt](OperationContext* opCtx,
+                                                               boost::optional<Timestamp>) {
         try {
             AutoGetCollection autoColl(opCtx, rdt.getNss(), MODE_IS);
             auto waitForActiveQueriesToComplete =
@@ -114,6 +115,7 @@ void RangeDeleterServiceOpObserver::onInserts(OperationContext* opCtx,
                                               const CollectionPtr& coll,
                                               std::vector<InsertStatement>::const_iterator begin,
                                               std::vector<InsertStatement>::const_iterator end,
+                                              const std::vector<RecordId>& recordIds,
                                               std::vector<bool> fromMigrate,
                                               bool defaultFromMigrate,
                                               OpStateAccumulator* opAccumulator) {
@@ -149,41 +151,6 @@ void RangeDeleterServiceOpObserver::onUpdate(OperationContext* opCtx,
                 IDLParserContext("RangeDeleterServiceOpObserver"), args.updateArgs->updatedDoc);
             registerTaskWithOngoingQueriesOnOpLogEntryCommit(opCtx, deletionTask);
         }
-    }
-}
-
-void RangeDeleterServiceOpObserver::aboutToDelete(OperationContext* opCtx,
-                                                  const CollectionPtr& coll,
-                                                  BSONObj const& doc,
-                                                  OplogDeleteEntryArgs* args,
-                                                  OpStateAccumulator* opAccumulator) {
-    if (coll->ns() == NamespaceString::kRangeDeletionNamespace) {
-        deletedDocumentDecoration(args) = doc;
-    }
-}
-
-void RangeDeleterServiceOpObserver::onDelete(OperationContext* opCtx,
-                                             const CollectionPtr& coll,
-                                             StmtId stmtId,
-                                             const BSONObj& doc,
-                                             const OplogDeleteEntryArgs& args,
-                                             OpStateAccumulator* opAccumulator) {
-    if (coll->ns() == NamespaceString::kRangeDeletionNamespace) {
-        opCtx->recoveryUnit()->onCommit([deletedDoc = deletedDocumentDecoration(args)](
-                                            OperationContext* opCtx, boost::optional<Timestamp>) {
-            auto deletionTask = RangeDeletionTask::parse(
-                IDLParserContext("RangeDeleterServiceOpObserver"), deletedDoc);
-            try {
-                RangeDeleterService::get(opCtx)->deregisterTask(deletionTask.getCollectionUuid(),
-                                                                deletionTask.getRange());
-            } catch (const DBException& ex) {
-                dassert(ex.code() == ErrorCodes::NotYetInitialized,
-                        str::stream()
-                            << "No error different from `NotYetInitialized` is expected "
-                               "to be propagated to the range deleter observer. Got error: "
-                            << ex.toStatus());
-            }
-        });
     }
 }
 

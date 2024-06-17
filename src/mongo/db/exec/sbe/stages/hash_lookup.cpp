@@ -27,78 +27,57 @@
  *    it in the license file.
  */
 
+#include "mongo/db/exec/sbe/stages/hash_lookup.h"
+
+#include <set>
+
 // IWYU pragma: no_include "ext/alloc_traits.h"
-#include <absl/container/flat_hash_map.h>
-#include <absl/container/flat_hash_set.h>
-#include <absl/container/inlined_vector.h>
-#include <absl/meta/type_traits.h>
-#include <boost/move/utility_core.hpp>
 #include <boost/none.hpp>
 #include <boost/optional.hpp>
 #include <boost/optional/optional.hpp>
-#include <set>
 
-#include "mongo/base/data_type_endian.h"
-#include "mongo/base/status.h"
-#include "mongo/base/status_with.h"
-#include "mongo/base/string_data.h"
-#include "mongo/bson/bsonobj.h"
-#include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/bson/timestamp.h"
-#include "mongo/bson/util/builder.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/exec/sbe/expressions/compile_ctx.h"
 #include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/size_estimator.h"
-#include "mongo/db/exec/sbe/stages/hash_lookup.h"
 #include "mongo/db/exec/sbe/stages/stage_visitors.h"
-#include "mongo/db/service_context.h"
-#include "mongo/db/storage/key_format.h"
-#include "mongo/db/storage/record_data.h"
-#include "mongo/db/storage/storage_engine.h"
-#include "mongo/db/storage/write_unit_of_work.h"
-#include "mongo/util/assert_util.h"
-#include "mongo/util/bufreader.h"
-#include "mongo/util/str.h"
 
-namespace mongo {
-namespace sbe {
+namespace mongo::sbe {
 
 HashLookupStage::HashLookupStage(std::unique_ptr<PlanStage> outer,
                                  std::unique_ptr<PlanStage> inner,
-                                 value::SlotId outerCond,
-                                 value::SlotId innerCond,
-                                 value::SlotVector innerProjects,
-                                 SlotExprPairVector innerAggs,
+                                 value::SlotId outerKeySlot,
+                                 value::SlotId innerKeySlot,
+                                 value::SlotId innerProjectSlot,
+                                 SlotExprPair innerAgg,
                                  boost::optional<value::SlotId> collatorSlot,
                                  PlanNodeId planNodeId,
                                  bool participateInTrialRunTracking)
-    : PlanStage("hash_lookup"_sd, planNodeId, participateInTrialRunTracking),
-      _outerCond(outerCond),
-      _innerCond(innerCond),
-      _innerProjects(innerProjects),
-      _innerAggs(std::move(innerAggs)),
-      _collatorSlot(collatorSlot),
-      _probeKey(0) {
+    : PlanStage(
+          "hash_lookup"_sd, nullptr /* yieldPolicy */, planNodeId, participateInTrialRunTracking),
+      _outerKeySlot(outerKeySlot),
+      _innerKeySlot(innerKeySlot),
+      _innerProjectSlot(innerProjectSlot),
+      _innerAgg(std::move(innerAgg)),
+      _lookupStageOutputSlot(_innerAgg.first),
+      _collatorSlot(collatorSlot) {
     _children.emplace_back(std::move(outer));
     _children.emplace_back(std::move(inner));
 }
 
 std::unique_ptr<PlanStage> HashLookupStage::clone() const {
-    SlotExprPairVector innerAggs;
-    for (auto& [k, v] : _innerAggs) {
-        innerAggs.emplace_back(k, v->clone());
-    }
+    auto& [slotId, expr] = _innerAgg;
+    SlotExprPair innerAgg{slotId, expr->clone()};
 
     return std::make_unique<HashLookupStage>(outerChild()->clone(),
                                              innerChild()->clone(),
-                                             _outerCond,
-                                             _innerCond,
-                                             _innerProjects,
-                                             std::move(innerAggs),
+                                             _outerKeySlot,
+                                             _innerKeySlot,
+                                             _innerProjectSlot,
+                                             std::move(innerAgg),
                                              _collatorSlot,
                                              _commonStats.nodeId,
-                                             _participateInTrialRunTracking);
+                                             participateInTrialRunTracking());
 }
 
 void HashLookupStage::prepare(CompileCtx& ctx) {
@@ -115,315 +94,102 @@ void HashLookupStage::prepare(CompileCtx& ctx) {
                 "collatorSlot must be of collator type",
                 collatorTag == value::TypeTags::collator);
         // Stash the collator because we need it when spilling strings to the record store.
-        _collator = value::getCollatorView(collatorVal);
+        _hashTable.setCollator(value::getCollatorView(collatorVal));
     }
 
     value::SlotSet inputSlots;
-    value::SlotSet resultSlots;
 
-    auto slot = _outerCond;
+    value::SlotId slot = _outerKeySlot;
     inputSlots.emplace(slot);
     _inOuterMatchAccessor = outerChild()->getAccessor(ctx, slot);
 
-    slot = _innerCond;
+    slot = _innerKeySlot;
     inputSlots.emplace(slot);
     _inInnerMatchAccessor = innerChild()->getAccessor(ctx, slot);
 
-    size_t idx = 0;
-    value::SlotSet innerProjectDupCheck;
-    _outInnerProjectAccessors.reserve(_innerProjects.size());
-    _outInnerBufferProjectAccessors.reserve(_innerProjects.size());
-    _outInnerBufValueRecordStoreAccessors.reserve(_innerProjects.size());
-    for (auto slot : _innerProjects) {
-        inputSlots.emplace(slot);
-        auto [it, inserted] = innerProjectDupCheck.emplace(slot);
-        tassert(6367802, str::stream() << "duplicate inner project field: " << slot, inserted);
+    // Accessor for '_innerProjectSlot' only when outside the VM.
+    slot = _innerProjectSlot;
+    inputSlots.emplace(slot);
+    _inInnerProjectAccessor = innerChild()->getAccessor(ctx, slot);
 
-        auto accessor = innerChild()->getAccessor(ctx, slot);
-        _inInnerProjectAccessors.push_back(accessor);
+    // Set '_compileInnerAgg' to make getAccessor() return '_outInnerProjectAccessor' as the
+    // accessor for the SlotId '_innerProjectSlot' (called 'foreignRecordSlot' in the stage builder)
+    // while compiling the EExpr, as the compiler binds that SlotId to that accessor inside the VM.
+    _compileInnerAgg = true;
+    ctx.root = this;
+    ctx.aggExpression = true;
+    ctx.accumulator = &_lookupStageOutputAccessor;  // VM output slot
+    _aggCode = _innerAgg.second->compile(ctx);
+    ctx.aggExpression = false;
+    _compileInnerAgg = false;
 
-        _outInnerBufferProjectAccessors.emplace_back(_buffer, _bufferIt, idx);
-        _outInnerBufValueRecordStoreAccessors.push_back(
-            value::MaterializedSingleRowAccessor(_bufValueRecordStore, idx));
-
-        // Use a switch accessor to feed the buffered value from the '_buffer' or the value spilled
-        // to '_recordStoreBuf'.
-        _outInnerProjectAccessors.push_back(value::SwitchAccessor(
-            std::vector<value::SlotAccessor*>{&_outInnerBufferProjectAccessors.back(),
-                                              &_outInnerBufValueRecordStoreAccessors.back()}));
-
-        // '_outInnerProjectAccessors' has been preallocated, so it's element pointers will be
-        // stable.
-        _outInnerProjectAccessorMap.emplace(slot, &_outInnerProjectAccessors.back());
-        idx++;
+    if (inputSlots.contains(_lookupStageOutputSlot)) {
+        // 'errMsg' works around tasserted() macro's problem referencing '_lookupStageOutputSlot'.
+        std::string errMsg = str::stream()
+            << "conflicting input and result field: " << _lookupStageOutputSlot;
+        tasserted(6367804, errMsg);
     }
 
-    idx = 0;
-    _outResultAggAccessors.reserve(_innerAggs.size());
-    for (auto& [slot, expr] : _innerAggs) {
-        auto [it, inserted] = resultSlots.emplace(slot);
-        // Some compilers do not allow to capture local bindings by lambda functions (the one
-        // is used implicitly in tassert below), so we need a local variable to construct an
-        // error message.
-        auto& slotId = slot;
-        tassert(6367803, str::stream() << "duplicate inner agg field: " << slotId, inserted);
-
-        // Construct accessors for the agg state to be returned.
-        _outResultAggAccessors.emplace_back(_resultAggRow, idx);
-
-        // '_outResultAggAccessors' has been preallocated, so it's element pointers will be stable.
-        _outAccessorMap[slot] = &_outResultAggAccessors.back();
-
-        // Set '_compileInnerAgg' to make only '_outInnerProjectAccessorMap' visible when compiling
-        // the expression.
-        _compileInnerAgg = true;
-        ctx.root = this;
-        ctx.aggExpression = true;
-        ctx.accumulator = &_outResultAggAccessors.back();
-        _aggCodes.emplace_back(expr->compile(ctx));
-        ctx.aggExpression = false;
-        _compileInnerAgg = false;
-
-        idx++;
-    }
-
-    for (auto slot : resultSlots) {
-        tassert(6367804,
-                str::stream() << "conflicting input and result field: " << slot,
-                !inputSlots.contains(slot));
-    }
-
-    _resultAggRow.resize(_outResultAggAccessors.size());
-    _probeKey.resize(1);
-}
+    _outInnerProject.resize(1);
+    _lookupStageOutput.resize(1);
+}  // HashLookupStage::prepare
 
 value::SlotAccessor* HashLookupStage::getAccessor(CompileCtx& ctx, value::SlotId slot) {
     if (_compileInnerAgg) {
-        if (auto it = _outInnerProjectAccessorMap.find(slot);
-            it != _outInnerProjectAccessorMap.end()) {
-            return it->second;
+        if (slot == _innerProjectSlot) {
+            return &_outInnerProjectAccessor;
         }
-
         return ctx.getAccessor(slot);
     } else {
-        if (auto it = _outAccessorMap.find(slot); it != _outAccessorMap.end()) {
-            return it->second;
+        if (slot == _lookupStageOutputSlot) {
+            return &_lookupStageOutputAccessor;
         }
-
         return outerChild()->getAccessor(ctx, slot);
     }
 }
+
+void HashLookupStage::doAttachToOperationContext(OperationContext* opCtx) {
+    _hashTable.doAttachToOperationContext(_opCtx);
+}
+
+void HashLookupStage::doDetachFromOperationContext() {
+    _hashTable.doDetachFromOperationContext();
+}
+
 void HashLookupStage::doSaveState(bool relinquishCursor) {
-    if (_recordStoreHt) {
-        _recordStoreHt->saveState();
-    }
-    if (_recordStoreBuf) {
-        _recordStoreBuf->saveState();
-    }
+    _hashTable.doSaveState(relinquishCursor);
 }
+
 void HashLookupStage::doRestoreState(bool relinquishCursor) {
-    if (_recordStoreHt) {
-        _recordStoreHt->restoreState();
-    }
-    if (_recordStoreBuf) {
-        _recordStoreBuf->restoreState();
-    }
+    _hashTable.doRestoreState(relinquishCursor);
 }
 
-void HashLookupStage::reset() {
-    _ht = boost::none;
-
-    // Reset the memory threshold if the knob changes between re-open calls.
-    _memoryUseInBytesBeforeSpill = internalQuerySBELookupApproxMemoryUseInBytesBeforeSpill.load();
-
-    if (_recordStoreHt) {
-        _recordStoreHt.reset(nullptr);
-    }
-    if (_recordStoreBuf) {
-        _recordStoreBuf.reset(nullptr);
-    }
-
-    // Erase but don't change its reference. Otherwise it will invalidate the slot accessors.
-    _buffer.clear();
-    _valueId = 0;
-    _bufferIt = 0;
-}
-
-std::pair<RecordId, key_string::TypeBits> HashLookupStage::serializeKeyForRecordStore(
-    const value::MaterializedRow& key) const {
-    key_string::Builder kb{key_string::Version::kLatestVersion};
-    return encodeKeyString(kb, key);
-}
-
-std::tuple<bool, value::TypeTags, value::Value> HashLookupStage::normalizeStringIfCollator(
-    value::TypeTags tag, value::Value val) {
-    if (value::isString(tag) && _collatorSlot) {
-        auto [tagColl, valColl] = value::makeNewString(
-            _collator->getComparisonKey(value::getStringView(tag, val)).getKeyData());
-        return {true, tagColl, valColl};
-    }
-    return {false, tag, val};
-}
-
-void HashLookupStage::addHashTableEntry(value::SlotAccessor* keyAccessor, size_t valueIndex) {
-    // Adds a new key-value entry. Will attempt to move or copy from key accessor when needed.
-    // array case each elem in array we put each element into ht.
-    auto [tagKeyView, valKeyView] = keyAccessor->getViewOfValue();
-    _probeKey.reset(0, false, tagKeyView, valKeyView);
-
-    // Check to see if key is already in memory. If not, we will emplace a new key or spill to disk.
-    auto htIt = _ht->find(_probeKey);
-    if (htIt == _ht->end()) {
-        // If the key and one 'size_t' index fit into the '_ht' without reaching the memory limit
-        // and we haven't spilled yet emplace into '_ht'. Otherwise, we will always spill the key to
-        // the record store. The additional guard !hasSpilledHtToDisk() ensures that a key that is
-        // evicted from '_ht' never ends in '_ht' again.
-        const long long newMemUsage = _computedTotalMemUsage +
-            size_estimator::estimate(tagKeyView, valKeyView) + sizeof(size_t);
-
-        value::MaterializedRow key{1};
-        if (!hasSpilledHtToDisk() && newMemUsage <= _memoryUseInBytesBeforeSpill) {
-            // We have to insert an owned key, attempt a move, but force copy if necessary when we
-            // haven't spilled to the '_recordStore' yet.
-            auto [tagKey, valKey] = keyAccessor->copyOrMoveValue();
-            key.reset(0, true, tagKey, valKey);
-
-            auto [it, inserted] = _ht->try_emplace(std::move(key));
-            invariant(inserted);
-            htIt = it;
-            htIt->second.push_back(valueIndex);
-            _computedTotalMemUsage = newMemUsage;
-        } else {
-            // Write record to rs.
-            if (!hasSpilledHtToDisk()) {
-                makeTemporaryRecordStore();
-            }
-
-            auto val = std::vector<size_t>{valueIndex};
-            auto [tagKey, valKey] = keyAccessor->getViewOfValue();
-            spillIndicesToRecordStore(_recordStoreHt.get(), tagKey, valKey, val);
-        }
-    } else {
-        // The key is already present in '_ht' so the memory will only grow by one size_t. If we
-        // reach the memory limit, the key/value in '_ht' will be evicted from memory and spilled to
-        // '_recordStoreHt' along with the new index.
-        const long long newMemUsage = _computedTotalMemUsage + sizeof(size_t);
-        if (newMemUsage <= _memoryUseInBytesBeforeSpill) {
-            htIt->second.push_back(valueIndex);
-            _computedTotalMemUsage = newMemUsage;
-        } else {
-            if (!hasSpilledHtToDisk()) {
-                makeTemporaryRecordStore();
-            }
-
-            value::MaterializedRow key{1};
-            key.reset(0, true, tagKeyView, valKeyView);
-            _computedTotalMemUsage -= size_estimator::estimate(tagKeyView, valKeyView);
-
-            // Evict the hash table value.
-            _computedTotalMemUsage -= htIt->second.size() * sizeof(size_t);
-            htIt->second.push_back(valueIndex);
-            spillIndicesToRecordStore(_recordStoreHt.get(), tagKeyView, valKeyView, htIt->second);
-            _ht->erase(htIt);
-        }
-    }
-}
-
-void HashLookupStage::makeTemporaryRecordStore() {
-    tassert(6373901,
-            "HashLookupStage attempted to write to disk in an environment which is not prepared to "
-            "do so",
-            _opCtx->getServiceContext());
-    tassert(6373902,
-            "No storage engine so HashLookupStage cannot spill to disk",
-            _opCtx->getServiceContext()->getStorageEngine());
-    assertIgnorePrepareConflictsBehavior(_opCtx);
-
-    _recordStoreBuf = std::make_unique<SpillingStore>(_opCtx, KeyFormat::Long);
-
-    _recordStoreHt = std::make_unique<SpillingStore>(_opCtx, KeyFormat::String);
-
-    _specificStats.usedDisk = true;
-}
-
-void HashLookupStage::spillBufferedValueToDisk(OperationContext* opCtx,
-                                               SpillingStore* rs,
-                                               size_t bufferIdx,
-                                               const value::MaterializedRow& val) {
-    CurOp::get(_opCtx)->debug().hashLookupSpillToDisk += 1;
-
-    auto rid = getValueRecordId(bufferIdx);
-
-    BufBuilder buf;
-    val.serializeForSorter(buf);
-
-    rs->upsertToRecordStore(opCtx, rid, buf, false);
-
-    _specificStats.spilledBuffRecords++;
-    // Add size of record ID + size of buffer.
-    _specificStats.spilledBuffBytesOverAllRecords += sizeof(size_t) + buf.len();
-    return;
-}
-
-size_t HashLookupStage::bufferValueOrSpill(value::MaterializedRow& value) {
-    size_t bufferIndex = _valueId;
-    const long long newMemUsage = _computedTotalMemUsage + size_estimator::estimate(value);
-    if (!hasSpilledBufToDisk() && newMemUsage <= _memoryUseInBytesBeforeSpill) {
-        _buffer.emplace_back(std::move(value));
-        _computedTotalMemUsage = newMemUsage;
-    } else {
-        if (!hasSpilledBufToDisk()) {
-            makeTemporaryRecordStore();
-        }
-        spillBufferedValueToDisk(_opCtx, _recordStoreBuf.get(), bufferIndex, value);
-    }
-    _valueId++;
-    return bufferIndex;
-}
-
-void HashLookupStage::setInnerProjectSwitchAccessor(int newIdx) {
-    if (newIdx != _currentSwitchIdx) {
-        for (size_t idx = 0; idx < _outInnerProjectAccessors.size(); idx++) {
-            _outInnerProjectAccessors[idx].setIndex(newIdx);
-        }
-        _currentSwitchIdx = newIdx;
-    }
+void HashLookupStage::reset(bool fromClose) {
+    // Also resets the memory threshold if the knob changes between re-open calls.
+    _hashTable.reset(fromClose);
 }
 
 void HashLookupStage::open(bool reOpen) {
     auto optTimer(getOptTimer(_opCtx));
 
     if (reOpen) {
-        reset();
+        reset(false /* fromClose */);
     }
 
     _commonStats.opens++;
-    if (_collatorAccessor) {
-        auto [tag, collatorVal] = _collatorAccessor->getViewOfValue();
-        tassert(6367810, "collatorSlot must be of collator type", tag == value::TypeTags::collator);
-        auto collatorView = value::getCollatorView(collatorVal);
-        const value::MaterializedRowHasher hasher(collatorView);
-        const value::MaterializedRowEq equator(collatorView);
-        _ht.emplace(0, hasher, equator);
-    } else {
-        _ht.emplace();
-    }
-
-    innerChild()->open(false);
+    _hashTable.open();
 
     // Insert the inner side into the hash table.
+    innerChild()->open(false);
     while (innerChild()->getNext() == PlanState::ADVANCED) {
-        value::MaterializedRow value{_inInnerProjectAccessors.size()};
+        value::MaterializedRow value{1};
 
-        // Copy all projected values.
-        size_t idx = 0;
-        for (auto accessor : _inInnerProjectAccessors) {
-            auto [tag, val] = accessor->copyOrMoveValue();
-            value.reset(idx++, true, tag, val);
-        }
+        // Copy the projected value.
+        auto [tag, val] = _inInnerProjectAccessor->getCopyOfValue();
+        value.reset(0, true, tag, val);
 
         // This where we put the value in here. This can grow need to spill.
-        auto bufferIndex = bufferValueOrSpill(value);
+        size_t bufferIndex = _hashTable.bufferValueOrSpill(value);
 
         auto [tagKeyView, valKeyView] = _inInnerMatchAccessor->getViewOfValue();
         if (value::isArray(tagKeyView)) {
@@ -431,198 +197,52 @@ void HashLookupStage::open(bool reOpen) {
             arrayAccessor.reset(_inInnerMatchAccessor);
 
             while (!arrayAccessor.atEnd()) {
-                addHashTableEntry(&arrayAccessor, bufferIndex);
+                _hashTable.addHashTableEntry(&arrayAccessor, bufferIndex);
                 arrayAccessor.advance();
             }
         } else {
-            addHashTableEntry(_inInnerMatchAccessor, bufferIndex);
+            _hashTable.addHashTableEntry(_inInnerMatchAccessor, bufferIndex);
         }
     }
-
     innerChild()->close();
     outerChild()->open(reOpen);
-}
+}  // HashLookupStage::open
 
-template <typename C>
-void HashLookupStage::accumulateFromValueIndices(const C& bufferIndices) {
-    boost::optional<size_t> prevIdx;
-    for (auto bufferIdx : bufferIndices) {
-        tassert(6367811, "Indices expected to be sorted", !prevIdx || prevIdx < bufferIdx);
+template <typename Container>
+void HashLookupStage::accumulateFromValueIndices(const Container* bufferIndices) {
+    for (const size_t bufferIdx : *bufferIndices) {
+        boost::optional<std::pair<value::TypeTags, value::Value>> innerMatch =
+            _hashTable.getValueAtIndex(bufferIdx);
+        _outInnerProjectAccessor.reset(false /* owned */, innerMatch->first, innerMatch->second);
 
-        _bufferIt = bufferIdx;
-        // Point iterator to a row to accumulate.
-        if (_buffer.size() > 0 && _bufferIt < _buffer.size()) {
-            setInnerProjectSwitchAccessor(0);
-        } else {
-            // Point the _outInnerProjectAccessors to the accessor for the value from
-            // '_recordStoreBuf' since we need to read a spilled value.
-            setInnerProjectSwitchAccessor(1);
-
-            // We must shift the '_bufferIt' index by one when using it as a RecordId because a
-            // RecordId of 0 is invalid.
-            auto rid = getValueRecordId(_bufferIt);
-            auto rsValue = _recordStoreBuf->readFromRecordStore(_opCtx, rid);
-            if (!rsValue) {
-                tasserted(6373900, "bufferIdx not found in record store");
-            }
-            _bufValueRecordStore = *rsValue;
-        }
-
-        for (size_t idx = 0; idx < _outResultAggAccessors.size(); idx++) {
-            auto [owned, tag, val] = _bytecode.run(_aggCodes[idx].get());
-            _resultAggRow.reset(idx, owned, tag, val);
-        }
-
-        prevIdx = bufferIdx;
+        // Run the VM code to "accumulate" the current inner doc into the lookup output array.
+        auto [owned, tag, val] = _bytecode.run(_aggCode.get());
+        _lookupStageOutput.reset(0 /* column */, owned, tag, val);
     }
-}
-
-void HashLookupStage::writeIndicesToRecordStore(SpillingStore* rs,
-                                                value::TypeTags tagKey,
-                                                value::Value valKey,
-                                                const std::vector<size_t>& value,
-                                                bool update) {
-    BufBuilder buf;
-    buf.appendNum(value.size());  // number of indices
-    for (auto& idx : value) {
-        buf.appendNum(static_cast<size_t>(idx));
-    }
-
-    value::MaterializedRow key{1};
-    key.reset(0, false, tagKey, valKey);
-    auto [rid, typeBits] = serializeKeyForRecordStore(key);
-
-    rs->upsertToRecordStore(_opCtx, rid, buf, typeBits, update);
-    if (!update) {
-        _specificStats.spilledHtRecords++;
-        // Add the size of key (which comprises of the memory usage for the key + its type bits),
-        // as well as the size of one integer to store the length of indices vector in the value.
-        _specificStats.spilledHtBytesOverAllRecords +=
-            rid.memUsage() + typeBits.getSize() + sizeof(size_t);
-    }
-    // Add the size of indices vector used in the hash-table value to the accounting.
-    _specificStats.spilledHtBytesOverAllRecords += value.size() * sizeof(size_t);
-}
-
-boost::optional<std::vector<size_t>> HashLookupStage::readIndicesFromRecordStore(
-    SpillingStore* rs, value::TypeTags tagKey, value::Value valKey) {
-    _probeKey.reset(0, false, tagKey, valKey);
-
-    auto [rid, _] = serializeKeyForRecordStore(_probeKey);
-    RecordData record;
-    if (rs->findRecord(_opCtx, rid, &record)) {
-        // 'BufBuilder' writes numbers in little endian format, so must read them using the same.
-        auto valueReader = BufReader(record.data(), record.size());
-        auto nRecords = valueReader.read<LittleEndian<size_t>>();
-        std::vector<size_t> result(nRecords);
-        for (size_t i = 0; i < nRecords; ++i) {
-            auto idx = valueReader.read<LittleEndian<size_t>>();
-            result[i] = idx;
-        }
-        return result;
-    }
-    return boost::none;
-}
-
-void HashLookupStage::spillIndicesToRecordStore(SpillingStore* rs,
-                                                value::TypeTags tagKey,
-                                                value::Value valKey,
-                                                const std::vector<size_t>& value) {
-    CurOp::get(_opCtx)->debug().hashLookupSpillToDisk += 1;
-
-    auto [owned, tagKeyColl, valKeyColl] = normalizeStringIfCollator(tagKey, valKey);
-    _probeKey.reset(0, owned, tagKeyColl, valKeyColl);
-
-    auto valFromRs = readIndicesFromRecordStore(rs, tagKeyColl, valKeyColl);
-
-    auto update = false;
-    if (valFromRs) {
-        valFromRs->insert(valFromRs->end(), value.begin(), value.end());
-        update = true;
-        // As we're updating these records, we'd remove the old size from the accounting. The new
-        // size is added back to the accounting in the call to 'writeIndicesToRecordStore' below.
-        _specificStats.spilledHtBytesOverAllRecords -= value.size();
-    } else {
-        valFromRs = value;
-    }
-
-    writeIndicesToRecordStore(rs, tagKeyColl, valKeyColl, *valFromRs, update);
-}
+}  // HashLookupStage::accumulateFromValueIndices
 
 PlanState HashLookupStage::getNext() {
     auto optTimer(getOptTimer(_opCtx));
 
-    auto state = outerChild()->getNext();
+    PlanState state = outerChild()->getNext();
     if (state == PlanState::ADVANCED) {
-        // Clear the result accumulators.
-        for (size_t idx = 0; idx < _outResultAggAccessors.size(); idx++) {
-            _resultAggRow.reset(0, false, value::TypeTags::Nothing, 0);
-        }
-        auto [tagKeyView, valKeyView] = _inOuterMatchAccessor->getViewOfValue();
-        if (value::isArray(tagKeyView)) {
-            // We are using sorted set, so that fetching by index is monotonic.
-            // It also provides a deterministic execution, that is unrelated to a hash function
-            // chosen. This way of constructing union is not optimal in the worst case O(INPUT *
-            // log INPUT), where INPUT is total count of input indices to union. This could be
-            // improved to O(OUTPUT * log OUTPUT), by using hash set and sorting later. Hovewer
-            // its not obvious which approach will be acutally better in real world scenarios.
-            std::set<size_t> indices;
-            value::ArrayEnumerator enumerator(tagKeyView, valKeyView);
-            while (!enumerator.atEnd()) {
-                auto [tagElemView, valElemView] = enumerator.getViewOfValue();
-                _probeKey.reset(0, false, tagElemView, valElemView);
-                auto htIt = _ht->find(_probeKey);
-                if (htIt != _ht->end()) {
-                    indices.insert(htIt->second.begin(), htIt->second.end());
-                } else if (_recordStoreHt) {
-                    // The key wasn't in memory and we have spilled to a '_recordStoreHt', fetch it
-                    // if it exists.
-                    auto [_, tagElemCollView, valElemCollView] =
-                        normalizeStringIfCollator(tagElemView, valElemView);
+        // We just got this outer doc, so reset the $lookup "as" result array accumulator to nothing
+        // and the hash table iterator to the outer key.
+        _lookupStageOutput.reset(0, false, value::TypeTags::Nothing, 0);
+        auto [outerKeyTag, outerKeyVal] = _inOuterMatchAccessor->getViewOfValue();
+        _hashTable.htIter.reset(outerKeyTag, outerKeyVal);
 
-                    auto indicesFromRS = readIndicesFromRecordStore(
-                        _recordStoreHt.get(), tagElemCollView, valElemCollView);
-                    if (indicesFromRS) {
-                        indices.insert(indicesFromRS->begin(), indicesFromRS->end());
-                    }
-                }
-                enumerator.advance();
-            }
-            accumulateFromValueIndices(indices);
-        } else {
-            _probeKey.reset(0, false, tagKeyView, valKeyView);
-            auto htIt = _ht->find(_probeKey);
-            if (htIt != _ht->end()) {
-                accumulateFromValueIndices(htIt->second);
-            } else if (_recordStoreHt) {
-                // Need to make sure we have spilled by checking if the '_recordStoreHt' is
-                // non-nullptr if we don't find the '_probeKey' in the '_ht'. Otherwise, the empty
-                // foreign side edge case won't fallthrough and we may hit this block and try to
-                // read from a non-existent '_recordStoreHt'.
-                auto [_, tagKeyCollView, valKeyCollView] =
-                    normalizeStringIfCollator(tagKeyView, valKeyView);
-
-                auto indicesFromRS = readIndicesFromRecordStore(
-                    _recordStoreHt.get(), tagKeyCollView, valKeyCollView);
-                if (indicesFromRS) {
-                    accumulateFromValueIndices(*indicesFromRS);
-                }
-            }
-        }
+        // Accumulate all the matching inner docs for the outer key(s).
+        accumulateFromValueIndicesVariant(_hashTable.htIter.getAllMatchingIndices());
     }
-
     return trackPlanState(state);
-}
+}  // HashLookupStage::getNext
 
 void HashLookupStage::close() {
     auto optTimer(getOptTimer(_opCtx));
-
     trackClose();
-
     outerChild()->close();
-    reset();
-
-    _buffer.shrink_to_fit();
+    reset(true /* fromClose */);
 }
 
 std::unique_ptr<PlanStageStats> HashLookupStage::getStats(bool includeDebugInfo) const {
@@ -630,37 +250,32 @@ std::unique_ptr<PlanStageStats> HashLookupStage::getStats(bool includeDebugInfo)
     invariant(ret);
     ret->children.emplace_back(outerChild()->getStats(includeDebugInfo));
     ret->children.emplace_back(innerChild()->getStats(includeDebugInfo));
-    ret->specific = std::make_unique<HashLookupStats>(_specificStats);
+
+    const HashLookupStats* specificStats = static_cast<const HashLookupStats*>(getSpecificStats());
+    ret->specific = std::make_unique<HashLookupStats>(*specificStats);
     if (includeDebugInfo) {
         BSONObjBuilder bob(StorageAccessStatsVisitor::collectStats(*this, *ret).toBSON());
         // Spilling stats.
-        bob.appendBool("usedDisk", _specificStats.usedDisk)
-            .appendNumber("spilledRecords", _specificStats.getSpilledRecords())
-            .appendNumber("spilledBytesApprox", _specificStats.getSpilledBytesApprox());
+        bob.appendBool("usedDisk", specificStats->usedDisk)
+            .appendNumber("spilledRecords", specificStats->getSpilledRecords())
+            .appendNumber("spilledBytesApprox", specificStats->getSpilledBytesApprox());
         ret->debugInfo = bob.obj();
     }
     return ret;
 }
 
 const SpecificStats* HashLookupStage::getSpecificStats() const {
-    return &_specificStats;
+    return _hashTable.getHashLookupStats();
 }
 
 std::vector<DebugPrinter::Block> HashLookupStage::debugPrint() const {
     auto ret = PlanStage::debugPrint();
 
     ret.emplace_back(DebugPrinter::Block("[`"));
-    bool first = true;
-    for (auto&& [slot, expr] : _innerAggs) {
-        if (!first) {
-            ret.emplace_back(DebugPrinter::Block("`,"));
-        }
-
-        DebugPrinter::addIdentifier(ret, slot);
-        ret.emplace_back("=");
-        DebugPrinter::addBlocks(ret, expr->debugPrint());
-        first = false;
-    }
+    auto& [slot, expr] = _innerAgg;
+    DebugPrinter::addIdentifier(ret, slot);
+    ret.emplace_back("=");
+    DebugPrinter::addBlocks(ret, expr->debugPrint());
     ret.emplace_back("`]");
 
     if (_collatorSlot) {
@@ -670,23 +285,14 @@ std::vector<DebugPrinter::Block> HashLookupStage::debugPrint() const {
     ret.emplace_back(DebugPrinter::Block::cmdIncIndent);
 
     DebugPrinter::addKeyword(ret, "outer");
-    DebugPrinter::addIdentifier(ret, _outerCond);
+    DebugPrinter::addIdentifier(ret, _outerKeySlot);
     ret.emplace_back(DebugPrinter::Block::cmdIncIndent);
     DebugPrinter::addBlocks(ret, outerChild()->debugPrint());
     ret.emplace_back(DebugPrinter::Block::cmdDecIndent);
 
     DebugPrinter::addKeyword(ret, "inner");
-    DebugPrinter::addIdentifier(ret, _innerCond);
-
-    ret.emplace_back(DebugPrinter::Block("[`"));
-    for (size_t idx = 0; idx < _innerProjects.size(); ++idx) {
-        if (idx) {
-            ret.emplace_back(DebugPrinter::Block("`,"));
-        }
-
-        DebugPrinter::addIdentifier(ret, _innerProjects[idx]);
-    }
-    ret.emplace_back(DebugPrinter::Block("`]"));
+    DebugPrinter::addIdentifier(ret, _innerKeySlot);
+    DebugPrinter::addIdentifier(ret, _innerProjectSlot);
 
     ret.emplace_back(DebugPrinter::Block::cmdIncIndent);
     DebugPrinter::addBlocks(ret, innerChild()->debugPrint());
@@ -695,14 +301,13 @@ std::vector<DebugPrinter::Block> HashLookupStage::debugPrint() const {
     ret.emplace_back(DebugPrinter::Block::cmdDecIndent);
 
     return ret;
-}
+}  // HashLookupStage::debugPrint
 
 size_t HashLookupStage::estimateCompileTimeSize() const {
     size_t size = sizeof(*this);
     size += size_estimator::estimate(_children);
-    size += size_estimator::estimate(_innerProjects);
-    size += size_estimator::estimate(_innerAggs);
+    size += size_estimator::estimate(_innerProjectSlot);
+    size += size_estimator::estimate(_innerAgg);
     return size;
 }
-}  // namespace sbe
-}  // namespace mongo
+}  // namespace mongo::sbe

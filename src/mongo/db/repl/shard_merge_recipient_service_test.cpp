@@ -61,7 +61,7 @@
 #include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/op_observer/op_observer_impl.h"
 #include "mongo/db/op_observer/op_observer_registry.h"
-#include "mongo/db/op_observer/oplog_writer_impl.h"
+#include "mongo/db/op_observer/operation_logger_impl.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/member_state.h"
@@ -175,6 +175,7 @@ public:
                    const CollectionPtr& coll,
                    std::vector<InsertStatement>::const_iterator first,
                    std::vector<InsertStatement>::const_iterator last,
+                   const std::vector<RecordId>& recordIds,
                    std::vector<bool> fromMigrate,
                    bool defaultFromMigrate,
                    OpStateAccumulator* opAccumulator = nullptr) final {
@@ -236,7 +237,7 @@ public:
             OpObserverRegistry* opObserverRegistry =
                 dynamic_cast<OpObserverRegistry*>(serviceContext->getOpObserver());
             opObserverRegistry->addObserver(
-                std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterImpl>()));
+                std::make_unique<OpObserverImpl>(std::make_unique<OperationLoggerImpl>()));
             opObserverRegistry->addObserver(
                 std::make_unique<PrimaryOnlyServiceOpObserver>(serviceContext));
             auto opObserver = std::make_unique<ShardMergeRecipientServiceTestOpObserver>();
@@ -353,7 +354,7 @@ public:
 
         ASSERT_OK(replCoord->setFollowerMode(MemberState::RS_PRIMARY));
         ASSERT_OK(replCoord->updateTerm(opCtx.get(), _term));
-        replCoord->setMyLastAppliedOpTimeAndWallTime(
+        replCoord->setMyLastAppliedOpTimeAndWallTimeForward(
             OpTimeAndWallTime(OpTime(Timestamp(1, 1), _term), Date_t()));
 
         _registry->onStepUpComplete(opCtx.get(), _term);
@@ -638,7 +639,7 @@ private:
  */
 class ShardMergeRecipientServiceTestInsert : public ShardMergeRecipientServiceTest {
 private:
-    void addOpObserver(OpObserverRegistry* opObserverRegistry) {
+    void addOpObserver(OpObserverRegistry* opObserverRegistry) override {
         opObserverRegistry->addObserver(std::make_unique<ShardMergeRecipientOpObserver>());
     }
 

@@ -12,7 +12,12 @@ import {
     summarizeExplainForCE
 } from "jstests/libs/ce_stats_utils.js";
 import {loadJSONDataset} from "jstests/libs/load_ce_test_data.js";
-import {forceCE, round2} from "jstests/libs/optimizer_utils.js";
+import {
+    forceCE,
+    round2,
+    runWithFastPathsDisabled,
+    runWithParams
+} from "jstests/libs/optimizer_utils.js";
 import {computeStrategyErrors} from "jstests/query_golden/libs/compute_errors.js";
 
 /**
@@ -21,7 +26,9 @@ import {computeStrategyErrors} from "jstests/query_golden/libs/compute_errors.js
  */
 function getMatchCE(coll, predicate) {
     jsTestLog(`Query: ${coll.getName()} ${tojson(predicate)}`);
-    const explain = coll.explain("executionStats").aggregate([{$match: predicate}]);
+    // Cardinality estimation will be skipped if the query is optimized using a fast path.
+    const explain = runWithFastPathsDisabled(
+        () => coll.explain("executionStats").aggregate([{$match: predicate}]));
     const n = round2(explain.executionStats.nReturned);
     const ce = round2(getRootCE(explain));
     const explainSummarized = tojson(summarizeExplainForCE(explain));
@@ -93,8 +100,8 @@ await runHistogramsTest(async function testSampleHistogram() {
     await loadJSONDataset(baseDB, chunkNames, dataDir, dbMetadata);
     const collSize = baseColl.count();
 
-    // Select approximately 'sampleRate'*collSize documents from the base collection to insert
-    // into the sample collection.
+    // Select approximately 'sampleRate'*collSize documents from the base collection to
+    // insert into the sample collection.
     let sample = [];
     for (let i = 0; i < collSize; i++) {
         if (Random.rand() < sampleRate) {
@@ -114,55 +121,74 @@ await runHistogramsTest(async function testSampleHistogram() {
         createHistogram(sampleColl, field);
     }
 
-    // Replace the sample coll with the full collection. In this way, we have a histogram on only a
-    // sample of documents in the base collection. Note that this does not test $analyze sampling
-    // logic, because that yields different results on every test run.
+    // Replace the sample coll with the full collection. In this way, we have a histogram on
+    // only a sample of documents in the base collection. Note that this does not test
+    // $analyze sampling logic, because that yields different results on every test run.
     baseColl.aggregate({$out: {db: sampleDB.getName(), coll: collName}});
 
     // Run some queries to demonstrate that the sample CE scales to approach the base CE.
     const totSampleErr = {absError: 0, relError: 0, selError: 0};
     const totBaseErr = {absError: 0, relError: 0, selError: 0};
 
-    forceCE("histogram");
-    let count = 0;
-    // Sort the values to ensure a stable test result.
-    const values =
-        baseColl.find({_id: {$in: [3, 123, 405]}}, projection).sort(sortFields).toArray();
-    for (const field of fields) {
-        for (let i = 1; i < values.length; i++) {
-            const prev = values[i - 1][field];
-            const cur = values[i][field];
+    const runTest =
+        () => {
+            let count = 0;
+            // Sort the values to ensure a stable test result.
+            const values =
+                baseColl.find({_id: {$in: [3, 123, 405]}}, projection).sort(sortFields).toArray();
+            for (const field of fields) {
+                for (let i = 1; i < values.length; i++) {
+                    const prev = values[i - 1][field];
+                    const cur = values[i][field];
 
-            const min = prev < cur ? prev : cur;
-            const max = prev > cur ? prev : cur;
+                    const min = prev < cur ? prev : cur;
+                    const max = prev > cur ? prev : cur;
 
-            // Test a variety of queries.
-            testMatchPredicate(baseColl,
-                               sampleColl,
-                               {[field]: {$gte: min, $lte: max}},
-                               collSize,
-                               totSampleErr,
-                               totBaseErr);
-            testMatchPredicate(
-                baseColl, sampleColl, {[field]: {$lt: min}}, collSize, totSampleErr, totBaseErr);
-            testMatchPredicate(
-                baseColl, sampleColl, {[field]: {$eq: min}}, collSize, totSampleErr, totBaseErr);
-            count += 3;
+                    // Test a variety of queries.
+                    testMatchPredicate(baseColl,
+                                       sampleColl,
+                                       {[field]: {$gte: min, $lte: max}},
+                                       collSize,
+                                       totSampleErr,
+                                       totBaseErr);
+                    testMatchPredicate(baseColl,
+                                       sampleColl,
+                                       {[field]: {$lt: min}},
+                                       collSize,
+                                       totSampleErr,
+                                       totBaseErr);
+                    testMatchPredicate(baseColl,
+                                       sampleColl,
+                                       {[field]: {$eq: min}},
+                                       collSize,
+                                       totSampleErr,
+                                       totBaseErr);
+                    count += 3;
+                }
+            }
+
+            const avgBaseErr = {
+                absError: round2(totBaseErr.absError / count),
+                relError: round2(totBaseErr.relError / count),
+                selError: round2(totBaseErr.selError / count)
+            };
+            const avgSampleErr = {
+                absError: round2(totSampleErr.absError / count),
+                relError: round2(totSampleErr.relError / count),
+                selError: round2(totSampleErr.selError / count)
+            };
+
+            jsTestLog(`Average errors (${count} queries):`);
+            print(`Average base error: ${tojson(avgBaseErr)}\n`);
+            print(`Average sample error: ${tojson(avgSampleErr)}`);
         }
-    }
 
-    const avgBaseErr = {
-        absError: round2(totBaseErr.absError / count),
-        relError: round2(totBaseErr.relError / count),
-        selError: round2(totBaseErr.selError / count)
-    };
-    const avgSampleErr = {
-        absError: round2(totSampleErr.absError / count),
-        relError: round2(totSampleErr.relError / count),
-        selError: round2(totSampleErr.selError / count)
-    };
-
-    jsTestLog(`Average errors (${count} queries):`);
-    print(`Average base error: ${tojson(avgBaseErr)}\n`);
-    print(`Average sample error: ${tojson(avgSampleErr)}`);
+    forceCE("histogram");
+    // Sargable nodes and Filter nodes get different CEs. Repeat test with/without sargable rewrite.
+    runWithParams([{key: "internalCascadesOptimizerDisableSargableWhenNoIndexes", value: false}],
+                  runTest);
+    // TODO: Enable with SERVER-84366 - currently explain will incorrectly show Filter CE as the
+    // CE of the PhysicalScanNode.
+    // runWithParams([{key: "internalCascadesOptimizerDisableSargableWhenNoIndexes", value: true}],
+    //              runTest);
 });

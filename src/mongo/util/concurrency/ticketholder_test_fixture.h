@@ -31,6 +31,7 @@
 
 #include <boost/move/utility_core.hpp>
 #include <boost/optional/optional.hpp>
+#include <functional>
 #include <memory>
 
 #include "mongo/base/string_data.h"
@@ -81,6 +82,16 @@ protected:
      */
     void interruptTest(OperationContext* opCtx, std::unique_ptr<TicketHolder> holder);
 
+    /**
+     * Tests that the ticket is released with the same priority with which it was acquired.
+     */
+    void priorityBookkeepingTest(OperationContext* opCtx,
+                                 std::unique_ptr<TicketHolder> holder,
+                                 AdmissionContext::Priority oldPriority,
+                                 AdmissionContext::Priority newPriority,
+                                 std::function<void(BSONObj& /*statsWhileProcessing*/,
+                                                    BSONObj& /*statsWhenFinished*/)> checks);
+
     ServiceContext::UniqueClient _client;
     ServiceContext::UniqueOperationContext _opCtx;
 };
@@ -120,12 +131,13 @@ struct TicketHolderTestFixture::MockAdmission {
     MockAdmission(ServiceContext* serviceContext, AdmissionContext::Priority priority) {
         client = serviceContext->getService()->makeClient("");
         opCtx = client->makeOperationContext();
-        admCtx.setPriority(priority);
+        admissionPriority.emplace(opCtx.get(), admCtx, priority);
     }
 
-    AdmissionContext admCtx;
     ServiceContext::UniqueClient client;
     ServiceContext::UniqueOperationContext opCtx;
+    MockAdmissionContext admCtx;
+    boost::optional<ScopedAdmissionPriorityBase> admissionPriority;
     boost::optional<Ticket> ticket;
 };
 

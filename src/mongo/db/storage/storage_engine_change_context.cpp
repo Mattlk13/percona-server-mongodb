@@ -38,6 +38,7 @@
 #include "mongo/db/operation_id.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_engine_change_context.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -95,11 +96,11 @@ void StorageEngineChangeOperationContextDoneNotifier::setNotifyWhenDone(ServiceC
     _service = service;
 }
 
-StorageChangeLock::Token StorageEngineChangeContext::killOpsForStorageEngineChange(
-    ServiceContext* service) {
+stdx::unique_lock<ServiceContext::StorageChangeMutexType>
+StorageEngineChangeContext::killOpsForStorageEngineChange(ServiceContext* service) {
     invariant(this == StorageEngineChangeContext::get(service));
     // Prevent new operations from being created.
-    auto storageChangeLk = service->getStorageChangeLock().acquireExclusiveStorageChangeToken();
+    stdx::unique_lock storageChangeLk(service->getStorageChangeMutex());
     stdx::unique_lock lk(_mutex);
     {
         ServiceContext::LockedClientsCursor clientCursor(service);
@@ -109,10 +110,10 @@ StorageChangeLock::Token StorageEngineChangeContext::killOpsForStorageEngineChan
                 continue;
             OperationId killedOperationId;
             {
-                stdx::lock_guard<Client> lk(*client);
+                ClientLock lk(client);
                 auto opCtxToKill = client->getOperationContext();
-                if (!opCtxToKill || !opCtxToKill->recoveryUnit() ||
-                    opCtxToKill->recoveryUnit()->isNoop())
+                if (!opCtxToKill || !shard_role_details::getRecoveryUnit(opCtxToKill) ||
+                    shard_role_details::getRecoveryUnit(opCtxToKill)->isNoop())
                     continue;
                 service->killOperation(lk, opCtxToKill, ErrorCodes::InterruptedDueToStorageChange);
                 auto& doneNotifier =
@@ -136,13 +137,13 @@ StorageChangeLock::Token StorageEngineChangeContext::killOpsForStorageEngineChan
     return storageChangeLk;
 }
 
-void StorageEngineChangeContext::changeStorageEngine(ServiceContext* service,
-                                                     StorageChangeLock::Token token,
-                                                     std::unique_ptr<StorageEngine> engine) {
+void StorageEngineChangeContext::changeStorageEngine(
+    ServiceContext* service,
+    stdx::unique_lock<ServiceContext::StorageChangeMutexType> lk,
+    std::unique_ptr<StorageEngine> engine) {
     invariant(this == StorageEngineChangeContext::get(service));
     service->setStorageEngine(std::move(engine));
-    // Token -- which is a lock -- is released at end of scope, allowing OperationContexts to be
-    // created again.
+    // The lock is released at end of scope, allowing OperationContexts to be created again.
 }
 
 void StorageEngineChangeContext::notifyOpCtxDestroyed() noexcept {

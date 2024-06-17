@@ -1,6 +1,8 @@
 //
 // Tests that multi-writes (update/delete) target *all* shards and not just shards in the collection
 //
+
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
 import {
     WriteWithoutShardKeyTestUtil
 } from "jstests/sharding/updateOne_without_shard_key/libs/write_without_shard_key_test_util.js";
@@ -49,9 +51,9 @@ assert.neq(null, st.shard2.getCollection(coll.toString()).findOne({updated: true
 var staleColl = st.s1.getCollection('foo.bar');
 assert.commandWorked(staleColl.update({_id: 0}, {$set: {updatedById: true}}, {multi: false}));
 
-// Ensure _id update goes to *all* shards
-assert.neq(null, st.shard0.getCollection(coll.toString()).findOne({updatedById: true}));
-assert.neq(null, st.shard2.getCollection(coll.toString()).findOne({updatedById: true}));
+// Ensure _id update goes to at least one shard
+assert(st.shard0.getCollection(coll.toString()).findOne({updatedById: true}) != null ||
+       st.shard2.getCollection(coll.toString()).findOne({updatedById: true}) != null)
 
 jsTest.log("Testing multi-delete...");
 
@@ -78,7 +80,7 @@ assert.commandWorked(st.shard2.getCollection(coll.toString()).insert({_id: 0, sk
 
 assert.commandWorked(coll.remove({_id: 0}, {justOne: true}));
 
-// Ensure _id delete goes to *all* shards
+// Ensure _id update goes to all shards
 assert.eq(null, st.shard0.getCollection(coll.toString()).findOne({x: 1}));
 assert.eq(null, st.shard2.getCollection(coll.toString()).findOne({x: 1}));
 

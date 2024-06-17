@@ -40,9 +40,7 @@ import mongo.toolchain as mongo_toolchain
 import mongo.generators as mongo_generators
 import mongo.install_actions as install_actions
 
-# TODO SERVER-79172
-# We cannot set the limit to python 3.10 since python 3.9 is needed for windows testing
-EnsurePythonVersion(3, 9)
+EnsurePythonVersion(3, 10)
 EnsureSConsVersion(3, 1, 1)
 
 utc_starttime = datetime.utcnow()
@@ -106,7 +104,7 @@ def use_system_version_of_library(name):
 # add a new C++ library dependency that may be shimmed out to the system, add it to the below
 # list.
 def using_system_version_of_cxx_libraries():
-    cxx_library_names = ["tcmalloc", "boost"]
+    cxx_library_names = ["tcmalloc-google", "boost", "tcmalloc-gperf"]
     return True in [use_system_version_of_library(x) for x in cxx_library_names]
 
 
@@ -221,8 +219,12 @@ add_option(
 
 add_option(
     'release',
+    choices=['on', 'off'],
+    const='on',
+    default=build_profile.release,
     help='release build',
-    nargs=0,
+    nargs='?',
+    type='choice',
 )
 
 add_option(
@@ -365,7 +367,7 @@ add_option(
     'separate-debug',
     choices=['on', 'off'],
     const='on',
-    default='off',
+    default="off",
     help='Produce separate debug files',
     nargs='?',
     type='choice',
@@ -439,8 +441,18 @@ add_option(
 )
 
 add_option(
+    'shared-libsan',
+    choices=['on', 'off'],
+    default='off',
+    nargs='?',
+    const='on',
+    help='dynamically link to sanitizer runtime(s)',
+    type='choice',
+)
+
+add_option(
     'allocator',
-    choices=["auto", "system", "tcmalloc", "tcmalloc-experimental"],
+    choices=["auto", "system", "tcmalloc-google", "tcmalloc-gperf"],
     default=build_profile.allocator,
     help='allocator to use (use "auto" for best choice for current platform)',
     type='choice',
@@ -487,7 +499,7 @@ add_option(
 add_option(
     'use-diagnostic-latches',
     choices=['on', 'off'],
-    default='on',
+    default='off',
     help='Enable annotated Mutex types',
     type='choice',
 )
@@ -510,7 +522,8 @@ for pack in [
     ('protobuf', "Protocol Buffers"),
     ('snappy', ),
     ('stemmer', ),
-    ('tcmalloc', ),
+    ('tcmalloc-google', ),
+    ('tcmalloc-gperf', ),
     ('libunwind', ),
     ('valgrind', ),
     ('wiredtiger', ),
@@ -725,6 +738,17 @@ add_option(
 )
 
 add_option(
+    'xray',
+    choices=["on", "off"],
+    default="off",
+    help="Build with LLVM XRay support",
+    type='choice',
+)
+
+add_option('xray-instruction-threshold', help="XRay instrumentation instruction threshold",
+           default=1, nargs='?', type=int)
+
+add_option(
     'git-decider',
     choices=["on", "off"],
     const='on',
@@ -766,7 +790,7 @@ add_option(
     " jlink value."
     "\n\nExample: --jlink=0.75 --jobs 8 will result in a jlink value of 6",
     const=0.5,
-    default=None,
+    default=build_profile.jlink,
     nargs='?',
     type=float,
 )
@@ -829,6 +853,12 @@ add_option(
     default=False,
     action='store_true',
     help='Bypass link-model=dynamic check for macos versions <12.',
+)
+
+add_option(
+    'evergreen-tmp-dir',
+    help='Configures the path to the evergreen configured tmp directory.',
+    default=None,
 )
 
 try:
@@ -1096,7 +1126,7 @@ env_vars.Add(
     help=
     'Enables/disables building with bazel. Note that this project is in flight, and thus subject to breaking changes. See https://jira.mongodb.org/browse/PM-3332 for details.',
     converter=functools.partial(bool_var_converter, var='BAZEL_BUILD_ENABLED'),
-    default="0",
+    default="1",
 )
 
 env_vars.Add(
@@ -1816,7 +1846,7 @@ env.AddMethod(conf_error, 'ConfError')
 # Normalize the VERBOSE Option, and make its value available as a
 # function.
 if env['VERBOSE'] == "auto":
-    env['VERBOSE'] = not sys.stdout.isatty()
+    env['VERBOSE'] = not sys.stdout.isatty() and env.get('__NINJA_NO') != "1"
 else:
     try:
         env['VERBOSE'] = to_boolean(env['VERBOSE'])
@@ -2030,7 +2060,7 @@ def is_toolchain(self, *args):
 env.AddMethod(get_toolchain_name, 'ToolchainName')
 env.AddMethod(is_toolchain, 'ToolchainIs')
 
-releaseBuild = has_option("release")
+releaseBuild = get_option("release") == "on"
 debugBuild = get_option('dbg') == "on"
 optBuild = mongo_generators.get_opt_options(env)
 
@@ -2056,7 +2086,7 @@ if env.get('ENABLE_OOM_RETRY'):
                 'C1060: compiler is out of heap space',
                 'c1xx : fatal error C1063: INTERNAL COMPILER ERROR',
                 r'LNK1171: unable to load mspdbcore\.dll',
-                "LNK1201: error writing to program database ''",
+                "LNK1201: error writing to program database ",
             ]
             env['OOM_RETRY_RETURNCODES'] = [1102]
 
@@ -2133,16 +2163,43 @@ env['TARGET_OS_FAMILY'] = 'posix' if env.TargetOSIs('posix') else env.GetTargetO
 # would be nicer to use SetOption here, but you can't reset user
 # options for some strange reason in SCons. Instead, we store this
 # option as a new variable in the environment.
+try:
+    kernel_version = platform.release().split(".")
+    kernel_major = int(kernel_version[0])
+    kernel_minor = int(kernel_version[1])
+except (ValueError, IndexError):
+    print(
+        f"Failed to extract kernel major and minor versions, tcmalloc-google will not be available for use: {kernel_version}"
+    )
+    kernel_major = 0
+    kernel_minor = 0
+
 if get_option('allocator') == "auto":
-    # using an allocator besides system on android would require either fixing or disabling
-    # gperftools on android
-    if env.TargetOSIs('windows') or \
-       env.TargetOSIs('linux') and not env.TargetOSIs('android'):
-        env['MONGO_ALLOCATOR'] = "tcmalloc"
+    if env.TargetOSIs('linux') and env['TARGET_ARCH'] in ('x86_64', 'aarch64'):
+        env['MONGO_ALLOCATOR'] = "tcmalloc-google"
+
+        # googles tcmalloc uses the membarrier() system call which was added in Linux 4.3,
+        # so fall back to gperf implementation for older kernels
+        if kernel_major < 4 or (kernel_major == 4 and kernel_minor < 3):
+            env['MONGO_ALLOCATOR'] = "tcmalloc-gperf"
+
+    elif env.TargetOSIs('windows') or (env.TargetOSIs('linux')
+                                       and env['TARGET_ARCH'] in ('ppc64le', 's390x')):
+        env['MONGO_ALLOCATOR'] = "tcmalloc-gperf"
     else:
         env['MONGO_ALLOCATOR'] = "system"
 else:
     env['MONGO_ALLOCATOR'] = get_option('allocator')
+
+    if env['MONGO_ALLOCATOR'] == "tcmalloc-google":
+        if kernel_major < 4 or (kernel_major == 4 and kernel_minor < 3):
+            env.ConfError(
+                f"tcmalloc-google allocator only supported on linux kernel 4.3 or greater: kenerl verison={platform.release()}"
+            )
+
+if env['MONGO_ALLOCATOR'] == "tcmalloc-google":
+    env.Append(CPPDEFINES=["ABSL_ALLOCATOR_NOTHROW"])
+    env.Append(CXXFLAGS=['-faligned-new=8'])
 
 if has_option("cache"):
     if has_option("gcov"):
@@ -2227,6 +2284,13 @@ if env.TargetOSIs('windows') and not visibility_annotations_enabled:
     if link_model not in ['object', 'static', 'dynamic-sdk']:
         env.FatalError(
             "Windows builds must use the 'object', 'dynamic-sdk', or 'static' link models")
+
+# TODO(SERVER-85904): remove check when object mode & LTO are supported in bazel
+if link_model == "object" and env.get("BAZEL_BUILD_ENABLED"):
+    env.FatalError(
+        "Bazel-enabled builds currently do not support the \"object\" link model. "
+        "Please add BAZEL_BUILD_ENABLED=0 to the end of your command line argument if you need to build with the \"object\" link model."
+    )
 
 # The 'object' mode for libdeps is enabled by setting _LIBDEPS to $_LIBDEPS_OBJS. The other two
 # modes operate in library mode, enabled by setting _LIBDEPS to $_LIBDEPS_LIBS.
@@ -2447,6 +2511,13 @@ if not env.TargetOSIs('windows'):
     env["LINKCOM"] = env["LINKCOM"].replace("$LINKFLAGS", "$PROGLINKFLAGS")
     env["PROGLINKFLAGS"] = ['$LINKFLAGS']
 
+    # CPPFLAGS is used for assembler commands, this condition below assumes assembler files
+    # will be only directly assembled in librarys and not programs
+    if link_model.startswith("dynamic"):
+        env.Append(CPPFLAGS=["-fPIC"])
+    else:
+        env.Append(CPPFLAGS=["-fPIE"])
+
 # When it is necessary to supply additional SHLINKFLAGS without modifying the toolset default,
 # following appends contents of SHLINKFLAGS_EXTRA variable to the linker command
 env.AppendUnique(SHLINKFLAGS=['$SHLINKFLAGS_EXTRA'])
@@ -2556,6 +2627,11 @@ if get_option('ninja') == 'disabled' and link_model.startswith("dynamic"):
             abilink(env)
 
     if env.get('TAPI'):
+        # TAPI is less useful when running with Bazel + Remote Execution. Disable since the initial implementation
+        # of the build system with Bazel will not support it.
+        # TODO(SERVER-88612): Remove fatal error we decide to implement TAPI support in Bazel
+        env.FatalError("TAPI is not supported with the hybrid build system.")
+
         tapilink = Tool('tapilink')
         if tapilink.exists(env):
             tapilink(env)
@@ -2947,7 +3023,16 @@ elif env.TargetOSIs('windows'):
     env.Append(CCFLAGS=["/MDd" if debugBuild else "/MD"])
 
     if optBuild == "off":
-        env.Append(CCFLAGS=["/Od"])
+        env.Append(
+            CCFLAGS=["/Od"],
+            # windows non optimized builds will cause the PDB to blow up in size,
+            # this allows a larger PDB. The flag is undocumented at the time of writing
+            # but the microsoft thread which brought about its creation can be found here:
+            # https://developercommunity.visualstudio.com/t/pdb-limit-of-4-gib-is-likely-to-be-a-problem-in-a/904784
+            #
+            # Without this flag MSVC will report a red herring error message, about disk space or invalid path.
+            LINKFLAGS=["/pdbpagesize:16384"])
+
         if debugBuild:
             # /RTC1: - Enable Stack Frame Run-Time Error Checking; Reports when a variable is used
             # without having been initialized (implies /Od: no optimizations)
@@ -3072,7 +3157,9 @@ if env.TargetOSIs('posix'):
             # If runtime hardening is requested, then build anything
             # destined for an executable with the necessary flags for PIE.
             env.AppendUnique(
+                PROGCFLAGS=['-fPIE'],
                 PROGCCFLAGS=['-fPIE'],
+                PROGCXXFLAGS=['-fPIE'],
                 PROGLINKFLAGS=['-pie'],
             )
 
@@ -3104,7 +3191,8 @@ if env.TargetOSIs('posix'):
 
     # For debug builds with tcmalloc, we need the frame pointer so it can
     # record the stack of allocations.
-    can_nofp &= not (debugBuild and (env['MONGO_ALLOCATOR'] == 'tcmalloc'))
+    can_nofp &= not (debugBuild and
+                     (env['MONGO_ALLOCATOR'] in ['tcmalloc-google', 'tcmalloc-gperf']))
 
     # Only disable frame pointers if requested
     can_nofp &= ("nofp" in selected_experimental_optimizations)
@@ -3607,7 +3695,10 @@ def doConfigure(myenv):
                 f"Use the '--linker' option instead of modifying the LINKFLAGS directly.")
 
         linker_ld = get_option('linker')
-        if linker_ld == 'auto':
+
+        if linker_ld == "bfd" and env.get("BAZEL_BUILD_ENABLED"):
+            myenv.FatalError(f"The linker 'bfd' is not supported with BAZEL_BUILD_ENABLED.")
+        elif linker_ld == 'auto':
             if not env.TargetOSIs('darwin', 'macOS'):
                 if not myenv.AddToLINKFLAGSIfSupported('-fuse-ld=lld'):
                     myenv.FatalError(
@@ -4122,6 +4213,10 @@ def doConfigure(myenv):
         if not myenv.ToolchainIs('clang', 'gcc'):
             env.FatalError('sanitize is only supported with clang or gcc')
 
+        # sanitizer libs may inject undefined refs (for hooks) at link time, but
+        # the symbols will be available at runtime via the compiler runtime lib.
+        env.Append(LINKFLAGS='-Wl,--allow-shlib-undefined')
+
         if myenv.ToolchainIs('gcc'):
             # GCC's implementation of ASAN depends on libdl.
             env.Append(LIBS=['dl'])
@@ -4135,11 +4230,42 @@ def doConfigure(myenv):
         using_ubsan = 'undefined' in sanitizer_list
         using_msan = 'memory' in sanitizer_list
 
+        if get_option('shared-libsan') == 'on' and len(sanitizer_list) > 0:
+            if not myenv.ToolchainIs('clang') or not myenv.TargetOSIs('linux'):
+                env.FatalError('Error: --shared-libsan is only supported with clang on linux')
+
+            def get_san_lib_path(sanitizer):
+                # TODO SERVER-83727: the v4 clang toolchain doesn't support shared TSAN. Add
+                # support here once the toolchain is upgraded.
+                san_to_lib = {
+                    'address': 'asan',
+                    'undefined': 'ubsan_standalone',
+                }
+                sanitizer_lib = san_to_lib.get(sanitizer)
+                if sanitizer_lib is None:
+                    env.FatalError(
+                        f'Error: --shared-libsan is not supported with {sanitizer} sanitizer')
+                arch = env['TARGET_ARCH']
+                san_rt_name = f'libclang_rt.{sanitizer_lib}-{arch}.so'
+                p = subprocess.run([env['CXX'], f'-print-file-name={san_rt_name}'],
+                                   capture_output=True, text=True)
+                clang_rt_path = p.stdout.strip()
+                if not os.path.isfile(clang_rt_path):
+                    env.FatalError(f"Error: couldn't find sanitizer runtime library {san_rt_name}")
+                return clang_rt_path
+
+            env['SANITIZER_RUNTIME_LIBS'] = [
+                get_san_lib_path(sanitizer) for sanitizer in sanitizer_list
+            ]
+
+        if 'thread' not in sanitizer_list:
+            env.Append(LINKFLAGS=['-rtlib=compiler-rt', '-unwindlib=libgcc'])
+
         if using_lsan:
             env.FatalError("Please use --sanitize=address instead of --sanitize=leak")
 
         if (using_asan
-                or using_msan) and env['MONGO_ALLOCATOR'] in ['tcmalloc', 'tcmalloc-experimental']:
+                or using_msan) and env['MONGO_ALLOCATOR'] in ['tcmalloc-google', 'tcmalloc-gperf']:
             # There are multiply defined symbols between the sanitizer and
             # our vendorized tcmalloc.
             env.FatalError("Cannot use --sanitize=address or --sanitize=memory with tcmalloc")
@@ -4213,6 +4339,11 @@ def doConfigure(myenv):
             myenv.Append(CCFLAGS=['-fno-omit-frame-pointer'])
         else:
             myenv.ConfError('Failed to enable sanitizers with flag: {0}', sanitizer_option)
+
+        if get_option("shared-libsan") == "on":
+            shared_libsan_option = '-shared-libsan'
+            if myenv.AddToCCFLAGSIfSupported(shared_libsan_option):
+                myenv.Append(LINKFLAGS=[shared_libsan_option])
 
         myenv['SANITIZERS_ENABLED'] = sanitizer_list
 
@@ -4420,7 +4551,7 @@ def doConfigure(myenv):
             # reporting thread leaks, which we have because we don't
             # do a clean shutdown of the ServiceContext.
             #
-            tsan_options = f"abort_on_error=1:disable_coredump=0:handle_abort=1:halt_on_error=1:report_thread_leaks=0:die_after_fork=0:suppressions={myenv.File('#etc/tsan.suppressions').abspath}"
+            tsan_options = f"abort_on_error=1:disable_coredump=0:handle_abort=1:halt_on_error=1:report_thread_leaks=0:die_after_fork=0:history_size=5:suppressions={myenv.File('#etc/tsan.suppressions').abspath}"
             myenv['ENV']['TSAN_OPTIONS'] = tsan_options + symbolizer_option
             myenv.AppendUnique(CPPDEFINES=['THREAD_SANITIZER'])
 
@@ -4428,9 +4559,7 @@ def doConfigure(myenv):
             # By default, undefined behavior sanitizer doesn't stop on
             # the first error. Make it so. Newer versions of clang
             # have renamed the flag.
-            # However, this flag cannot be included when using the fuzzer sanitizer
-            # if we want to suppress errors to uncover new ones.
-            if not using_fsan and not myenv.AddToCCFLAGSIfSupported("-fno-sanitize-recover"):
+            if not myenv.AddToCCFLAGSIfSupported("-fno-sanitize-recover"):
                 myenv.AddToCCFLAGSIfSupported("-fno-sanitize-recover=undefined")
             myenv.AppendUnique(CPPDEFINES=['UNDEFINED_BEHAVIOR_SANITIZER'])
 
@@ -4583,6 +4712,9 @@ def doConfigure(myenv):
                 env.FatalError(
                     'The --detect-odr-violations flag is expected to only be reliable with --opt=off'
                 )
+            if linker_ld != "gold":
+                myenv.FatalError(
+                    "The --detect-odr-violations flag currently only works with --linker=gold")
             myenv.AddToLINKFLAGSIfSupported('-Wl,--detect-odr-violations')
 
         # Disallow an executable stack. Also, issue a warning if any files are found that would
@@ -5254,13 +5386,16 @@ def doConfigure(myenv):
 
     # 'tcmalloc' needs to be the last library linked. Please, add new libraries before this
     # point.
-    if myenv['MONGO_ALLOCATOR'] == 'tcmalloc':
-        if use_system_version_of_library('tcmalloc'):
-            conf.FindSysLibDep("tcmalloc", ["tcmalloc"])
-    elif myenv['MONGO_ALLOCATOR'] in ['system', 'tcmalloc-experimental']:
+    if myenv['MONGO_ALLOCATOR'] == 'tcmalloc-google':
+        if use_system_version_of_library('tcmalloc-google'):
+            conf.FindSysLibDep("tcmalloc-google", ["tcmalloc"])
+    elif myenv['MONGO_ALLOCATOR'] == 'tcmalloc-gperf':
+        if use_system_version_of_library('tcmalloc-gperf'):
+            conf.FindSysLibDep("tcmalloc-gperf", ["tcmalloc"])
+    elif myenv['MONGO_ALLOCATOR'] in ['system']:
         pass
     else:
-        myenv.FatalError("Invalid --allocator parameter: $MONGO_ALLOCATOR")
+        myenv.FatalError(f"Invalid --allocator parameter: {env['MONGO_ALLOCATOR']}")
 
     def CheckStdAtomic(context, base_type, extra_message):
         test_body = """
@@ -5468,6 +5603,16 @@ def doConfigure(myenv):
                 "Running on ppc64le, but can't find a correct vec_vbpermq output index.  Compiler or platform not supported"
             )
 
+    if get_option('xray') == "on":
+        if not (myenv.ToolchainIs('clang') and env.TargetOSIs('linux')):
+            env.FatalError("LLVM Xray is only supported with clang on linux")
+
+        myenv.AppendUnique(
+            CCFLAGS=[
+                '-fxray-instrument',
+                '-fxray-instruction-threshold=' + str(get_option('xray-instruction-threshold'))
+            ], LINKFLAGS=['-fxray-instrument'])
+
     myenv = conf.Finish()
 
     conf = Configure(myenv)
@@ -5484,6 +5629,30 @@ def doConfigure(myenv):
         elif usdt_provider:
             conf.env.SetConfigHeaderDefine("MONGO_CONFIG_USDT_ENABLED")
             conf.env.SetConfigHeaderDefine("MONGO_CONFIG_USDT_PROVIDER", usdt_provider)
+    myenv = conf.Finish()
+
+    def CheckGlibcRseqPresent(context):
+        compile_test_body = textwrap.dedent("""
+        #include <sys/rseq.h>
+        #include <stdlib.h>
+        #include <stdio.h>
+
+        int main() {
+            printf("%d", __rseq_size);
+            return EXIT_SUCCESS;
+        }
+        """)
+
+        context.Message("Checking if glibc rseq implemenation is present...")
+        result = context.TryCompile(compile_test_body, ".cpp")
+        context.Result(result)
+        return result
+
+    conf = Configure(myenv)
+    conf.AddTest('CheckGlibcRseqPresent', CheckGlibcRseqPresent)
+
+    if conf.CheckGlibcRseqPresent():
+        conf.env.SetConfigHeaderDefine("MONGO_CONFIG_GLIBC_RSEQ")
     myenv = conf.Finish()
 
     return myenv
@@ -5729,7 +5898,7 @@ if get_option('ninja') != 'disabled':
             "$env$WINLINK @$out.rsp",
             description="Linked $out",
             deps=None,
-            pool="local_pool",
+            pool="link_pool",
             use_depfile=False,
             use_response_file=True,
             response_file_content="$rspc $in_newline",
@@ -5860,6 +6029,11 @@ if gdb_index_enabled == True:
 if env.get('ENABLE_GRPC_BUILD'):
     env.SetConfigHeaderDefine("MONGO_CONFIG_GRPC")
     env.Tool('protobuf_compiler')
+
+if env['MONGO_ALLOCATOR'] == 'tcmalloc-google':
+    env.SetConfigHeaderDefine("MONGO_CONFIG_TCMALLOC_GOOGLE")
+elif env['MONGO_ALLOCATOR'] == 'tcmalloc-gperf':
+    env.SetConfigHeaderDefine("MONGO_CONFIG_TCMALLOC_GPERF")
 
 if get_option('separate-debug') == "on" or env.TargetOSIs("windows"):
 
@@ -6034,6 +6208,18 @@ env.AddPackageNameAlias(
 )
 
 env.AddPackageNameAlias(
+    component="benchmarks",
+    role="runtime",
+    name="benchmarks",
+)
+
+env.AddPackageNameAlias(
+    component="benchmarks",
+    role="debug",
+    name="benchmarks-debugsymbols",
+)
+
+env.AddPackageNameAlias(
     component="mh",
     role="runtime",
     # TODO: we should be able to move this to where the mqlrun binary is
@@ -6058,6 +6244,22 @@ env.AutoInstall(
     AIB_COMPONENT='pretty-printer-tests',
     AIB_COMPONENTS_EXTRA=['dist-test'],
 )
+
+env.AutoInstall(
+    ".",
+    "$BENCHMARK_LIST",
+    AIB_COMPONENT="benchmarks",
+    AIB_ROLE='runtime',
+)
+
+if 'SANITIZER_RUNTIME_LIBS' in env:
+    env.AutoInstall(
+        target='$PREFIX_LIBDIR',
+        source=[env.File(path) for path in env['SANITIZER_RUNTIME_LIBS']],
+        AIB_COMPONENT='dist',
+        AIB_ROLE='runtime',
+        AIB_COMPONENTS_EXTRA=['dist-test'],
+    )
 
 env['RPATH_ESCAPED_DOLLAR_ORIGIN'] = '\\$$$$ORIGIN'
 
@@ -6447,11 +6649,13 @@ env.Alias("distsrc", "distsrc-tgz")
 env.Tool('task_limiter')
 if has_option('jlink'):
 
-    env.SetupTaskLimiter(
+    link_jobs = env.SetupTaskLimiter(
         name='jlink',
         concurrency_ratio=get_option('jlink'),
         builders=['Program', 'SharedLibrary', 'LoadableModule'],
     )
+    if get_option("ninja") != "disabled":
+        env['NINJA_LINK_JOBS'] = link_jobs
 
 if env.get('UNITTESTS_COMPILE_CONCURRENCY'):
 
@@ -6535,6 +6739,9 @@ if has_option("cache"):
 # load the tool late to make sure we can copy over any new
 # emitters/scanners we may have created in the SConstruct when
 # we go to make stand in bazel builders for the various scons builders
+# TODO SERVER-86052 After thin targets are implemented we should
+# be able to load this tool much earlier (before configure checks!)
+# and start the bazel build thread as early as possible.
 env.Tool('integrate_bazel')
 
 env.SConscript(
@@ -6609,14 +6816,35 @@ env.FinalizeInstallDependencies()
 # Create a install-all-meta alias that excludes unittests. This is most useful in
 # static builds where the resource requirements of linking 100s of static unittest
 # binaries is prohibitive.
-candidate_nodes = set([
-    str(gchild) for gchild in env.Flatten(
-        [child.all_children() for child in env.Alias('install-all-meta')[0].all_children()])
-])
-names = [f'install-{env["AIB_META_COMPONENT"]}', 'install-tests', env["UNITTEST_ALIAS"]]
+candidate_nodes = set()
+for child in env.Alias('install-all-meta')[0].all_children():
+    candidate_nodes.add(child)
+    for gchild in child.all_children():
+        candidate_nodes.add(gchild)
+
+names = [
+    f'install-{env["AIB_META_COMPONENT"]}',
+    'install-tests',
+    env["UNITTEST_ALIAS"],
+    'install-first-quarter-unittests',
+    'install-second-quarter-unittests',
+    'install-third-quarter-unittests',
+    'install-fourth-quarter-unittests',
+]
+
 env.Alias('install-all-meta-but-not-unittests', [
     node for node in candidate_nodes if str(node) not in names
     and not str(node).startswith(tuple([prefix_name + '-' for prefix_name in names]))
+])
+
+# prove prefix only operates on real AIB_COMPONENTS, unittests is now a meta component
+# made up of all the quarter components combined. We create the prove alias for this meta
+# component for compatibility with the past and ease of use.
+env.Alias("prove-unittests", [
+    'prove-first-quarter-unittests',
+    'prove-second-quarter-unittests',
+    'prove-third-quarter-unittests',
+    'prove-fourth-quarter-unittests',
 ])
 
 # We don't want installing files to cause them to flow into the cache,
@@ -6642,3 +6870,20 @@ for i, s in enumerate(BUILD_TARGETS):
 # SConscripts have been read but before building begins.
 libdeps.LibdepLinter(env).final_checks()
 libdeps.generate_libdeps_graph(env)
+
+# We put this next section at the end of the SConstruct since all the targets
+# have been declared, and we know all possible bazel targets so
+# we can now generate this info into a file for the ninja build to consume.
+if env.get("BAZEL_BUILD_ENABLED"):
+    if env.GetOption('ninja') != "disabled":
+
+        # convert the SCons FunctioAction into a format that ninja can understand
+        env.NinjaRegisterFunctionHandler("bazel_builder_action", env.NinjaBazelBuilder)
+
+        # we generate the list of all targets that were labeled Bazel* builder targets
+        # via the emitter, this outputs a json file which will be read during the ninja
+        # build.
+        env.GenerateBazelInfoForNinja()
+
+    else:
+        env.WaitForBazel()

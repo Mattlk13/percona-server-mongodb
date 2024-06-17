@@ -86,15 +86,15 @@ protected:
     }
 
 public:
-    virtual void setUp() {
+    void setUp() override {
         auto configObj = getConfigObj();
         assertStartSuccess(configObj, HostAndPort("node1", 12345));
         ReplSetConfig config = assertMakeRSConfig(configObj);
         replCoord = getReplCoord();
 
         ASSERT_OK(replCoord->setFollowerMode(MemberState::RS_SECONDARY));
-        replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 1), Date_t() + Seconds(100));
-        replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 1), Date_t() + Seconds(100));
+        replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 1),
+                                                            Date_t() + Seconds(100));
         simulateSuccessfulV1Election();
         ASSERT(replCoord->getMemberState().primary());
 
@@ -107,7 +107,7 @@ public:
         observer->init(serviceContext, replCoord);
     }
 
-    virtual void tearDown() {
+    void tearDown() override {
         observer->shutdown();
         ASSERT(observer->isShutdown());
         observer.reset();
@@ -190,7 +190,7 @@ TEST_F(TopologyVersionObserverTest, HandleDBException) {
     ASSERT(observerClient);
 
     auto tryKillOperation = [&] {
-        stdx::lock_guard clientLock(*observerClient);
+        ClientLock clientLock(observerClient);
 
         if (auto opCtx = observerClient->getOperationContext()) {
             observerClient->getServiceContext()->killOperation(clientLock, opCtx);

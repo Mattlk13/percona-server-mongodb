@@ -35,11 +35,11 @@
 #include "mongo/db/auth/authz_session_external_state.h"
 #include "mongo/db/auth/authz_session_external_state_d.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -50,15 +50,22 @@ AuthzSessionExternalStateMongod::~AuthzSessionExternalStateMongod() {}
 
 void AuthzSessionExternalStateMongod::startRequest(OperationContext* opCtx) {
     // No locks should be held as this happens before any database accesses occur
-    dassert(!opCtx->lockState()->isLocked());
+    dassert(!shard_role_details::getLocker(opCtx)->isLocked());
 
     _checkShouldAllowLocalhost(opCtx);
 }
 
 bool AuthzSessionExternalStateMongod::shouldIgnoreAuthChecks() const {
+    if (AuthzSessionExternalStateServerCommon::shouldIgnoreAuthChecks()) {
+        return true;
+    }
+
+    if (!haveClient()) {
+        return false;
+    }
+
     // TODO(spencer): get "isInDirectClient" from OperationContext
-    return cc().isInDirectClient() ||
-        AuthzSessionExternalStateServerCommon::shouldIgnoreAuthChecks();
+    return cc().isInDirectClient();
 }
 
 bool AuthzSessionExternalStateMongod::serverIsArbiter() const {
@@ -67,18 +74,5 @@ bool AuthzSessionExternalStateMongod::serverIsArbiter() const {
         repl::ReplicationCoordinator::get(getGlobalServiceContext())->getSettings().isReplSet() &&
         repl::ReplicationCoordinator::get(getGlobalServiceContext())->getMemberState().arbiter());
 }
-
-namespace {
-
-std::unique_ptr<AuthzSessionExternalState> authzSessionExternalStateImpl(
-    AuthorizationManager* authzManager) {
-    return std::make_unique<AuthzSessionExternalStateMongod>(authzManager);
-}
-
-auto authzSessionExternalStateRegistration = MONGO_WEAK_FUNCTION_REGISTRATION(
-    AuthzSessionExternalState::create, authzSessionExternalStateImpl);
-
-}  // namespace
-
 
 }  // namespace mongo

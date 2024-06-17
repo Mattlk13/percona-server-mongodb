@@ -43,6 +43,7 @@
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_version.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/str.h"
 
@@ -113,30 +114,24 @@ void DBPrimaryRouter::_onException(RouteContext* context, Status s) {
     }
 }
 
-CollectionRouter::CollectionRouter(ServiceContext* service, NamespaceString nss)
-    : RouterBase(service), _nss(std::move(nss)) {}
+CollectionRouterCommon::CollectionRouterCommon(
+    ServiceContext* service, const std::vector<NamespaceString>& targetedNamespaces)
+    : RouterBase(service), _targetedNamespaces(targetedNamespaces) {}
 
-void CollectionRouter::appendCRUDRoutingTokenToCommand(const ShardId& shardId,
-                                                       const CollectionRoutingInfo& cri,
-                                                       BSONObjBuilder* builder) {
-    if (cri.cm.getVersion(shardId) == ChunkVersion::UNSHARDED()) {
-        // Need to add the database version as well
-        const auto& dbVersion = cri.cm.dbVersion();
-        if (!dbVersion.isFixed()) {
-            BSONObjBuilder dbvBuilder(builder->subobjStart(DatabaseVersion::kDatabaseVersionField));
-            dbVersion.serialize(&dbvBuilder);
+void CollectionRouterCommon::_onException(RouteContext* context, Status s) {
+    auto catalogCache = Grid::get(_service)->catalogCache();
+
+    const auto isNssInvolvedInRouting = [&](const NamespaceString& nss) {
+        if (nss.isTimeseriesBucketsCollection() &&
+            std::find(_targetedNamespaces.begin(),
+                      _targetedNamespaces.end(),
+                      nss.getTimeseriesViewNamespace()) != _targetedNamespaces.end()) {
+            return true;
         }
-    }
-    cri.getShardVersion(shardId).serialize(ShardVersion::kShardVersionField, builder);
-}
 
-CollectionRoutingInfo CollectionRouter::_getRoutingInfo(OperationContext* opCtx) const {
-    auto catalogCache = Grid::get(_service)->catalogCache();
-    return uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, _nss));
-}
-
-void CollectionRouter::_onException(RouteContext* context, Status s) {
-    auto catalogCache = Grid::get(_service)->catalogCache();
+        return std::find(_targetedNamespaces.begin(), _targetedNamespaces.end(), nss) !=
+            _targetedNamespaces.end();
+    };
 
     if (s == ErrorCodes::StaleDbVersion) {
         auto si = s.extraInfo<StaleDbRoutingVersion>();
@@ -145,10 +140,19 @@ void CollectionRouter::_onException(RouteContext* context, Status s) {
     } else if (s == ErrorCodes::StaleConfig) {
         auto si = s.extraInfo<StaleConfigInfo>();
         tassert(6375904, "StaleConfig must have extraInfo", si);
+
+        if (!isNssInvolvedInRouting(si->getNss())) {
+            uassertStatusOK(s);
+        }
+
         catalogCache->invalidateShardOrEntireCollectionEntryForShardedCollection(
             si->getNss(), si->getVersionWanted(), si->getShardId());
     } else if (s == ErrorCodes::StaleEpoch) {
         if (auto si = s.extraInfo<StaleEpochInfo>()) {
+            if (!isNssInvolvedInRouting(si->getNss())) {
+                uassertStatusOK(s);
+            }
+
             catalogCache->invalidateShardOrEntireCollectionEntryForShardedCollection(
                 si->getNss(), si->getVersionWanted(), ShardId());
         }
@@ -171,6 +175,80 @@ void CollectionRouter::_onException(RouteContext* context, Status s) {
     }
 }
 
+CollectionRoutingInfo CollectionRouterCommon::_getRoutingInfo(OperationContext* opCtx,
+                                                              const NamespaceString& nss) {
+    auto catalogCache = Grid::get(opCtx->getServiceContext())->catalogCache();
+    // When in a multi-document transaction, allow getting routing info from the CatalogCache even
+    // though locks may be held. The CatalogCache will throw CannotRefreshDueToLocksHeld if the
+    // entry is not already cached.
+    const auto allowLocks = opCtx->inMultiDocumentTransaction();
+    return uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, nss, allowLocks));
+}
+
+void CollectionRouterCommon::appendCRUDRoutingTokenToCommand(const ShardId& shardId,
+                                                             const CollectionRoutingInfo& cri,
+                                                             BSONObjBuilder* builder) {
+    if (cri.cm.getVersion(shardId) == ChunkVersion::UNSHARDED()) {
+        // Need to add the database version as well.
+        const auto& dbVersion = cri.cm.dbVersion();
+        if (!dbVersion.isFixed()) {
+            BSONObjBuilder dbvBuilder(builder->subobjStart(DatabaseVersion::kDatabaseVersionField));
+            dbVersion.serialize(&dbvBuilder);
+        }
+    }
+    cri.getShardVersion(shardId).serialize(ShardVersion::kShardVersionField, builder);
+}
+
+CollectionRouter::CollectionRouter(ServiceContext* service, NamespaceString nss)
+    : CollectionRouterCommon(service, {std::move(nss)}) {}
+
+MultiCollectionRouter::MultiCollectionRouter(ServiceContext* service,
+                                             const std::vector<NamespaceString>& nssList)
+    : CollectionRouterCommon(service, nssList) {}
+
+bool MultiCollectionRouter::isAnyCollectionNotLocal(
+    OperationContext* opCtx,
+    const stdx::unordered_map<NamespaceString, CollectionRoutingInfo>& criMap) {
+    auto* grid = Grid::get(opCtx->getServiceContext());
+    // By definition, all collections in a non sharded deployment are local.
+    if (!(grid->isInitialized() && grid->isShardingInitialized())) {
+        return false;
+    }
+
+    const auto myShardId = ShardingState::get(opCtx)->shardId();
+    bool anyCollectionNotLocal = false;
+
+    // For each collection, figure out if it fully lives on this shard.
+    for (const auto& nss : _targetedNamespaces) {
+        const auto nssCri = criMap.find(nss);
+        tassert(8322001,
+                "Must be an entry in criMap for namespace " + nss.toStringForErrorMsg(),
+                nssCri != criMap.end());
+
+        const auto atClusterTime = repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime();
+        const auto chunkManagerMaybeAtClusterTime = atClusterTime
+            ? ChunkManager::makeAtTime(nssCri->second.cm, atClusterTime->asTimestamp())
+            : nssCri->second.cm;
+
+        bool isNssLocal = [&]() {
+            if (chunkManagerMaybeAtClusterTime.isSharded()) {
+                return false;
+            } else if (chunkManagerMaybeAtClusterTime.isUnsplittable()) {
+                return chunkManagerMaybeAtClusterTime.getMinKeyShardIdWithSimpleCollation() ==
+                    myShardId;
+            } else {
+                // If collection is untracked, it is only local if this shard is the
+                // dbPrimary shard.
+                return chunkManagerMaybeAtClusterTime.dbPrimary() == myShardId;
+            }
+        }();
+
+        if (!isNssLocal) {
+            anyCollectionNotLocal = true;
+        }
+    }
+    return anyCollectionNotLocal;
+}
 }  // namespace router
 }  // namespace sharding
 }  // namespace mongo

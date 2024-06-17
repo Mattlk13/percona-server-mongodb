@@ -5,12 +5,11 @@
  * 'multiversion_incompatible' tag.
  * @tags: [
  *   uses_atclustertime,
- *   multiversion_incompatible,
  *   requires_persistence,
- *   requires_fcv_72,
+ *   requires_fcv_80,
  *   featureFlagReshardingImprovements,
  *   featureFlagMoveCollection,
- *   featureFlagTrackUnshardedCollectionsOnShardingCatalog,
+ *   # TODO (SERVER-87812) Remove multiversion_incompatible tag
  *   multiversion_incompatible,
  * ]
  */

@@ -28,24 +28,26 @@
  */
 
 #include "mongo/db/profile_filter.h"
+#include "mongo/platform/mutex.h"
 
 #include <mutex>
+#include <shared_mutex>
 #include <utility>
-
-#include "mongo/platform/mutex.h"
 
 namespace mongo {
 
+// std::atomic<std::shared_ptr> is not supported until GCC 12 and not in clang libc++ as of
+// 9/28/2023
 static std::shared_ptr<ProfileFilter> defaultProfileFilter;
-static Mutex mutex = MONGO_MAKE_LATCH("ProfileFilter::mutex");
+static std::shared_mutex mutex;  // NOLINT
 
 std::shared_ptr<ProfileFilter> ProfileFilter::getDefault() {
-    stdx::lock_guard<Latch> lk(mutex);
+    std::shared_lock lock(mutex);  // NOLINT
     return defaultProfileFilter;
 }
 
 void ProfileFilter::setDefault(std::shared_ptr<ProfileFilter> filter) {
-    stdx::lock_guard<Latch> lk(mutex);
+    stdx::unique_lock lock(mutex);  // NOLINT
     defaultProfileFilter = std::move(filter);
 }
 

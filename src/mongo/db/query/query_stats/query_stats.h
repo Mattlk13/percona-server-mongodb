@@ -49,16 +49,18 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/cursor_response_gen.h"
 #include "mongo/db/query/partitioned_cache.h"
 #include "mongo/db/query/plan_explainer.h"
-#include "mongo/db/query/query_stats/key_generator.h"
+#include "mongo/db/query/query_stats/key.h"
+#include "mongo/db/query/query_stats/optimizer_metrics_stats_entry.h"
 #include "mongo/db/query/query_stats/query_stats_entry.h"
 #include "mongo/db/query/query_stats/rate_limiting.h"
 #include "mongo/db/service_context.h"
 
 namespace mongo::query_stats {
 
-extern CounterMetric queryStatsStoreSizeEstimateBytesMetric;
+extern Counter64& queryStatsStoreSizeEstimateBytesMetric;
 
 struct QueryStatsPartitioner {
     // The partitioning function for use with the 'Partitioned' utility.
@@ -108,6 +110,11 @@ using QueryStatsStore = PartitionedCache<std::size_t,
  */
 class QueryStatsStoreManager {
 public:
+    // The query stats store can be configured using these objects on a per-ServiceContext level.
+    // This is essentially global, but can be manipulated by unit tests.
+    static const ServiceContext::Decoration<std::unique_ptr<QueryStatsStoreManager>> get;
+    static const ServiceContext::Decoration<std::unique_ptr<RateLimiting>> getRateLimiter;
+
     template <typename... QueryStatsStoreArgs>
     QueryStatsStoreManager(size_t cacheSize, size_t numPartitions)
         : _queryStatsStore(std::make_unique<QueryStatsStore>(cacheSize, numPartitions)),
@@ -121,7 +128,7 @@ public:
     }
 
     size_t getMaxSize() {
-        return _maxSize;
+        return _maxSize.load();
     }
 
     /**
@@ -129,7 +136,7 @@ public:
      * entries.
      */
     size_t resetSize(size_t cacheSize) {
-        _maxSize = cacheSize;
+        _maxSize.store(cacheSize);
         return _queryStatsStore->reset(cacheSize);
     }
 
@@ -140,20 +147,13 @@ private:
      * Max size of the queryStats store. Tracked here to avoid having to recompute after it's
      * divided up into partitions.
      */
-    size_t _maxSize;
+    AtomicWord<size_t> _maxSize;
 };
 
-const auto queryStatsStoreDecoration =
-    ServiceContext::declareDecoration<std::unique_ptr<QueryStatsStoreManager>>();
-
-const auto queryStatsRateLimiter =
-    ServiceContext::declareDecoration<std::unique_ptr<RateLimiting>>();
 /**
  * Acquire a reference to the global queryStats store.
  */
 QueryStatsStore& getQueryStatsStore(OperationContext* opCtx);
-
-bool isQueryStatsFeatureEnabled(bool requiresFullQueryStatsFeatureFlag);
 
 /**
  * Registers a request for query stats collection. The function may decide not to collect anything,
@@ -187,15 +187,49 @@ bool isQueryStatsFeatureEnabled(bool requiresFullQueryStatsFeatureFlag);
  *   deferred construction callback to ensure that this feature does not impact performance if
  *   collecting stats is not needed due to the feature being disabled or the request being rate
  *   limited.
- * - Since we currently have 2 feature flags (one for full query stats, and one for
- *   find-command-only query stats), we use the requiresFullQueryStatsFeatureFlag parameter to
- * denote which requests should only be registered when the full feature flag is enabled. TODO
- * SERVER-79494 Remove requiresFullQueryStatsFeatureFlag parameter.
  */
 void registerRequest(OperationContext* opCtx,
                      const NamespaceString& collection,
-                     std::function<std::unique_ptr<Key>(void)> makeKey,
-                     bool requiresFullQueryStatsFeatureFlag = true);
+                     std::function<std::unique_ptr<Key>(void)> makeKey);
+
+
+/**
+ * Returns whether or not the current operation should request metrics from remote hosts. This
+ * can be either because this query was chosen for query stats collection, the user explicitly
+ * requested query stats collection for this query, or this query is an internal query generated
+ * by a user query that met one of the first two conditions.
+ */
+bool shouldRequestRemoteMetrics(const OpDebug& opDebug);
+
+/**
+ * Convert an optional Duration to a count of Microseconds uint64_t.
+ */
+inline uint64_t microsecondsToUint64(boost::optional<Microseconds> duration) {
+    return static_cast<uint64_t>(duration.value_or(Microseconds{0}).count());
+}
+
+/**
+ * Snapshot of query stats from CurOp::OpDebug to store in query stats store.
+ */
+struct QueryStatsSnapshot {
+    uint64_t queryExecMicros;
+    uint64_t firstResponseExecMicros;
+    uint64_t docsReturned;
+
+    uint64_t keysExamined;
+    uint64_t docsExamined;
+    bool hasSortStage;
+    bool usedDisk;
+    bool fromMultiPlanner;
+    bool fromPlanCache;
+};
+
+/**
+ * Get a snapshot of the metrics to store in query stats from CurOp::OpDebug and others.
+ */
+QueryStatsSnapshot captureMetrics(const OperationContext* opCtx,
+                                  int64_t firstResponseExecutionTime,
+                                  const OpDebug::AdditiveMetrics& metrics);
 
 /**
  * Writes query stats to the query stats store for the operation identified by `queryStatsKeyHash`.
@@ -210,7 +244,7 @@ void registerRequest(OperationContext* opCtx,
 void writeQueryStats(OperationContext* opCtx,
                      boost::optional<size_t> queryStatsKeyHash,
                      std::unique_ptr<Key> key,
-                     uint64_t queryExecMicros,
-                     uint64_t firstResponseExecMicros,
-                     uint64_t docsReturned);
+                     const QueryStatsSnapshot& snapshot,
+                     std::unique_ptr<SupplementalStatsEntry> supplementalMetrics = nullptr);
+
 }  // namespace mongo::query_stats

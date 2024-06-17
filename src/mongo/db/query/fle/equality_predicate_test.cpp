@@ -52,7 +52,6 @@
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/fle/encrypted_predicate_test_fixtures.h"
 #include "mongo/db/query/fle/equality_predicate.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/unittest/bson_test_util.h"
 #include "mongo/unittest/framework.h"
@@ -88,18 +87,17 @@ protected:
         return true;
     }
 
-    std::vector<PrfBlock> generateTags(BSONValue payload) const {
-        return stdx::visit(
-            OverloadedVisitor{
-                [&](BSONElement p) {
-                    ASSERT(p.isNumber());  // Only accept numbers as mock FFPs.
-                    ASSERT(_tags.find({p.fieldNameStringData(), p.Int()}) != _tags.end());
-                    return _tags.find({p.fieldNameStringData(), p.Int()})->second;
-                },
-                [&](std::reference_wrapper<Value> v) {
-                    return std::vector<PrfBlock>{};
-                }},
-            payload);
+    std::vector<PrfBlock> generateTags(BSONValue payload) const override {
+        return visit(OverloadedVisitor{
+                         [&](BSONElement p) {
+                             ASSERT(p.isNumber());  // Only accept numbers as mock FFPs.
+                             ASSERT(_tags.find({p.fieldNameStringData(), p.Int()}) != _tags.end());
+                             return _tags.find({p.fieldNameStringData(), p.Int()})->second;
+                         },
+                         [&](std::reference_wrapper<Value> v) {
+                             return std::vector<PrfBlock>{};
+                         }},
+                     payload);
     }
 
 private:
@@ -262,7 +260,7 @@ TEST_F(EqualityPredicateCollScanRewriteTest, Eq_Match) {
             }
         }
     })");
-    ASSERT_BSONOBJ_EQ(aggExpr->serialize(SerializationOptions{}).getDocument().toBson(), expected);
+    ASSERT_BSONOBJ_EQ(aggExpr->serialize().getDocument().toBson(), expected);
 }
 
 TEST_F(EqualityPredicateCollScanRewriteTest, Eq_Expr) {
@@ -284,7 +282,7 @@ TEST_F(EqualityPredicateCollScanRewriteTest, Eq_Expr) {
         }
     })");
     ASSERT(result);
-    ASSERT_BSONOBJ_EQ(result->serialize(SerializationOptions{}).getDocument().toBson(), expected);
+    ASSERT_BSONOBJ_EQ(result->serialize().getDocument().toBson(), expected);
 }
 
 TEST_F(EqualityPredicateCollScanRewriteTest, In_Match) {
@@ -373,7 +371,7 @@ TEST_F(EqualityPredicateCollScanRewriteTest, In_Expr) {
                     }
                 }}
             ]})");
-    ASSERT_BSONOBJ_EQ(result->serialize(SerializationOptions{}).getDocument().toBson(), expected);
+    ASSERT_BSONOBJ_EQ(result->serialize().getDocument().toBson(), expected);
 }
 
 }  // namespace

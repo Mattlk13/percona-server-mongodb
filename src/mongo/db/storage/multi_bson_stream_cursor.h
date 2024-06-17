@@ -52,6 +52,7 @@ class MultiBsonStreamCursor : public SeekableRecordCursor {
 public:
     MultiBsonStreamCursor(const VirtualCollectionOptions& vopts)
         : _numStreams(vopts.dataSources.size()), _vopts(vopts) {
+        using namespace fmt::literals;
         tassert(6968310, "_numStreams {} <= 0"_format(_numStreams), _numStreams > 0);
         _streamReader = getInputStream(_vopts.dataSources[_streamIdx].url);
     }
@@ -70,15 +71,15 @@ public:
     void setSaveStorageCursorOnDetachFromOperationContext(bool) override {}
 
     // Seeking is not currently supported.
-    boost::optional<Record> seekExact(const RecordId& id) {
+    boost::optional<Record> seekExact(const RecordId& id) override {
         tasserted(6968300, "MultiBsonStreamCursor::seekExact is not supported");
         return boost::none;
     }
 
     // Seeking is not currently supported.
-    boost::optional<Record> seekNear(const RecordId& start) {
-        tasserted(6968301, "MultiBsonStreamCursor::seekNear is not supported");
-        return boost::none;
+    boost::optional<Record> seek(const RecordId& start, BoundInclusion boundInclusion) override {
+        tasserted(6968320, "MultiBsonStreamCursor::seek is not supported");
+        return {};
     }
 
 private:

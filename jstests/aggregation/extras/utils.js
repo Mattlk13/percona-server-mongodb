@@ -540,17 +540,15 @@ export function getExplainedPipelineFromAggregation(
     const result = coll.explain().aggregate(pipeline, aggOptions);
 
     assert.commandWorked(result);
-    return getExplainPipelineFromAggregationResult(
-        db, result, {inhibitOptimization, postPlanningResults});
+    return getExplainPipelineFromAggregationResult(result,
+                                                   {inhibitOptimization, postPlanningResults});
 }
 
-export function getExplainPipelineFromAggregationResult(db, result, {
+export function getExplainPipelineFromAggregationResult(result, {
     inhibitOptimization = true,
     postPlanningResults = false,
 } = {}) {
-    // We proceed by cases based on topology.
-    if (!FixtureHelpers.isMongos(db)) {
-        assert(Array.isArray(result.stages) || result.queryPlanner, result);
+    if (Array.isArray(result.stages)) {
         // The first two stages should be the .find() cursor and the inhibit-optimization stage (if
         // enabled); the rest of the stages are what the user's 'stage' expanded to.
         assert(result.stages[0].$cursor, result);

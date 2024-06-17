@@ -60,7 +60,8 @@ namespace mongo::timeseries::bucket_catalog {
  *
  * Returns a bad status if the bucket document is malformed.
  */
-StatusWith<MinMax> generateMinMaxFromBucketDoc(const BSONObj& bucketDoc,
+StatusWith<MinMax> generateMinMaxFromBucketDoc(TrackingContext&,
+                                               const BSONObj& bucketDoc,
                                                const StringDataComparator* comparator);
 
 /**
@@ -69,7 +70,8 @@ StatusWith<MinMax> generateMinMaxFromBucketDoc(const BSONObj& bucketDoc,
  *
  * Returns a bad status if the bucket document is malformed or contains mixed schema measurements.
  */
-StatusWith<Schema> generateSchemaFromBucketDoc(const BSONObj& bucketDoc,
+StatusWith<Schema> generateSchemaFromBucketDoc(TrackingContext&,
+                                               const BSONObj& bucketDoc,
                                                const StringDataComparator* comparator);
 
 /**
@@ -121,5 +123,5 @@ std::vector<BSONObj> generateReopeningPipeline(OperationContext* opCtx,
  *
  * To be called from an OpObserver, e.g. in aboutToDelete and onUpdate.
  */
-void handleDirectWrite(OperationContext* opCtx, const NamespaceString& ns, const OID& bucketId);
+void handleDirectWrite(OperationContext* opCtx, const UUID& collectionUUID, const OID& bucketId);
 }  // namespace mongo::timeseries::bucket_catalog

@@ -44,6 +44,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/client.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/generic_cursor_gen.h"
 #include "mongo/db/logical_time.h"
@@ -93,40 +94,49 @@ std::vector<BSONObj> CommonProcessInterface::getCurrentOps(
     auto blockedOpGuard = DiagnosticInfo::maybeMakeBlockedOpForTest(opCtx->getClient());
 #endif
 
-    for (ServiceContext::LockedClientsCursor cursor(opCtx->getClient()->getServiceContext());
-         Client* client = cursor.next();) {
-        invariant(client);
+    auto reportCurrentOpForService = [&](Service* service) {
+        for (Service::LockedClientsCursor cursor(service); ClientLock lc = cursor.next();) {
+            Client* client = &*lc;
+            if (ctxAuth->getAuthorizationManager().isAuthEnabled()) {
+                // If auth is disabled, ignore the allUsers parameter.
+                if (userMode == CurrentOpUserMode::kExcludeOthers &&
+                    !ctxAuth->isCoauthorizedWithClient(client, lc)) {
+                    continue;
+                }
 
-        stdx::lock_guard<Client> lk(*client);
+                // If currOp is being run for a particular tenant, ignore any ops that don't belong
+                // to it.
+                if (auto expCtxTenantId = expCtx->ns.tenantId()) {
+                    auto userName = AuthorizationSession::get(client)->getAuthenticatedUserName();
+                    if ((userName && userName->getTenant() &&
+                         userName->getTenant() != expCtxTenantId) ||
+                        (userName && !userName->getTenant() &&
+                         !CurOp::currentOpBelongsToTenant(client, *expCtxTenantId))) {
+                        continue;
+                    }
+                }
+            }
 
-        if (ctxAuth->getAuthorizationManager().isAuthEnabled()) {
-            // If auth is disabled, ignore the allUsers parameter.
-            if (userMode == CurrentOpUserMode::kExcludeOthers &&
-                !ctxAuth->isCoauthorizedWithClient(client, lk)) {
+            // Ignore inactive connections unless 'idleConnections' is true.
+            if (connMode == CurrentOpConnectionsMode::kExcludeIdle &&
+                !client->hasAnyActiveCurrentOp()) {
                 continue;
             }
 
-            // If currOp is being run for a particular tenant, ignore any ops that don't belong to
-            // it.
-            if (auto expCtxTenantId = expCtx->ns.tenantId()) {
-                auto userName = AuthorizationSession::get(client)->getAuthenticatedUserName();
-                if ((userName && userName->getTenant() &&
-                     userName->getTenant() != expCtxTenantId) ||
-                    (userName && !userName->getTenant() &&
-                     !CurOp::currentOpBelongsToTenant(client, *expCtxTenantId))) {
-                    continue;
-                }
-            }
+            // Delegate to the mongoD- or mongoS-specific implementation of
+            // _reportCurrentOpForClient.
+            ops.emplace_back(
+                _reportCurrentOpForClient(expCtx, client, truncateMode, backtraceMode));
         }
+    };
 
-        // Ignore inactive connections unless 'idleConnections' is true.
-        if (connMode == CurrentOpConnectionsMode::kExcludeIdle &&
-            !client->hasAnyActiveCurrentOp()) {
-            continue;
-        }
-
-        // Delegate to the mongoD- or mongoS-specific implementation of _reportCurrentOpForClient.
-        ops.emplace_back(_reportCurrentOpForClient(expCtx, client, truncateMode, backtraceMode));
+    if (opCtx->routedByReplicaSetEndpoint()) {
+        // On the replica set endpoint, currentOp should report both router and shard operations.
+        auto serviceContext = opCtx->getServiceContext();
+        reportCurrentOpForService(serviceContext->getService(ClusterRole::RouterServer));
+        reportCurrentOpForService(serviceContext->getService(ClusterRole::ShardServer));
+    } else {
+        reportCurrentOpForService(opCtx->getService());
     }
 
     // If 'cursorMode' is set to include idle cursors, retrieve them and add them to ops.
@@ -135,7 +145,7 @@ std::vector<BSONObj> CommonProcessInterface::getCurrentOps(
         for (auto&& cursor : getIdleCursors(expCtx, userMode)) {
             BSONObjBuilder cursorObj;
             cursorObj.append("type", "idleCursor");
-            cursorObj.append("host", getHostNameCachedAndPort());
+            cursorObj.append("host", prettyHostNameAndPort(opCtx->getClient()->getLocalPort()));
             // First, extract fields which need to go at the top level out of the GenericCursor.
             if (auto ns = cursor.getNs()) {
                 tassert(7663401,
@@ -184,10 +194,12 @@ std::vector<BSONObj> CommonProcessInterface::getCurrentOps(
 
 std::vector<FieldPath> CommonProcessInterface::collectDocumentKeyFieldsActingAsRouter(
     OperationContext* opCtx, const NamespaceString& nss) const {
-    const auto [cm, _] =
-        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
-    if (cm.isSharded()) {
-        return _shardKeyToDocumentKeyFields(cm.getShardKeyPattern().getKeyPatternFields());
+    const auto criSW = Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss);
+    if (criSW.isOK() && criSW.getValue().cm.isSharded()) {
+        return shardKeyToDocumentKeyFields(
+            criSW.getValue().cm.getShardKeyPattern().getKeyPatternFields());
+    } else if (!criSW.isOK() && criSW.getStatus().code() != ErrorCodes::NamespaceNotFound) {
+        uassertStatusOK(criSW);
     }
 
     // We have no evidence this collection is sharded, so the document key is just _id.
@@ -237,8 +249,8 @@ boost::optional<ShardVersion> CommonProcessInterface::refreshAndGetCollectionVer
     return cri.cm.isSharded() ? boost::make_optional(cri.getCollectionVersion()) : boost::none;
 }
 
-std::vector<FieldPath> CommonProcessInterface::_shardKeyToDocumentKeyFields(
-    const std::vector<std::unique_ptr<FieldRef>>& keyPatternFields) const {
+std::vector<FieldPath> CommonProcessInterface::shardKeyToDocumentKeyFields(
+    const std::vector<std::unique_ptr<FieldRef>>& keyPatternFields) {
     std::vector<FieldPath> result;
     bool gotId = false;
     for (auto& field : keyPatternFields) {
@@ -251,8 +263,42 @@ std::vector<FieldPath> CommonProcessInterface::_shardKeyToDocumentKeyFields(
     return result;
 }
 
+boost::optional<ShardId> CommonProcessInterface::findOwningShard(OperationContext* opCtx,
+                                                                 const NamespaceString& nss) {
+    // Do not attempt to refresh the catalog cache when holding a lock.
+    if (shard_role_details::getLocker(opCtx)->isLocked()) {
+        return boost::none;
+    }
+    auto* grid = Grid::get(opCtx);
+    tassert(7958000, "Grid should be initialized", grid && grid->isInitialized());
+
+    return CommonProcessInterface::findOwningShard(opCtx, grid->catalogCache(), nss);
+}
+
+boost::optional<ShardId> CommonProcessInterface::findOwningShard(OperationContext* opCtx,
+                                                                 CatalogCache* catalogCache,
+                                                                 const NamespaceString& nss) {
+    tassert(7958001, "CatalogCache should be initialized", catalogCache);
+    auto swCRI = catalogCache->getCollectionRoutingInfo(opCtx, nss);
+    if (swCRI.getStatus().code() == ErrorCodes::NamespaceNotFound) {
+        return boost::none;
+    }
+    auto [cm, _] = uassertStatusOK(swCRI);
+
+    if (cm.hasRoutingTable()) {
+        if (cm.isUnsplittable()) {
+            return cm.getMinKeyShardIdWithSimpleCollation();
+        } else {
+            return boost::none;
+        }
+    } else {
+        return cm.dbPrimary();
+    }
+    return boost::none;
+}
+
 std::string CommonProcessInterface::getHostAndPort(OperationContext* opCtx) const {
-    return getHostNameCachedAndPort();
+    return prettyHostNameAndPort(opCtx->getClient()->getLocalPort());
 }
 
 }  // namespace mongo

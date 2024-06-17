@@ -46,6 +46,7 @@
 #include "mongo/db/cursor_id.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/cursor_response_gen.h"
 #include "mongo/db/tenant_id.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/reply_builder_interface.h"
@@ -133,6 +134,7 @@ public:
      */
     void done(CursorId cursorId,
               const NamespaceString& cursorNamespace,
+              boost::optional<CursorMetrics> metrics = boost::none,
               const SerializationContext& serializationContext =
                   SerializationContext::stateCommandReply());
 
@@ -178,20 +180,6 @@ void appendCursorResponseObject(
     boost::optional<StringData> cursorType,
     BSONObjBuilder* builder,
     const SerializationContext& serializationContext = SerializationContext::stateCommandReply());
-
-/**
- * Builds a getMore response object from the provided cursor identifiers and "nextBatch",
- * and appends the response object to the provided builder under the field name "cursor".
- *
- * The response object has the following format:
- *   { id: <NumberLong>, ns: <String>, nextBatch: <Array> }.
- *
- * This function is deprecated.  Prefer CursorResponseBuilder or CursorResponse::toBSON() instead.
- */
-void appendGetMoreResponseObject(long long cursorId,
-                                 StringData cursorNamespace,
-                                 BSONArray nextBatch,
-                                 BSONObjBuilder* builder);
 
 class CursorResponse {
 public:
@@ -241,7 +229,8 @@ public:
                    boost::optional<BSONObj> postBatchResumeToken = boost::none,
                    boost::optional<BSONObj> writeConcernError = boost::none,
                    boost::optional<BSONObj> varsField = boost::none,
-                   boost::optional<std::string> cursorType = boost::none,
+                   boost::optional<CursorTypeEnum> cursorType = boost::none,
+                   boost::optional<CursorMetrics> metrics = boost::none,
                    bool partialResultsReturned = false,
                    bool invalidated = false,
                    bool wasStatementExecuted = false);
@@ -285,6 +274,10 @@ public:
         return _varsField;
     }
 
+    auto& getCursorMetrics() const {
+        return _metrics;
+    }
+
     auto getCursorType() const {
         return _cursorType;
     }
@@ -322,7 +315,8 @@ private:
     boost::optional<BSONObj> _postBatchResumeToken;
     boost::optional<BSONObj> _writeConcernError;
     boost::optional<BSONObj> _varsField;
-    boost::optional<std::string> _cursorType;
+    boost::optional<CursorTypeEnum> _cursorType;
+    boost::optional<CursorMetrics> _metrics;
     bool _partialResultsReturned = false;
     bool _invalidated = false;
     bool _wasStatementExecuted = false;

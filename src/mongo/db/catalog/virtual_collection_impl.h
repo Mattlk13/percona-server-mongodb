@@ -91,7 +91,7 @@ public:
 
     VirtualCollectionImpl(const VirtualCollectionImpl&) = default;
 
-    ~VirtualCollectionImpl() = default;
+    ~VirtualCollectionImpl() override = default;
 
     const VirtualCollectionOptions& getVirtualCollectionOptions() const {
         return _shared->_recordStore->getOptions();
@@ -273,7 +273,8 @@ public:
         unimplementedTasserted();
     }
 
-    bool doesTimeseriesBucketsDocContainMixedSchemaData(const BSONObj& bucketsDoc) const final {
+    StatusWith<bool> doesTimeseriesBucketsDocContainMixedSchemaData(
+        const BSONObj& bucketsDoc) const final {
         unimplementedTasserted();
         return false;
     }
@@ -323,6 +324,10 @@ public:
                             boost::optional<long long> newCappedMax) final {
         unimplementedTasserted();
         return Status(ErrorCodes::UnknownError, "unknown");
+    }
+
+    void unsetRecordIdsReplicated(OperationContext* opCtx) final {
+        unimplementedTasserted();
     }
 
     StatusWith<int> checkMetaDataForIndex(const std::string& indexName,
@@ -474,6 +479,15 @@ public:
         return {};
     }
 
+    /**
+     * Virtual collections represent external data sources that are outside the control of the
+     * replication system. RecordIds being replicated are a property specific to collections
+     * managed by the replication & storage layers.
+     */
+    bool areRecordIdsReplicated() const final {
+        return false;
+    }
+
     bool isCapped() const final {
         return false;
     }
@@ -498,7 +512,7 @@ public:
         return _shared->_recordStore->dataSize(opCtx) == 0LL;
     }
 
-    inline int averageObjectSize(OperationContext* opCtx) const {
+    inline int averageObjectSize(OperationContext* opCtx) const override {
         return 0;
     }
 
@@ -558,7 +572,7 @@ public:
 
 private:
     void unimplementedTasserted() const {
-        MONGO_UNIMPLEMENTED_TASSERT(6968504);
+        MONGO_UNIMPLEMENTED_TASSERT(6968506);
     }
 
     struct SharedState {

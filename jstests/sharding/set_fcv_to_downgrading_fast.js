@@ -55,7 +55,7 @@ function runStandaloneTest() {
 
 function runReplicaSetTest() {
     jsTestLog("Running replica set test");
-    const rst = new ReplSetTest({nodes: 2, nodeOpts: {binVersion: latest}});
+    const rst = new ReplSetTest({nodes: 2, nodeOptions: {binVersion: latest}});
     rst.startSet();
     rst.initiate();
     const primaryAdminDB = rst.getPrimary().getDB("admin");
@@ -92,7 +92,9 @@ function runReplicaSetTest() {
 
 function runShardingTest() {
     jsTestLog("Running sharding test");
-    const st = new ShardingTest({shards: 2, mongos: 1, config: 1});
+    const numShards = 2;
+    const shardingTimeoutSeconds = timeoutSeconds * numShards;
+    const st = new ShardingTest({shards: numShards, mongos: 1, config: 1});
     const mongosAdminDB = st.s.getDB("admin");
     const configPrimary = st.configRS.getPrimary();
     const configPrimaryAdminDB = configPrimary.getDB("admin");
@@ -137,9 +139,9 @@ function runShardingTest() {
 
             return configFCVEqual && shard0FCVEqual && shard1FCVEqual && mongosFCVEqual;
         },
-        "sharded cluster FCV failed to reach downgrading state within " + timeoutSeconds +
+        "sharded cluster FCV failed to reach downgrading state within " + shardingTimeoutSeconds +
             " seconds",
-        timeoutSeconds * 1000);
+        shardingTimeoutSeconds * 1000);
 
     parallelShell();
     st.stop();

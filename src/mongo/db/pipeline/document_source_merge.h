@@ -91,6 +91,8 @@ namespace mongo {
 class DocumentSourceMerge final : public DocumentSourceWriter<MongoProcessInterface::BatchObject> {
 public:
     static constexpr StringData kStageName = "$merge"_sd;
+    static constexpr auto kDefaultWhenMatched = MergeStrategyDescriptor::WhenMatched::kMerge;
+    static constexpr auto kDefaultWhenNotMatched = MergeStrategyDescriptor::WhenNotMatched::kInsert;
 
     /**
      * A "lite parsed" $merge stage to disallow passthrough from mongos even if the source
@@ -114,6 +116,7 @@ public:
 
         ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level,
                                                      bool isImplicitDefault) const final {
+            using namespace fmt::literals;
             ReadConcernSupportResult result = {
                 {level == repl::ReadConcernLevel::kLinearizableReadConcern,
                  {ErrorCodes::InvalidOptions,
@@ -143,14 +146,10 @@ public:
         MergeWhenNotMatchedModeEnum _whenNotMatched;
     };
 
-    virtual ~DocumentSourceMerge() = default;
+    ~DocumentSourceMerge() override = default;
 
     const char* getSourceName() const final {
         return kStageName.rawData();
-    }
-
-    const NamespaceString& getOutputNs() const override {
-        return _outputNs;
     }
 
     MergeProcessor* getMergeProcessor() {
@@ -161,7 +160,7 @@ public:
 
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final;
 
-    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final override;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     /**
      * Creates a new $merge stage from the given arguments.
@@ -234,9 +233,15 @@ private:
 
     void waitWhileFailPointEnabled() override;
 
-    boost::optional<ShardId> _getMergeShardId() const;
+    // Holds the fields used for uniquely identifying documents. There must exist a unique index
+    // with this key pattern. Default is "_id" for unsharded collections, and "_id" plus the shard
+    // key for sharded collections.
+    std::set<FieldPath> _mergeOnFields;
 
-    const NamespaceString _outputNs;
+    // True if '_mergeOnFields' contains the _id. We store this as a separate boolean to avoid
+    // repeated lookups into the set.
+    bool _mergeOnFieldsIncludesId;
+
     boost::optional<MergeProcessor> _mergeProcessor;
 };
 

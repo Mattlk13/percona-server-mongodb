@@ -44,7 +44,6 @@
 #include "mongo/bson/oid.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/exec/sbe/values/bson.h"
@@ -54,11 +53,13 @@
 #include "mongo/db/query/plan_explainer_factory.h"
 #include "mongo/db/query/plan_insert_listener.h"
 #include "mongo/db/query/plan_ranker.h"
+#include "mongo/db/query/plan_yield_policy_remote_cursor.h"
 #include "mongo/db/query/sbe_plan_ranker.h"
 #include "mongo/db/query/sbe_stage_builder.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_component.h"
 #include "mongo/platform/compiler.h"
@@ -81,6 +82,7 @@ extern FailPoint planExecutorHangBeforeShouldWaitForInserts;
 
 PlanExecutorSBE::PlanExecutorSBE(OperationContext* opCtx,
                                  std::unique_ptr<CanonicalQuery> cq,
+                                 std::unique_ptr<Pipeline, PipelineDeleter> pipeline,
                                  std::unique_ptr<optimizer::AbstractABTPrinter> optimizerData,
                                  sbe::CandidatePlans candidates,
                                  bool returnOwnedBson,
@@ -88,8 +90,11 @@ PlanExecutorSBE::PlanExecutorSBE(OperationContext* opCtx,
                                  bool isOpen,
                                  std::unique_ptr<PlanYieldPolicySBE> yieldPolicy,
                                  bool generatedByBonsai,
+                                 boost::optional<size_t> cachedPlanHash,
+                                 OptimizerCounterInfo optCounterInfo,
                                  std::unique_ptr<RemoteCursorMap> remoteCursors,
-                                 std::unique_ptr<RemoteExplainVector> remoteExplains)
+                                 std::unique_ptr<RemoteExplainVector> remoteExplains,
+                                 std::unique_ptr<MultiPlanStage> classicRuntimePlannerStage)
     : _state{isOpen ? State::kOpened : State::kClosed},
       _opCtx(opCtx),
       _nss(std::move(nss)),
@@ -99,6 +104,7 @@ PlanExecutorSBE::PlanExecutorSBE(OperationContext* opCtx,
       _solution{std::move(candidates.winner().solution)},
       _stash{std::move(candidates.winner().results)},
       _cq{std::move(cq)},
+      _pipeline{std::move(pipeline)},
       _yieldPolicy(std::move(yieldPolicy)),
       _generatedByBonsai(generatedByBonsai),
       _remoteCursors(std::move(remoteCursors)),
@@ -127,7 +133,11 @@ PlanExecutorSBE::PlanExecutorSBE(OperationContext* opCtx,
     _minRecordIdSlot = env->getSlotIfExists("minRecordId"_sd);
     _maxRecordIdSlot = env->getSlotIfExists("maxRecordId"_sd);
 
-    initializeAccessors(_metadataAccessors, _rootData.staticData->metadataSlots);
+    if (_cq) {
+        initializeAccessors(_metadataAccessors,
+                            _rootData.staticData->metadataSlots,
+                            _cq->remainingSearchMetadata());
+    }
 
     if (!_stash.empty()) {
         // The PlanExecutor keeps an extra reference to the last object pulled out of the PlanStage
@@ -144,11 +154,12 @@ PlanExecutorSBE::PlanExecutorSBE(OperationContext* opCtx,
         _yieldPolicy->clearRegisteredPlans();
         _yieldPolicy->registerPlan(_root.get());
     }
-    const auto isMultiPlan = candidates.plans.size() > 1;
-    const auto isCachedCandidate = candidates.winner().isCachedCandidate;
+    const auto isMultiPlan = candidates.plans.size() > 1 || classicRuntimePlannerStage;
+    const auto isCachedCandidate = candidates.winner().fromPlanCache;
     if (!_cq || !_cq->getExpCtx()->explain) {
         // If we're not in explain mode, there is no need to keep rejected candidate plans around.
         candidates.plans.clear();
+        classicRuntimePlannerStage.reset();
     } else {
         // Keep only rejected candidate plans.
         candidates.plans.erase(candidates.plans.begin() + candidates.winnerIdx);
@@ -158,16 +169,39 @@ PlanExecutorSBE::PlanExecutorSBE(OperationContext* opCtx,
         _secondaryNssVector = _solution->getAllSecondaryNamespaces(_nss);
     }
 
-    _planExplainer = plan_explainer_factory::make(_root.get(),
-                                                  &_rootData,
-                                                  _solution.get(),
-                                                  std::move(optimizerData),
-                                                  std::move(candidates.plans),
-                                                  isMultiPlan,
-                                                  isCachedCandidate,
-                                                  _rootData.debugInfo,
-                                                  _remoteExplains.get());
+    _planExplainer = classicRuntimePlannerStage
+        // Classic multi-planner + SBE
+        ? plan_explainer_factory::make(_root.get(),
+                                       &_rootData,
+                                       _solution.get(),
+                                       isMultiPlan,
+                                       isCachedCandidate,
+                                       cachedPlanHash,
+                                       _rootData.debugInfo,
+                                       std::move(classicRuntimePlannerStage),
+                                       _remoteExplains.get())
+        // SBE runtime planner + SBE
+        : plan_explainer_factory::make(_root.get(),
+                                       &_rootData,
+                                       _solution.get(),
+                                       std::move(optimizerData),
+                                       std::move(candidates.plans),
+                                       isMultiPlan,
+                                       isCachedCandidate,
+                                       cachedPlanHash,
+                                       _rootData.debugInfo,
+                                       std::move(optCounterInfo),
+                                       _remoteExplains.get());
     _cursorType = _rootData.staticData->cursorType;
+
+    if (_remoteCursors) {
+        for (auto& it : *_remoteCursors) {
+            if (auto yieldPolicy =
+                    dynamic_cast<PlanYieldPolicyRemoteCursor*>(it.second->getYieldPolicy())) {
+                yieldPolicy->registerPlanExecutor(this);
+            }
+        }
+    }
 }
 
 void PlanExecutorSBE::saveState() {
@@ -178,8 +212,9 @@ void PlanExecutorSBE::saveState() {
         // cursors positioned. This ensures that no pointers into memory owned by the storage
         // engine held by the SBE PlanStage tree become invalid while the executor is in a saved
         // state.
-        _opCtx->recoveryUnit()->setAbandonSnapshotMode(RecoveryUnit::AbandonSnapshotMode::kCommit);
-        _opCtx->recoveryUnit()->abandonSnapshot();
+        shard_role_details::getRecoveryUnit(_opCtx)->setAbandonSnapshotMode(
+            RecoveryUnit::AbandonSnapshotMode::kCommit);
+        shard_role_details::getRecoveryUnit(_opCtx)->abandonSnapshot();
     } else {
         // Discard the slots as we won't access them before subsequent PlanExecutorSBE::getNext()
         // method call.
@@ -211,7 +246,8 @@ void PlanExecutorSBE::restoreState(const RestoreContext& context) {
         // Put the RU back into 'kAbort' mode. Since the executor is now in a restored state, calls
         // to doAbandonSnapshot() only happen if the query has failed and the executor will not be
         // used again. In this case, we do not rely on the guarantees provided by 'kCommit' mode.
-        _opCtx->recoveryUnit()->setAbandonSnapshotMode(RecoveryUnit::AbandonSnapshotMode::kAbort);
+        shard_role_details::getRecoveryUnit(_opCtx)->setAbandonSnapshotMode(
+            RecoveryUnit::AbandonSnapshotMode::kAbort);
     } else {
         _root->restoreState(true /* relinquish cursor */);
     }
@@ -323,16 +359,8 @@ PlanExecutor::ExecState PlanExecutorSBE::getNextImpl(ObjectType* out, RecordId* 
     // Capped insert data; declared outside the loop so we hold a shared pointer to the capped
     // insert notifier the entire time we are in the loop. Holding a shared pointer to the capped
     // insert notifier is necessary for the notifierVersion to advance.
-    //
-    // Note that we need to hold a database intent lock before acquiring a notifier.
-    boost::optional<AutoGetCollectionForReadMaybeLockFree> coll;
     std::unique_ptr<insert_listener::Notifier> notifier;
     if (insert_listener::shouldListenForInserts(_opCtx, _cq.get())) {
-        if (!_opCtx->isLockFreeReadsOp() &&
-            !_opCtx->lockState()->isCollectionLockedForMode(_nss, MODE_IS)) {
-            coll.emplace(_opCtx, _nss);
-        }
-
         notifier = insert_listener::getCappedInsertNotifier(_opCtx, _nss, _yieldPolicy.get());
     }
 
@@ -382,7 +410,10 @@ PlanExecutor::ExecState PlanExecutorSBE::getNextImpl(ObjectType* out, RecordId* 
                 planExecutorHangBeforeShouldWaitForInserts.pauseWhileSet();
             }
 
-            if (!_yieldPolicy ||
+            // The !notifier check is necessary because shouldWaitForInserts can return 'true' when
+            // shouldListenForInserts returned 'false' (above) in the case of a deadline becoming
+            // "unexpired" due to the system clock going backwards.
+            if (!_yieldPolicy || !notifier ||
                 !insert_listener::shouldWaitForInserts(_opCtx, _cq.get(), _yieldPolicy.get())) {
                 return PlanExecutor::ExecState::IS_EOF;
             }
@@ -460,7 +491,7 @@ BSONObj PlanExecutorSBE::getPostBatchResumeToken() const {
             BSONObjBuilder builder;
             sbe::value::getRecordIdView(val)->serializeToken("$recordId", &builder);
             if (resharding::gFeatureFlagReshardingImprovements.isEnabled(
-                    serverGlobalParams.featureCompatibility)) {
+                    serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
                 auto initialSyncId =
                     repl::ReplicationCoordinator::get(_opCtx)->getInitialSyncId(_opCtx);
                 if (initialSyncId) {
@@ -599,17 +630,25 @@ Document convertToDocument(const sbe::value::Object& obj) {
 }  // namespace
 
 void PlanExecutorSBE::initializeAccessors(
-    MetaDataAccessor& accessor, const stage_builder::PlanStageMetadataSlots& metadataSlots) {
-    if (auto slot = metadataSlots.searchScoreSlot) {
+    MetaDataAccessor& accessor,
+    const stage_builder::PlanStageMetadataSlots& metadataSlots,
+    const QueryMetadataBitSet& metadataBit) {
+    bool needsMerge = _cq->getExpCtxRaw()->needsMerge;
+
+    if (auto slot = metadataSlots.searchScoreSlot;
+        slot && (needsMerge || metadataBit.test(DocumentMetadataFields::MetaType::kSearchScore))) {
         accessor.metadataSearchScore = _root->getAccessor(_rootData.env.ctx, *slot);
     }
-    if (auto slot = metadataSlots.searchHighlightsSlot) {
+    if (auto slot = metadataSlots.searchHighlightsSlot; slot &&
+        (needsMerge || metadataBit.test(DocumentMetadataFields::MetaType::kSearchHighlights))) {
         accessor.metadataSearchHighlights = _root->getAccessor(_rootData.env.ctx, *slot);
     }
-    if (auto slot = metadataSlots.searchDetailsSlot) {
+    if (auto slot = metadataSlots.searchDetailsSlot; slot &&
+        (needsMerge || metadataBit.test(DocumentMetadataFields::MetaType::kSearchScoreDetails))) {
         accessor.metadataSearchDetails = _root->getAccessor(_rootData.env.ctx, *slot);
     }
-    if (auto slot = metadataSlots.searchSortValuesSlot) {
+    if (auto slot = metadataSlots.searchSortValuesSlot; slot &&
+        (needsMerge || metadataBit.test(DocumentMetadataFields::MetaType::kSearchSortValues))) {
         accessor.metadataSearchSortValues = _root->getAccessor(_rootData.env.ctx, *slot);
     }
     if (auto slot = metadataSlots.sortKeySlot) {
@@ -626,14 +665,15 @@ void PlanExecutorSBE::initializeAccessors(
             }
         }
     }
-    if (auto slot = metadataSlots.searchSequenceToken) {
+    if (auto slot = metadataSlots.searchSequenceToken; slot &&
+        (needsMerge || metadataBit.test(DocumentMetadataFields::MetaType::kSearchSequenceToken))) {
         accessor.metadataSearchSequenceToken = _root->getAccessor(_rootData.env.ctx, *slot);
     }
 }
 
 BSONObj PlanExecutorSBE::MetaDataAccessor::appendToBson(BSONObj doc) const {
     if (metadataSearchScore || metadataSearchHighlights || metadataSearchDetails ||
-        metadataSearchSortValues || sortKey) {
+        metadataSearchSortValues || sortKey || metadataSearchSequenceToken) {
         BSONObjBuilder bb(std::move(doc));
         if (metadataSearchScore) {
             auto [tag, val] = metadataSearchScore->getViewOfValue();
@@ -670,7 +710,7 @@ BSONObj PlanExecutorSBE::MetaDataAccessor::appendToBson(BSONObj doc) const {
 
 Document PlanExecutorSBE::MetaDataAccessor::appendToDocument(Document doc) const {
     if (metadataSearchScore || metadataSearchHighlights || metadataSearchDetails ||
-        metadataSearchSortValues || sortKey) {
+        metadataSearchSortValues || sortKey || metadataSearchSequenceToken) {
         MutableDocument out(std::move(doc));
         if (metadataSearchScore) {
             auto [tag, val] = metadataSearchScore->getViewOfValue();
@@ -769,10 +809,14 @@ sbe::PlanState fetchNextImpl(sbe::PlanStage* root,
         } else if (tag == sbe::value::TypeTags::bsonObject) {
             BSONObj result;
             if (returnOwnedBson) {
-                auto [ownedTag, ownedVal] = resultSlot->copyOrMoveValue();
-                auto sharedBuf =
-                    SharedBuffer(UniqueBuffer::reclaim(sbe::value::bitcastTo<char*>(ownedVal)));
-                result = BSONObj{std::move(sharedBuf)};
+                if (auto bsonResultAccessor = resultSlot->as<sbe::value::BSONObjValueAccessor>()) {
+                    result = bsonResultAccessor->getOwnedBSONObj();
+                } else {
+                    auto [ownedTag, ownedVal] = sbe::value::copyValue(tag, val);
+                    auto sharedBuf =
+                        SharedBuffer(UniqueBuffer::reclaim(sbe::value::bitcastTo<char*>(ownedVal)));
+                    result = BSONObj{std::move(sharedBuf)};
+                }
             } else {
                 result = BSONObj{sbe::value::bitcastTo<const char*>(val)};
             }

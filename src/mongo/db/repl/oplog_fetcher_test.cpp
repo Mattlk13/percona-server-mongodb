@@ -68,6 +68,7 @@
 #include "mongo/executor/task_executor_test_fixture.h"
 #include "mongo/executor/thread_pool_mock.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/rpc/message.h"
 #include "mongo/rpc/metadata.h"
@@ -119,7 +120,7 @@ BSONObj concatenate(BSONObj a, const BSONObj& b) {
     return bob.obj();
 }
 
-BSONObj makeNoopOplogEntry(OpTime opTime) {
+BSONObj makeNoopOplogEntry(OpTime opTime, std::int64_t version = repl::OplogEntry::kOplogVersion) {
     auto oplogEntry = repl::DurableOplogEntry(
         opTime,                                                    // optime
         OpTypeEnum ::kNoop,                                        // opType
@@ -127,7 +128,7 @@ BSONObj makeNoopOplogEntry(OpTime opTime) {
         boost::none,                                               // uuid
         boost::none,                                               // fromMigrate
         boost::none,                                               // checkExistenceForDiffInsert
-        repl::OplogEntry::kOplogVersion,                           // version
+        version,                                                   // version
         BSONObj(),                                                 // o
         boost::none,                                               // o2
         {},                                                        // sessionInfo
@@ -143,8 +144,9 @@ BSONObj makeNoopOplogEntry(OpTime opTime) {
     return oplogEntry.toBSON();
 }
 
-BSONObj makeNoopOplogEntry(Seconds seconds) {
-    return makeNoopOplogEntry({{seconds, 0}, 1LL});
+BSONObj makeNoopOplogEntry(Seconds seconds,
+                           std::int64_t version = repl::OplogEntry::kOplogVersion) {
+    return makeNoopOplogEntry({{seconds, 0}, 1LL}, version);
 }
 
 BSONObj makeOplogBatchMetadata(boost::optional<const rpc::ReplSetMetadata&> replMetadata,
@@ -423,6 +425,7 @@ const std::string OplogFetcherTest::syncSourceHost = "";
 const rpc::OplogQueryMetadata OplogFetcherTest::oqMetadata =
     rpc::OplogQueryMetadata({staleOpTime, staleWallTime},
                             remoteNewerOpTime,
+                            remoteNewerOpTime,
                             remoteRBID,
                             primaryIndex,
                             syncSourceIndex,
@@ -432,6 +435,7 @@ const OpTime OplogFetcherTest::staleOpTime = OpTime(Timestamp(1, 1), 0);
 const Date_t OplogFetcherTest::staleWallTime = Date_t() + Seconds(staleOpTime.getSecs());
 const rpc::OplogQueryMetadata OplogFetcherTest::staleOqMetadata =
     rpc::OplogQueryMetadata({staleOpTime, staleWallTime},
+                            staleOpTime,
                             staleOpTime,
                             remoteRBID,
                             primaryIndex,
@@ -448,8 +452,8 @@ void OplogFetcherTest::setUp() {
     lastFetched = {{123, 0}, 1};
 
     dataReplicatorExternalState = std::make_unique<DataReplicatorExternalStateMock>();
-    dataReplicatorExternalState->currentTerm = lastFetched.getTerm();
-    dataReplicatorExternalState->lastCommittedOpTime = {{9999, 0}, lastFetched.getTerm()};
+    dataReplicatorExternalState->setCurrentTerm(lastFetched.getTerm());
+    dataReplicatorExternalState->setLastCommittedOpTime({{9999, 0}, lastFetched.getTerm()});
 
     enqueueDocumentsFn = [this](OplogFetcher::Documents::const_iterator begin,
                                 OplogFetcher::Documents::const_iterator end,
@@ -590,7 +594,7 @@ void OplogFetcherTest::testSyncSourceChecking(const rpc::ReplSetMetadata& replMe
 
     auto metadataObj = makeOplogBatchMetadata(replMetadata, oqMetadata);
 
-    dataReplicatorExternalState->shouldStopFetchingResult = changeSyncSourceAction;
+    dataReplicatorExternalState->setShouldStopFetchingResult(changeSyncSourceAction);
 
     auto shutdownState =
         processSingleBatch(makeFirstBatch(0, {firstEntry, secondEntry, thirdEntry}, metadataObj),
@@ -874,12 +878,12 @@ TEST_F(OplogFetcherTest,
 
     auto term = findCmdRequest.getTerm();
     ASSERT(term);
-    ASSERT_EQUALS(dataReplicatorExternalState->currentTerm, *term);
+    ASSERT_EQUALS(dataReplicatorExternalState->getCurrentTerm(), *term);
 }
 
 TEST_F(OplogFetcherTest,
        FindQueryDoesNotContainTermIfGetCurrentTermAndLastCommittedOpTimeReturnsUninitializedTerm) {
-    dataReplicatorExternalState->currentTerm = OpTime::kUninitializedTerm;
+    dataReplicatorExternalState->setCurrentTerm(OpTime::kUninitializedTerm);
     auto oplogFetcher = makeOplogFetcher();
 
     // Test that the correct maxTimeMS is set if we are retrying the 'find' query.
@@ -907,7 +911,7 @@ TEST_F(OplogFetcherTest,
 TEST_F(
     OplogFetcherTest,
     GetMoreQueryDoesNotContainTermIfGetCurrentTermAndLastCommittedOpTimeReturnsUninitializedTerm) {
-    dataReplicatorExternalState->currentTerm = OpTime::kUninitializedTerm;
+    dataReplicatorExternalState->setCurrentTerm(OpTime::kUninitializedTerm);
 
     ShutdownState shutdownState;
 
@@ -993,11 +997,9 @@ TEST_F(OplogFetcherTest, ValidMetadataWithInResponseShouldBeForwardedToProcessMe
     auto metadataObj = makeOplogBatchMetadata(replSetMetadata, oqMetadata);
 
     ASSERT_OK(processSingleBatch(makeFirstBatch(cursorId, {entry}, metadataObj))->getStatus());
-    ASSERT_TRUE(dataReplicatorExternalState->metadataWasProcessed);
-    ASSERT_EQUALS(replSetMetadata.getIsPrimary(),
-                  dataReplicatorExternalState->replMetadataProcessed.getIsPrimary());
-    ASSERT_EQUALS(oqMetadata.hasPrimaryIndex(),
-                  dataReplicatorExternalState->oqMetadataProcessed.hasPrimaryIndex());
+    ASSERT_TRUE(dataReplicatorExternalState->getMetadataWasProcessed());
+    ASSERT_EQUALS(replSetMetadata.getIsPrimary(), dataReplicatorExternalState->getIsPrimary());
+    ASSERT_EQUALS(oqMetadata.hasPrimaryIndex(), dataReplicatorExternalState->getHasPrimaryIndex());
 }
 
 TEST_F(OplogFetcherTest, MetadataAndBatchAreNotProcessedWhenSyncSourceRollsBack) {
@@ -1005,6 +1007,7 @@ TEST_F(OplogFetcherTest, MetadataAndBatchAreNotProcessedWhenSyncSourceRollsBack)
     auto entry = makeNoopOplogEntry(lastFetched);
 
     rpc::OplogQueryMetadata oplogQueryMetadata({staleOpTime, staleWallTime},
+                                               remoteNewerOpTime,
                                                remoteNewerOpTime,
                                                remoteRBID + 1,
                                                primaryIndex,
@@ -1021,7 +1024,7 @@ TEST_F(OplogFetcherTest, MetadataAndBatchAreNotProcessedWhenSyncSourceRollsBack)
     ASSERT_EQUALS(ErrorCodes::InvalidSyncSource, shutdownState->getStatus());
     ASSERT_EQUALS(remoteRBID, shutdownState->getRBID());
 
-    ASSERT_FALSE(dataReplicatorExternalState->metadataWasProcessed);
+    ASSERT_FALSE(dataReplicatorExternalState->getMetadataWasProcessed());
     ASSERT(lastEnqueuedDocuments.empty());
 }
 
@@ -1033,7 +1036,7 @@ TEST_F(OplogFetcherTest, MetadataAndBatchAreNotProcessedWhenSyncSourceIsBehind) 
     ASSERT_EQUALS(ErrorCodes::InvalidSyncSource,
                   processSingleBatch(makeFirstBatch(cursorId, {entry}, metadataObj))->getStatus());
 
-    ASSERT_FALSE(dataReplicatorExternalState->metadataWasProcessed);
+    ASSERT_FALSE(dataReplicatorExternalState->getMetadataWasProcessed());
     ASSERT(lastEnqueuedDocuments.empty());
 }
 
@@ -1042,6 +1045,7 @@ TEST_F(OplogFetcherTest, MetadataAndBatchAreNotProcessedWhenSyncSourceIsNotAhead
     auto entry = makeNoopOplogEntry(lastFetched);
 
     rpc::OplogQueryMetadata oplogQueryMetadata({staleOpTime, staleWallTime},
+                                               lastFetched,
                                                lastFetched,
                                                remoteRBID,
                                                primaryIndex,
@@ -1052,7 +1056,7 @@ TEST_F(OplogFetcherTest, MetadataAndBatchAreNotProcessedWhenSyncSourceIsNotAhead
     ASSERT_EQUALS(ErrorCodes::InvalidSyncSource,
                   processSingleBatch(makeFirstBatch(cursorId, {entry}, metadataObj))->getStatus());
 
-    ASSERT_FALSE(dataReplicatorExternalState->metadataWasProcessed);
+    ASSERT_FALSE(dataReplicatorExternalState->getMetadataWasProcessed());
     ASSERT(lastEnqueuedDocuments.empty());
 }
 
@@ -1068,7 +1072,7 @@ TEST_F(OplogFetcherTest,
                                      false /* requireFresherSyncSource */)
                       ->getStatus());
 
-    ASSERT_FALSE(dataReplicatorExternalState->metadataWasProcessed);
+    ASSERT_FALSE(dataReplicatorExternalState->getMetadataWasProcessed());
     ASSERT(lastEnqueuedDocuments.empty());
 }
 
@@ -1085,13 +1089,14 @@ TEST_F(OplogFetcherTest, MetadataAndBatchAreProcessedWhenSyncSourceIsCurrentButM
                                  false /* requireFresherSyncSource */)
                   ->getStatus());
 
-    ASSERT(dataReplicatorExternalState->metadataWasProcessed);
+    ASSERT(dataReplicatorExternalState->getMetadataWasProcessed());
 }
 
 TEST_F(OplogFetcherTest,
        MetadataAndBatchAreProcessedWhenSyncSourceIsNotAheadWithoutRequiringFresherSyncSource) {
     CursorId cursorId = 0LL;
     rpc::OplogQueryMetadata oplogQueryMetadata({staleOpTime, staleWallTime},
+                                               lastFetched,
                                                lastFetched,
                                                remoteRBID,
                                                primaryIndex,
@@ -1104,7 +1109,7 @@ TEST_F(OplogFetcherTest,
                                  false /* shouldShutdown */,
                                  false /* requireFresherSyncSource */)
                   ->getStatus());
-    ASSERT(dataReplicatorExternalState->metadataWasProcessed);
+    ASSERT(dataReplicatorExternalState->getMetadataWasProcessed());
 }
 
 TEST_F(OplogFetcherTest, MetadataIsNotProcessedOnBatchThatTriggersRollback) {
@@ -1120,7 +1125,7 @@ TEST_F(OplogFetcherTest, MetadataIsNotProcessedOnBatchThatTriggersRollback) {
         ErrorCodes::OplogStartMissing,
         processSingleBatch(makeFirstBatch(cursorId, {entry}, {metadataObj}))->getStatus());
 
-    ASSERT_FALSE(dataReplicatorExternalState->metadataWasProcessed);
+    ASSERT_FALSE(dataReplicatorExternalState->getMetadataWasProcessed());
 }
 
 TEST_F(OplogFetcherTest, TooStaleToSyncFromSyncSource) {
@@ -1324,8 +1329,8 @@ TEST_F(OplogFetcherTest, DontRecreateNewCursorAfterFailedBatchWhenSyncSourceChan
         true /* skipFirstDoc */, firstBatch, oplogFetcher->getLastOpTimeFetched_forTest());
 
     // Mock a result that tells us to stop syncing.
-    dataReplicatorExternalState->shouldStopFetchingResult =
-        ChangeSyncSourceAction::kStopSyncingAndDropLastBatchIfPresent;
+    dataReplicatorExternalState->setShouldStopFetchingResult(
+        ChangeSyncSourceAction::kStopSyncingAndDropLastBatchIfPresent);
 
     // This will cause the oplog fetcher to fail while getting the next batch. Since we're expecting
     // a sync source change, the oplog fetcher will shut down.
@@ -1644,7 +1649,7 @@ TEST_F(OplogFetcherTest, OplogFetcherWorksWithoutExhaust) {
     // lastKnownCommittedOpTime. This must be done before we issue the response to the find request
     // so that the first getMore request (made immediately after processSingleRequestResponse) can
     // pick this up.
-    dataReplicatorExternalState->lastCommittedOpTime = OpTime();
+    dataReplicatorExternalState->setLastCommittedOpTime(OpTime());
     auto firstGetMoreTermAndLastCommittedOpTime =
         dataReplicatorExternalState->getCurrentTermAndLastCommittedOpTime();
 
@@ -1671,8 +1676,8 @@ TEST_F(OplogFetcherTest, OplogFetcherWorksWithoutExhaust) {
     // Reset the lastCommittedOpTime to non-null. This must be done before we issue the response to
     // the first getMore request so that the second getMore request (made immediately after
     // processSingleRequestResponse) can pick this up.
-    dataReplicatorExternalState->lastCommittedOpTime = {{9999, 0},
-                                                        dataReplicatorExternalState->currentTerm};
+    dataReplicatorExternalState->setLastCommittedOpTime(
+        {{9999, 0}, dataReplicatorExternalState->getCurrentTerm()});
     auto secondGetMoreTermAndLastCommittedOpTime =
         dataReplicatorExternalState->getCurrentTermAndLastCommittedOpTime();
 
@@ -2098,9 +2103,10 @@ TEST_F(OplogFetcherTest, FailedSyncSourceCheckWithBothMetadatasStopsTheOplogFetc
     testSyncSourceChecking(replSetMetadata, oqMetadata);
 
     // Sync source optime and "hasSyncSource" can be set if the response contains metadata.
-    ASSERT_EQUALS(source, dataReplicatorExternalState->lastSyncSourceChecked);
-    ASSERT_EQUALS(oqMetadata.getLastOpApplied(), dataReplicatorExternalState->syncSourceLastOpTime);
-    ASSERT_TRUE(dataReplicatorExternalState->syncSourceHasSyncSource);
+    ASSERT_EQUALS(source, dataReplicatorExternalState->getLastSyncSourceChecked());
+    ASSERT_EQUALS(oqMetadata.getLastOpApplied(),
+                  dataReplicatorExternalState->getSyncSourceLastOpTime());
+    ASSERT_TRUE(dataReplicatorExternalState->getSyncSourceHasSyncSource());
 
     // We should have enqueued the last batch if the 'shouldStopFetching' check returns
     // kStopSyncingAndEnqueueLastBatch.
@@ -2111,6 +2117,7 @@ TEST_F(OplogFetcherTest,
        FailedSyncSourceCheckWithSyncSourceHavingNoSyncSourceStopsTheOplogFetcher) {
     rpc::OplogQueryMetadata oplogQueryMetadata({staleOpTime, staleWallTime},
                                                remoteNewerOpTime,
+                                               remoteNewerOpTime,
                                                remoteRBID,
                                                primaryIndex,
                                                -1,
@@ -2118,10 +2125,10 @@ TEST_F(OplogFetcherTest,
     testSyncSourceChecking(replSetMetadata, oplogQueryMetadata);
 
     // Sync source "hasSyncSource" is derived from metadata.
-    ASSERT_EQUALS(source, dataReplicatorExternalState->lastSyncSourceChecked);
+    ASSERT_EQUALS(source, dataReplicatorExternalState->getLastSyncSourceChecked());
     ASSERT_EQUALS(oplogQueryMetadata.getLastOpApplied(),
-                  dataReplicatorExternalState->syncSourceLastOpTime);
-    ASSERT_FALSE(dataReplicatorExternalState->syncSourceHasSyncSource);
+                  dataReplicatorExternalState->getSyncSourceLastOpTime());
+    ASSERT_FALSE(dataReplicatorExternalState->getSyncSourceHasSyncSource());
 
     // We should have enqueued the last batch if the 'shouldStopFetching' check returns
     // kStopSyncingAndEnqueueLastBatch.
@@ -2135,6 +2142,32 @@ TEST_F(OplogFetcherTest, FailedSyncSourceCheckReturnsStopSyncingAndDropBatch) {
     // If the 'shouldStopFetching' check returns kStopSyncingAndDropLastBatchIfPresent, we should
     // not enqueue any documents.
     ASSERT_TRUE(lastEnqueuedDocuments.empty());
+}
+
+TEST_F(OplogFetcherTest, ValidateDocumentsReturnsBadValueIfAnyOplogEntryHasWrongVersion) {
+    RAIIServerParameterControllerForTest featureFlagController(
+        "featureFlagReduceMajorityWriteLatency", true);
+    auto firstEntry = makeNoopOplogEntry(Seconds(123));
+    auto secondEntry = makeNoopOplogEntry(Seconds(456),
+                                          firstEntry.getIntField(OplogEntry::kVersionFieldName) -
+                                              1 /* Set the wrong oplog version. */);
+
+    ASSERT_EQUALS(
+        ErrorCodes::BadValue,
+        OplogFetcher::validateDocuments({firstEntry, secondEntry}, false, {Seconds(100), 0})
+            .getStatus());
+}
+
+TEST_F(OplogFetcherTest, ValidateDocumentsReturnsBadValueIfAnyOplogEntryHasMissingVersion) {
+    RAIIServerParameterControllerForTest featureFlagController(
+        "featureFlagReduceMajorityWriteLatency", true);
+    auto firstEntry = makeNoopOplogEntry(Seconds(123));
+    auto secondEntry = makeNoopOplogEntry(Seconds(456)).removeField(OplogEntry::kVersionFieldName);
+
+    ASSERT_EQUALS(
+        ErrorCodes::BadValue,
+        OplogFetcher::validateDocuments({firstEntry, secondEntry}, false, {Seconds(100), 0})
+            .getStatus());
 }
 
 TEST_F(OplogFetcherTest, ValidateDocumentsReturnsNoSuchKeyIfTimestampIsNotFoundInAnyDocument) {
@@ -2340,8 +2373,8 @@ TEST_F(OplogFetcherTest, OplogFetcherDoesNotRetryConnectionWhenSyncSourceChangeI
     ShutdownState shutdownState;
 
     // Mock a result that tells us to stop syncing.
-    dataReplicatorExternalState->shouldStopFetchingResult =
-        ChangeSyncSourceAction::kStopSyncingAndDropLastBatchIfPresent;
+    dataReplicatorExternalState->setShouldStopFetchingResult(
+        ChangeSyncSourceAction::kStopSyncingAndDropLastBatchIfPresent);
 
     // Shutdown the mock remote server before the OplogFetcher tries to connect.
     _mockServer->shutdown();

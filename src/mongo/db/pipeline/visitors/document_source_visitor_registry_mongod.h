@@ -88,6 +88,12 @@
 #include "mongo/db/pipeline/document_source_tee_consumer.h"
 #include "mongo/db/pipeline/document_source_union_with.h"
 #include "mongo/db/pipeline/document_source_unwind.h"
+#include "mongo/db/pipeline/search/document_source_internal_search_id_lookup.h"
+#include "mongo/db/pipeline/search/document_source_internal_search_mongot_remote.h"
+#include "mongo/db/pipeline/search/document_source_list_search_indexes.h"
+#include "mongo/db/pipeline/search/document_source_search.h"
+#include "mongo/db/pipeline/search/document_source_search_meta.h"
+#include "mongo/db/pipeline/search/document_source_vector_search.h"
 #include "mongo/db/pipeline/visitors/document_source_visitor_registry.h"
 #include "mongo/db/s/document_source_analyze_shard_key_read_write_distribution.h"
 #include "mongo/db/s/resharding/document_source_resharding_add_resume_id.h"
@@ -141,13 +147,14 @@ void registerMongodVisitor(ServiceContext* service) {
                        DocumentSourceGeoNear,
                        DocumentSourceGraphLookUp,
                        DocumentSourceGroup,
-                       DocumentSourceIndexStats,
                        DocumentSourceInternalAllCollectionStats,
                        DocumentSourceInternalApplyOplogUpdate,
                        DocumentSourceInternalConvertBucketIndexStats,
                        DocumentSourceInternalDensify,
                        DocumentSourceInternalGeoNearDistance,
                        DocumentSourceInternalInhibitOptimization,
+                       DocumentSourceInternalSearchIdLookUp,
+                       DocumentSourceInternalSearchMongotRemote,
                        DocumentSourceInternalSetWindowFields,
                        DocumentSourceInternalShardFilter,
                        DocumentSourceInternalShardServerInfo,
@@ -155,10 +162,10 @@ void registerMongodVisitor(ServiceContext* service) {
                        DocumentSourceInternalSplitPipeline,
                        DocumentSourceInternalUnpackBucket,
                        DocumentSourceLimit,
-                       DocumentSourceListCachedAndActiveUsers,
                        DocumentSourceListCatalog,
                        DocumentSourceListLocalSessions,
                        analyze_shard_key::DocumentSourceListSampledQueries,
+                       DocumentSourceListSearchIndexes,
                        DocumentSourceListSessions,
                        DocumentSourceLookUp,
                        DocumentSourceMatch,
@@ -170,6 +177,8 @@ void registerMongodVisitor(ServiceContext* service) {
                        DocumentSourceRedact,
                        DocumentSourceSample,
                        DocumentSourceSampleFromRandomCursor,
+                       DocumentSourceSearchMeta,
+                       DocumentSourceSearch,
                        DocumentSourceSequentialDocumentCache,
                        DocumentSourceSetVariableFromSubPipeline,
                        DocumentSourceSingleDocumentTransformation,
@@ -179,7 +188,8 @@ void registerMongodVisitor(ServiceContext* service) {
                        DocumentSourceTeeConsumer,
                        DocumentSourceQueryStats,
                        DocumentSourceUnionWith,
-                       DocumentSourceUnwind>(&registry);
+                       DocumentSourceUnwind,
+                       DocumentSourceVectorSearch>(&registry);
 }
 
 /**

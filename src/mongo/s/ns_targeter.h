@@ -105,6 +105,7 @@ public:
         OperationContext* opCtx,
         const BatchItemRef& itemRef,
         bool* useTwoPhaseWriteProtocol = nullptr,
+        bool* isNonTargetedWriteWithoutShardKeyWithExactId = nullptr,
         std::set<ChunkRange>* chunkRanges = nullptr) const = 0;
 
     /**
@@ -137,13 +138,23 @@ public:
      *
      * Any stale responses noted here will be taken into account on the next refresh.
      *
-     * If stale responses are is noted, we must not have noted that we cannot target.
+     * If stale responses are noted, we must not have noted that we cannot target.
      */
     virtual void noteStaleDbResponse(OperationContext* optCtx,
                                      const ShardEndpoint& endpoint,
                                      const StaleDbRoutingVersion& staleInfo) = 0;
 
     virtual bool hasStaleShardResponse() = 0;
+
+    /**
+     * Informs the targeter of CannotImplicitlyCreateCollection responses for this collection from
+     * an endpoint, with further information available in the returned createInfo.
+     *
+     * Any cannotImplicitlyCreateCollection errors noted here will be taken into account on the next
+     * create.
+     */
+    virtual void noteCannotImplicitlyCreateCollectionResponse(
+        OperationContext* optCtx, const CannotImplicitlyCreateCollectionInfo& createInfo) = 0;
 
     /**
      * Refreshes the targeting metadata for the namespace if needed, based on previously-noted
@@ -160,9 +171,27 @@ public:
     virtual bool refreshIfNeeded(OperationContext* opCtx) = 0;
 
     /**
+     * Creates a collection if there were previously noted cannotImplicitlyCreateCollection
+     * failures.
+     *
+     * After this function is called, the targeter should be in a state such that the noted
+     * cannotImplicitlyCreateCollection responses are not seen again.
+     *
+     * Returns if the collection was created.
+     *
+     * NOTE: This function may block for shared resources or network calls.
+     */
+    virtual bool createCollectionIfNeeded(OperationContext* opCtx) = 0;
+
+    /**
      * Returns the number of shards that own one or more chunks for the targeted collection.
      */
     virtual int getNShardsOwningChunks() const = 0;
+
+    /**
+     * Returns whether the targeted collection is sharded or not
+     */
+    virtual bool isTargetedCollectionSharded() const = 0;
 };
 
 }  // namespace mongo

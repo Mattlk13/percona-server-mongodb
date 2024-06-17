@@ -1,31 +1,43 @@
 """Test hook to check the sharding metadata consistency of a sharded cluster."""
 
 import os.path
+import sys
 
 from buildscripts.resmokelib import errors
-from buildscripts.resmokelib.testing.fixtures import shardedcluster
+from buildscripts.resmokelib.testing.fixtures import multi_sharded_cluster, shardedcluster
 from buildscripts.resmokelib.testing.hooks import jsfile
 from buildscripts.resmokelib.testing.hooks.background_job import _BackgroundJob, _ContinuousDynamicJSTestCase
 
+_IS_WINDOWS = (sys.platform == "win32")
 
-class CheckMetadataConsistencyInBackground(jsfile.DataConsistencyHook):
+
+class CheckMetadataConsistencyInBackground(jsfile.PerClusterDataConsistencyHook):
     """Check the metadata consistency of a sharded cluster."""
 
     IS_BACKGROUND = True
 
     # The 'CheckMetadataConsistency' hook relies on the 'isMaster' command to asses if the fixture cluster is sharded.
-    # Skip tests that set a failPoint to make the 'isMaster' command unconditionally fail.
     SKIP_TESTS = [
-        "build/install/bin/executor_integration_test", "build/install/bin/rpc_integration_test",
-        "build/install/bin/transport_integration_test"
+        # Skip tests that set a failPoint to make the 'isMaster' command unconditionally fail.
+        "build/install/bin/executor_integration_test",
+        "build/install/bin/rpc_integration_test",
+        "build/install/bin/transport_integration_test",
+        # Skip tests that update the internalDocumentSourceGroupMaxMemoryBytes parameter and make
+        # checkMetadataConsistency fail with QueryExceededMemoryLimitNoDiskUseAllowed error.
+        "jstests/aggregation/sources/unionWith/unionWith.js"
     ]
+
+    if _IS_WINDOWS:
+        SKIP_TESTS = [path.replace('/', '\\') for path in SKIP_TESTS]
 
     def __init__(self, hook_logger, fixture, shell_options=None):
         """Initialize CheckMetadataConsistencyInBackground."""
 
-        if not isinstance(fixture, shardedcluster.ShardedClusterFixture):
-            raise ValueError(f"'fixture' must be an instance of ShardedClusterFixture, but got " \
-                             f"{fixture.__class__.__name__}")
+        if not isinstance(fixture, shardedcluster.ShardedClusterFixture) and not isinstance(
+                fixture, multi_sharded_cluster.MultiShardedClusterFixture):
+            raise ValueError(
+                f"'fixture' must be an instance of ShardedClusterFixture or MultiShardedClusterFixture, but got"
+                f" {fixture.__class__.__name__}")
 
         description = "Perform consistency checks between the config database and metadata " \
                       "stored/cached in the shards"
@@ -37,12 +49,6 @@ class CheckMetadataConsistencyInBackground(jsfile.DataConsistencyHook):
 
     def before_suite(self, test_report):
         """Start the background thread."""
-
-        # TODO SERVER-70396: unconditionally run this hook once the future flag will be removed
-        if not self.fixture.feature_flag_present_and_enabled("CheckMetadataConsistency"):
-            self.logger.info(
-                "Skipping background metadata consistency check because feature flag is disabled")
-            return
 
         self._background_job = _BackgroundJob("CheckMetadataConsistencyInBackground")
         self.logger.info("Starting background metadata consistency checker thread")
@@ -67,15 +73,20 @@ class CheckMetadataConsistencyInBackground(jsfile.DataConsistencyHook):
 
         # TODO SERVER-75675 do not skip index consistency check
         shell_options = self._shell_options.copy() if self._shell_options is not None else {}
-        shell_options.update(
-            {'global_vars': {'TestData': {'skipCheckingIndexesConsistentAcrossCluster': True}}})
+        if "global_vars" not in shell_options:
+            shell_options["global_vars"] = {}
+        if "TestData" not in shell_options["global_vars"]:
+            shell_options["global_vars"]["TestData"] = {}
+        shell_options["global_vars"]["TestData"][
+            "skipCheckingIndexesConsistentAcrossCluster"] = True
 
         hook_test_case = _ContinuousDynamicJSTestCase.create_before_test(
             test.logger, test, self, self._js_filename, shell_options)
         hook_test_case.configure(self.fixture)
 
         if test.test_name in self.SKIP_TESTS:
-            self.logger.info("Metadata consistency check explicitely disabled for {test.test_name}")
+            self.logger.info("Metadata consistency check explicitely disabled for %s",
+                             test.test_name)
             return
 
         self.logger.info("Resuming background metadata consistency checker thread")

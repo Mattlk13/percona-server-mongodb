@@ -62,7 +62,6 @@
 #include "mongo/db/stats/storage_stats.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/timeseries/bucket_catalog/bucket_catalog.h"
-#include "mongo/db/timeseries/timeseries_stats.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -129,9 +128,7 @@ void _appendRecordStats(OperationContext* opCtx,
             bob.append("avgBucketSize", collection->averageObjectSize(opCtx));
         }
         auto& bucketCatalog = timeseries::bucket_catalog::BucketCatalog::get(opCtx);
-        timeseries::bucket_catalog::appendExecutionStats(
-            bucketCatalog, collNss.getTimeseriesViewNamespace(), bob);
-        TimeseriesStats::get(collection.get()).append(opCtx, &bob);
+        timeseries::bucket_catalog::appendExecutionStats(bucketCatalog, collection->uuid(), bob);
     } else {
         result->appendNumber("count", numRecords);
         if (numRecords) {
@@ -255,7 +252,9 @@ void _appendInProgressIndexesStats(OperationContext* opCtx,
             collation = collator->getSpec().toBSON();
         }
         auto clusteredSpec = clustered_util::formatClusterKeyForListIndexes(
-            collection->getClusteredInfo().value(), collation);
+            collection->getClusteredInfo().value(),
+            collation,
+            collection->getCollectionOptions().expireAfterSeconds);
         auto indexSpec = collection->getClusteredInfo()->getIndexSpec();
         auto nameOptional = indexSpec.getName();
         // An index name is always expected.

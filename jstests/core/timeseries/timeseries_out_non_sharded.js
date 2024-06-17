@@ -11,7 +11,7 @@
  *   requires_fcv_71,
  *   featureFlagAggOutTimeseries,
  *   # TODO(mbroadst): Some bug here, appears to be double-prefixing
- *   not_allowed_with_security_token,
+ *   not_allowed_with_signed_security_token,
  * ]
  */
 import {TimeseriesAggTests} from "jstests/core/timeseries/libs/timeseries_agg_helpers.js";
@@ -97,13 +97,13 @@ runTest({observer: [{$out: "observer_out"}], timeseries: timeseriesPipeline});
 
 // Test that $out can replace an existing time-series collection without the 'timeseries' option.
 // Change an option in the existing time-series collections.
-assert.commandWorked(testDB.runCommand({collMod: targetCollName, expireAfterSeconds: 360}));
+assert.commandWorked(testDB.runCommand({collMod: targetCollName, expireAfterSeconds: 3600}));
 // Run the $out stage.
 timeseriesPipeline = [{$out: targetCollName}];
 runTest({observer: [{$out: "observer_out"}], timeseries: timeseriesPipeline, drop: false});
 
 // Test that $out can replace an existing time-series collection with the 'timeseries' option.
-let newDate = new Date('1999-09-30T03:24:00');
+let newDate = new Date();
 let observerPipeline = [{$set: {"time": newDate}}, {$out: "observer_out"}];
 timeseriesPipeline = TimeseriesAggTests.generateOutPipeline(
     targetCollName, dbName, {timeField: "time", metaField: "tags"}, {$set: {"time": newDate}});
@@ -115,12 +115,13 @@ const destDB = testDB.getSiblingDB("outDifferentDB");
 assert.commandWorked(destDB.dropDatabase());
 timeseriesPipeline =
     TimeseriesAggTests.generateOutPipeline(targetCollName, destDB.getName(), {timeField: "time"});
-// TODO SERVER-75856 remove this conditional.
-if (FixtureHelpers.isMongos(testDB)) {  // this is not supported in mongos.
-    assert.throwsWithCode(() => inColl.aggregate(timeseriesPipeline), ErrorCodes.NamespaceNotFound);
-} else {
+// TODO (SERVER-75856): Support implicit database creation for $merge and $out when running
+// aggregate on a mongos.
+try {
     inColl.aggregate(timeseriesPipeline);
     assert.eq(300, destDB[targetCollName].find().itcount());
+} catch (e) {
+    assert.eq(e.code, ErrorCodes.NamespaceNotFound, e);
 }
 
 // Tests that an error is raised when trying to create a time-series collection from a non

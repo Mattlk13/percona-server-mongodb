@@ -568,6 +568,13 @@ public:
      */
     Lock::SharedLock enterStableTopologyRegion(OperationContext* opCtx);
 
+    /**
+     * Updates the "hasTwoOrMoreShard" cluster cardinality parameter based on the given number of
+     * shards. Cannot be called while holding the _kShardMembershipLock in exclusive mode since
+     * setting cluster parameters requires taking this lock in shared mode.
+     */
+    Status updateClusterCardinalityParameter(OperationContext* opCtx, int numShards);
+
     //
     // Cluster Upgrade Operations
     //
@@ -649,6 +656,12 @@ public:
      * TODO SERVER-80266 delete once 8.0 becomes last lts
      */
     int deleteMaxSizeMbFromShardEntries(OperationContext* opCtx);
+
+    /**
+     * Updates the config.settings schema for FCV upgrade and downgrade.
+     * TODO (SERVER-83264): Remove once 8.0 becomes last LTS.
+     */
+    Status upgradeDowngradeConfigSettings(OperationContext* opCtx);
 
 private:
     /**
@@ -812,7 +825,6 @@ private:
      * Given a vector of cluster parameters in disk format, sets them locally.
      */
     void _setClusterParametersLocally(OperationContext* opCtx,
-                                      const boost::optional<TenantId>& tenantId,
                                       const std::vector<BSONObj>& parameters);
 
     /**
@@ -845,13 +857,12 @@ private:
     /**
      * Execute the migration chunk updates using the internal transaction API.
      */
-    void _commitChunkMigrationInTransaction(
-        OperationContext* opCtx,
-        const NamespaceString& nss,
-        std::shared_ptr<const ChunkType> migratedChunk,
-        std::shared_ptr<const std::vector<ChunkType>> splitChunks,
-        std::shared_ptr<ChunkType> controlChunk,
-        const ShardId& donorShardId);
+    void _commitChunkMigrationInTransaction(OperationContext* opCtx,
+                                            const NamespaceString& nss,
+                                            const ChunkType& migratedChunk,
+                                            const std::vector<ChunkType>& splitChunks,
+                                            const boost::optional<ChunkType>& controlChunk,
+                                            const ShardId& donorShardId);
 
     /**
      * Inserts new entries into the config catalog to describe the shard being added (and the
@@ -882,12 +893,8 @@ private:
                                    std::shared_ptr<std::vector<ChunkType>> chunksToMerge);
 
     struct SplitChunkInTransactionResult {
-        SplitChunkInTransactionResult(const ChunkVersion& currentMaxVersion_,
-                                      std::shared_ptr<std::vector<ChunkType>> newChunks_)
-            : currentMaxVersion(currentMaxVersion_), newChunks(newChunks_) {}
-
         ChunkVersion currentMaxVersion;
-        std::shared_ptr<std::vector<ChunkType>> newChunks;
+        std::vector<ChunkType> newChunks;
     };
 
     /**
@@ -900,6 +907,17 @@ private:
                                                            const ChunkType& origChunk,
                                                            const ChunkVersion& collPlacementVersion,
                                                            const std::vector<BSONObj>& splitPoints);
+
+    /**
+     * Updates the "hasTwoOrMoreShard" cluster cardinality parameter after an add or remove shard
+     * operation if needed. Can only be called after refreshing the shard registry and while holding
+     * _kClusterCardinalityParameterLock lock in exclusive mode to avoid interleaving with other
+     * add/remove shard operation and its set cluster cardinality parameter operation.
+     */
+    Status _updateClusterCardinalityParameterAfterAddShardIfNeeded(const Lock::ExclusiveLock&,
+                                                                   OperationContext* opCtx);
+    Status _updateClusterCardinalityParameterAfterRemoveShardIfNeeded(const Lock::ExclusiveLock&,
+                                                                      OperationContext* opCtx);
 
     // The owning service context
     ServiceContext* const _serviceContext;
@@ -939,6 +957,11 @@ private:
      * requests).
      */
     Lock::ResourceMutex _kShardMembershipLock;
+
+    /**
+     * Lock that guards changes to the cluster cardinality parameter.
+     */
+    Lock::ResourceMutex _kClusterCardinalityParameterLock;
 
     /**
      * Lock for chunk split/merge/move operations. This should be acquired when doing split/merge/

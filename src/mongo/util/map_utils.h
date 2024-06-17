@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <utility>
+
 namespace mongo {
 
 /*
@@ -43,4 +45,14 @@ static void extractFromMap(MapType map, const ConsumerType& consumer) {
     }
 }
 
+/*
+ * Similar to `extractFromMap` but for sets.
+ */
+template <class SetType, class ConsumerType>
+static void extractFromSet(SetType set, const ConsumerType& consumer) {
+    while (!set.empty()) {
+        auto entry = set.extract(set.begin());
+        consumer(std::move(entry.value()));
+    }
+}
 }  // namespace mongo

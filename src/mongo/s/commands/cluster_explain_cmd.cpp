@@ -71,7 +71,7 @@ class ClusterExplainCmd final : public Command {
 public:
     ClusterExplainCmd() : Command("explain") {}
 
-    const std::set<std::string>& apiVersions() const {
+    const std::set<std::string>& apiVersions() const override {
         return kApiVersions1;
     }
 
@@ -110,10 +110,19 @@ public:
                std::unique_ptr<CommandInvocation> innerInvocation)
         : CommandInvocation(explainCommand),
           _outerRequest{&request},
-          _ns{CommandHelpers::parseNsFromCommand(_outerRequest->getDbName(), _outerRequest->body)},
+          _ns{CommandHelpers::parseNsFromCommand(_outerRequest->parseDbName(),
+                                                 _outerRequest->body)},
           _verbosity{std::move(verbosity)},
           _innerRequest{std::move(innerRequest)},
           _innerInvocation{std::move(innerInvocation)} {}
+
+    ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level,
+                                                 bool isImplicitDefault) const override {
+        static const Status kDefaultReadConcernNotPermitted{
+            ErrorCodes::InvalidOptions,
+            "Explain does not permit default readConcern to be applied."};
+        return {Status::OK(), {kDefaultReadConcernNotPermitted}};
+    }
 
 private:
     void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) override {
@@ -128,6 +137,10 @@ private:
 
     NamespaceString ns() const override {
         return _ns;
+    }
+
+    const DatabaseName& db() const override {
+        return _ns.dbName();
     }
 
     bool supportsWriteConcern() const override {

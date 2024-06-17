@@ -52,6 +52,7 @@
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
 #include "mongo/bson/oid.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/client/dbclient_cursor.h"
@@ -62,7 +63,6 @@
 #include "mongo/db/cluster_role.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/cursor_id.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/dbdirectclient.h"
@@ -86,7 +86,6 @@
 #include "mongo/db/s/resharding/resharding_txn_cloner_progress_gen.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/sharding_mongod_test_fixture.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session/logical_session_cache.h"
@@ -98,6 +97,7 @@
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/db/transaction/transaction_participant.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/vector_clock_metadata_hook.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_factory.h"
@@ -141,7 +141,7 @@ namespace mongo {
 namespace {
 
 class ReshardingTxnClonerTest : public ShardServerTestFixtureWithCatalogCacheLoaderMock {
-    void setUp() {
+    void setUp() override {
         ShardServerTestFixtureWithCatalogCacheLoaderMock::setUp();
 
         // The config database's primary shard is always config, and it is always sharded.
@@ -169,7 +169,7 @@ class ReshardingTxnClonerTest : public ShardServerTestFixtureWithCatalogCacheLoa
         LogicalSessionCache::set(getServiceContext(), std::make_unique<LogicalSessionCacheNoop>());
     }
 
-    void tearDown() {
+    void tearDown() override {
         WaitForMajorityService::get(getServiceContext()).shutDown();
         ShardServerTestFixtureWithCatalogCacheLoaderMock::tearDown();
     }
@@ -180,14 +180,16 @@ class ReshardingTxnClonerTest : public ShardServerTestFixtureWithCatalogCacheLoa
      * ShardRegistry reload is done over DBClient, not the NetworkInterface, and there is no
      * DBClientMock analogous to the NetworkInterfaceMock.
      */
-    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient() {
+    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient() override {
 
         class StaticCatalogClient final : public ShardingCatalogClientMock {
         public:
             StaticCatalogClient(std::vector<ShardId> shardIds) : _shardIds(std::move(shardIds)) {}
 
             StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
-                OperationContext* opCtx, repl::ReadConcernLevel readConcern) override {
+                OperationContext* opCtx,
+                repl::ReadConcernLevel readConcern,
+                bool excludeDraining) override {
                 std::vector<ShardType> shardTypes;
                 for (const auto& shardId : _shardIds) {
                     const ConnectionString cs = ConnectionString::forReplicaSet(
@@ -219,9 +221,9 @@ class ReshardingTxnClonerTest : public ShardServerTestFixtureWithCatalogCacheLoa
 
 protected:
     const UUID kDefaultReshardingId = UUID::gen();
-    const std::vector<ShardId> kTwoShardIdList{_myShardName, {"otherShardName"}};
+    const std::vector<ShardId> kTwoShardIdList{kMyShardName, {"otherShardName"}};
     const std::vector<ReshardingSourceId> kTwoSourceIdList = {
-        {kDefaultReshardingId, _myShardName}, {kDefaultReshardingId, ShardId("otherShardName")}};
+        {kDefaultReshardingId, kMyShardName}, {kDefaultReshardingId, ShardId("otherShardName")}};
 
     const std::vector<DurableTxnStateEnum> kDurableTxnStateEnumValues = {
         DurableTxnStateEnum::kPrepared,
@@ -326,11 +328,15 @@ protected:
         auto txnParticipant = TransactionParticipant::get(opCtx);
         ASSERT(txnParticipant);
         if (multiDocTxn) {
-            txnParticipant.beginOrContinue(
-                opCtx, {txnNum}, false /* autocommit */, true /* startTransaction */);
+            txnParticipant.beginOrContinue(opCtx,
+                                           {txnNum},
+                                           false /* autocommit */,
+                                           TransactionParticipant::TransactionActions::kStart);
         } else {
-            txnParticipant.beginOrContinue(
-                opCtx, {txnNum}, boost::none /* autocommit */, boost::none /* startTransaction */);
+            txnParticipant.beginOrContinue(opCtx,
+                                           {txnNum},
+                                           boost::none /* autocommit */,
+                                           TransactionParticipant::TransactionActions::kNone);
         }
     }
 
@@ -468,8 +474,10 @@ protected:
         auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
         auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
-        txnParticipant.beginOrContinue(
-            opCtx, {txnNumber}, false /* autocommit */, true /* startTransaction */);
+        txnParticipant.beginOrContinue(opCtx,
+                                       {txnNumber},
+                                       false /* autocommit */,
+                                       TransactionParticipant::TransactionActions::kStart);
 
         txnParticipant.unstashTransactionResources(opCtx, "insert");
         txnParticipant.stashTransactionResources(opCtx);
@@ -485,8 +493,10 @@ protected:
         auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
         auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
-        txnParticipant.beginOrContinue(
-            opCtx, {txnNumber}, false /* autocommit */, true /* startTransaction */);
+        txnParticipant.beginOrContinue(opCtx,
+                                       {txnNumber},
+                                       false /* autocommit */,
+                                       TransactionParticipant::TransactionActions::kStart);
 
         txnParticipant.unstashTransactionResources(opCtx, "prepareTransaction");
 
@@ -499,8 +509,8 @@ protected:
             auto opTime = repl::getNextOpTime(opCtx);
             wuow.release();
 
-            opCtx->recoveryUnit()->abortUnitOfWork();
-            opCtx->lockState()->endWriteUnitOfWork();
+            shard_role_details::getRecoveryUnit(opCtx)->abortUnitOfWork();
+            shard_role_details::getLocker(opCtx)->endWriteUnitOfWork();
 
             return opTime;
         }();
@@ -518,8 +528,10 @@ protected:
         auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
         auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
-        txnParticipant.beginOrContinue(
-            opCtx, {txnNumber}, false /* autocommit */, boost::none /* startTransaction */);
+        txnParticipant.beginOrContinue(opCtx,
+                                       {txnNumber},
+                                       false /* autocommit */,
+                                       TransactionParticipant::TransactionActions::kContinue);
 
         txnParticipant.unstashTransactionResources(opCtx, "abortTransaction");
         txnParticipant.abortTransaction(opCtx);
@@ -1223,6 +1235,34 @@ TEST_F(ReshardingTxnClonerTest, CancelableWhileWaitingOnInProgressInternalTxnFor
 
     cancelSource.cancel();
     ASSERT_EQ(future.getNoThrow(), ErrorCodes::CallbackCanceled);
+}
+
+TEST_F(ReshardingTxnClonerTest, DoNotAddDeadEndSentinelTwice) {
+    auto opCtx = operationContext();
+    ReshardingTxnCloner cloner(kTwoSourceIdList[1], Timestamp::max());
+    auto txnRecord = SessionTxnRecord::parse(
+        IDLParserContext{"ReshardingTxnClonerTest::DoNotAddDeadEndSentinelTwice"}, makeTxn());
+
+    DBDirectClient client(opCtx);
+    auto filter = fromjson(fmt::format(
+        R"(
+            {{
+                lsid: {{ $eq: {} }},
+                o2: {{ $eq: {} }}
+            }}
+        )",
+        tojson(txnRecord.getSessionId().toBSON()),
+        tojson(TransactionParticipant::kDeadEndSentinel)));
+
+    auto getSentinelCount = [&] {
+        return client.count(NamespaceString::kRsOplogNamespace, filter);
+    };
+
+    ASSERT_EQ(getSentinelCount(), 0);
+    cloner.doOneRecord(opCtx, txnRecord);
+    ASSERT_EQ(getSentinelCount(), 1);
+    cloner.doOneRecord(opCtx, txnRecord);
+    ASSERT_EQ(getSentinelCount(), 1);
 }
 
 }  // namespace

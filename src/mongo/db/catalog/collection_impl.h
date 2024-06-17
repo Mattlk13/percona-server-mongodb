@@ -70,6 +70,7 @@
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/snapshot.h"
 #include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/util/uuid.h"
@@ -93,7 +94,7 @@ public:
                             std::shared_ptr<BSONCollectionCatalogEntry::MetaData> metadata,
                             std::unique_ptr<RecordStore> recordStore);
 
-    ~CollectionImpl();
+    ~CollectionImpl() override;
 
     std::shared_ptr<Collection> clone() const final;
 
@@ -163,7 +164,7 @@ public:
     bool requiresIdIndex() const final;
 
     Snapshotted<BSONObj> docFor(OperationContext* opCtx, const RecordId& loc) const final {
-        return Snapshotted<BSONObj>(opCtx->recoveryUnit()->getSnapshotId(),
+        return Snapshotted<BSONObj>(shard_role_details::getRecoveryUnit(opCtx)->getSnapshotId(),
                                     _shared->_recordStore->dataFor(opCtx, loc).releaseToBson());
     }
 
@@ -246,7 +247,8 @@ public:
     void setTimeseriesBucketingParametersChanged(OperationContext* opCtx,
                                                  boost::optional<bool> value) final;
 
-    bool doesTimeseriesBucketsDocContainMixedSchemaData(const BSONObj& bucketsDoc) const final;
+    StatusWith<bool> doesTimeseriesBucketsDocContainMixedSchemaData(
+        const BSONObj& bucketsDoc) const final;
 
     bool getRequiresTimeseriesExtendedRangeSupport() const final;
     void setRequiresTimeseriesExtendedRangeSupport(OperationContext* opCtx) const final;
@@ -266,9 +268,13 @@ public:
                             boost::optional<long long> newCappedSize,
                             boost::optional<long long> newCappedMax) final;
 
+    void unsetRecordIdsReplicated(OperationContext* opCtx) final;
+
     //
     // Stats
     //
+
+    bool areRecordIdsReplicated() const final;
 
     bool isCapped() const final;
     long long getCappedMaxDocs() const final;
@@ -296,7 +302,7 @@ public:
      */
     bool isEmpty(OperationContext* opCtx) const final;
 
-    inline int averageObjectSize(OperationContext* opCtx) const {
+    inline int averageObjectSize(OperationContext* opCtx) const override {
         uint64_t n = numRecords(opCtx);
 
         if (n == 0)

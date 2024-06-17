@@ -4,6 +4,7 @@
 import {
     checkCascadesOptimizerEnabled,
     removeUUIDsFromExplain,
+    runWithFastPathsDisabled,
     runWithParams
 } from "jstests/libs/optimizer_utils.js";
 
@@ -82,7 +83,8 @@ IndexScan [{'<rid>': rid_1}, scanDefName: cqf_disjunction_, indexDefName: a_1, i
 result = coll.find({arr: {$eq: [2]}}).toArray();
 assert.eq(result.length, 0, result);
 
-result = coll.find({arr: {$gt: MinKey()}}).toArray();
+// See SERVER-68274.
+result = runWithFastPathsDisabled(() => coll.find({arr: {$gt: MinKey()}}).toArray());
 assert.eq(result.length, docs.length, result);
 
 // Test a nested or/and where one leaf predicate ($exists) cannot be fully satisfied with index
@@ -143,7 +145,10 @@ IndexScan [{'<rid>': rid_1}, scanDefName: cqf_disjunction_, indexDefName: a_1, i
     const params = [
         {key: 'internalCascadesOptimizerExplainVersion', value: "v2"},
         {key: "internalCascadesOptimizerUseDescriptiveVarNames", value: true},
-        {key: "internalCascadesOptimizerDisableIndexes", value: true}
+        {key: "internalCascadesOptimizerDisableIndexes", value: true},
+        // TODO SERVER-83574: Enable after implementing rewriting single-field disjunctions to
+        // eqMember.
+        {key: "internalCascadesOptimizerDisableSargableWhenNoIndexes", value: false}
     ];
 
     //

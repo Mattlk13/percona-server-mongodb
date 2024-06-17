@@ -1,6 +1,7 @@
 // Tests mongos behavior on stale database version errors received in a transaction.
 //
 // @tags: [requires_sharding, uses_transactions, uses_multi_shard_transaction]
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
 import {
     assertNoSuchTransactionOnAllShards,
     disableStaleVersionAndSnapshotRetriesWithinTransactions,
@@ -11,6 +12,14 @@ const dbName = "test";
 const collName = "foo";
 
 const st = new ShardingTest({shards: 2, mongos: 1});
+
+// Database versioning tests only make sense when all collections are not tracked.
+const isTrackUnshardedUponCreationEnabled = FeatureFlagUtil.isPresentAndEnabled(
+    st.s.getDB('admin'), "TrackUnshardedCollectionsUponCreation");
+if (isTrackUnshardedUponCreationEnabled) {
+    st.stop();
+    quit();
+}
 
 enableStaleVersionAndSnapshotRetriesWithinTransactions(st);
 

@@ -9,8 +9,7 @@ sets**](https://docs.mongodb.com/manual/replication/).
 Replica sets are a group of nodes with one primary and multiple secondaries. The primary is
 responsible for all writes. Users may specify that reads from secondaries are acceptable via
 [`setSecondaryOk`](https://docs.mongodb.com/manual/reference/method/Mongo.setSecondaryOk/) or through
-[**read preference**](https://docs.mongodb.com/manual/core/read-preference/#secondaryPreferred), but
-they are not by default.
+[**read preference**](#read-preference), but they are not by default.
 
 # Steady State Replication
 
@@ -27,7 +26,7 @@ standalone would. The one difference from a standalone write is that replica set
 `OpObserver` that inserts a document to the **oplog** whenever a write to the database happens,
 describing the write. The oplog is a capped collection called `oplog.rs` in the `local` database.
 There are a few optimizations made for it in WiredTiger, and it is the only collection that doesn't
-include an _id field.
+include an \_id field.
 
 If a write does multiple operations, each will have its own oplog entry; for example, inserts with
 implicit collection creation create two oplog entries, one for the `create` and one for the
@@ -47,7 +46,7 @@ or **majority**. If **majority** is specified, the write waits for that write to
 **committed snapshot** as well, so that it can be read with `readConcern: { level: majority }`
 reads. (If this last sentence made no sense, come back to it at the end).
 
-###  Default Write Concern
+### Default Write Concern
 
 If a write operation does not explicitly specify a write concern, the server will use a default
 write concern. This default write concern will be defined by either the
@@ -55,7 +54,7 @@ write concern. This default write concern will be defined by either the
 **implicit default write concern**, implicitly set by the
 server based on replica set configuration.
 
-####  Cluster-Wide Write Concern
+#### Cluster-Wide Write Concern
 
 Users can set the cluster-wide write concern (CWWC) using the
 [`setDefaultRWConcern`](https://docs.mongodb.com/manual/reference/command/setDefaultRWConcern/)
@@ -68,7 +67,7 @@ On sharded clusters, the CWWC will be stored on config servers. Shard servers th
 store the CWWC. Instead, mongos polls the config server and applies the default write concern to
 requests it forwards to shards.
 
-####  Implicit Default Write Concern
+#### Implicit Default Write Concern
 
 If there is no cluster-wide default write concern set, the server will set the default. This is
 known as the implicit default write concern (IDWC). For most cases, the IDWC will default to
@@ -88,7 +87,7 @@ successfully acknowledge a majority write as the majority for the set is two nod
 primary will remain primary with the arbiter's vote. In this case, the DWCF will have preemptively
 set the IDWC to `{w: 1}` so the user can still perform writes to the replica set.
 
- #### Implicit Default Write Concern and Sharded Clusters
+#### Implicit Default Write Concern and Sharded Clusters
 
 For sharded clusters, the implicit default write concern will always be `{w: "majority"}`.
 As mentioned above, mongos will send the default write concern with all requests that it forwards
@@ -109,7 +108,7 @@ the result of the default write concern formula is `{w: 1}`. Similarly, we will 
 `{w: "majority"}` across the cluster, but we do not want to specify that for PSA sets for reasons
 listed above.
 
-####  Replica Set Reconfigs and Default Write Concern
+#### Replica Set Reconfigs and Default Write Concern
 
 A replica set reconfig will recalculate the default write concern using the Default Write Concern
 Formula if CWWC is not set. If the new value of the implicit default write concern is different
@@ -125,11 +124,12 @@ majority write concern needed to set the CWWC, users can run
 setting CWWC does not get in the way of being able to do a force reconfig.
 
 #### Code References
-- [The definition of an Oplog Entry](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/oplog_entry.idl)
-- [Upper layer uses OpObserver class to write Oplog](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/op_observer/op_observer.h#L112), for example, [it is helpful to take a look at ObObserverImpl::logOperation()](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/op_observer/op_observer_impl.cpp#L114)
-- [Oplog::logOpsInner() is a common function to write Oplogs into Oplog Collection](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/oplog.cpp#L356)
-- [WriteConcernOptions is filled in extractWriteConcern()](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/write_concern.cpp#L71)
-- [Upper level uses waitForWriteConcern() to wait for the write concern to be fulfilled](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/write_concern.cpp#L254)
+
+-   [The definition of an Oplog Entry](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/oplog_entry.idl)
+-   [Upper layer uses OpObserver class to write Oplog](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/op_observer/op_observer.h#L112), for example, [it is helpful to take a look at ObObserverImpl::logOperation()](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/op_observer/op_observer_impl.cpp#L114)
+-   [repl::logOplogRecords() is a common function to write Oplogs into Oplog Collection](https://github.com/mongodb/mongo/blob/r7.1.0/src/mongo/db/repl/oplog.cpp#L440)
+-   [WriteConcernOptions is filled in extractWriteConcern()](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/write_concern.cpp#L71)
+-   [Upper level uses waitForWriteConcern() to wait for the write concern to be fulfilled](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/write_concern.cpp#L254)
 
 ## Life as a Secondary
 
@@ -215,22 +215,22 @@ the `OplogFetcher` decides to continue, it will wait for the next batch to arriv
 not, the `OplogFetcher` will terminate, which will lead to `BackgroundSync` choosing a new sync
 source. Reasons for changing sync sources include:
 
-* If the node is no longer in the replica set configuration.
-* If the current sync source is no longer in the replica set configuration.
-* If the user has requested another sync source via the `replSetSyncFrom` command.
-* If chaining is disabled and the node is not currently syncing from the primary.
-* If the sync source is not the primary, does not have its own sync source, and is not ahead of
-  the node. This indicates that the sync source will not receive writes in a timely manner. As a
-  result, continuing to sync from it will likely cause the node to be lagged.
-* If the most recent OpTime of the sync source is more than `maxSyncSourceLagSecs` seconds behind
-  another member's latest oplog entry. This ensures that the sync source is not too far behind
-  other nodes in the set. `maxSyncSourceLagSecs` is a server parameter and has a default value of
-  30 seconds.
-* If the node has discovered another eligible sync source that is significantly closer. A
-  significantly closer node has a ping time that is at least `changeSyncSourceThresholdMillis`
-  lower than our current sync source. This minimizes the number of nodes that have sync sources
-  located far away.`changeSyncSourceThresholdMillis` is a server parameter and has a default value
-  of 5 ms.
+-   If the node is no longer in the replica set configuration.
+-   If the current sync source is no longer in the replica set configuration.
+-   If the user has requested another sync source via the `replSetSyncFrom` command.
+-   If chaining is disabled and the node is not currently syncing from the primary.
+-   If the sync source is not the primary, does not have its own sync source, and is not ahead of
+    the node. This indicates that the sync source will not receive writes in a timely manner. As a
+    result, continuing to sync from it will likely cause the node to be lagged.
+-   If the most recent OpTime of the sync source is more than `maxSyncSourceLagSecs` seconds behind
+    another member's latest oplog entry. This ensures that the sync source is not too far behind
+    other nodes in the set. `maxSyncSourceLagSecs` is a server parameter and has a default value of
+    30 seconds.
+-   If the node has discovered another eligible sync source that is significantly closer. A
+    significantly closer node has a ping time that is at least `changeSyncSourceThresholdMillis`
+    lower than our current sync source. This minimizes the number of nodes that have sync sources
+    located far away.`changeSyncSourceThresholdMillis` is a server parameter and has a default value
+    of 5 ms.
 
 ### Sync Source Selection
 
@@ -257,29 +257,29 @@ candidate.
 
 Otherwise, it iterates through all of the nodes and sees which one is the best.
 
-* First the secondary checks the `TopologyCoordinator`'s cached view of the replica set for the
-  latest OpTime known to be on the primary. Secondaries do not sync from nodes whose newest oplog
-  entry is more than
-  [`maxSyncSourceLagSecs`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/topology_coordinator.cpp#L302-L315)
-  seconds behind the primary's newest oplog entry.
-* Secondaries then loop through each node and choose the closest node that satisfies [various
-  criteria](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/topology_coordinator.cpp#L200-L438).
-  “Closest” here is determined by the lowest ping time to each node.
-* If no node satisfies the necessary criteria, then the `BackgroundSync` waits 1 second and restarts
-  the sync source selection process.
+-   First the secondary checks the `TopologyCoordinator`'s cached view of the replica set for the
+    latest OpTime known to be on the primary. Secondaries do not sync from nodes whose newest oplog
+    entry is more than
+    [`maxSyncSourceLagSecs`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/topology_coordinator.cpp#L302-L315)
+    seconds behind the primary's newest oplog entry.
+-   Secondaries then loop through each node and choose the closest node that satisfies [various
+    criteria](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/topology_coordinator.cpp#L200-L438).
+    “Closest” here is determined by the lowest ping time to each node.
+-   If no node satisfies the necessary criteria, then the `BackgroundSync` waits 1 second and restarts
+    the sync source selection process.
 
 #### Sync Source Probing
 
 After choosing a sync source candidate, the `SyncSourceResolver` probes the sync source candidate to
 make sure it actually is able to fetch from the sync source candidate’s oplog.
 
-* If the sync source candidate has no oplog or there is an error, the secondary denylists that sync
-  source for some time and then tries to find a new sync source candidate.
-* If the oldest entry in the sync source candidate's oplog is newer than the node's newest entry,
-  then the node denylists that sync source candidate as well because the candidate is too far
-  ahead.
-* The sync source's **RollbackID** is also fetched to be checked after the first batch is returned
-  by the `OplogFetcher`.
+-   If the sync source candidate has no oplog or there is an error, the secondary denylists that sync
+    source for some time and then tries to find a new sync source candidate.
+-   If the oldest entry in the sync source candidate's oplog is newer than the node's newest entry,
+    then the node denylists that sync source candidate as well because the candidate is too far
+    ahead.
+-   The sync source's **RollbackID** is also fetched to be checked after the first batch is returned
+    by the `OplogFetcher`.
 
 If the secondary is too far behind all possible sync source candidates then it goes into maintenance
 mode and waits for manual intervention (likely a call to `resync`). If no viable candidates were
@@ -327,14 +327,15 @@ endless loop doing the following:
    last optime in the batch.
 
 #### Code References
-- [Start background threads like bgSync/oplogApplier/syncSourceFeedback](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_external_state_impl.cpp#L213)
-- [BackgroundSync starts SyncSourceResolver and OplogFetcher to sync log](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/bgsync.cpp#L225)
-- [SyncSourceResolver chooses a sync source to sync from](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/sync_source_resolver.cpp#L545)
-- [OplogBuffer currently uses a BlockingQueue as underlying data structure](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/oplog_buffer_blocking_queue.h#L41)
-- [OplogFetcher queries from sync source and put fetched oplogs in OplogApplier::_oplogBuffer](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/oplog_fetcher.cpp#L209)
-- [OplogBatcher polls oplogs from OplogApplier::_oplogBuffer and creates an OplogBatch to apply](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/oplog_batcher.cpp#L282)
-- [OplogApplier gets batches of oplog entries from the OplogBatcher and applies entries in parallel](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/oplog_applier_impl.cpp#L297)
-- [SyncSourceFeedback keeps checking if there are new oplogs applied on this instance and issues `UpdatePositionCmd` to sync source](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/sync_source_feedback.cpp#L157)
+
+-   [Start background threads like bgSync/oplogApplier/syncSourceFeedback](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_external_state_impl.cpp#L213)
+-   [BackgroundSync starts SyncSourceResolver and OplogFetcher to sync log](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/bgsync.cpp#L225)
+-   [SyncSourceResolver chooses a sync source to sync from](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/sync_source_resolver.cpp#L545)
+-   [OplogBuffer currently uses a BlockingQueue as underlying data structure](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/oplog_buffer_blocking_queue.h#L41)
+-   [OplogFetcher queries from sync source and put fetched oplogs in OplogApplier::\_oplogBuffer](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/oplog_fetcher.cpp#L209)
+-   [OplogBatcher polls oplogs from OplogApplier::\_oplogBuffer and creates an OplogBatch to apply](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/oplog_batcher.cpp#L282)
+-   [OplogApplier gets batches of oplog entries from the OplogBatcher and applies entries in parallel](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/oplog_applier_impl.cpp#L297)
+-   [SyncSourceFeedback keeps checking if there are new oplogs applied on this instance and issues `UpdatePositionCmd` to sync source](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/sync_source_feedback.cpp#L157)
 
 ## Replication and Topology Coordinators
 
@@ -394,9 +395,9 @@ issuing remote commands to other nodes.
 
 Each node communicates with other nodes at regular intervals to:
 
-* Check the liveness of the other nodes (heartbeats)
-* Stay up to date with the primary (oplog fetching)
-* Update their sync source with their progress (`replSetUpdatePosition` commands)
+-   Check the liveness of the other nodes (heartbeats)
+-   Stay up to date with the primary (oplog fetching)
+-   Update their sync source with their progress (`replSetUpdatePosition` commands)
 
 Each oplog entry is assigned a unique `OpTime` to describe when it occurred so other nodes can
 compare how up-to-date they are.
@@ -605,14 +606,15 @@ The `replSetUpdatePosition` command response does not include any information un
 error, such as in a `ReplSetConfig` mismatch.
 
 #### Code References
-- [OplogFetcher passes on the metadata it received from its sync source](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/oplog_fetcher.cpp#L897)
-- [Node handles heartbeat response and schedules the next heartbeat after it receives heartbeat response](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl_heartbeat.cpp#L190)
-- [Node responds to heartbeat request](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/repl_set_commands.cpp#L752)
-- [Primary advances the replica set's commit point after receiving replSetUpdatePosition command](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L1889)
-- [Secondary advances its understanding of the replica set commit point using metadata fetched from its sync source](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L5649)
-- [TopologyCoordinator updates commit optime](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/topology_coordinator.cpp#L2885)
-- [SyncSourceFeedback triggers replSetUpdatePosition command using Reporter](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/reporter.cpp#L189)
-- [Node updates replica set metadata after receiving replSetUpdatePosition command](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/repl_set_commands.cpp#L675)
+
+-   [OplogFetcher passes on the metadata it received from its sync source](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/oplog_fetcher.cpp#L897)
+-   [Node handles heartbeat response and schedules the next heartbeat after it receives heartbeat response](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl_heartbeat.cpp#L190)
+-   [Node responds to heartbeat request](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/repl_set_commands.cpp#L752)
+-   [Primary advances the replica set's commit point after receiving replSetUpdatePosition command](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L1889)
+-   [Secondary advances its understanding of the replica set commit point using metadata fetched from its sync source](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L5649)
+-   [TopologyCoordinator updates commit optime](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/topology_coordinator.cpp#L2885)
+-   [SyncSourceFeedback triggers replSetUpdatePosition command using Reporter](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/reporter.cpp#L189)
+-   [Node updates replica set metadata after receiving replSetUpdatePosition command](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/repl_set_commands.cpp#L675)
 
 ## Read Concern
 
@@ -626,11 +628,11 @@ any updates that occurred since the read began may or may not be seen.
 read command to specify at what consistency level the read should be satisfied. There are 5 read
 concern levels:
 
-* Local
-* Majority
-* Linearizable
-* Snapshot
-* Available
+-   Local
+-   Majority
+-   Linearizable
+-   Snapshot
+-   Available
 
 **Local** just returns whatever the most up-to-date data is on the node. On a primary, it does this
 by reading from the storage engine's most recent snapshot. On a secondary, it performs a timestamped
@@ -645,10 +647,10 @@ been replicated to a majority of nodes in the replica set. Any data seen in majo
 roll back in the future. Thus majority reads prevent **dirty reads**, though they often are
 **stale reads**.
 
-Read concern majority reads do not wait for anything to be committed; they just use different 
-snapshots from local reads. Read concern majority reads usually return as fast as local reads, but 
-sometimes will block. For example, right after startup or rollback when we do not have a committed 
-snapshot, majority reads will be blocked. Also, when some of the secondaries are unavailable or 
+Read concern majority reads do not wait for anything to be committed; they just use different
+snapshots from local reads. Read concern majority reads usually return as fast as local reads, but
+sometimes will block. For example, right after startup or rollback when we do not have a committed
+snapshot, majority reads will be blocked. Also, when some of the secondaries are unavailable or
 lagging, majority reads could slow down or block.
 
 For information on how majority read concern works within a multi-document transaction, see the
@@ -696,10 +698,61 @@ the local snapshot is beyond the specified OpTime. If read concern majority is s
 wait until the committed snapshot is beyond the specified OpTime.
 
 **afterClusterTime** is a read concern option used for supporting **causal consistency**.
+
 <!-- TODO: link to the Causal Consistency section of the Sharding Architecture Guide -->
 
 #### Code References
-- [ReadConcernArg is filled in _extractReadConcern()](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/service_entry_point_common.cpp#L261)
+
+-   [ReadConcernArg is filled in \_extractReadConcern()](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/service_entry_point_common.cpp#L261)
+
+## Read Preference
+
+The [read preference](https://www.mongodb.com/docs/manual/core/read-preference/) set on a read
+operation determines which nodes in a replica set are eligible to serve that operation. It allows
+the user to control where and how read operations are directed within a replica set. The accepted
+modes for read preference are `primary`, `primaryPreferred`, `secondary`, `secondaryPreferred`,
+and `nearest`. The formal definitions and additional command format information can be found
+[in the driver specification](https://github.com/mongodb/specifications/blob/master/source/server-selection/server-selection.rst#read-preference).
+
+### Server Selection
+
+Server selection is the process of selecting a node for a command. The client first filters servers
+by specified read preference, and then if there is more than one eligible server, filters the
+remaining servers based on latency. The server selection specification is fulfilled by any MongoDB
+replica set client that can select from multiple servers to execute reads, such as a driver or
+`mongos`. The specification determines the algorithms for filtering servers based on
+`readPreference` mode, formulas for calculating roundtrip times, etc.
+
+### Passing `$readPreference` as a parameter
+
+A client will pass any non-primary read preference to the selected server in the form of a
+`$readPreference` parameter attached to each operation. In this context, a server means either
+a replica set node or `mongos`. If the read preference parameter is omitted, the server will assume
+read preference `primary`. In the case of a replica set, `$readPreference` is passed to the
+targeted node [to validate](https://github.com/mongodb/mongo/blob/r7.1.0/src/mongo/db/service_entry_point_common.cpp#L1642-L1658)
+that the replica set state still aligns with the desired read preference.
+
+For sharded clusters, the client skips filtering servers based on read preference and passes the
+`$readPreference` directly to `mongos`. The `mongos` instance then carries out the read preference
+matching on the appropriate shard and forwards the `$readPreference` to the shard server for
+validation. It’s worth noting that if multiple `mongos` nodes exist in the topology, the driver
+will still filter based on latency.
+
+### Replica Set State and Read Preference
+
+Replica set nodes receive the `$readPreference` in a command invocation for validation purposes.
+This is to ensure that the given `$readPreference` matches the current state of the node, as the
+replica set state may have changed in the time between the client’s server selection and the node
+receiving the command. If it doesn't match, the operation will fail with one of the error codes
+mentioned below.
+
+Commands can define whether or not they can run on a secondary by overriding the
+`[secondaryAllowed](https://github.com/10gen/mongo/blob/r7.1.0/src/mongo/db/commands.h#L502-L509)`
+function. If a secondary node receives an operation it cannot service, it will either fail with a
+`NotWritablePrimary` error if the command is designated as primary-only, or a `NotPrimaryNoSecondaryOk`
+error if the command can be serviced by a secondary but the operation’s`$readPreference` specifies
+primary-only. A primary node that receives a `secondary` read preference operation will service it,
+although this case is rare since it requires the node to step up before it receives the operation.
 
 # enableMajorityReadConcern Flag
 
@@ -888,7 +941,7 @@ atomicity of a transaction that involves multiple shards. One important part of 
 Protocol is making sure that all shards participating in the transaction are in the
 **prepared state**, or guaranteed to be able to commit, before actually committing the transaction.
 This will allow us to avoid a situation where the transaction only commits on some of the shards and
-aborts on others. Once a node puts a transaction in the prepared state, it *must* be able to commit
+aborts on others. Once a node puts a transaction in the prepared state, it _must_ be able to commit
 the transaction if we decide to commit the overall cross-shard transaction.
 
 Another key piece of the Two Phase Commit Protocol is the [**`TransactionCoordinator`**](https://github.com/mongodb/mongo/blob/be38579dc72a40988cada1f43ab6695dcff8cc36/src/mongo/db/s/transaction_coordinator.h#L70), which is
@@ -992,7 +1045,7 @@ transaction are visible.
 When a node receives the `commitTransaction` command and the transaction is in the prepared state,
 it will first [re-acquire](https://github.com/mongodb/mongo/blob/be38579dc72a40988cada1f43ab6695dcff8cc36/src/mongo/db/transaction/transaction_participant.cpp#L1962) the [RSTL](#replication-state-transition-lock) to prevent any state
 transitions from happening while the commit is in progress. It will then [reserve an oplog slot](https://github.com/mongodb/mongo/blob/be38579dc72a40988cada1f43ab6695dcff8cc36/src/mongo/db/transaction/transaction_participant.cpp#L2021-L2030),
-[commit the storage transaction at the `commitTimestamp`](https://github.com/mongodb/mongo/blob/be38579dc72a40988cada1f43ab6695dcff8cc36/src/mongo/db/transaction/transaction_participant.cpp#L2057-L2059), 
+[commit the storage transaction at the `commitTimestamp`](https://github.com/mongodb/mongo/blob/be38579dc72a40988cada1f43ab6695dcff8cc36/src/mongo/db/transaction/transaction_participant.cpp#L2057-L2059),
 [write the `commitTransaction` oplog entry](https://github.com/mongodb/mongo/blob/be38579dc72a40988cada1f43ab6695dcff8cc36/src/mongo/db/transaction/transaction_participant.cpp#L2065-L2069)
 into the oplog, [update the transactions table](https://github.com/mongodb/mongo/blob/master/src/mongo/db/op_observer/op_observer_impl.cpp#L201), transition the `txnState` to `kCommitted`, record
 metrics, and [clean up the transaction resources](https://github.com/mongodb/mongo/blob/be38579dc72a40988cada1f43ab6695dcff8cc36/src/mongo/db/transaction/transaction_participant.cpp#L2073-L2075).
@@ -1048,7 +1101,7 @@ holding these locks to prevent conflicting operations.
 
 ### Recovering Prepared Transactions
 
-The prepare state *must* endure any state transition or failover, so they must be recovered and
+The prepare state _must_ endure any state transition or failover, so they must be recovered and
 reconstructed in all situations. If the in-memory state of a prepared transaction is lost, it can be
 reconstructed using the information in the prepare oplog entry(s).
 
@@ -1060,7 +1113,7 @@ set.
 As the node applies oplog entries, it will update the transaction table every time it encounters a
 `prepareTransaction` oplog entry to save that the state of the transaction is prepared. Instead of
 actually applying the oplog entry and preparing the transaction, the node will wait until oplog
-application has completed to reconstruct the transaction. If the node encounters a
+application [has completed](https://github.com/mongodb/mongo/blob/be38579dc72a40988cada1f43ab6695dcff8cc36/src/mongo/db/repl/replication_recovery.cpp#L472) to reconstruct the transaction. If the node encounters a
 `commitTransaction` oplog entry, it will immediately commit the transaction. If the transaction it's
 about to commit was prepared, the node will find the `prepareTransaction` oplog entry(s) using the
 [`TransactionHistoryIterator`](https://github.com/mongodb/mongo/blob/v6.1/src/mongo/db/transaction/transaction_history_iterator.h)
@@ -1072,6 +1125,14 @@ state. At that point, the node will find the `prepareTransaction` oplog entry(s)
 transaction using the `TransactionHistoryIterator`. It will check out the session associated with
 the transaction, apply all the operations from the oplog entry(s) and prepare the transaction.
 
+#### Code references
+
+-   Function to [abort unprepared transactions during stepup or stepdown](https://github.com/mongodb/mongo/blob/be38579dc72a40988cada1f43ab6695dcff8cc36/src/mongo/db/repl/replication_coordinator_impl.cpp#L2766).
+-   Where we [yield locks for transactions](https://github.com/mongodb/mongo/blob/be38579dc72a40988cada1f43ab6695dcff8cc36/src/mongo/db/transaction/transaction_participant.cpp#L1282-L1287).
+-   Where we [restore locks for transactions](https://github.com/mongodb/mongo/blob/be38579dc72a40988cada1f43ab6695dcff8cc36/src/mongo/db/transaction/transaction_participant.cpp#L1343-L1348).
+-   Function to [reconstruct prepared transactions from oplog entries](https://github.com/mongodb/mongo/blob/be38579dc72a40988cada1f43ab6695dcff8cc36/src/mongo/db/repl/transaction_oplog_application.cpp#L804).
+-   Where we [skip over prepareTransaction oplog entries](https://github.com/mongodb/mongo/blob/be38579dc72a40988cada1f43ab6695dcff8cc36/src/mongo/db/repl/transaction_oplog_application.cpp#L737-L752) during recovery oplog application.
+
 ## Read Concern Behavior Within Transactions
 
 The read concern for all operations within a transaction should be specified when starting the
@@ -1080,8 +1141,8 @@ transaction. If no read concern was specified, the default read concern is local
 Reads within a transaction behave differently from reads outside of a transaction because of
 **speculative** behavior. This means a transaction speculatively executes without ensuring that
 the data read won't be rolled back until it commits. No matter the read concern, when a node goes to
-commit a transaction, it waits for the data that it read to be majority committed *as long as the
-transaction was run with write concern majority*. Because of speculative behavior, this means that
+commit a transaction, it waits for the data that it read to be majority committed _as long as the
+transaction was run with write concern majority_. Because of speculative behavior, this means that
 the transaction can only provide the guarantees of majority read concern, that data that it read
 won't roll back, if it is run with write concern majority.
 
@@ -1116,6 +1177,11 @@ timestamp. If `atClusterTime` is not specified, then the read timestamp of the t
 the [`all_durable`](#replication-timestamp-glossary) timestamp when the transaction is started,
 which ensures a snapshot with no oplog holes.
 
+#### Code references
+
+-   [Noop write for read-only transactions](https://github.com/mongodb/mongo/blob/be38579dc72a40988cada1f43ab6695dcff8cc36/src/mongo/db/transaction/transaction_participant.cpp#L1940-L1944).
+-   Function to [set a read snapshot for transactions](https://github.com/mongodb/mongo/blob/be38579dc72a40988cada1f43ab6695dcff8cc36/src/mongo/db/transaction/transaction_participant.cpp#L1170).
+
 ## Transaction Oplog Application
 
 Secondaries begin replicating transaction oplog entries once the primary has either prepared or
@@ -1124,8 +1190,8 @@ writer thread pool to schedule operations to apply. See the
 [oplog entry application](#oplog-entry-application) section for more details on how secondary oplog
 application works.
 
-Before secondaries process and apply transaction oplog entries, they will track operations that
-require changes to `config.transactions`. This results in an update to the transactions table entry
+Before secondaries process and apply transaction oplog entries, they will [track operations](https://github.com/mongodb/mongo/blob/be38579dc72a40988cada1f43ab6695dcff8cc36/src/mongo/db/repl/oplog_applier_impl.cpp#L968) that
+require changes to `config.transactions`. This results in an [update to the transactions table entry](https://github.com/mongodb/mongo/blob/be38579dc72a40988cada1f43ab6695dcff8cc36/src/mongo/db/repl/session_update_tracker.cpp#L336)
 (`sessionTxnRecord`) that corresponds to the oplog entry operation. For example,
 `prepareTransaction`, `commitTransaction`, and `abortTransaction` will all update the `txnState`
 accordingly.
@@ -1231,6 +1297,13 @@ commands. However we do not need to apply any operations in the original transac
 an [empty transaction](https://github.com/mongodb/mongo/blob/07e1e93c566243983b45385f5c85bc7df0026f39/src/mongo/db/repl/transaction_oplog_application.cpp#L720-L731))
 since the operations should be applied by its split transactions.
 
+#### Code references
+
+-   [Filling writer vectors for unprepared transactions on terminal applyOps.](https://github.com/mongodb/mongo/blob/be38579dc72a40988cada1f43ab6695dcff8cc36/src/mongo/db/repl/oplog_applier_impl.cpp#L1018-L1033)
+-   [Applying writes in parallel](https://github.com/mongodb/mongo/blob/be38579dc72a40988cada1f43ab6695dcff8cc36/src/mongo/db/repl/oplog_applier_impl.cpp#L809-L832) via the writer thread pool.
+-   Function to [unstash transaction resources](https://github.com/mongodb/mongo/blob/be38579dc72a40988cada1f43ab6695dcff8cc36/src/mongo/db/transaction/transaction_participant.cpp#L1462) from the RecoveryUnit to the OperationContext.
+-   Function to [stash transaction resources](https://github.com/mongodb/mongo/blob/be38579dc72a40988cada1f43ab6695dcff8cc36/src/mongo/db/transaction/transaction_participant.cpp#L1427) from the OperationContext to the RecoveryUnit.
+
 ## Transaction Errors
 
 ### PreparedTransactionInProgress Errors
@@ -1296,54 +1369,61 @@ prepared transaction, and checking/setting if the node can accept writes or serv
 
 ## Global Lock Acquisition Ordering
 
-Both the FCV lock and RSTL are global resources that must be acquired before the global lock is
-acquired. The node must first acquire the FCV lock in [intent
-shared](https://docs.mongodb.com/manual/reference/glossary/#term-intent-lock) or intent exclusive
-mode. Next, it must acquire the RSTL in intent exclusive mode. Only then can it acquire the global
-lock in its desired mode.
+Both the MultiDocumentTransactionsBarrier lock and RSTL are global resources that are acquired
+before the global lock is acquired.
+
+First, the MultiDocumentTransactionsBarrier lock is only acquired when
+the request is part of a multi-document transaction, or when the global lock is requested in
+[shared](https://www.mongodb.com/docs/manual/reference/glossary/#std-term-read-lock) or
+[exclusive](https://www.mongodb.com/docs/manual/reference/glossary/#std-term-write-lock) mode;
+the lock is acquired in the same mode as the global lock request.
+Next, it must acquire the RSTL in [intent exclusive](https://docs.mongodb.com/manual/reference/glossary/#term-intent-lock)
+mode. Only then can it acquire the global lock in its desired mode.
 
 # Elections
 
 ## Step Up
 
 There are a number of ways that a node will run for election:
-* If it hasn't seen a primary within the election timeout (which defaults to 10 seconds).
-* If it realizes that it has higher priority than the primary, it will wait and run for
-  election (also known as a **priority takeover**). The amount of time the node waits before calling
-  an election is directly related to its priority in comparison to the priority of rest of the set
-  (so higher priority nodes will call for a priority takeover faster than lower priority nodes).
-  Priority takeovers allow users to specify a node that they would prefer be the primary.
-* Newly elected primaries attempt to catchup to the latest applied OpTime in the replica
-  set. Until this process (called primary catchup) completes, the new primary will not accept
-  writes. If a secondary realizes that it is more up-to-date than the primary and the primary takes
-  longer than `catchUpTakeoverDelayMillis` (default 30 seconds), it will run for election. This
-  behvarior is known as a **catchup takeover**. If primary catchup is taking too long, catchup
-  takeover can help allow the replica set to accept writes sooner, since a more up-to-date node will
-  not spend as much time (or any time) in catchup. See the [Transitioning to `PRIMARY` section](https://github.com/mongodb/mongo/blob/master/src/mongo/db/repl/README.md#transitioning-to-primary) section for
-  further details on primary catchup.
-* The `replSetStepUp` command can be run on an eligible node to cause it to run for election
-  immediately. We don't expect users to call this command, but it is run internally for election
-  handoff and testing.
-* When a node is stepped down via the `replSetStepDown` command, if the `enableElectionHandoff`
-  parameter is set to true (the default), it will choose an eligible secondary to run the
-  `replSetStepUp` command on a best-effort basis. This behavior is called **election handoff**. This
-  will mean that the replica set can shorten failover time, since it skips waiting for the election
-  timeout. If `replSetStepDown` was called with `force: true` or the node was stepped down while
-  `enableElectionHandoff` is false, then nodes in the replica set will wait until the election
-  timeout triggers to run for election.
+
+-   If it hasn't seen a primary within the election timeout (which defaults to 10 seconds).
+-   If it realizes that it has higher priority than the primary, it will wait and run for
+    election (also known as a **priority takeover**). The amount of time the node waits before calling
+    an election is directly related to its priority in comparison to the priority of rest of the set
+    (so higher priority nodes will call for a priority takeover faster than lower priority nodes).
+    Priority takeovers allow users to specify a node that they would prefer be the primary.
+-   Newly elected primaries attempt to catchup to the latest applied OpTime in the replica
+    set. Until this process (called primary catchup) completes, the new primary will not accept
+    writes. If a secondary realizes that it is more up-to-date than the primary and the primary takes
+    longer than `catchUpTakeoverDelayMillis` (default 30 seconds), it will run for election. This
+    behvarior is known as a **catchup takeover**. If primary catchup is taking too long, catchup
+    takeover can help allow the replica set to accept writes sooner, since a more up-to-date node will
+    not spend as much time (or any time) in catchup. See the [Transitioning to `PRIMARY` section](https://github.com/mongodb/mongo/blob/master/src/mongo/db/repl/README.md#transitioning-to-primary) section for
+    further details on primary catchup.
+-   The `replSetStepUp` command can be run on an eligible node to cause it to run for election
+    immediately. We don't expect users to call this command, but it is run internally for election
+    handoff and testing.
+-   When a node is stepped down via the `replSetStepDown` command, if the `enableElectionHandoff`
+    parameter is set to true (the default), it will choose an eligible secondary to run the
+    `replSetStepUp` command on a best-effort basis. This behavior is called **election handoff**. This
+    will mean that the replica set can shorten failover time, since it skips waiting for the election
+    timeout. If `replSetStepDown` was called with `force: true` or the node was stepped down while
+    `enableElectionHandoff` is false, then nodes in the replica set will wait until the election
+    timeout triggers to run for election.
 
 ### Code references
-* [election timeout](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L345) ([defaults](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/repl_set_config.idl#L101))
-* [priority takeover](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl_heartbeat.cpp#L449)
-* [priority takeover: priority check](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/topology_coordinator.cpp#L1568-L1578)
-* [priority takeover: wait time calculation](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/repl_set_config.cpp#L705-L709)
-* [newly elected primary catchup](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L4714)
-* [primary catchup completion](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L4799-L4813)
-* [primary start accepting writes](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L1361)
-* [catchup takeover](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl_heartbeat.cpp#L466)
-* [catchup takeover: takeover check](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl_heartbeat.cpp#L466)
-* [election handoff](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L2924)
-* [election handoff: skip wait](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L2917-L2921)
+
+-   [election timeout](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L345) ([defaults](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/repl_set_config.idl#L101))
+-   [priority takeover](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl_heartbeat.cpp#L449)
+-   [priority takeover: priority check](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/topology_coordinator.cpp#L1568-L1578)
+-   [priority takeover: wait time calculation](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/repl_set_config.cpp#L705-L709)
+-   [newly elected primary catchup](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L4714)
+-   [primary catchup completion](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L4799-L4813)
+-   [primary start accepting writes](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L1361)
+-   [catchup takeover](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl_heartbeat.cpp#L466)
+-   [catchup takeover: takeover check](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl_heartbeat.cpp#L466)
+-   [election handoff](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L2924)
+-   [election handoff: skip wait](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L2917-L2921)
 
 ### Candidate Perspective
 
@@ -1371,11 +1451,12 @@ If the candidate received votes from a majority of nodes, including itself, the 
 election.
 
 #### Code references
-* [dry-run election](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl_elect_v1.cpp#L203)
-* [skipping dry-run](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl_elect_v1.cpp#L185)
-* [real election](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl_elect_v1.cpp#L277)
-* [candidate process vote response](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/vote_requester.cpp#L114)
-* [candidate checks election result](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl_elect_v1.cpp#L416)
+
+-   [dry-run election](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl_elect_v1.cpp#L203)
+-   [skipping dry-run](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl_elect_v1.cpp#L185)
+-   [real election](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl_elect_v1.cpp#L277)
+-   [candidate process vote response](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/vote_requester.cpp#L114)
+-   [candidate checks election result](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl_elect_v1.cpp#L416)
 
 ### Voter Perspective
 
@@ -1399,8 +1480,9 @@ future elections. This ensures that even if a node restarts, it does not vote fo
 same term.
 
 #### Code references
-* [node processing vote request](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/topology_coordinator.cpp#L3429)
-* [recording LastVote durably](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L5739)
+
+-   [node processing vote request](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/topology_coordinator.cpp#L3429)
+-   [recording LastVote durably](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L5739)
 
 ### Transitioning to `PRIMARY`
 
@@ -1442,14 +1524,15 @@ and logs “transition to primary complete”. At this point, new writes will be
 primary.
 
 #### Code references
-* [clearing the sync source, notify nodes of election, prepare catch up](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L4697-L4707)
-* [catchup to latest optime known via heartbeats](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L4800)
-* [catchup-timeout](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L4746)
-* [always allow chaining for catchup](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L5231)
-* [enter drain mode after catchup attempt](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L4783)
-* [exit drain mode](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L1205)
-* [term bump](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L1300)
-* [drop temporary collections](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_external_state_impl.cpp#L532)
+
+-   [clearing the sync source, notify nodes of election, prepare catch up](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L4697-L4707)
+-   [catchup to latest optime known via heartbeats](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L4800)
+-   [catchup-timeout](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L4746)
+-   [always allow chaining for catchup](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L5231)
+-   [enter drain mode after catchup attempt](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L4783)
+-   [exit drain mode](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L1205)
+-   [term bump](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L1300)
+-   [drop temporary collections](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_external_state_impl.cpp#L532)
 
 ## Step Down
 
@@ -1458,14 +1541,15 @@ primary.
 The `replSetStepDown` command is one way that a node relinquishes its position as primary. Stepdown via the
 `replSetStepDown` command is called "conditional" because it may or may not succeed. Success in this case
 depends on the params passed to the command as well as the state of nodes of the replica set.
-* If the `force` option is set to `true`:
-  * In this case the primary node will wait for `secondaryCatchUpPeriodSecs`, a `replSetStepDown` parameter,
-  before stepping down regardless of whether the other nodes have caught up or are electable.
-* If the `force` option is omitted or set to `false`, the following conditions must be met for the command to
-succeed:
-  * The [`lastApplied`](#replication-timestamp-glossary) OpTime of the primary must be replicated to a majority
-  of the nodes
-  * At least one of the up-to-date secondaries must also be electable
+
+-   If the `force` option is set to `true`:
+    -   In this case the primary node will wait for `secondaryCatchUpPeriodSecs`, a `replSetStepDown` parameter,
+        before stepping down regardless of whether the other nodes have caught up or are electable.
+-   If the `force` option is omitted or set to `false`, the following conditions must be met for the command to
+    succeed:
+    -   The [`lastApplied`](#replication-timestamp-glossary) OpTime of the primary must be replicated to a majority
+        of the nodes
+    -   At least one of the up-to-date secondaries must also be electable
 
 When a `replSetStepDown` command comes in, the node begins to check if it can step down. First, the
 node attempts to acquire the [RSTL](#replication-state-transition-lock). In order to do so, it must
@@ -1481,40 +1565,43 @@ Upon a successful stepdown, it yields locks held by
 Finally, we log stepdown metrics and update our member state to `SECONDARY`.
 
 #### Code references
-* [User-facing documentation](https://www.mongodb.com/docs/manual/reference/command/replSetStepDown/#command-fields).
-* [Replication coordinator stepDown method](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L2729)
-* [ReplSetStepDown command class](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/repl_set_commands.cpp#L527)
-* [The node loops trying to step down](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L2836)
-* [A majority of nodes need to have reached the last applied optime](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/topology_coordinator.cpp#L2733)
-* [At least one caught up node needs to be electable](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/topology_coordinator.cpp#L2738)
-* [Set the LeaderMode to kSteppingDown](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/topology_coordinator.cpp#L1721)
-* [Upon a successful stepdown, it yields locks held by prepared transactions](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L2899)
+
+-   [User-facing documentation](https://www.mongodb.com/docs/manual/reference/command/replSetStepDown/#command-fields).
+-   [Replication coordinator stepDown method](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L2729)
+-   [ReplSetStepDown command class](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/repl_set_commands.cpp#L527)
+-   [The node loops trying to step down](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L2836)
+-   [A majority of nodes need to have reached the last applied optime](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/topology_coordinator.cpp#L2733)
+-   [At least one caught up node needs to be electable](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/topology_coordinator.cpp#L2738)
+-   [Set the LeaderMode to kSteppingDown](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/topology_coordinator.cpp#L1721)
+-   [Upon a successful stepdown, it yields locks held by prepared transactions](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L2899)
 
 ### Unconditional
 
 Stepdowns can also occur for the following reasons:
-* If the primary learns of a higher term
-* Liveness timeout: If a primary stops being able to transitively communicate with a majority of
-nodes. The primary does not need to be able to communicate directly with a majority of nodes. If
-primary A can’t communicate with node B, but A can communicate with C which can communicate with B,
-that is okay. If you consider the minimum spanning tree on the cluster where edges are connections
-from nodes to their sync source, then as long as the primary is connected to a majority of nodes, it
-will stay primary.
-* Force reconfig via the `replSetReconfig` command
-* Force reconfig via heartbeat: If we learn of a newer config through heartbeats, we will
-schedule a replica set config change.
+
+-   If the primary learns of a higher term
+-   Liveness timeout: If a primary stops being able to transitively communicate with a majority of
+    nodes. The primary does not need to be able to communicate directly with a majority of nodes. If
+    primary A can’t communicate with node B, but A can communicate with C which can communicate with B,
+    that is okay. If you consider the minimum spanning tree on the cluster where edges are connections
+    from nodes to their sync source, then as long as the primary is connected to a majority of nodes, it
+    will stay primary.
+-   Force reconfig via the `replSetReconfig` command
+-   Force reconfig via heartbeat: If we learn of a newer config through heartbeats, we will
+    schedule a replica set config change.
 
 During unconditional stepdown, we do not check preconditions before attempting to step down. Similar
 to conditional stepdowns, we must kill any conflicting user/system operations before acquiring the
 RSTL and yield locks of prepared transactions following a successful stepdown.
 
 #### Code references
-* [Stepping down on learning of a higher term](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L6066)
-* [Liveness timeout checks](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/topology_coordinator.cpp#L1236-L1249)
-* [Stepping down on liveness timeout](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl_heartbeat.cpp#L424)
-* [ReplSetReconfig command class](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/repl_set_commands.cpp#L431)
-* [Stepping on reconfig](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L4010)
-* [Stepping down on heartbeat](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl_heartbeat.cpp#L980)
+
+-   [Stepping down on learning of a higher term](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L6066)
+-   [Liveness timeout checks](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/topology_coordinator.cpp#L1236-L1249)
+-   [Stepping down on liveness timeout](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl_heartbeat.cpp#L424)
+-   [ReplSetReconfig command class](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/repl_set_commands.cpp#L431)
+-   [Stepping on reconfig](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L4010)
+-   [Stepping down on heartbeat](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl_heartbeat.cpp#L980)
 
 ### Concurrent Stepdown Attempts
 
@@ -1606,16 +1693,17 @@ the `stableTimestamp` refers to a point in time that is before the last update, 
 lose the session information that was never applied as part of the coalescing.
 
 As an example, consider the following:
+
 1.  During a single batch of secondary oplog application:
-    i).  User data write for stmtId=0 at t=10.
-    ii).  User data write for stmtId=1 at t=11.
-    iii).  User data write for stmtId=2 at t=12.
-    iv).  Session txn record write at t=12 with stmtId=2 as lastWriteOpTime. In particular, no
+    i). User data write for stmtId=0 at t=10.
+    ii). User data write for stmtId=1 at t=11.
+    iii). User data write for stmtId=2 at t=12.
+    iv). Session txn record write at t=12 with stmtId=2 as lastWriteOpTime. In particular, no
     session txn record write for t=10 with stmtId=0 as lastWriteOpTime or for t=11 with stmtId=1 as lastWriteOpTime because they were coalseced by the [SessionUpdateTracker](https://github.com/mongodb/mongo/blob/9d601c939bca2a4304dca2d3c8abd195c1f070af/src/mongo/db/repl/session_update_tracker.cpp#L217-L221).
 2.  Rollback to stable timestamp t=10.
 3.  The session txn record won't exist with stmtId=0 as lastWriteOpTime (because the write was
-entirely skipped by oplog application) despite the user data write for stmtId=0 being reflected
-on-disk. Without any fix, this allows stmtId=0 to be re-executed by this node if it became primary.
+    entirely skipped by oplog application) despite the user data write for stmtId=0 being reflected
+    on-disk. Without any fix, this allows stmtId=0 to be re-executed by this node if it became primary.
 
 As a solution, we traverse the oplog to find the last completed retryable write statements that occur before or at the `stableTimestamp`, and use this information to restore the `config.transactions`
 table. More specifically, we perform a forward scan of the oplog starting from the first entry
@@ -1700,26 +1788,30 @@ Before the data clone phase begins, the node will do the following:
    node restarts while this flag is set, it will restart initial sync even though it may already
    have data because it means that initial sync didn't complete. We also check this flag to prevent
    reading from the oplog while initial sync is in progress.
-2. Find a sync source.
-3. Drop all of its data except for the local database and recreate the oplog.
-4. Get the Rollback ID (RBID) from the sync source to ensure at the end that no rollbacks occurred
+2. [Reset the in-memory FCV to `kUnsetDefaultLastLTSBehavior`.](https://github.com/10gen/mongo/blob/b718dc1aa3ffb3e6df4f61a30d54cda578cf2830/src/mongo/db/repl/initial_syncer.cpp#L689). This is to ensure compatibility between the sync source and sync
+   target. If the sync source is actually in a different feature compatibility version, we will find
+   out when we clone from the sync source.
+3. Find a sync source.
+4. Drop all of its data except for the local database and recreate the oplog.
+5. Get the Rollback ID (RBID) from the sync source to ensure at the end that no rollbacks occurred
    during initial sync.
-5. Query its sync source's oplog for its latest OpTime and save it as the
+6. Query its sync source's oplog for its latest OpTime and save it as the
    `defaultBeginFetchingOpTime`. If there are no open transactions on the sync source, this will be
    used as the `beginFetchingTimestamp` or the timestamp that it begins fetching oplog entries from.
-6. Query its sync source's transactions table for the oldest starting OpTime of all active
+7. Query its sync source's transactions table for the oldest starting OpTime of all active
    transactions. If this timestamp exists (meaning there is an open transaction on the sync source)
    this will be used as the `beginFetchingTimestamp`. If this timestamp doesn't exist, the node will
    use the `defaultBeginFetchingOpTime` instead. This will ensure that even if a transaction was
    started on the sync source after it was queried for the oldest active transaction timestamp, the
    syncing node will have all the oplog entries associated with an active transaction in its oplog.
-7. Query its sync source's oplog for its lastest OpTime. This will be the `beginApplyingTimestamp`,
+8. Query its sync source's oplog for its lastest OpTime. This will be the `beginApplyingTimestamp`,
    or the timestamp that it begins applying oplog entries at once it has completed the data clone
    phase. If there was no active transaction on the sync source, the `beginFetchingTimestamp` will
    be the same as the `beginApplyingTimestamp`.
-8. Create an `OplogFetcher` and start fetching and buffering oplog entries from the sync source
-   to be applied later. Operations are buffered to a collection so that they are not limited by the
-   amount of memory available.
+9. [Set the in-memory FCV to the sync source's FCV.](https://github.com/10gen/mongo/blob/b718dc1aa3ffb3e6df4f61a30d54cda578cf2830/src/mongo/db/repl/initial_syncer.cpp#L1153). This is because during the cloning phase, we do expect to clone the sync source's "admin.system.version" collection eventually (which contains the FCV document), but we can't guarantee that we will clone "admin.system.version" first. Setting the in-memory FCV value to the sync source's FCV first will ensure that we clone collections using the same FCV as the sync source. However, we won't persist the FCV to disk nor will we update our minWireVersion until we clone the actual document.
+10. Create an `OplogFetcher` and start fetching and buffering oplog entries from the sync source
+    to be applied later. Operations are buffered to a collection so that they are not limited by the
+    amount of memory available.
 
 ## Data clone phase
 
@@ -1741,19 +1833,19 @@ run a `getMore` on an open cursor to get the next batch, exhaust cursors make it
 `find` does not exhaust the cursor, the sync source will keep sending batches until there are none
 left.
 
-The cloners are resilient to transient errors.  If a cloner encounters an error marked with the
+The cloners are resilient to transient errors. If a cloner encounters an error marked with the
 `RetriableError` label in
 [`error_codes.yml`](https://github.com/mongodb/mongo/blob/r4.3.2/src/mongo/base/error_codes.yml), it
-will retry whatever network operation it was attempting.  It will continue attempting to retry for a
+will retry whatever network operation it was attempting. It will continue attempting to retry for a
 length of time set by the server parameter `initialSyncTransientErrorRetryPeriodSeconds`, after
-which it will consider the failure permanent.  A permanent failure means it will choose a new sync
+which it will consider the failure permanent. A permanent failure means it will choose a new sync
 source and retry all of initial sync, up to a number of times set by the server parameter
-`numInitialSyncAttempts`.  One notable exception, where we do not retry the entire operation, is for
-the actual querying of the collection data.  For querying, we use a feature called **resume
-tokens**.  We set a flag on the query: `$_requestResumeToken`.  This causes each batch we receive
+`numInitialSyncAttempts`. One notable exception, where we do not retry the entire operation, is for
+the actual querying of the collection data. For querying, we use a feature called **resume
+tokens**. We set a flag on the query: `$_requestResumeToken`. This causes each batch we receive
 from the sync source to contain an opaque token which indicates our current position in the
-collection.  After storing a batch of data, we store the most recent resume token in a member
-variable of the `CollectionCloner`.  Then, when retrying we provide this resume token in the query,
+collection. After storing a batch of data, we store the most recent resume token in a member
+variable of the `CollectionCloner`. Then, when retrying we provide this resume token in the query,
 allowing us to avoid having to re-fetch the parts of the collection we have already stored.
 
 The `initialSyncTransientErrorRetryPeriodSeconds` is also used to control retries for the oplog
@@ -1826,23 +1918,24 @@ is the node's last applied OpTime. Finally, the `InitialSyncer` shuts down and t
 `ReplicationCoordinator` starts steady state replication.
 
 #### Code References
-- [ReplicationCoordinator starts initial sync if the node is started up without any data](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L887)
-- [Follow this flowchart for initial sync call stack.](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/initial_syncer.h#L278)
-- [Initial syncer uses AllDatabaseCloner/DatabaseCloner/CollectionCloner to clone data from sync source, where the state transition is defined in runStages().](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/base_cloner.cpp#L268)
-- [AllDatabaseCloner creates and runs each DatabaseCloner in its post stage.](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/all_database_cloner.cpp#L263)
-- [DatabaseCloner creates and runs each CollectionCloner in its post stage.](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/database_cloner.cpp#L137)
-- [InitialSyncer uses RollbackChecker to check if there is a rollback on sync source during initial sync.](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/initial_syncer.cpp#L2014)
-- [Set lastApplied OpTime as initialDataTimestamp to storage engine after initial sync finishes.](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/initial_syncer.cpp#L586-L590)
-- [Start steady state replication after initial sync completes.](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L847)
+
+-   [ReplicationCoordinator starts initial sync if the node is started up without any data](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L887)
+-   [Follow this flowchart for initial sync call stack.](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/initial_syncer.h#L278)
+-   [Initial syncer uses AllDatabaseCloner/DatabaseCloner/CollectionCloner to clone data from sync source, where the state transition is defined in runStages().](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/base_cloner.cpp#L268)
+-   [AllDatabaseCloner creates and runs each DatabaseCloner in its post stage.](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/all_database_cloner.cpp#L263)
+-   [DatabaseCloner creates and runs each CollectionCloner in its post stage.](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/database_cloner.cpp#L137)
+-   [InitialSyncer uses RollbackChecker to check if there is a rollback on sync source during initial sync.](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/initial_syncer.cpp#L2014)
+-   [Set lastApplied OpTime as initialDataTimestamp to storage engine after initial sync finishes.](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/initial_syncer.cpp#L586-L590)
+-   [Start steady state replication after initial sync completes.](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L847)
 
 # Reconfiguration
 
-MongoDB replica sets consist of a set of members, where a *member* corresponds to a single
-participant of the replica set, identified by a host name and port. We refer to a *node* as the
+MongoDB replica sets consist of a set of members, where a _member_ corresponds to a single
+participant of the replica set, identified by a host name and port. We refer to a _node_ as the
 mongod server process that corresponds to a particular replica set member. A replica set
-*configuration* [consists](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/repl_set_config.idl#L133-L135) of a list of members in a replica set along with some member specific
+_configuration_ [consists](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/repl_set_config.idl#L133-L135) of a list of members in a replica set along with some member specific
 settings as well as global settings for the set. We alternately refer to a configuration as a
-*config*, for brevity. Each member of the config has a [member
+_config_, for brevity. Each member of the config has a [member
 id](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/member_id.h#L42-L45), which is a
 unique integer identifier for that member. A config is defined in the
 [ReplSetConfig](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/repl_set_config.h#L156)
@@ -1865,7 +1958,7 @@ heartbeats](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/repli
 To update the current configuration, a client may execute the [`replSetReconfig`](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/repl_set_commands.cpp#L424-L426) command with the
 new, desired config. Reconfigurations [can be run
 ](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/repl_set_commands.cpp#L446-L448)in
-*safe* mode or in *force* mode. We alternately refer to reconfigurations as *reconfigs*, for
+_safe_ mode or in _force_ mode. We alternately refer to reconfigurations as _reconfigs_, for
 brevity. Safe reconfigs, which are the default, can only be run against primary nodes and ensure the
 replication safety guarantee that majority committed writes will not be rolled back. Force reconfigs
 can be run against either a primary or secondary node and their usage may cause the rollback of
@@ -1881,7 +1974,7 @@ differences to integrate with the existing, heartbeat-based reconfig protocol mo
 
 Note that in a static configuration, the safety of the Raft protocol depends on the fact that any
 two quorums (i.e. majorities) of a replica set have at least one member in common i.e. they satisfy
-the *quorum overlap* property. For any two arbitrary configurations, however, this is not the case.
+the _quorum overlap_ property. For any two arbitrary configurations, however, this is not the case.
 So, extra restrictions are placed on how nodes are allowed to move between configurations. First,
 all safe reconfigs enforce a [single node
 change](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/repl_set_config_checks.cpp#L101-L109)
@@ -1896,18 +1989,18 @@ two additional constraints that must be satisfied before a primary node can inst
 configuration:
 
 1. **[Config
-Replication](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L4023-L4026)**:
-The current config, C, must be installed on at least a majority of voting nodes in C.
+   Replication](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L4023-L4026)**:
+   The current config, C, must be installed on at least a majority of voting nodes in C.
 2. **[Oplog
-Commitment](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L4045-L4052)**:
-Any oplog entries that were majority committed in the previous config, C0, must be replicated to at
-least a majority of voting nodes in the current config, C1.
+   Commitment](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L4045-L4052)**:
+   Any oplog entries that were majority committed in the previous config, C0, must be replicated to at
+   least a majority of voting nodes in the current config, C1.
 
 Condition 1 ensures that any configs earlier than C can no longer independently form a quorum to
 elect a node or commit a write. Condition 2 ensures that committed writes in any older configs are
 now committed by the rules of the current configuration. This guarantees that any leaders elected in
 a subsequent configuration will contain these entries in their log upon assuming role as leader.
-When both conditions are satisfied, we say that the current config is *committed*.
+When both conditions are satisfied, we say that the current config is _committed_.
 
 We wait for both of these conditions to become true at the
 [beginning](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/repl_set_commands.cpp#L450-L466)
@@ -1937,7 +2030,7 @@ term)`](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/repl_set_
 pair, where `term` is compared first, and then `version`, analogous to the rules for optime
 comparison. The `term` of a config is the term of the primary that originally created that config,
 and the `version` is a [monotonically increasing number](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L4112) assigned to each config. When executing a
-reconfig, the version of the new config must be greater than the version of the current config.  If
+reconfig, the version of the new config must be greater than the version of the current config. If
 the `(version, term)` pair of config A is greater than that of config B, then it is considered
 "newer" than config B. If a node hears about a newer config via a heartbeat from another node, it
 will [schedule a
@@ -2043,6 +2136,7 @@ the replica set configuration, [set its `lastApplied` and
 to the top of the oplog (the latest entry in the oplog) and start steady state replication.
 
 ## Recover from Unstable Checkpoint
+
 We may not have a recovery timestamp if we need to recover from an **unstable checkpoint**. MongoDB
 takes unstable checkpoints by setting the [`initialDataTimestamp`](#replication-timestamp-glossary)
 to the `kAllowUnstableCheckpointsSentinel`. Recovery from an unstable checkpoint replays the oplog
@@ -2109,42 +2203,31 @@ from now on when we invent a new system collection we will place it on "admin".
 # Replication Timestamp Glossary
 
 In this section, when we refer to the word "transaction" without any other qualifier, we are talking
-about a storage transaction. Transactions in the replication layer will be referred to as
-multi-document or prepared transactions.
+about a storage transaction (aka [WriteUnitOfWork](https://github.com/mongodb/mongo/blob/00fbc981646d9e6ebc391f45a31f4070d4466753/src/mongo/db/storage/write_unit_of_work.h#L48)).
+Transactions in the replication layer will be referred to as multi-document or prepared transactions.
 
 **`all_durable`**: All transactions with timestamps earlier than the `all_durable` timestamp are
 committed. This is the point at which the oplog has no gaps, which are created when we reserve
-timestamps before executing the associated write. Since this timestamp is used to maintain the oplog
-visibility point, it is important that all operations up to and including this timestamp are
-committed and durable on disk. This is so that we can replicate the oplog without any gaps.
-
-**`commit oplog entry timestamp`**: The timestamp of the ‘commitTransaction’ oplog entry for a
-prepared transaction, or the timestamp of the ‘applyOps’ oplog entry for a non-prepared transaction.
-In a cross-shard transaction each shard may have a different commit oplog entry timestamp. This is
-guaranteed to be greater than the `prepareTimestamp`.
-
-**`commitTimestamp`**: The timestamp at which we committed a multi-document transaction. This will
-be the `commitTimestamp` field in the `commitTransaction` oplog entry for a prepared transaction, or
-the timestamp of the ‘applyOps’ oplog entry for a non-prepared transaction. In a cross-shard
-transaction this timestamp is the same across all shards. The effects of the transaction are visible
-as of this timestamp. Note that `commitTimestamp` and the `commit oplog entry timestamp` are the
-same for non-prepared transactions because we do not write down the oplog entry until we commit the
-transaction. For a prepared transaction, we have the following guarantee: `prepareTimestamp` <=
-`commitTimestamp` <= `commit oplog entry timestamp`
+timestamps before executing the associated write (ex: [insert path](https://github.com/mongodb/mongo/blob/2ff8fff5b01eeda5722884c5fd104716117c9606/src/mongo/db/ops/write_ops_exec.cpp#L379)).
+Since this timestamp is used to maintain the oplog visibility point, it is important that all
+operations up to and including this timestamp are committed. This is so that we can replicate the
+oplog without any gaps.  
+This is calculated at the storage level and can be retrieved through [getAllDurableTimestamp](https://github.com/mongodb/mongo/blob/2ff8fff5b01eeda5722884c5fd104716117c9606/src/mongo/db/repl/storage_interface.h#L471).  
+Contrary to what the name might imply, this timestamp does not indicate that all transactions
+preceding it are durable on disk; rather, it solely signifies they are committed. Therefore,
+replication consistently [maintains that](https://github.com/mongodb/mongo/blob/00fbc981646d9e6ebc391f45a31f4070d4466753/src/mongo/db/repl/replication_coordinator_impl.cpp#L4843-L4861) `stable_timestamp` <= `all_durable`.
 
 **`currentCommittedSnapshot`**: An optime maintained in `ReplicationCoordinator` that is used to
 serve majority reads and is always guaranteed to be <= `lastCommittedOpTime`. When `eMRC=true`, this
 is currently [set to the stable optime](https://github.com/mongodb/mongo/blob/00fbc981646d9e6ebc391f45a31f4070d4466753/src/mongo/db/repl/replication_coordinator_impl.cpp#L4945).
-Since it is reset every time we recalculate the stable optime, it will also be up to date.
-
+Since it is reset every time we recalculate the stable optime, it will also be up to date.  
 When `eMRC=false`, this [is set](https://github.com/mongodb/mongo/blob/00fbc981646d9e6ebc391f45a31f4070d4466753/src/mongo/db/repl/replication_coordinator_impl.cpp#L4952-L4961)
 to the minimum of the stable optime and the `lastCommittedOpTime`, even though it is not used to
 serve majority reads in that case.
 
 **`initialDataTimestamp`**: A timestamp used to indicate the timestamp at which history “begins”.
 When a node comes out of initial sync, we inform the storage engine that the `initialDataTimestamp`
-is the node's `lastApplied`.
-
+is the node's `lastApplied`.  
 By setting this value to 0, it informs the storage engine to take unstable checkpoints. Stable
 checkpoints can be viewed as timestamped reads that persist the data they read into a checkpoint.
 Unstable checkpoints simply open a transaction and read all data that is currently committed at the
@@ -2182,27 +2265,51 @@ at the end of batch application. Startup recovery will use the `oplogTruncateAft
 the oplog back to an oplog point consistent with the rest of the replica set: other nodes may have
 replicated in-memory data that a crashed node no longer has and is unaware that it lacks.
 
-**`prepareTimestamp`**: The timestamp of the ‘prepare’ oplog entry for a prepared transaction. This
-is the earliest timestamp at which it is legal to commit the transaction. This timestamp is provided
-to the storage engine to block reads that are trying to read prepared data until the storage engines
-knows whether the prepared transaction has committed or aborted.
-
 **`readConcernMajorityOpTime`**: Exposed in replSetGetStatus as “readConcernMajorityOpTime” but is
 populated internally from the `currentCommittedSnapshot` timestamp inside `ReplicationCoordinator`.
 
 **`stable_timestamp`**: The newest timestamp at which the storage engine is allowed to take a
 checkpoint, which can be thought of as a consistent snapshot of the data. Replication informs the
 storage engine of where it is safe to take its next checkpoint. This timestamp is guaranteed to be
-majority committed so that RTT rollback can use it. In the case when
-[`eMRC=false`](#enableMajorityReadConcern-flag), the stable timestamp may not be majority committed,
-which is why we must use the Rollback via Refetch rollback algorithm.
-
+majority committed (other than a specific caveat during restore noted below) so that RTT rollback
+can use it. In the case when [`eMRC=false`](#enableMajorityReadConcern-flag), the stable timestamp
+may not be majority committed, which is why we must use the Rollback via Refetch rollback algorithm.
 This timestamp is also required to increase monotonically except when `eMRC=false`, where in a
-special case during rollback it is possible for the `stableTimestamp` to move backwards.
-
+special case during rollback it is possible for the `stableTimestamp` to move backwards.  
 The calculation of this value in the replication layer occurs [here](https://github.com/mongodb/mongo/blob/00fbc981646d9e6ebc391f45a31f4070d4466753/src/mongo/db/repl/replication_coordinator_impl.cpp#L4824-L4881).
-The replication layer will [skip setting the stable timestamp](https://github.com/mongodb/mongo/blob/00fbc981646d9e6ebc391f45a31f4070d4466753/src/mongo/db/repl/replication_coordinator_impl.cpp#L4907-L4921) if it is earlier than the
-`initialDataTimestamp`, since data earlier than that timestamp may be inconsistent.
+The replication layer will [skip setting the stable timestamp](https://github.com/mongodb/mongo/blob/00fbc981646d9e6ebc391f45a31f4070d4466753/src/mongo/db/repl/replication_coordinator_impl.cpp#L4907-L4921)
+if it is earlier than the `initialDataTimestamp`, since data earlier than that timestamp may be
+inconsistent.
+During restore, we may proactively set the stable timestamp as we apply oplog batches even before
+we set the `initialDataTimestamp`. This means that after startup recovery for restore (and for
+File Copy Based Initial Sync), we cannot guarantee that the stable timestamp is actually majority
+committed. However, this is safe because we do not allow rollbacks before the
+`initialDataTimestamp` and when both FCBIS and startup recovery for restore complete, the
+`initialDataTimestamp` will be equal to the stable timestamp.
+
+#### Timestamps related to both prepared and non-prepared transactions:
+
+-   **`prepareTimestamp`**: The timestamp of the ‘prepare’ oplog entry for a prepared transaction. This
+    is the earliest timestamp at which it is legal to commit the transaction. This timestamp is provided
+    to the storage engine to block reads that are trying to read prepared data until the storage engines
+    knows whether the prepared transaction has committed or aborted.
+
+-   **`commit oplog entry timestamp`**: The timestamp of the ‘commitTransaction’ oplog entry for a
+    prepared transaction, or the timestamp of the ‘applyOps’ oplog entry for a non-prepared transaction.
+    In a cross-shard transaction each shard may have a different commit oplog entry timestamp. This is
+    guaranteed to be greater than the `prepareTimestamp`. When the `stable_timestamp` advances to this
+    point, the transaction can’t be rolled-back; hence, it is referred to as the transaction's
+    `durable_timestamp` in [WT](https://source.wiredtiger.com/develop/timestamp_txn_api.html).
+
+-   **`commitTimestamp`**: The timestamp at which we committed a multi-document transaction, referred
+    to as `commit_timestamp` in [WT](https://source.wiredtiger.com/develop/timestamp_txn_api.html). This will
+    be the `commitTimestamp` field in the `commitTransaction` oplog entry for a prepared transaction, or
+    the timestamp of the ‘applyOps’ oplog entry for a non-prepared transaction. In a cross-shard
+    transaction this timestamp is the same across all shards. The effects of the transaction are visible
+    as of this timestamp. Note that `commitTimestamp` and the `commit oplog entry timestamp` are the
+    same for non-prepared transactions because we do not write down the oplog entry until we commit the
+    transaction. For a prepared transaction, we have the following guarantee: `prepareTimestamp` <=
+    `commitTimestamp` <= `commit oplog entry timestamp`
 
 # Non-replication subsystems dependent on replication state transitions.
 
@@ -2225,5 +2332,5 @@ entire node which can result in longer periods of write unavailability for the r
 
 The PrimaryOnlyService interface is more sophisticated than the ReplicaSetAwareService interface and
 is designed specifically for services built on persistent state machines that must be driven to
-conclusion by the Primary node of the replica set, even across failovers.  Check out [this
+conclusion by the Primary node of the replica set, even across failovers. Check out [this
 document](../../../../docs/primary_only_service.md) for more information about PrimaryOnlyServices.

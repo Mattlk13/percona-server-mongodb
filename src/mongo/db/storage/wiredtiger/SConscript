@@ -37,6 +37,7 @@ wtEnv.Library(
         'wiredtiger_backup_cursor_hooks.cpp',
         'wiredtiger_begin_transaction_block.cpp',
         'wiredtiger_column_store.cpp',
+        'wiredtiger_compiled_configuration.cpp',
         'wiredtiger_cursor.cpp',
         'wiredtiger_cursor_helpers.cpp',
         'wiredtiger_data_protector.cpp',
@@ -75,7 +76,6 @@ wtEnv.Library(
         '$BUILD_DIR/mongo/db/storage/record_store_base',
         '$BUILD_DIR/mongo/db/storage/recovery_unit_base',
         '$BUILD_DIR/mongo/db/storage/storage_file_util',
-        '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/mongo/util/concurrency/ticketholder',
         '$BUILD_DIR/mongo/util/elapsed_tracker',
         '$BUILD_DIR/mongo/util/processinfo',
@@ -99,8 +99,9 @@ wtEnv.Library(
         '$BUILD_DIR/mongo/db/storage/backup_block',
         '$BUILD_DIR/mongo/db/storage/backup_cursor_hooks',
         '$BUILD_DIR/mongo/db/storage/capped_snapshots',
-        '$BUILD_DIR/mongo/db/storage/storage_engine_parameters',
+        '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/mongo/db/storage/storage_repair_observer',
+        '$BUILD_DIR/mongo/util/concurrency/spin_lock',
         '$BUILD_DIR/mongo/util/log_and_backoff',
         '$BUILD_DIR/mongo/util/namespace_string_database_name_util',
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
@@ -150,6 +151,7 @@ wtEnv.Library(
         '$BUILD_DIR/mongo/db/commands/server_status_core',
         '$BUILD_DIR/mongo/db/shard_role',
         '$BUILD_DIR/mongo/db/storage/storage_engine_common',
+        '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
     ],
     LIBDEPS_DEPENDENTS=[
@@ -200,6 +202,7 @@ wtEnv.CppUnitTest(
         'wiredtiger_stats_test.cpp',
         'wiredtiger_recovery_unit_test.cpp',
         'wiredtiger_session_cache_test.cpp',
+        'wiredtiger_size_storer_test.cpp',
         'wiredtiger_util_test.cpp',
     ],
     LIBDEPS=[
@@ -230,6 +233,7 @@ wtEnv.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/repl/replmocks',
         '$BUILD_DIR/mongo/db/service_context_test_fixture',
+        '$BUILD_DIR/mongo/db/shard_role_api',
         '$BUILD_DIR/mongo/db/storage/durable_catalog',
         '$BUILD_DIR/mongo/db/storage/record_store_test_harness',
         '$BUILD_DIR/mongo/util/clock_source_mock',
@@ -244,6 +248,7 @@ wtEnv.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/service_context_test_fixture',
+        '$BUILD_DIR/mongo/db/shard_role_api',
         '$BUILD_DIR/mongo/db/storage/sorted_data_interface_test_harness',
         'storage_wiredtiger_core',
     ],
@@ -301,17 +306,20 @@ wtEnv.CppUnitTest(
 )
 
 wtEnv.Benchmark(
-    target='storage_wiredtiger_index_bm',
+    target='storage_wiredtiger_record_store_and_index_bm',
     source=[
         'wiredtiger_index_bm.cpp',
+        'wiredtiger_record_store_bm.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/multitenancy',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/storage/durable_catalog',
+        '$BUILD_DIR/mongo/db/storage/record_store_bm',
         '$BUILD_DIR/mongo/db/storage/sorted_data_interface_bm',
         'wiredtiger_index_test_harness',
+        'wiredtiger_record_store_test_harness',
     ],
 )
 
@@ -322,6 +330,7 @@ wtEnv.Benchmark(
         '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/service_context_non_d',
         '$BUILD_DIR/mongo/db/service_context_test_fixture',
+        '$BUILD_DIR/mongo/db/shard_role_api',
         '$BUILD_DIR/mongo/db/storage/durable_catalog',
         '$BUILD_DIR/mongo/util/clock_source_mock',
         'storage_wiredtiger_core',

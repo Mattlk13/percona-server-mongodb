@@ -42,6 +42,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/role_name.h"
 #include "mongo/db/auth/user_name.h"
+#include "mongo/db/auth/validated_tenancy_scope_factory.h"
 #include "mongo/db/basic_types.h"
 #include "mongo/db/client.h"
 #include "mongo/db/write_block_bypass.h"
@@ -61,19 +62,21 @@ ForwardableOperationMetadata::ForwardableOperationMetadata(OperationContext* opC
     if (auto optComment = opCtx->getComment()) {
         setComment(optComment->wrap());
     }
+
     if (const auto authMetadata = rpc::getImpersonatedUserMetadata(opCtx)) {
         if (authMetadata->getUser()) {
             AuthenticationMetadata metadata;
             metadata.setUser(authMetadata->getUser().get());
             metadata.setRoles(authMetadata->getRoles());
             setImpersonatedUserMetadata(metadata);
-        } else if (authMetadata->getUsers()) {
-            AuthenticationMetadata metadata;
-            metadata.setUsers(authMetadata->getUsers().get());
-            metadata.setRoles(authMetadata->getRoles());
-            setImpersonatedUserMetadata(metadata);
         }
     }
+    boost::optional<StringData> originalSecurityToken = boost::none;
+    const auto vts = auth::ValidatedTenancyScope::get(opCtx);
+    if (vts != boost::none && !vts->getOriginalToken().empty()) {
+        originalSecurityToken = vts->getOriginalToken();
+    }
+    setValidatedTenancyScopeToken(originalSecurityToken);
 
     setMayBypassWriteBlocking(WriteBlockBypass::get(opCtx).isWriteBlockBypassEnabled());
 }
@@ -87,17 +90,7 @@ void ForwardableOperationMetadata::setOn(OperationContext* opCtx) const {
 
     if (const auto& optAuthMetadata = getImpersonatedUserMetadata()) {
         const auto& authMetadata = optAuthMetadata.value();
-        UserName username;
-
-        if (authMetadata.getUser()) {
-            fassert(ErrorCodes::InternalError, authMetadata.getUsers() == boost::none);
-
-            username = authMetadata.getUser().get();
-        } else if (authMetadata.getUsers()) {
-            // TODO SERVER-72448: Remove
-            fassert(ErrorCodes::InternalError, authMetadata.getUsers()->size() == 1);
-            username = authMetadata.getUsers().get()[0];
-        }
+        UserName username(authMetadata.getUser().value_or(UserName()));
 
         if (!authMetadata.getRoles().empty()) {
             AuthorizationSession::get(client)->setImpersonatedUserData(username,
@@ -106,6 +99,12 @@ void ForwardableOperationMetadata::setOn(OperationContext* opCtx) const {
     }
 
     WriteBlockBypass::get(opCtx).set(getMayBypassWriteBlocking());
+    boost::optional<auth::ValidatedTenancyScope> validatedTenancyScope = boost::none;
+    const auto originalToken = getValidatedTenancyScopeToken();
+    if (originalToken != boost::none && !originalToken->empty()) {
+        validatedTenancyScope = auth::ValidatedTenancyScopeFactory::parse(client, *originalToken);
+    }
+    auth::ValidatedTenancyScope::set(opCtx, validatedTenancyScope);
 }
 
 }  // namespace mongo

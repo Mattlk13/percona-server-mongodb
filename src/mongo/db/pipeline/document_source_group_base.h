@@ -56,7 +56,6 @@
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/group_from_first_document_transformation.h"
 #include "mongo/db/pipeline/group_processor.h"
-#include "mongo/db/pipeline/memory_usage_tracker.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/stage_constraints.h"
 #include "mongo/db/pipeline/variables.h"
@@ -64,6 +63,7 @@
 #include "mongo/db/sorter/sorter.h"
 #include "mongo/db/sorter/sorter_stats.h"
 #include "mongo/logv2/log_attr.h"
+#include "mongo/util/memory_usage_tracker.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -81,7 +81,7 @@ public:
     using Accumulators = std::vector<boost::intrusive_ptr<AccumulatorState>>;
     using GroupsMap = ValueUnorderedMap<Accumulators>;
 
-    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final override;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
     boost::intrusive_ptr<DocumentSource> optimize() final;
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
     void addVariableRefs(std::set<Variables::Id>* refs) const final;
@@ -209,7 +209,7 @@ protected:
                             const boost::intrusive_ptr<ExpressionContext>& expCtx,
                             boost::optional<int64_t> maxMemoryUsageBytes = boost::none);
 
-    virtual ~DocumentSourceGroupBase();
+    ~DocumentSourceGroupBase() override;
 
     void initializeFromBson(BSONElement elem);
     virtual bool isSpecFieldReserved(StringData fieldName) = 0;
@@ -218,6 +218,13 @@ protected:
 
     virtual void serializeAdditionalFields(
         MutableDocument& out, const SerializationOptions& opts = SerializationOptions{}) const {};
+
+    /**
+     * Returns true iff rewriteGroupAsTransformOnFirstDocument() returns a non-null value.
+     */
+    bool isEligibleForTransformOnFirstDocument(
+        GroupFromFirstDocumentTransformation::ExpectedInput& expectedInput,
+        std::string& groupId) const;
 
     GroupProcessor _groupProcessor;
 

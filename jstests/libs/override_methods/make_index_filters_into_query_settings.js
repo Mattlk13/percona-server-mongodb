@@ -1,4 +1,4 @@
-import {getWinningPlan, isIdhack} from "jstests/libs/analyze_plan.js";
+import {getWinningPlan, isIdhackOrExpress} from "jstests/libs/analyze_plan.js";
 import {OverrideHelpers} from "jstests/libs/override_methods/override_helpers.js";
 
 function addOptionalQueryFields(src, dst) {
@@ -50,12 +50,23 @@ function planCacheSetFilterToSetQuerySettings(conn, dbName, cmdObj) {
     // Setting index filters on idhack query is no-op for index filter command, but is a failure
     // for query settings command, therefore avoid specifying query settings and return success.
     const explain = db.runCommand({explain: queryInstance});
-    if (isIdhack(db, getWinningPlan(explain.queryPlanner))) {
+    if (isIdhackOrExpress(db, getWinningPlan(explain.queryPlanner))) {
         return {ok: 1};
     }
 
+    // Query settings differ from index filters in the sense that they need explicit '$natural'
+    // hints to allow for collection scans. Otherwise, 'COLLSCAN' stages are outright forbidden and
+    // it's possible that the re-planning fallback will generate an undesired IXSCAN stage.
+    //
+    // To prevent this from happening we append '{$natural: 1}' and '{$natural: -1}' to allow both
+    // forward and backward collection scans.
     queryInstance["$db"] = dbName;
-    const settings = {indexHints: {allowedIndexes: cmdObj["indexes"]}};
+    const settings = {
+        indexHints: {
+            ns: {db: dbName, coll: collName},
+            allowedIndexes: [...cmdObj["indexes"], {$natural: 1}, {$natural: -1}]
+        }
+    };
 
     // Run setQuerySettings command.
     const adminDb = conn.getDB("admin");
@@ -99,10 +110,15 @@ function planCacheListFiltersToDollarQuerySettings(conn, cmdObj) {
             ])
             .toArray();
 
+    function isNotNaturalHint(allowedIndex) {
+        return typeof allowedIndex !== "object" || !allowedIndex.hasOwnProperty("$natural");
+    }
     function fromQueryShapeConfigurationToIndexFilter(queryShapeConfig) {
         let indexFilter = {
             query: queryShapeConfig.representativeQuery.filter,
-            indexes: queryShapeConfig.settings.indexHints.allowedIndexes
+            // Remove the previously added '$natural' hints to ensure that the results match the
+            // expected output.
+            indexes: queryShapeConfig.settings.indexHints.allowedIndexes.filter(isNotNaturalHint)
         };
         addOptionalQueryFields(queryShapeConfig.representativeQuery, indexFilter);
         return indexFilter;
@@ -142,4 +158,5 @@ function runCommandOverride(conn, dbName, cmdName, cmdObj, clientFunction, makeF
 OverrideHelpers.overrideRunCommand(runCommandOverride);
 
 // Always apply the override if a test spawns a parallel shell.
-OverrideHelpers.prependOverrideInParallelShell("jstests/libs/override_methods/rerun_queries.js");
+OverrideHelpers.prependOverrideInParallelShell(
+    "jstests/libs/override_methods/make_index_filters_into_query_settings.js");

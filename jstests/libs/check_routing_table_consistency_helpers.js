@@ -15,11 +15,10 @@ export var RoutingTableConsistencyChecker = (function() {
         return true;
     };
 
-    const fetchRoutingTableData =
-        (mongos) => {
-            // Group docs in config.chunks by coll UUID (sorting by minKey), then join with docs in
-            // config.collections.
-            return mongos.getDB('config')
+    const fetchRoutingTableData = (mongos) => {
+        // Group docs in config.chunks by coll UUID (sorting by minKey), then join with docs in
+        // config.collections.
+        return mongos.getDB('config')
                 .chunks
                 .aggregate([
                     { $sort: { min: 1 } },
@@ -37,8 +36,8 @@ export var RoutingTableConsistencyChecker = (function() {
                             as: 'details'
                         },
                     }
-                ]);
-        };
+                ], {readConcern: {level: "snapshot"}});
+    };
 
     const checkCollRoutingTable = (nss, shardKeyPattern, routingTable) => {
         if (!routingTable) {
@@ -92,7 +91,7 @@ export var RoutingTableConsistencyChecker = (function() {
      * }
      **/
     const collectPlacementMetadataByNamespace = (mongos) => {
-        const pipeline = [
+        let pipeline = [
             // 1.1  Current placement metadata on existing collections
             {
                 $lookup: {
@@ -192,6 +191,24 @@ export var RoutingTableConsistencyChecker = (function() {
             }
         ];
 
+        // Sharding metadata on temporary resharding collections require special treatment:
+        // - when created by the server code, they only include routing information (but no
+        // historical placement metadata)
+        // - when forged by the test code (usually through shardCollection()) they behave as a
+        // regular collection. The pipeline needs hence to be modified as follows:
+        const tempReshardingCollectionsFilter = {
+            $match: {_id: {$not: {$regex: /^[^.]+\.system\.resharding\..+$/}}}
+        };
+        if (TestData.mayForgeReshardingTempCollections) {
+            // Perform no check on the temporary collections by adding a filter to
+            // the fully-outer-joined data.
+            pipeline.push(tempReshardingCollectionsFilter);
+        } else {
+            // Only filter out temporary collections from config.collections; this will allow to
+            // check that such namespaces are not mentioned in config.placementHistory.
+            pipeline.unshift(tempReshardingCollectionsFilter);
+        }
+
         return mongos.getDB('config').collections.aggregate(pipeline,
                                                             {readConcern: {level: "snapshot"}});
     };
@@ -223,6 +240,19 @@ export var RoutingTableConsistencyChecker = (function() {
         try {
             jsTest.log('Checking routing table consistency');
 
+            // Although the balancer has already stopped its activity, there might still be some
+            // outstanding moveCollection (backed by _shardsvrReshardCollection) running on shards.
+            // TODO SERVER-76646 remove/adapt the assert.soon logic below.
+            assert.soon(function() {
+                const adminDB = mongos.getDB('admin');
+                const inflightReshardCollections =
+                    assert
+                        .commandWorked(
+                            adminDB.currentOp({type: 'op', desc: 'ReshardCollectionCoordinator'}))
+                        .inprog;
+                return inflightReshardCollections.length === 0;
+            }, 'Unable to drain inflight reshardCollection operations within the expected timeout');
+
             // Group docs in config.chunks by coll UUID (sorting by minKey), then join with docs in
             // config.collections.
             const testCollectionsWithRoutingTable = fetchRoutingTableData(mongos);
@@ -241,11 +271,17 @@ export var RoutingTableConsistencyChecker = (function() {
             });
             jsTest.log('Routing table consistency check completed');
         } catch (e) {
-            if (e.code !== ErrorCodes.Unauthorized) {
+            if (e.code === ErrorCodes.Unauthorized) {
+                jsTest.log(
+                    'Skipping check of routing table consistency - access to admin collections is not authorized');
+            } else if (e.code === ErrorCodes.FailedToSatisfyReadPreference) {
+                // $currentOp may fail when a test stops a replica set outside the standard cluster
+                // fixture teardown procedure.
+                jsTest.log(
+                    'Skipping check of routing table consistency - unable to access all the shards of the cluster');
+            } else {
                 throw e;
             }
-            jsTest.log(
-                'Skipping check of routing table consistency - access to admin collections is not authorized');
         }
 
         try {

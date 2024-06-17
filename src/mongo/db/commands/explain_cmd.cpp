@@ -50,6 +50,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/service_context.h"
 #include "mongo/idl/idl_parser.h"
 #include "mongo/rpc/op_msg.h"
@@ -78,7 +79,7 @@ class CmdExplain final : public Command {
 public:
     CmdExplain() : Command("explain") {}
 
-    const std::set<std::string>& apiVersions() const {
+    const std::set<std::string>& apiVersions() const override {
         return kApiVersions1;
     }
 
@@ -125,7 +126,7 @@ public:
                std::unique_ptr<CommandInvocation> innerInvocation)
         : CommandInvocation(explainCommand),
           _outerRequest{&request},
-          _dbName(request.getDbName()),
+          _dbName(request.parseDbName()),
           _verbosity{std::move(verbosity)},
           _innerRequest{std::move(innerRequest)},
           _innerInvocation{std::move(innerInvocation)} {}
@@ -151,8 +152,24 @@ public:
         return _innerInvocation->ns();
     }
 
+    const DatabaseName& db() const override {
+        return _dbName;
+    }
+
     bool supportsWriteConcern() const override {
         return false;
+    }
+
+    ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level,
+                                                 bool isImplicitDefault) const override {
+        static const Status kDefaultReadConcernNotPermitted{
+            ErrorCodes::InvalidOptions,
+            "Explain does not permit default readConcern to be applied."};
+        return {Status::OK(), {kDefaultReadConcernNotPermitted}};
+    }
+
+    bool isSubjectToIngressAdmissionControl() const override {
+        return true;
     }
 
     /**
@@ -171,7 +188,6 @@ private:
 
     const OpMsgRequest* _outerRequest;
     const DatabaseName _dbName;
-    const NamespaceString _ns;
     ExplainOptions::Verbosity _verbosity;
     std::unique_ptr<OpMsgRequest> _innerRequest;  // Lifespan must enclose that of _innerInvocation.
     std::unique_ptr<CommandInvocation> _innerInvocation;
@@ -189,6 +205,16 @@ std::unique_ptr<CommandInvocation> CmdExplain::parse(OperationContext* opCtx,
     auto const dbName = cmdObj.getDbName();
     ExplainOptions::Verbosity verbosity = cmdObj.getVerbosity();
     auto explainedObj = cmdObj.getCommandParameter();
+
+    // Ensure the explain verbosities are supported
+    uassert(
+        ErrorCodes::CommandNotSupported,
+        str::stream() << "Verbosity \"" << Verbosity_serializer(verbosity)
+                      << "\" not available for this configuration. featureFlagCommonQueryFramework "
+                         "must be enabled to run with verbosity queryPlannerDebug",
+        verbosity != ExplainOptions::Verbosity::kQueryPlannerDebug ||
+            feature_flags::gFeatureFlagCommonQueryFramework.isEnabled(
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot()));
 
     // Extract 'comment' field from the 'explainedObj' only if there is no top-level comment.
     auto commentField = explainedObj["comment"];
@@ -212,9 +238,8 @@ std::unique_ptr<CommandInvocation> CmdExplain::parse(OperationContext* opCtx,
             str::stream() << "Explain failed due to unknown command: "
                           << explainedObj.firstElementFieldName(),
             explainedCommand);
-    auto innerRequest =
-        std::make_unique<OpMsgRequest>(OpMsgRequestBuilder::createWithValidatedTenancyScope(
-            dbName, request.validatedTenancyScope, explainedObj, cmdObj.getSerializationContext()));
+    auto innerRequest = std::make_unique<OpMsgRequest>(
+        OpMsgRequestBuilder::create(request.validatedTenancyScope, dbName, explainedObj));
     auto innerInvocation = explainedCommand->parseForExplain(opCtx, *innerRequest, verbosity);
     return std::make_unique<Invocation>(
         this, request, std::move(verbosity), std::move(innerRequest), std::move(innerInvocation));

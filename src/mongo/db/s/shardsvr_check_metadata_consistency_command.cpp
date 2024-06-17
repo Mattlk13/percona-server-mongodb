@@ -75,7 +75,6 @@
 #include "mongo/db/s/ddl_lock_manager.h"
 #include "mongo/db/s/metadata_consistency_util.h"
 #include "mongo/db/s/operation_sharding_state.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/shard_id.h"
 #include "mongo/executor/task_executor_pool.h"
@@ -95,6 +94,7 @@
 #include "mongo/s/query/establish_cursors.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 #include "mongo/s/shard_version.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/decorable.h"
 #include "mongo/util/duration.h"
@@ -168,7 +168,7 @@ public:
         using InvocationBase::InvocationBase;
 
         Response typedRun(OperationContext* opCtx) {
-            uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
+            ShardingState::get(opCtx)->assertCanAcceptShardedCommands();
 
             opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
             {
@@ -265,8 +265,6 @@ public:
          */
         std::vector<RemoteCursor> _establishCursorOnParticipants(OperationContext* opCtx,
                                                                  const NamespaceString& nss) {
-            std::vector<std::pair<ShardId, BSONObj>> requests;
-
             // Shard requests
             const auto shardOpKey = UUID::gen();
             ShardsvrCheckMetadataConsistencyParticipant participantRequest{nss};
@@ -274,8 +272,14 @@ public:
             participantRequest.setPrimaryShardId(ShardingState::get(opCtx)->shardId());
             participantRequest.setCursor(request().getCursor());
             const auto participants = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
-            auto participantRequestWithOpKey =
-                appendOpKey(shardOpKey, participantRequest.toBSON({}));
+
+            BSONObjBuilder participantRequestBob;
+            participantRequest.serialize(BSONObj(), &participantRequestBob);
+            appendOpKey(shardOpKey, &participantRequestBob);
+            auto participantRequestWithOpKey = participantRequestBob.obj();
+
+            std::vector<AsyncRequestsSender::Request> requests;
+            requests.reserve(participants.size() + 1);
             for (const auto& shardId : participants) {
                 requests.emplace_back(shardId, participantRequestWithOpKey.getOwned());
             }
@@ -284,8 +288,11 @@ public:
             const auto configOpKey = UUID::gen();
             ConfigsvrCheckMetadataConsistency configRequest{nss};
             participantRequest.setCursor(request().getCursor());
-            requests.emplace_back(ShardId::kConfigServerId,
-                                  appendOpKey(configOpKey, configRequest.toBSON({})));
+
+            BSONObjBuilder configRequestBob;
+            configRequest.serialize(BSONObj(), &configRequestBob);
+            appendOpKey(configOpKey, &configRequestBob);
+            requests.emplace_back(ShardId::kConfigServerId, configRequestBob.obj());
 
             return establishCursors(opCtx,
                                     Grid::get(opCtx)->getExecutorPool()->getFixedExecutor(),

@@ -1,4 +1,7 @@
-import {getAggPlanStage, isAggregationPlan} from "jstests/libs/analyze_plan.js";
+import {getAggPlanStage, getQueryPlanner, isAggregationPlan} from "jstests/libs/analyze_plan.js";
+import {DiscoverTopology} from "jstests/libs/discover_topology.js";
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {setParameterOnAllHosts} from "jstests/noPassthrough/libs/server_parameter_helpers.js";
 
 /**
  * Utility for checking if the Cascades optimizer code path is enabled (checks framework control).
@@ -7,11 +10,6 @@ export function checkCascadesOptimizerEnabled(theDB) {
     const val = theDB.adminCommand({getParameter: 1, internalQueryFrameworkControl: 1})
                     .internalQueryFrameworkControl;
     return val == "tryBonsai" || val == "tryBonsaiExperimental" || val == "forceBonsai";
-}
-
-// TODO SERVER-82185: Remove this once M2-eligibility checker + E2E parameterization implemented
-export function checkPlanCacheParameterization(theDB) {
-    return false;
 }
 
 /**
@@ -28,25 +26,38 @@ export function checkExperimentalCascadesOptimizerEnabled(theDB) {
  * Utility for checking if the Cascades optimizer feature flag is on.
  */
 export function checkCascadesFeatureFlagEnabled(theDB) {
-    const featureFlag = theDB.adminCommand({getParameter: 1, featureFlagCommonQueryFramework: 1});
-    return featureFlag.hasOwnProperty("featureFlagCommonQueryFramework") &&
-        featureFlag.featureFlagCommonQueryFramework.value;
+    return FeatureFlagUtil.isPresentAndEnabled(theDB, "CommonQueryFramework");
 }
 
 /**
  * Given the result of an explain command, returns whether the bonsai optimizer was used.
  */
 export function usedBonsaiOptimizer(explain) {
-    if (!isAggregationPlan(explain)) {
-        return explain.queryPlanner.winningPlan.hasOwnProperty("optimizerPlan");
+    function isCQF(queryPlanner) {
+        return queryPlanner.queryFramework === "cqf";
     }
 
-    const plannerOutput = getAggPlanStage(explain, "$cursor");
-    if (plannerOutput != null) {
-        return plannerOutput["$cursor"].queryPlanner.winningPlan.hasOwnProperty("optimizerPlan");
-    } else {
-        return explain.queryPlanner.winningPlan.hasOwnProperty("optimizerPlan");
+    // This section handles the explain output for aggregations against sharded colls.
+    if (explain.hasOwnProperty("shards")) {
+        for (let shardName of Object.keys(explain.shards)) {
+            if (!isCQF(getQueryPlanner(explain.shards[shardName]))) {
+                return false;
+            }
+        }
+        return true;
+    } else if (explain.hasOwnProperty("queryPlanner") &&
+               explain.queryPlanner.winningPlan.hasOwnProperty("shards")) {
+        // This section handles the explain output for find queries against sharded colls.
+        for (let shardExplain of explain.queryPlanner.winningPlan.shards) {
+            if (!isCQF(shardExplain)) {
+                return false;
+            }
+        }
+        return true
     }
+
+    // This section handles the explain output for unsharded queries.
+    return explain.hasOwnProperty("queryPlanner") && isCQF(explain.queryPlanner);
 }
 
 /**
@@ -61,10 +72,12 @@ export function leftmostLeafStage(node) {
             node = node.queryPlanner;
         } else if (node.winningPlan) {
             node = node.winningPlan;
-        } else if (node.optimizerPlan) {
-            node = node.optimizerPlan;
+        } else if (node.queryPlan) {
+            node = node.queryPlan;
         } else if (node.child) {
             node = node.child;
+        } else if (node.inputStage) {
+            node = node.inputStage;
         } else if (node.leftChild) {
             node = node.leftChild;
         } else if (node.children) {
@@ -97,7 +110,7 @@ export function getPlanSkeleton(node, options = {}) {
 
         'queryPlanner',
         'winningPlan',
-        'optimizerPlan',
+        'queryPlan',
         'child',
         'children',
         'leftChild',
@@ -306,7 +319,7 @@ export function prettyOp(op) {
  */
 export function removeUUIDsFromExplain(db, explain) {
     const listCollsRes = db.runCommand({listCollections: 1}).cursor.firstBatch;
-    let plan = explain.queryPlanner.winningPlan.optimizerPlan.plan.toString();
+    let plan = explain.queryPlanner.winningPlan.queryPlan.plan.toString();
 
     for (let entry of listCollsRes) {
         const uuidStr = entry.info.uuid.toString().slice(6).slice(0, -2);
@@ -316,34 +329,35 @@ export function removeUUIDsFromExplain(db, explain) {
 }
 
 export function navigateToPath(doc, path) {
-    let result;
-    let field;
-
+    let result = doc;
+    // Drop empty path components so we can treat '' as a 0-element path,
+    // and also not worry about extra '.' when concatenating paths.
+    let components = path.split(".").filter(s => s.length > 0);
     try {
-        result = doc;
-        for (field of path.split(".")) {
-            assert(result.hasOwnProperty(field));
-            result = result[field];
+        for (; components.length > 0; components = components.slice(1)) {
+            assert(result.hasOwnProperty(components[0]));
+            result = result[components[0]];
         }
         return result;
     } catch (e) {
-        jsTestLog("Error navigating to path '" + path + "'");
-        jsTestLog("Missing field: " + field);
+        const field = components[0];
+        const suffix = components.join('.');
+        jsTestLog(`Error navigating to path '${path}'\n` +
+                  `because the suffix '${suffix}' does not exist,\n` +
+                  `because the field '${field}' does not exist in this subtree:`);
         printjson(result);
+        jsTestLog("The entire tree was: ");
+        printjson(doc);
         throw e;
     }
 }
 
 export function navigateToPlanPath(doc, path) {
-    return navigateToPath(doc, "queryPlanner.winningPlan.optimizerPlan." + path);
-}
-
-function navigateToNonOptimizerPlanPath(doc, path) {
     return navigateToPath(doc, "queryPlanner.winningPlan.queryPlan." + path);
 }
 
 export function navigateToRootNode(doc) {
-    return navigateToPath(doc, "queryPlanner.winningPlan.optimizerPlan");
+    return navigateToPath(doc, "queryPlanner.winningPlan.queryPlan");
 }
 
 export function assertValueOnPathFn(value, doc, path, fn) {
@@ -364,10 +378,15 @@ export function assertValueOnPlanPath(value, doc, path) {
     assertValueOnPathFn(value, doc, path, navigateToPlanPath);
 }
 
-export function assertValueOnNonOptimizerPlanPath(value, doc, path) {
-    assertValueOnPathFn(value, doc, path, navigateToNonOptimizerPlanPath);
+export function runWithFastPathsDisabled(fn) {
+    const disableFastPath = [{key: "internalCascadesOptimizerDisableFastPath", value: true}];
+    return runWithParams(disableFastPath, fn);
 }
 
+// TODO SERVER-84743: Consolidate the following two functions.
+/**
+ * This is meant to be used by standalone passthrough tests, no need to pass in the db variable.
+ */
 export function runWithParams(keyValPairs, fn) {
     let prevVals = [];
 
@@ -399,6 +418,38 @@ export function runWithParams(keyValPairs, fn) {
             setParamObj[flag] = prevVals[i];
 
             assert.commandWorked(db.adminCommand(setParamObj));
+        }
+    }
+}
+
+/**
+ * This can be used for both standalone and sharded cases.
+ */
+export function runWithParamsAllNodes(db, keyValPairs, fn) {
+    let prevVals = [];
+
+    try {
+        for (let i = 0; i < keyValPairs.length; i++) {
+            const flag = keyValPairs[i].key;
+            const valIn = keyValPairs[i].value;
+            const val = (typeof valIn === 'object') ? JSON.stringify(valIn) : valIn;
+
+            let getParamObj = {};
+            getParamObj["getParameter"] = 1;
+            getParamObj[flag] = 1;
+            const prevVal = db.adminCommand(getParamObj);
+            prevVals.push(prevVal[flag]);
+
+            setParameterOnAllHosts(DiscoverTopology.findNonConfigNodes(db.getMongo()), flag, val);
+        }
+
+        return fn();
+    } finally {
+        for (let i = 0; i < keyValPairs.length; i++) {
+            const flag = keyValPairs[i].key;
+
+            setParameterOnAllHosts(
+                DiscoverTopology.findNonConfigNodes(db.getMongo()), flag, prevVals[i]);
         }
     }
 }

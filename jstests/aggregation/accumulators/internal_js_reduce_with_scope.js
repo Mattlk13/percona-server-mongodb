@@ -2,8 +2,9 @@
 // specified in runtimeConstants.
 //
 // Do not run in sharded passthroughs since 'runtimeConstants' is disallowed on mongos.
+// Must also set 'fromMongos: true' as otherwise 'runtimeConstants' is disallowed on mongod.
 // @tags: [
-//   assumes_unsharded_collection,
+//   assumes_against_mongod_not_mongos,
 //   requires_scripting,
 // ]
 import {resultsEq} from "jstests/aggregation/extras/utils.js";
@@ -38,6 +39,7 @@ const command = {
             }
         }
     }],
+    fromMongos: true,
 };
 
 const expectedResults = [

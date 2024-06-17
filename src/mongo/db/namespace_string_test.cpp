@@ -39,6 +39,7 @@
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_component.h"
 #include "mongo/unittest/assert.h"
@@ -55,8 +56,16 @@ protected:
         return NamespaceString(tenantId, ns);
     }
 
+    NamespaceString makeNamespaceString(const DatabaseName& dbName) {
+        return NamespaceString(dbName);
+    }
+
     NamespaceString makeNamespaceString(const DatabaseName& dbName, StringData coll) {
         return NamespaceString(dbName, coll);
+    }
+
+    NamespaceString makeNamespaceString(StringData dbName, StringData coll) {
+        return NamespaceString(boost::none, dbName, coll);
     }
 
     NamespaceString makeNamespaceString(boost::optional<TenantId> tenantId,
@@ -162,17 +171,36 @@ TEST_F(NamespaceStringTest, IsCollectionlessCursorNamespace) {
 }
 
 TEST_F(NamespaceStringTest, IsLegalClientSystemNamespace) {
-    const auto& currentFCV = serverGlobalParams.featureCompatibility;
-    ASSERT_TRUE(makeNamespaceString(boost::none, "test.system.buckets.1234")
-                    .isLegalClientSystemNS(currentFCV));
-    ASSERT_TRUE(makeNamespaceString(boost::none, "test.system.buckets.abcde")
-                    .isLegalClientSystemNS(currentFCV));
-    ASSERT_FALSE(makeNamespaceString(boost::none, "test.system.buckets..1234")
-                     .isLegalClientSystemNS(currentFCV));
-    ASSERT_FALSE(makeNamespaceString(boost::none, "test.system.buckets.a234$")
-                     .isLegalClientSystemNS(currentFCV));
+    // Generally speaking *.system.* collections are not valid client namespaces,
     ASSERT_FALSE(
-        makeNamespaceString(boost::none, "test.system.buckets.").isLegalClientSystemNS(currentFCV));
+        makeNamespaceString(boost::none, "admin.system.randomness").isLegalClientSystemNS());
+    ASSERT_FALSE(
+        makeNamespaceString(boost::none, "test.system.randomness").isLegalClientSystemNS());
+
+    // *.system.buckets.* is permitted, provided the collection name is valid.
+    ASSERT_TRUE(
+        makeNamespaceString(boost::none, "test.system.buckets.1234").isLegalClientSystemNS());
+    ASSERT_TRUE(
+        makeNamespaceString(boost::none, "test.system.buckets.abcde").isLegalClientSystemNS());
+    ASSERT_FALSE(
+        makeNamespaceString(boost::none, "test.system.buckets..1234").isLegalClientSystemNS());
+    ASSERT_FALSE(
+        makeNamespaceString(boost::none, "test.system.buckets.a234$").isLegalClientSystemNS());
+    ASSERT_FALSE(makeNamespaceString(boost::none, "test.system.buckets.").isLegalClientSystemNS());
+
+    // admin.system.new_users may have been created during a migration from MongoDB 2.4-2.6
+    // It is no longer used by mongod, however clients with adequate permissions should still
+    // be able to drop it, perform backups, etc..
+    ASSERT_TRUE(makeNamespaceString(boost::none, "admin.system.new_users").isLegalClientSystemNS());
+
+    // *.system.users is always permitted because in 2.4 and earlier's auth schema,
+    // users were stored in an individual database's db.system.users collection.
+    ASSERT_TRUE(makeNamespaceString(boost::none, "admin.system.users").isLegalClientSystemNS());
+    ASSERT_TRUE(makeNamespaceString(boost::none, "test.system.users").isLegalClientSystemNS());
+
+    // By contrast, .system.roles is only allowed in the admin database.
+    ASSERT_TRUE(makeNamespaceString(boost::none, "admin.system.roles").isLegalClientSystemNS());
+    ASSERT_FALSE(makeNamespaceString(boost::none, "test.system.roles").isLegalClientSystemNS());
 }
 
 TEST_F(NamespaceStringTest, IsDropPendingNamespace) {
@@ -286,6 +314,11 @@ TEST_F(NamespaceStringTest, CollectionValidNames) {
     ASSERT(!NamespaceString::validCollectionName("a\0b"_sd));
 }
 
+TEST_F(NamespaceStringTest, DbForSharding) {
+    ASSERT_EQ(makeNamespaceString("foo", "bar").db_forSharding(), "foo");
+    ASSERT_EQ(makeNamespaceString("foo", "").db_forSharding(), "foo");
+}
+
 TEST_F(NamespaceStringTest, nsToDatabase1) {
     ASSERT_EQUALS("foo", nsToDatabaseSubstring("foo.bar"));
     ASSERT_EQUALS("foo", nsToDatabaseSubstring("foo"));
@@ -351,6 +384,8 @@ TEST_F(NamespaceStringTest, EmptyDbWithColl) {
     NamespaceString nss = makeNamespaceString(boost::none, "", "coll");
     ASSERT_EQ(nss.db_forTest(), StringData{});
     ASSERT_EQ(nss.coll(), "coll");
+    ASSERT_EQ(nss.dbName(), DatabaseName::kEmpty);
+    ASSERT_EQ(nss.dbName().compare(DatabaseName::kEmpty), 0);
 }
 
 TEST_F(NamespaceStringTest, NSSWithTenantId) {
@@ -359,13 +394,17 @@ TEST_F(NamespaceStringTest, NSSWithTenantId) {
     {
         std::string tenantNsStr = str::stream() << tenantId.toString() << "_foo.bar";
         NamespaceString nss = makeNamespaceString(tenantId, "foo.bar");
+        DatabaseName db = DatabaseName::createDatabaseName_forTest(tenantId, "foo");
+
         ASSERT_EQ(nss.size(), 7);
         ASSERT_EQ(nss.ns_forTest(), "foo.bar");
         ASSERT_EQ(nss.toString_forTest(), "foo.bar");
         ASSERT_EQ(nss.toStringWithTenantId_forTest(), tenantNsStr);
         ASSERT_EQ(nss.db_forTest(), "foo");
         ASSERT_EQ(nss.coll(), "bar");
+        ASSERT_EQ(nss.dbName(), db);
         ASSERT_EQ(nss.dbName().toString_forTest(), "foo");
+        ASSERT_EQ(nss.dbName().size(), db.size());
         ASSERT_EQ(nss.size(), 7);
         ASSERT(nss.tenantId());
         ASSERT(nss.dbName().tenantId());
@@ -587,6 +626,82 @@ TEST_F(NamespaceStringTest, EmptyNamespaceString) {
     ASSERT_EQ(emptyNss.toStringForErrorMsg(), "");
 }
 
+TEST_F(NamespaceStringTest, NsFromDbOnly) {
+    DatabaseName db = DatabaseName::createDatabaseName_forTest(boost::none, "testdb");
+    NamespaceString ns(db);
+
+    ASSERT_EQ(ns.size(), 6);
+    ASSERT_EQ(ns, makeNamespaceString(boost::none, "testdb", ""));
+}
+
+TEST_F(NamespaceStringTest, ConstRefAssignmentOperator) {
+    NamespaceString expected{makeNamespaceString("foo", "bar")};
+
+    NamespaceString actual;
+    actual = expected;
+
+    ASSERT_EQ(actual, expected);
+    ASSERT_EQ(actual.coll(), "bar");
+    ASSERT_EQ(actual.sizeWithTenant(), 7);
+    ASSERT_EQ(actual.size(), 7);
+}
+
+// Verify we can create a new NamespaceString with a DatabaseName created by ns.dbName(). We must
+// ensure we discard the collection from `ns` and we don't end up with `db.collection.collection`.
+TEST_F(NamespaceStringTest, NamespaceToDatabaseRoundtrip) {
+    auto dbName = "test"_sd;
+    auto collName = "foo"_sd;
+    auto otherCollName = "othername"_sd;
+
+    NamespaceString ns = makeNamespaceString(boost::none, dbName, collName);
+    NamespaceString nsDbOnly =
+        makeNamespaceString(DatabaseName::createDatabaseName_forTest(boost::none, dbName));
+    NamespaceString nsWithOtherColl = makeNamespaceString(boost::none, dbName, otherCollName);
+
+    auto runChecks = [&](const DatabaseName& db) {
+        ASSERT_EQ(db.size(), 4);
+
+        auto nsWithEmptyColl = makeNamespaceString(db);
+        ASSERT_EQ(nsWithEmptyColl, nsDbOnly);
+        ASSERT_EQ(nsWithEmptyColl.compare(nsDbOnly), 0);
+
+        auto newNs = makeNamespaceString(db, collName);
+        ASSERT_EQ(newNs.size(), 8);
+        ASSERT_EQ(ns, newNs);
+        ASSERT_EQ(ns.compare(newNs), 0);
+
+        auto anotherColl = makeNamespaceString(db, otherCollName);
+        ASSERT_EQ(anotherColl.size(), 14);
+        ASSERT_EQ(anotherColl.coll(), otherCollName);
+        ASSERT_EQ(anotherColl, nsWithOtherColl);
+        ASSERT_EQ(anotherColl.compare(nsWithOtherColl), 0);
+    };
+
+    const DatabaseName& dbRef = ns.dbName();
+    runChecks(dbRef);
+
+    const DatabaseName dbVal(ns.dbName());
+    runChecks(dbVal);
+}
+
+TEST_F(NamespaceStringTest, HashTest) {
+    auto ns = NamespaceString::createNamespaceString_forTest(boost::none, "foo", "bar");
+    auto ns2 = NamespaceString::createNamespaceString_forTest(boost::none, "foo", "bar");
+
+    auto db = DatabaseName::createDatabaseName_forTest(boost::none, "foo");
+
+    using NsHash = absl::Hash<NamespaceString>;
+    using DbHash = absl::Hash<DatabaseName>;
+
+    ASSERT_EQ(DbHash()(db), DbHash()(ns.dbName()));
+    ASSERT_EQ(NsHash()(ns), NsHash()(ns2));
+    ASSERT_EQ(NsHash()(ns2),
+              NsHash()(NamespaceString::createNamespaceString_forTest(ns.dbName(), "bar")));
+
+    ASSERT_EQ(NsHash()(NamespaceString(ns.dbName())),
+              NsHash()(NamespaceString::createNamespaceString_forTest(boost::none, "foo", "")));
+}
+
 TEST_F(NamespaceStringTest, isDbOnly) {
     TenantId tenantId(OID::gen());
 
@@ -616,7 +731,6 @@ TEST_F(NamespaceStringTest, isDbOnly) {
             DatabaseName::createDatabaseName_forTest(tenantId, "foo"), "bar")};
 
     for (const auto& nss : dbOnlyNamespaces) {
-        std::cout << "nss=" << nss.toStringForErrorMsg() << std::endl;
         ASSERT_TRUE(nss.isDbOnly());
     }
 
@@ -624,6 +738,30 @@ TEST_F(NamespaceStringTest, isDbOnly) {
         ASSERT_FALSE(nss.isDbOnly());
     }
 }
+
+TEST_F(NamespaceStringTest, CheckFormatNamespaceEmptyColl) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", false);
+    TenantId tenantId(OID::gen());
+    DatabaseName dbName = DatabaseName::createDatabaseName_forTest(tenantId, "dbTest");
+    auto nssInclColl = makeNamespaceString(dbName, "coll");
+    ASSERT_EQ(nssInclColl.toString_forTest(), "dbTest.coll");
+
+    auto nssEmptyColl = makeNamespaceString(dbName, "");
+    ASSERT_EQ(nssEmptyColl.toString_forTest(), "dbTest");
+}
+
+
+TEST_F(NamespaceStringTest, CheckFormatNamespaceEmptyCollMultitenancy) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    TenantId tenantId(OID::gen());
+    DatabaseName dbName = DatabaseName::createDatabaseName_forTest(tenantId, "dbTest");
+    auto nssInclColl = makeNamespaceString(dbName, "coll");
+    ASSERT_EQ(nssInclColl.toString_forTest(), "dbTest.coll");
+
+    auto nssEmptyColl = makeNamespaceString(dbName, "");
+    ASSERT_EQ(nssEmptyColl.toString_forTest(), "dbTest");
+}
+
 
 }  // namespace
 }  // namespace mongo

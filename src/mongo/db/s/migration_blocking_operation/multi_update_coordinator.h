@@ -31,16 +31,27 @@
 
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/s/migration_blocking_operation/multi_update_coordinator.h"
+#include "mongo/db/s/migration_blocking_operation/multi_update_coordinator_external_state.h"
 #include "mongo/db/s/migration_blocking_operation/multi_update_coordinator_gen.h"
 #include "mongo/db/s/primary_only_service_helpers/retry_until_majority_commit.h"
 
 namespace mongo {
 
+class MultiUpdateCoordinatorInstance;
+
 class MultiUpdateCoordinatorService : public repl::PrimaryOnlyService {
 public:
     static constexpr StringData kServiceName = "MultiUpdateCoordinatorService"_sd;
 
+    friend MultiUpdateCoordinatorInstance;
+
+    static void abortAndWaitForAllInstances(OperationContext* opCtx, Status reason);
+
     MultiUpdateCoordinatorService(ServiceContext* serviceContext);
+
+    MultiUpdateCoordinatorService(
+        ServiceContext* serviceContext,
+        std::unique_ptr<MultiUpdateCoordinatorExternalStateFactory> factory);
 
     StringData getServiceName() const override;
 
@@ -57,6 +68,7 @@ public:
 
 private:
     ServiceContext* _serviceContext;
+    std::unique_ptr<MultiUpdateCoordinatorExternalStateFactory> _externalStateFactory;
 };
 
 class MultiUpdateCoordinatorInstance
@@ -68,6 +80,7 @@ public:
     SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                          const CancellationToken& stepdownToken) noexcept override;
 
+    void abort(Status reason);
     void interrupt(Status status) override;
 
     boost::optional<BSONObj> reportForCurrentOp(
@@ -78,33 +91,60 @@ public:
 
     const MultiUpdateCoordinatorMetadata& getMetadata() const;
 
-    SharedSemiFuture<void> getCompletionFuture() const;
+    SharedSemiFuture<BSONObj> getCompletionFuture() const;
 
 private:
+    const boost::optional<Status>& _getAbortReason() const;
+    StatusWith<BSONObj> _getResult() const;
+
     MultiUpdateCoordinatorMutableFields _getMutableFields() const;
-    MultiUpdateCoordinatorStateEnum _getCurrentState() const;
+    MultiUpdateCoordinatorPhaseEnum _getCurrentPhase() const;
     MultiUpdateCoordinatorDocument _buildCurrentStateDocument() const;
+
+    void _acquireSession();
+    void _releaseSession();
+    const LogicalSessionId& _getSessionId() const;
+    bool _sessionIsCheckedOut() const;
+    bool _sessionIsPersisted() const;
+    bool _shouldReleaseSession() const;
+    bool _shouldUnblockMigrations() const;
+    bool _updatesPossiblyRunningFromPreviousTerm() const;
+    bool _currentlySteppingDown() const;
 
     void _initializeRun(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                         const CancellationToken& stepdownToken);
-    ExecutorFuture<void> _runWorkflow();
-    ExecutorFuture<void> _transitionToState(MultiUpdateCoordinatorStateEnum newState);
+    ExecutorFuture<void> _transitionToPhase(MultiUpdateCoordinatorPhaseEnum newPhase);
 
     void _updateInMemoryState(const MultiUpdateCoordinatorDocument& newStateDocument);
     void _updateOnDiskState(OperationContext* opCtx,
                             const MultiUpdateCoordinatorDocument& newStateDocument);
+
+    ExecutorFuture<BSONObj> _runWorkflow();
+    ExecutorFuture<void> _doAcquireSessionPhase();
+    ExecutorFuture<void> _doBlockMigrationsPhase();
+    ExecutorFuture<void> _doPerformUpdatePhase();
+    ExecutorFuture<void> _stopBlockingMigrationsIfNeeded();
+
+    Message getUpdateAsClusterCommand() const;
+    ExecutorFuture<void> _sendUpdateRequest();
+    ExecutorFuture<void> _waitForPendingUpdates();
+
 
     const MultiUpdateCoordinatorService* const _service;
 
     mutable Mutex _mutex = MONGO_MAKE_LATCH("MultiUpdateCoordinatorInstance::_mutex");
     const MultiUpdateCoordinatorMetadata _metadata;
     MultiUpdateCoordinatorMutableFields _mutableFields;
+    const MultiUpdateCoordinatorPhaseEnum _beganInPhase;
+    std::unique_ptr<MultiUpdateCoordinatorExternalState> _externalState;
 
     std::shared_ptr<executor::ScopedTaskExecutor> _taskExecutor;
     boost::optional<primary_only_service_helpers::CancelState> _cancelState;
     boost::optional<primary_only_service_helpers::RetryUntilMajorityCommit> _retry;
 
-    SharedPromise<void> _completionPromise;
+    SharedPromise<BSONObj> _completionPromise;
+    boost::optional<BSONObj> _cmdResponse;
+    boost::optional<Status> _abortReason;
 };
 
 }  // namespace mongo

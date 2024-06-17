@@ -1,19 +1,20 @@
 // Tests that the winning plan statistics are correctly reported in Explain output at
 // "allPlansExecution" verbosity mode.
 //
-// This test is not prepared to handle explain output for sharded collections or when executed
-// against a mongos.
+// This test is not prepared to handle explain output for sharded collections.
 // @tags: [
 //   assumes_unsharded_collection,
 //   assumes_against_mongod_not_mongos,
 // ]
+
+import {getExecutionStats, getOptimizer} from "jstests/libs/analyze_plan.js";
 
 const coll = db.explain_winning_plan;
 coll.drop();
 
 // Create two indexes to ensure that the best plan will be picked by the multi-planner.
 assert.commandWorked(coll.createIndex({a: 1}));
-assert.commandWorked(coll.createIndex({a: 1, b: 1}));
+assert.commandWorked(coll.createIndex({a: -1, b: 1}));
 
 // Load the server parameter which instructs the planner to stop when a candidate plan returns that
 // many documents.
@@ -42,22 +43,34 @@ assert.eq(explain.executionStats.nReturned, numDocs);
 // Make sure the "allPlansExecution" section contains an array with exactly two elements
 // representing two candidate plans evaluated by the multi-planner.
 assert(explain.executionStats.hasOwnProperty("allPlansExecution"), explain);
-assert(Array.isArray(explain.executionStats.allPlansExecution), explain);
-assert.eq(explain.executionStats.allPlansExecution.length, 2, explain);
+// On a sharded cluster, this test assumes that the cluster only has one shard.
+const executionStats = getExecutionStats(explain)[0];
+assert(Array.isArray(executionStats.allPlansExecution), explain);
+
+switch (getOptimizer(explain)) {
+    case "classic":
+        assert.eq(executionStats.allPlansExecution.length, 2, explain);
+        break;
+    case "CQF":
+        // TODO SERVER-77719: Ensure that the decision for using the scan lines up with CQF
+        // optimizer. M2: allow only collscans, M4: check bonsai behavior for index scan.
+        break;
+}
 
 // Each candidate plan should have returned exactly 'maxResults' number of documents during the
 // trial period.
-for (const planStats of explain.executionStats.allPlansExecution) {
+for (const planStats of executionStats.allPlansExecution) {
     assert(planStats.hasOwnProperty("nReturned"));
     assert.eq(planStats.nReturned, maxResults, explain);
 }
 
 // If there was a single plan, allPlansExecution array should be present but empty.
 const explainSinglePlan = coll.find().explain("allPlansExecution");
-assert(explainSinglePlan.hasOwnProperty("executionStats"), explainSinglePlan);
-assert.eq(explainSinglePlan.executionStats.nReturned, numDocs);
-assert(explainSinglePlan.executionStats.hasOwnProperty("allPlansExecution"), explainSinglePlan);
-assert(Array.isArray(explainSinglePlan.executionStats.allPlansExecution), explainSinglePlan);
-assert.eq(explainSinglePlan.executionStats.allPlansExecution.length, 0, explainSinglePlan);
+// On a sharded cluster, this test assumes that the cluster only has one shard.
+const explainSingleExecutionStats = getExecutionStats(explainSinglePlan)[0];
+assert.eq(explainSingleExecutionStats.nReturned, numDocs);
+assert(explainSingleExecutionStats.hasOwnProperty("allPlansExecution"), explainSinglePlan);
+assert(Array.isArray(explainSingleExecutionStats.allPlansExecution), explainSinglePlan);
+assert.eq(explainSingleExecutionStats.allPlansExecution.length, 0, explainSinglePlan);
 
 assert(coll.drop());

@@ -3,7 +3,7 @@
 // @tags: [
 //   # The test runs commands that are not allowed with security token: endSession,
 //   # setProfilingLevel.
-//   not_allowed_with_security_token,
+//   not_allowed_with_signed_security_token,
 //   uses_transactions,
 //   requires_profiling,
 // ]
@@ -239,3 +239,4 @@ assert.eq(profileObj.errCode, ErrorCodes.WriteConflict, tojson(profileObj));
 assert.commandFailedWithCode(session.abortTransaction_forTesting(), ErrorCodes.NoSuchTransaction);
 
 session.endSession();
+assert.commandWorked(testDB.setProfilingLevel(0));

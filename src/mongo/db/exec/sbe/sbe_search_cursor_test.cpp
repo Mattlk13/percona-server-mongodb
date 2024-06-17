@@ -37,6 +37,7 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/sbe_plan_stage_test.h"
 #include "mongo/db/exec/sbe/stages/search_cursor.h"
@@ -56,6 +57,7 @@
 #include "mongo/unittest/framework.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 namespace mongo::sbe {
 
 using SearchCursorStageTest = PlanStageTestFixture;
@@ -126,30 +128,41 @@ std::unique_ptr<executor::TaskExecutorCursor> mockTaskExecutorCursor(OperationCo
         std::move(opts));
 }
 
-std::unique_ptr<PlanStage> makeSearchCursorStage(value::SlotId resultSlot,
+std::unique_ptr<PlanStage> makeSearchCursorStage(value::SlotId idSlot,
+                                                 value::SlotId resultSlot,
                                                  std::vector<std::string> metadataNames,
                                                  value::SlotVector metadataSlots,
                                                  std::vector<std::string> fieldNames,
                                                  value::SlotVector fieldSlots,
                                                  bool isStoredSource,
                                                  value::SlotId limitSlot) {
-    const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->uuid = UUID::gen();
-    return makeS<SearchCursorStage>(NamespaceString::kEmpty,
-                                    expCtx->uuid,
-                                    resultSlot,
-                                    metadataNames,
-                                    metadataSlots,
-                                    fieldNames,
-                                    fieldSlots,
-                                    0,
-                                    isStoredSource,
-                                    boost::none, /* sortSpecSlot */
-                                    limitSlot,
-                                    boost::none, /* sortKeySlot */
-                                    boost::none, /* collatorSlot */
-                                    nullptr /* yieldPolicy */,
-                                    kEmptyPlanNodeId);
+    return isStoredSource
+        ? SearchCursorStage::createForStoredSource(NamespaceString::kEmpty,
+                                                   UUID::gen(),
+                                                   resultSlot,
+                                                   metadataNames,
+                                                   metadataSlots,
+                                                   fieldNames,
+                                                   fieldSlots,
+                                                   0 /* remoteCursorId */,
+                                                   boost::none /* sortSpecSlot */,
+                                                   limitSlot,
+                                                   boost::none /* sortKeySlot */,
+                                                   boost::none /* collatorSlot */,
+                                                   nullptr /* yieldPolicy */,
+                                                   kEmptyPlanNodeId)
+        : SearchCursorStage::createForNonStoredSource(NamespaceString::kEmpty,
+                                                      UUID::gen(),
+                                                      idSlot,
+                                                      metadataNames,
+                                                      metadataSlots,
+                                                      0 /* remoteCursorId */,
+                                                      boost::none /* sortSpecSlot */,
+                                                      limitSlot,
+                                                      boost::none /* sortKeySlot */,
+                                                      boost::none /* collatorSlot */,
+                                                      nullptr /* yieldPolicy */,
+                                                      kEmptyPlanNodeId);
 }
 
 TEST_F(SearchCursorStageTest, SearchTestOutputs) {
@@ -163,18 +176,22 @@ TEST_F(SearchCursorStageTest, SearchTestOutputs) {
                                        getSlotIdGenerator());
 
     // Generate slots for the outputs.
-    auto resultSlot = generateSlotId();
+    auto idSlot = generateSlotId();
     std::vector<std::string> metadataNames = {"metaA", "metaB"};
     auto metadataSlots = generateMultipleSlotIds(2);
-    std::vector<std::string> fieldNames = {"fieldA", "fieldB"};
-    auto fieldSlots = generateMultipleSlotIds(2);
 
     const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     expCtx->uuid = UUID::gen();
 
     // Build and prepare for execution of the search cursor stage.
-    auto searchCursor = makeSearchCursorStage(
-        resultSlot, metadataNames, metadataSlots, fieldNames, fieldSlots, false, limitSlot);
+    auto searchCursor = makeSearchCursorStage(idSlot,
+                                              0 /* resultSlot */,
+                                              metadataNames,
+                                              metadataSlots,
+                                              {} /* fieldNames */,
+                                              {} /* fieldSlots */,
+                                              false /* isStoredSource */,
+                                              limitSlot);
 
     auto ctx = makeCompileCtx(std::move(env));
     auto remoteCursors = std::make_unique<RemoteCursorMap>();
@@ -189,23 +206,14 @@ TEST_F(SearchCursorStageTest, SearchTestOutputs) {
          st = searchCursor->getNext(), i++) {
         auto curElem = resultArray[i].Obj();
 
-        auto [actualTag, actualVal] = searchCursor->getAccessor(*ctx, resultSlot)->getViewOfValue();
-        auto [expectedTag, expectedVal] = stage_builder::makeValue(curElem);
-        value::ValueGuard guard(expectedTag, expectedVal);
-        assertValuesEqual(actualTag, actualVal, expectedTag, expectedVal);
+        auto [idTag, idVal] = searchCursor->getAccessor(*ctx, idSlot)->getViewOfValue();
+        ASSERT_EQ(idTag, sbe::value::TypeTags::NumberInt32);
+        ASSERT_EQ(curElem.getIntField("_id"), value::bitcastTo<int32_t>(idVal));
 
         for (size_t p = 0; p < metadataNames.size(); ++p) {
             ASSERT(curElem.hasField(metadataNames[p]));
             auto [tag, val] = searchCursor->getAccessor(*ctx, metadataSlots[p])->getViewOfValue();
             auto expVal = curElem[metadataNames[p]].Int();
-            ASSERT_EQ(tag, sbe::value::TypeTags::NumberInt32);
-            ASSERT_EQ(value::bitcastTo<int32_t>(val), expVal);
-        }
-
-        for (size_t p = 0; p < fieldNames.size(); ++p) {
-            ASSERT(curElem.hasField(fieldNames[p]));
-            auto [tag, val] = searchCursor->getAccessor(*ctx, fieldSlots[p])->getViewOfValue();
-            auto expVal = curElem[fieldNames[p]].Int();
             ASSERT_EQ(tag, sbe::value::TypeTags::NumberInt32);
             ASSERT_EQ(value::bitcastTo<int32_t>(val), expVal);
         }
@@ -234,8 +242,14 @@ TEST_F(SearchCursorStageTest, SearchTestLimit) {
 
 
     // Build and prepare for execution of the search cursor stage.
-    auto searchCursor = makeSearchCursorStage(
-        resultSlot, metadataNames, metadataSlots, fieldNames, fieldSlots, true, limitSlot);
+    auto searchCursor = makeSearchCursorStage(0 /* idSlot */,
+                                              resultSlot,
+                                              metadataNames,
+                                              metadataSlots,
+                                              fieldNames,
+                                              fieldSlots,
+                                              true /* isStoredSource */,
+                                              limitSlot);
 
     auto ctx = makeCompileCtx(std::move(env));
     auto remoteCursors = std::make_unique<RemoteCursorMap>();
@@ -273,8 +287,14 @@ TEST_F(SearchCursorStageTest, SearchTestStoredSource) {
     expCtx->uuid = UUID::gen();
 
     // Build and prepare for execution of the search cursor stage.
-    auto searchCursor = makeSearchCursorStage(
-        resultSlot, metadataNames, metadataSlots, fieldNames, fieldSlots, true, limitSlot);
+    auto searchCursor = makeSearchCursorStage(0 /* idSlot */,
+                                              resultSlot,
+                                              metadataNames,
+                                              metadataSlots,
+                                              fieldNames,
+                                              fieldSlots,
+                                              true /* isStoredSource */,
+                                              limitSlot);
 
     auto ctx = makeCompileCtx(std::move(env));
     auto remoteCursors = std::make_unique<RemoteCursorMap>();

@@ -323,8 +323,9 @@ void AuthCounter::append(BSONObjBuilder* b) {
 }
 
 OpCounterServerStatusSection::OpCounterServerStatusSection(const std::string& sectionName,
+                                                           ClusterRole role,
                                                            OpCounters* counters)
-    : ServerStatusSection(sectionName), _counters(counters) {}
+    : ServerStatusSection(sectionName, role), _counters(counters) {}
 
 BSONObj OpCounterServerStatusSection::generateSection(OperationContext* opCtx,
                                                       const BSONElement& configElement) const {
@@ -335,7 +336,7 @@ OpCounters globalOpCounters;
 OpCounters replOpCounters;
 NetworkCounter networkCounter;
 AuthCounter authCounter;
-AggStageCounters aggStageCounters;
+AggStageCounters aggStageCounters{"aggStageCounters."};
 DotsAndDollarsFieldsCounters dotsAndDollarsFieldsCounters;
 QueryFrameworkCounters queryFrameworkCounters;
 LookupPushdownCounters lookupPushdownCounters;
@@ -349,16 +350,27 @@ OperatorCounters operatorCountersMatchExpressions{"operatorCounters.match."};
 OperatorCounters operatorCountersGroupAccumulatorExpressions{"operatorCounters.groupAccumulators."};
 OperatorCounters operatorCountersWindowAccumulatorExpressions{
     "operatorCounters.windowAccumulators."};
-CounterMetric updateManyCount("query.updateManyCount");
-CounterMetric deleteManyCount("query.deleteManyCount");
-CounterMetric updateOneTargetedShardedCount("query.updateOneTargetedShardedCount");
-CounterMetric deleteOneTargetedShardedCount("query.deleteOneTargetedShardedCount");
-CounterMetric findAndModifyTargetedShardedCount("query.findAndModifyTargetedShardedCount");
-CounterMetric updateOneUnshardedCount("query.updateOneUnshardedCount");
-CounterMetric deleteOneUnshardedCount("query.deleteOneUnshardedCount");
-CounterMetric findAndModifyUnshardedCount("query.findAndModifyUnshardedCount");
-CounterMetric updateOneNonTargetedShardedCount("query.updateOneNonTargetedShardedCount");
-CounterMetric deleteOneNonTargetedShardedCount("query.deleteOneNonTargetedShardedCount");
-CounterMetric findAndModifyNonTargetedShardedCount("query.findAndModifyNonTargetedShardedCount");
 
+#define DEFN_QUERY_COUNTER(var)                  \
+    Counter64& var = *MetricBuilder<Counter64> { \
+        std::string{"query."} + #var             \
+    }
+DEFN_QUERY_COUNTER(updateManyCount);
+DEFN_QUERY_COUNTER(deleteManyCount);
+DEFN_QUERY_COUNTER(updateOneTargetedShardedCount);
+DEFN_QUERY_COUNTER(deleteOneTargetedShardedCount);
+DEFN_QUERY_COUNTER(findAndModifyTargetedShardedCount);
+DEFN_QUERY_COUNTER(updateOneUnshardedCount);
+DEFN_QUERY_COUNTER(deleteOneUnshardedCount);
+DEFN_QUERY_COUNTER(findAndModifyUnshardedCount);
+DEFN_QUERY_COUNTER(updateOneNonTargetedShardedCount);
+DEFN_QUERY_COUNTER(deleteOneNonTargetedShardedCount);
+DEFN_QUERY_COUNTER(findAndModifyNonTargetedShardedCount);
+DEFN_QUERY_COUNTER(deleteOneWithoutShardKeyWithIdCount);
+DEFN_QUERY_COUNTER(nonRetryableDeleteOneWithoutShardKeyWithIdCount);
+DEFN_QUERY_COUNTER(updateOneWithoutShardKeyWithIdCount);
+DEFN_QUERY_COUNTER(nonRetryableUpdateOneWithoutShardKeyWithIdCount);
+DEFN_QUERY_COUNTER(updateOneWithoutShardKeyWithIdRetryCount);
+DEFN_QUERY_COUNTER(deleteOneWithoutShardKeyWithIdRetryCount);
+#undef DEFN_QUERY_COUNTER
 }  // namespace mongo

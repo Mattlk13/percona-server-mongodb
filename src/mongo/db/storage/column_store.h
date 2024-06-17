@@ -323,7 +323,7 @@ public:
     //
     // Whole ColumnStore ops
     //
-    virtual Status compact(OperationContext* opCtx) = 0;
+    virtual StatusWith<int64_t> compact(OperationContext* opCtx, const CompactOptions& options) = 0;
     virtual IndexValidateResults validate(OperationContext* opCtx, bool full) const = 0;
 
     virtual bool appendCustomStats(OperationContext* opCtx,
@@ -505,7 +505,7 @@ struct SplitCellView {
     struct CursorWithArrayDepth {
         CursorWithArrayDepth(int pathLength,
                              const char* elemPtr,
-                             const StringData& arrayInfo,
+                             StringData arrayInfo,
                              ValueEncoder* encoder)
             : elemPtr(elemPtr),
               end(arrayInfo.rawData()),
@@ -680,8 +680,8 @@ struct SplitCellView {
         using TinySize = ColumnStore::Bytes::TinySize;
 
         auto out = SplitCellView();
-        auto it = cell.begin();
-        const auto end = cell.end();
+        auto it = cell.data();
+        const auto end = cell.data() + cell.size();
         size_t arrInfoSize = 0;
 
         // This block handles all prefix bytes, and leaves `it` pointing at the first elem.
@@ -741,9 +741,9 @@ struct SplitCellView {
         }
 
         out.firstValuePtr = it;
-        out.arrInfo = StringData(cell.end() - arrInfoSize, cell.end());
+        out.arrInfo = cell.substr(cell.size() - arrInfoSize);
 
-        if (it == out.arrInfo.begin()) {  // Reminder: beginning of arrInfo is end of values.
+        if (it == out.arrInfo.data()) {  // Reminder: beginning of arrInfo is end of values.
             // The lack of any values implies that there must be sub paths.
             out.hasSubPaths = true;
         } else {

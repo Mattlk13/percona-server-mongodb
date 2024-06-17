@@ -74,13 +74,13 @@ class DBClientCursor;
  */
 class DBClientConnection : public DBClientSession {
 public:
-    DBClientConnection(bool _autoReconnect = false,
-                       double so_timeout = 0,
+    DBClientConnection(bool autoReconnect = false,
+                       double soTimeout = 0,
                        MongoURI uri = {},
                        const HandshakeValidationHook& hook = HandshakeValidationHook(),
                        const ClientAPIVersionParameters* apiParameters = nullptr);
 
-    virtual ~DBClientConnection() {
+    ~DBClientConnection() override {
         _numConnections.fetchAndAdd(-1);
     }
 
@@ -119,7 +119,7 @@ public:
 
     bool isUsingTransientSSLParams() const override;
 
-    bool isTLS();
+    bool isTLS() override;
 #endif
 
 protected:
@@ -141,8 +141,8 @@ private:
         transport::ConnectSSLMode sslMode,
         Milliseconds timeout,
         boost::optional<TransientSSLParams> transientSSLParams = boost::none) override;
-    void _ensureSession() override;
-    void _shutdownSession() override;
+    void _reconnectSession() override;
+    void _killSession() override;
 
     /**
      * Inspects the contents of 'replyBody' and informs the replica set monitor that the host 'this'

@@ -69,33 +69,44 @@ public:
 
 protected:
     /**
-     * Returns true if and only if the cursor advanced to EOF.
+     * Returns false if and only if the cursor advanced to EOF.
      */
     [[nodiscard]] bool advanceWTCursor() {
         WT_CURSOR* c = _cursor->get();
         int ret = wiredTigerPrepareConflictRetry(
             _opCtx, [&] { return _forward ? c->next(c) : c->prev(c); });
         if (ret == WT_NOTFOUND) {
-            return true;
+            return false;
         }
         invariantWTOK(ret, c->session);
-        return false;
+        return true;
     }
 
     void setKey(WT_CURSOR* cursor, const WT_ITEM* item) {
         cursor->set_key(cursor, item);
     }
 
-    void getKey(WT_CURSOR* cursor, WT_ITEM* key) {
+    void getKey(WT_CURSOR* cursor, WT_ITEM* key, ResourceConsumption::MetricsCollector* metrics) {
         invariantWTOK(cursor->get_key(cursor, key), cursor->session);
 
-        auto& metricsCollector = ResourceConsumption::MetricsCollector::get(_opCtx);
-        metricsCollector.incrementOneIdxEntryRead(cursor->internal_uri, key->size);
+        if (metrics) {
+            metrics->incrementOneIdxEntryRead(cursor->internal_uri, key->size);
+        }
+    }
+
+    void getKeyValue(WT_CURSOR* cursor,
+                     WT_ITEM* key,
+                     WT_ITEM* value,
+                     ResourceConsumption::MetricsCollector* metrics) {
+        invariantWTOK(cursor->get_raw_key_value(cursor, key, value), cursor->session);
+
+        if (metrics) {
+            metrics->incrementOneIdxEntryRead(cursor->internal_uri, key->size);
+        }
     }
 
     OperationContext* _opCtx;
     const bool _forward;
-
     boost::optional<WiredTigerCursor> _cursor;
 
     bool _saveStorageCursorOnDetachFromOperationContext = false;

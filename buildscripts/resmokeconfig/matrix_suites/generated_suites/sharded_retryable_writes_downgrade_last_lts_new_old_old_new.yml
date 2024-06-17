@@ -28,6 +28,7 @@ executor:
           logRetryAttempts: true
           networkErrorAndTxnOverrideConfig:
             retryOnNetworkErrors: true
+          nonClusteredConfigTransactions: true
           overrideRetryAttempts: 3
           sessionOptions:
             readConcern:
@@ -96,7 +97,6 @@ selector:
   - jstests/core/**/project_with_collation.js
   - jstests/core/**/currentop.js
   - jstests/core/**/fsync.js
-  - jstests/core/**/killop_drop_collection.js
   - jstests/core/**/explain_upsert.js
   - jstests/core/**/indexes_multiple_commands.js
   - jstests/core/**/create_indexes.js
@@ -112,8 +112,6 @@ selector:
   - jstests/core/**/shell_connection_strings.js
   - jstests/core/**/geo_s2ordering.js
   - jstests/core/**/dbhash.js
-  - jstests/core/**/dbhash2.js
-  - jstests/core/**/explain_missing_database.js
   - jstests/core/**/geo_2d_explain.js
   - jstests/core/**/geo_s2explain.js
   - jstests/core/**/geo_s2sparse.js
@@ -142,4 +140,5 @@ selector:
   - requires_timeseries
   roots:
   - jstests/core/**/*.js
+  - jstests/core_sharding/**/*.js
 test_kind: js_test

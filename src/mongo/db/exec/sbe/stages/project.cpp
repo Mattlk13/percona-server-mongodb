@@ -49,7 +49,7 @@ ProjectStage::ProjectStage(std::unique_ptr<PlanStage> input,
                            SlotExprPairVector projects,
                            PlanNodeId nodeId,
                            bool participateInTrialRunTracking)
-    : PlanStage("project"_sd, nodeId, participateInTrialRunTracking),
+    : PlanStage("project"_sd, nullptr /* yieldPolicy */, nodeId, participateInTrialRunTracking),
       _projects(std::move(projects)) {
     _children.emplace_back(std::move(input));
 }
@@ -62,7 +62,7 @@ std::unique_ptr<PlanStage> ProjectStage::clone() const {
     return std::make_unique<ProjectStage>(_children[0]->clone(),
                                           std::move(projects),
                                           _commonStats.nodeId,
-                                          _participateInTrialRunTracking);
+                                          participateInTrialRunTracking());
 }
 
 void ProjectStage::prepare(CompileCtx& ctx) {

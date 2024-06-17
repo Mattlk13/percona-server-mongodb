@@ -38,7 +38,6 @@
 #include "mongo/db/service_context.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/unordered_map.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/uuid.h"
 
 /**
@@ -52,18 +51,21 @@ public:
     static TTLCollectionCache& get(ServiceContext* ctx);
 
     // Specifies that a collection is clustered and is TTL.
-    class ClusteredId : public stdx::monostate {};
+    class ClusteredId : public std::monostate {};
     // Names an index that is TTL.
     using IndexName = std::string;
 
     // Specifies how a collection should expire data with TTL.
     class Info {
     public:
-        explicit Info(ClusteredId) : _isClustered(true), _isExpireAfterSecondsInvalid(false) {}
-        Info(IndexName indexName, bool isExpireAfterSecondsInvalid)
+        enum class ExpireAfterSecondsType { kInvalid, kNonInt, kInt };
+
+        explicit Info(ClusteredId)
+            : _isClustered(true), _expireAfterSecondsType(ExpireAfterSecondsType::kInt) {}
+        Info(IndexName indexName, ExpireAfterSecondsType type)
             : _isClustered(false),
               _indexName(std::move(indexName)),
-              _isExpireAfterSecondsInvalid(isExpireAfterSecondsInvalid) {}
+              _expireAfterSecondsType(type) {}
         bool isClustered() const {
             return _isClustered;
         }
@@ -71,16 +73,19 @@ public:
             return _indexName;
         }
         bool isExpireAfterSecondsInvalid() const {
-            return _isExpireAfterSecondsInvalid;
+            return _expireAfterSecondsType == ExpireAfterSecondsType::kInvalid;
         }
-        void unsetExpireAfterSecondsInvalid() {
-            _isExpireAfterSecondsInvalid = false;
+        bool isExpireAfterSecondsNonInt() const {
+            return _expireAfterSecondsType == ExpireAfterSecondsType::kNonInt;
+        }
+        void setExpireAfterSecondsType(ExpireAfterSecondsType type) {
+            _expireAfterSecondsType = type;
         }
 
     private:
         bool _isClustered;
         IndexName _indexName;
-        bool _isExpireAfterSecondsInvalid;
+        ExpireAfterSecondsType _expireAfterSecondsType;
     };
 
     // Caller is responsible for ensuring no duplicates are registered.
@@ -92,7 +97,9 @@ public:
      * Resets expireAfterSeconds flag on TTL index.
      * For idempotency, this has no effect if index is not found.
      */
-    void unsetTTLIndexExpireAfterSecondsInvalid(UUID uuid, const IndexName& indexName);
+    void setTTLIndexExpireAfterSecondsType(UUID uuid,
+                                           const IndexName& indexName,
+                                           Info::ExpireAfterSecondsType type);
 
     using InfoMap = stdx::unordered_map<UUID, std::vector<Info>, UUID::Hash>;
     InfoMap getTTLInfos();

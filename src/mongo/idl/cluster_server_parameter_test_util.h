@@ -40,7 +40,7 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/multitenancy_gen.h"
-#include "mongo/db/query/query_settings_manager.h"
+#include "mongo/db/query/query_settings/query_settings_manager.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_settings.h"
@@ -65,7 +65,7 @@ const auto kNilCPT = LogicalTime::kUninitialized;
 
 class ClusterServerParameterTestBase : public ServiceContextMongoDTest {
 public:
-    virtual void setUp() override {
+    void setUp() override {
         gMultitenancySupport = true;
         // Set up mongod.
         ServiceContextMongoDTest::setUp();
@@ -84,7 +84,7 @@ public:
         ChangeStreamOptionsManager::create(service);
 
         // Set up the QuerySettingsManager so that it can be retrieved/set.
-        query_settings::QuerySettingsManager::create(service);
+        query_settings::QuerySettingsManager::create(service, {});
 
         // Ensure that we are primary.
         auto replCoord = repl::ReplicationCoordinator::get(opCtx.get());

@@ -44,42 +44,20 @@
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bson_depth.h"
-#include "mongo/bson/bsonmisc.h"
-#include "mongo/bson/bsonobj.h"
-#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
 #include "mongo/bson/oid.h"
-#include "mongo/crypto/mechanism_scram.h"
-#include "mongo/crypto/sha1_block.h"
-#include "mongo/crypto/sha256_block.h"
 #include "mongo/db/auth/access_checks_gen.h"
-#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_checks.h"
 #include "mongo/db/auth/authorization_contract.h"
 #include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/authorization_manager_impl.h"
-#include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/authorization_session_for_test.h"
-#include "mongo/db/auth/authorization_session_impl.h"
-#include "mongo/db/auth/authz_manager_external_state_mock.h"
-#include "mongo/db/auth/authz_session_external_state_mock.h"
-#include "mongo/db/auth/privilege.h"
-#include "mongo/db/auth/resource_pattern.h"
-#include "mongo/db/auth/restriction_environment.h"
+#include "mongo/db/auth/authorization_session_test_fixture.h"
 #include "mongo/db/auth/role_name.h"
-#include "mongo/db/auth/sasl_options.h"
-#include "mongo/db/auth/user.h"
-#include "mongo/db/auth/user_name.h"
 #include "mongo/db/auth/validated_tenancy_scope.h"
 #include "mongo/db/client.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/list_collections_gen.h"
-#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/pipeline/aggregate_command_gen.h"
-#include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/tenant_id.h"
 #include "mongo/idl/idl_parser.h"
 #include "mongo/idl/server_parameter_test_util.h"
@@ -87,10 +65,7 @@
 #include "mongo/transport/mock_session.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer_mock.h"
-#include "mongo/unittest/assert.h"
 #include "mongo/unittest/framework.h"
-#include "mongo/util/assert_util.h"
-#include "mongo/util/clock_source_mock.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/net/sockaddr.h"
 #include "mongo/util/time_support.h"
@@ -99,185 +74,10 @@
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 namespace mongo {
+
+using AuthorizationSessionTest = AuthorizationSessionTestFixture;
+
 namespace {
-
-class FailureCapableAuthzManagerExternalStateMock : public AuthzManagerExternalStateMock {
-public:
-    FailureCapableAuthzManagerExternalStateMock() = default;
-    ~FailureCapableAuthzManagerExternalStateMock() = default;
-
-    void setFindsShouldFail(bool enable) {
-        _findsShouldFail = enable;
-    }
-
-    Status findOne(OperationContext* opCtx,
-                   const NamespaceString& collectionName,
-                   const BSONObj& query,
-                   BSONObj* result) override {
-        if (_findsShouldFail && collectionName == NamespaceString::kAdminUsersNamespace) {
-            return Status(ErrorCodes::UnknownError,
-                          "findOne on admin.system.users set to fail in mock.");
-        }
-        return AuthzManagerExternalStateMock::findOne(opCtx, collectionName, query, result);
-    }
-
-private:
-    bool _findsShouldFail{false};
-};
-
-class AuthorizationSessionTest : public ServiceContextMongoDTest {
-public:
-    void setUp() {
-        gMultitenancySupport = true;
-        ServiceContextMongoDTest::setUp();
-
-        _session = transportLayer.createSession();
-        _client = getServiceContext()->getService()->makeClient("testClient", _session);
-        _opCtx = _client->makeOperationContext();
-        managerState->setAuthzVersion(_opCtx.get(), AuthorizationManager::schemaVersion26Final);
-
-        authzManager = AuthorizationManager::get(getServiceContext());
-        auto localSessionState = std::make_unique<AuthzSessionExternalStateMock>(authzManager);
-        sessionState = localSessionState.get();
-        authzSession = std::make_unique<AuthorizationSessionForTest>(
-            std::move(localSessionState),
-            AuthorizationSessionImpl::InstallMockForTestingOrAuthImpl{});
-        authzManager->setAuthEnabled(true);
-        authzSession->startContractTracking();
-
-        credentials =
-            BSON("SCRAM-SHA-1" << scram::Secrets<SHA1Block>::generateCredentials(
-                                      "a", saslGlobalParams.scramSHA1IterationCount.load())
-                               << "SCRAM-SHA-256"
-                               << scram::Secrets<SHA256Block>::generateCredentials(
-                                      "a", saslGlobalParams.scramSHA256IterationCount.load()));
-
-        // assume tenantId is from security token with no expectPrefix
-        _sc = SerializationContext(SerializationContext::Source::Command,
-                                   SerializationContext::CallerType::Request,
-                                   SerializationContext::Prefix::Default,
-                                   true /* nonPrefixedTenantId */,
-                                   false /* authExpectTenantPrefix */);
-    }
-
-    void tearDown() override {
-        authzSession->logoutAllDatabases(_client.get(), "Ending AuthorizationSessionTest");
-        ServiceContextMongoDTest::tearDown();
-        gMultitenancySupport = false;
-    }
-
-    Status createUser(const UserName& username, const std::vector<RoleName>& roles) {
-        BSONObjBuilder userDoc;
-        userDoc.append("_id", username.getUnambiguousName());
-        username.appendToBSON(&userDoc);
-        userDoc.append("credentials", credentials);
-
-        BSONArrayBuilder rolesBSON(userDoc.subarrayStart("roles"));
-        for (const auto& role : roles) {
-            role.serializeToBSON(&rolesBSON);
-        }
-        rolesBSON.doneFast();
-
-        return managerState->insert(
-            _opCtx.get(),
-            NamespaceString::makeTenantUsersCollection(username.getTenant()),
-            userDoc.obj(),
-            {});
-    }
-
-    void assertLogout(const ResourcePattern& resource, ActionType action) {
-        ASSERT_FALSE(authzSession->isExpired());
-        ASSERT_EQ(authzSession->getAuthenticationMode(),
-                  AuthorizationSession::AuthenticationMode::kNone);
-        ASSERT_FALSE(authzSession->isAuthenticated());
-        ASSERT_EQ(authzSession->getAuthenticatedUser(), boost::none);
-        ASSERT_FALSE(authzSession->isAuthorizedForActionsOnResource(resource, action));
-    }
-
-    void assertExpired(const ResourcePattern& resource, ActionType action) {
-        ASSERT_TRUE(authzSession->isExpired());
-        ASSERT_EQ(authzSession->getAuthenticationMode(),
-                  AuthorizationSession::AuthenticationMode::kNone);
-        ASSERT_FALSE(authzSession->isAuthenticated());
-        ASSERT_EQ(authzSession->getAuthenticatedUser(), boost::none);
-        ASSERT_FALSE(authzSession->isAuthorizedForActionsOnResource(resource, action));
-    }
-
-    void assertActive(const ResourcePattern& resource, ActionType action) {
-        ASSERT_FALSE(authzSession->isExpired());
-        ASSERT_EQ(authzSession->getAuthenticationMode(),
-                  AuthorizationSession::AuthenticationMode::kConnection);
-        ASSERT_TRUE(authzSession->isAuthenticated());
-        ASSERT_NOT_EQUALS(authzSession->getAuthenticatedUser(), boost::none);
-        ASSERT_TRUE(authzSession->isAuthorizedForActionsOnResource(resource, action));
-    }
-
-    void assertSecurityToken(const ResourcePattern& resource, ActionType action) {
-        ASSERT_FALSE(authzSession->isExpired());
-        ASSERT_EQ(authzSession->getAuthenticationMode(),
-                  AuthorizationSession::AuthenticationMode::kSecurityToken);
-        ASSERT_TRUE(authzSession->isAuthenticated());
-        ASSERT_NOT_EQUALS(authzSession->getAuthenticatedUser(), boost::none);
-        ASSERT_TRUE(authzSession->isAuthorizedForActionsOnResource(resource, action));
-    }
-
-    void assertNotAuthorized(const ResourcePattern& resource, ActionType action) {
-        ASSERT_FALSE(authzSession->isAuthorizedForActionsOnResource(resource, action));
-    }
-
-    AggregateCommandRequest buildAggReq(const NamespaceString& nss, const BSONArray& pipeline) {
-        return uassertStatusOK(aggregation_request_helper::parseFromBSONForTests(
-            nss,
-            BSON("aggregate" << nss.coll() << "pipeline" << pipeline << "cursor" << BSONObj()
-                             << "$db" << nss.db_forTest()),
-            boost::none,
-            false /* apiStrict */,
-            _sc));
-    }
-
-    AggregateCommandRequest buildAggReq(const NamespaceString& nss,
-                                        const BSONArray& pipeline,
-                                        bool bypassDocValidation) {
-        return uassertStatusOK(aggregation_request_helper::parseFromBSONForTests(
-            nss,
-            BSON("aggregate" << nss.coll() << "pipeline" << pipeline << "cursor" << BSONObj()
-                             << "bypassDocumentValidation" << bypassDocValidation << "$db"
-                             << nss.db_forTest()),
-            boost::none,
-            false /* apiStrict */,
-            _sc));
-    }
-
-private:
-    static Options createServiceContextOptions() {
-        Options o;
-        return o.useMockClock(true).useMockAuthzManagerExternalState(
-            std::make_unique<FailureCapableAuthzManagerExternalStateMock>());
-    }
-
-protected:
-    AuthorizationSessionTest() : ServiceContextMongoDTest(createServiceContextOptions()) {
-        managerState =
-            dynamic_cast<FailureCapableAuthzManagerExternalStateMock*>(_authzExternalState);
-        invariant(managerState);
-    }
-
-    ClockSourceMock* clockSource() {
-        return static_cast<ClockSourceMock*>(getServiceContext()->getFastClockSource());
-    }
-
-protected:
-    FailureCapableAuthzManagerExternalStateMock* managerState;
-    transport::TransportLayerMock transportLayer;
-    std::shared_ptr<transport::Session> _session;
-    ServiceContext::UniqueClient _client;
-    ServiceContext::UniqueOperationContext _opCtx;
-    AuthzSessionExternalStateMock* sessionState;
-    AuthorizationManager* authzManager;
-    std::unique_ptr<AuthorizationSessionForTest> authzSession;
-    BSONObj credentials;
-    SerializationContext _sc;
-};
 
 const TenantId kTenantId1(OID("12345678901234567890aaaa"));
 const TenantId kTenantId2(OID("12345678901234567890aaab"));
@@ -556,7 +356,7 @@ TEST_F(AuthorizationSessionTest, InvalidateUser) {
     ASSERT_OK(createUser(kSpencerTest, {{"read", "test"}}));
 
     // Make sure that invalidating the user causes the session to reload its privileges.
-    authzManager->invalidateUserByName(_opCtx.get(), user->getName());
+    AuthorizationManager::get(_opCtx->getService())->invalidateUserByName(user->getName());
     authzSession->startRequest(_opCtx.get());  // Refreshes cached data for invalid users
     ASSERT_TRUE(
         authzSession->isAuthorizedForActionsOnResource(testFooCollResource, ActionType::find));
@@ -569,7 +369,7 @@ TEST_F(AuthorizationSessionTest, InvalidateUser) {
     ASSERT_OK(managerState->remove(
         _opCtx.get(), NamespaceString::kAdminUsersNamespace, BSONObj(), BSONObj(), &ignored));
     // Make sure that invalidating the user causes the session to reload its privileges.
-    authzManager->invalidateUserByName(_opCtx.get(), user->getName());
+    AuthorizationManager::get(_opCtx->getService())->invalidateUserByName(user->getName());
     authzSession->startRequest(_opCtx.get());  // Refreshes cached data for invalid users
     ASSERT_FALSE(
         authzSession->isAuthorizedForActionsOnResource(testFooCollResource, ActionType::find));
@@ -601,7 +401,7 @@ TEST_F(AuthorizationSessionTest, UseOldUserInfoInFaceOfConnectivityProblems) {
     // Even though the user's privileges have been reduced, since we've configured user
     // document lookup to fail, the authz session should continue to use its known out-of-date
     // privilege data.
-    authzManager->invalidateUserByName(_opCtx.get(), user->getName());
+    AuthorizationManager::get(_opCtx->getService())->invalidateUserByName(user->getName());
     authzSession->startRequest(_opCtx.get());  // Refreshes cached data for invalid users
     ASSERT_TRUE(
         authzSession->isAuthorizedForActionsOnResource(testFooCollResource, ActionType::find));
@@ -1497,6 +1297,7 @@ TEST_F(AuthorizationSessionTest, CanListOwnCollectionsWithPrivilege) {
 
 const auto kAnyResource = ResourcePattern::forAnyResource(boost::none);
 const auto kAnyNormalResource = ResourcePattern::forAnyNormalResource(boost::none);
+const auto kAnySystemBucketResource = ResourcePattern::forAnySystemBuckets(boost::none);
 
 TEST_F(AuthorizationSessionTest, CanCheckIfHasAnyPrivilegeOnResource) {
     ASSERT_FALSE(authzSession->isAuthorizedForAnyActionOnResource(testFooCollResource));
@@ -1533,7 +1334,6 @@ TEST_F(AuthorizationSessionTest, CanUseUUIDNamespacesWithPrivilege) {
     BSONObj stringObj = BSON("a"
                              << "string");
     BSONObj uuidObj = BSON("a" << UUID::gen());
-    BSONObj invalidObj = BSON("a" << 12);
 
     // Strings require no privileges
     ASSERT_TRUE(authzSession->isAuthorizedToParseNamespaceElement(stringObj.firstElement()));
@@ -1541,20 +1341,12 @@ TEST_F(AuthorizationSessionTest, CanUseUUIDNamespacesWithPrivilege) {
     // UUIDs cannot be parsed with default privileges
     ASSERT_FALSE(authzSession->isAuthorizedToParseNamespaceElement(uuidObj.firstElement()));
 
-    // Element must be either a string, or a UUID
-    ASSERT_THROWS_CODE(authzSession->isAuthorizedToParseNamespaceElement(invalidObj.firstElement()),
-                       AssertionException,
-                       ErrorCodes::InvalidNamespace);
-
     // The useUUID privilege allows UUIDs to be parsed
     authzSession->assumePrivilegesForDB(
         Privilege(ResourcePattern::forClusterResource(boost::none), ActionType::useUUID), testDB);
 
     ASSERT_TRUE(authzSession->isAuthorizedToParseNamespaceElement(stringObj.firstElement()));
     ASSERT_TRUE(authzSession->isAuthorizedToParseNamespaceElement(uuidObj.firstElement()));
-    ASSERT_THROWS_CODE(authzSession->isAuthorizedToParseNamespaceElement(invalidObj.firstElement()),
-                       AssertionException,
-                       ErrorCodes::InvalidNamespace);
 
     // Verify we recorded the all the auth checks correctly
     AuthorizationContract ac(
@@ -1832,7 +1624,6 @@ TEST_F(AuthorizationSessionTest, ExpirationWithSecurityTokenNOK) {
 
     // Tests authorization flow from unauthenticated to active (via token) to unauthenticated to
     // active (via stateful connection) to unauthenticated.
-    using VTS = auth::ValidatedTenancyScope;
 
     // Create and authorize a security token user.
     ASSERT_OK(createUser(kTenant1UserTest, {{"readWrite", "test"}, {"dbAdmin", "test"}}));
@@ -1840,20 +1631,24 @@ TEST_F(AuthorizationSessionTest, ExpirationWithSecurityTokenNOK) {
     ASSERT_OK(createUser(kTenant2UserTest, {{"readWriteAnyDatabase", "admin"}}));
 
     {
-        VTS validatedTenancyScope(
-            kTenant1UserTest, kVTSKey, VTS::TenantProtocol::kDefault, VTS::TokenForTestingTag{});
+        auth::ValidatedTenancyScope validatedTenancyScope =
+            auth::ValidatedTenancyScopeFactory::create(
+                kTenant1UserTest,
+                kVTSKey,
+                auth::ValidatedTenancyScope::TenantProtocol::kDefault,
+                auth::ValidatedTenancyScopeFactory::TokenForTestingTag{});
 
         // Actual expiration used by AuthorizationSession will be the minimum of
         // the token's known expiraiton time and the expiration time passed in.
         const auto checkExpiration = [&](const boost::optional<Date_t>& expire,
                                          const Date_t& expect) {
-            VTS::set(_opCtx.get(), validatedTenancyScope);
+            auth::ValidatedTenancyScope::set(_opCtx.get(), validatedTenancyScope);
             ASSERT_OK(
                 authzSession->addAndAuthorizeUser(_opCtx.get(), kTenant1UserTestRequest, expire));
             ASSERT_EQ(authzSession->getExpiration(), expect);
 
             // Reset for next test.
-            VTS::set(_opCtx.get(), boost::none);
+            auth::ValidatedTenancyScope::set(_opCtx.get(), boost::none);
             authzSession->startRequest(_opCtx.get());
             assertLogout(testTenant1FooCollResource, ActionType::insert);
         };
@@ -1864,11 +1659,15 @@ TEST_F(AuthorizationSessionTest, ExpirationWithSecurityTokenNOK) {
     }
 
     {
-        VTS validatedTenancyScope(
-            kTenant1UserTest, kVTSKey, VTS::TenantProtocol::kDefault, VTS::TokenForTestingTag{});
+        auth::ValidatedTenancyScope validatedTenancyScope =
+            auth::ValidatedTenancyScopeFactory::create(
+                kTenant1UserTest,
+                kVTSKey,
+                auth::ValidatedTenancyScope::TenantProtocol::kDefault,
+                auth::ValidatedTenancyScopeFactory::TokenForTestingTag{});
 
         // Perform authentication checks.
-        VTS::set(_opCtx.get(), validatedTenancyScope);
+        auth::ValidatedTenancyScope::set(_opCtx.get(), validatedTenancyScope);
         ASSERT_OK(
             authzSession->addAndAuthorizeUser(_opCtx.get(), kTenant1UserTestRequest, boost::none));
 
@@ -1885,7 +1684,7 @@ TEST_F(AuthorizationSessionTest, ExpirationWithSecurityTokenNOK) {
 
         // Check that starting a new request without the security token decoration results in token
         // user logout.
-        VTS::set(_opCtx.get(), boost::none);
+        auth::ValidatedTenancyScope::set(_opCtx.get(), boost::none);
         authzSession->startRequest(_opCtx.get());
         assertLogout(testTenant1FooCollResource, ActionType::insert);
 
@@ -1906,9 +1705,14 @@ TEST_F(AuthorizationSessionTest, ExpirationWithSecurityTokenNOK) {
 
     // Create a new validated tenancy scope for the readWriteAny tenant user.
     {
-        VTS validatedTenancyScope(
-            kTenant2UserTest, kVTSKey, VTS::TenantProtocol::kDefault, VTS::TokenForTestingTag{});
-        VTS::set(_opCtx.get(), validatedTenancyScope);
+        auth::ValidatedTenancyScope validatedTenancyScope =
+            auth::ValidatedTenancyScopeFactory::create(
+                kTenant2UserTest,
+                kVTSKey,
+                auth::ValidatedTenancyScope::TenantProtocol::kDefault,
+                auth::ValidatedTenancyScopeFactory::TokenForTestingTag{});
+        auth::ValidatedTenancyScope::set(_opCtx.get(), validatedTenancyScope);
+        auth::ValidatedTenancyScope::set(_opCtx.get(), validatedTenancyScope);
 
         ASSERT_OK(
             authzSession->addAndAuthorizeUser(_opCtx.get(), kTenant2UserTestRequest, boost::none));
@@ -1922,10 +1726,25 @@ TEST_F(AuthorizationSessionTest, ExpirationWithSecurityTokenNOK) {
 
         // Check that starting a new request without the security token decoration results in token
         // user logout.
-        VTS::set(_opCtx.get(), boost::none);
+        auth::ValidatedTenancyScope::set(_opCtx.get(), boost::none);
         authzSession->startRequest(_opCtx.get());
         assertLogout(testTenant2FooCollResource, ActionType::insert);
     }
+}
+
+TEST_F(AuthorizationSessionTest, CheckBuiltInRolesForBypassDefaultMaxTimeMS) {
+    // Verify the "root" role is authorised  for 'bypassDefaultMaxTimeMS' for all resources.
+    authzSession->assumePrivilegesForBuiltinRole(RoleName{"root", "admin"});
+    ASSERT_TRUE(authzSession->isAuthorizedForActionsOnResource(
+        ResourcePattern::forAnyResource(boost::none), ActionType::bypassDefaultMaxTimeMS));
+
+    authzSession->logoutAllDatabases(_client.get(), "Test finished");
+
+    // Verify the "__system" role is authorised  for 'bypassDefaultMaxTimeMS' for all resources.
+    auto client = getServiceContext()->getService()->makeClient("directClient");
+    authzSession->grantInternalAuthorization(client.get());
+    ASSERT_TRUE(authzSession->isAuthorizedForActionsOnResource(
+        ResourcePattern::forAnyResource(boost::none), ActionType::bypassDefaultMaxTimeMS));
 }
 
 class SystemBucketsTest : public AuthorizationSessionTest {
@@ -2169,6 +1988,21 @@ TEST_F(SystemBucketsTest, CheckBuiltinRolesForSystemBuckets) {
                                                                ActionType::find));
     ASSERT_TRUE(authzSession->isAuthorizedForActionsOnResource(otherDbSystemBucketResource,
                                                                ActionType::find));
+
+    // If we have clusterMonitor, make sure the following actions are authorized o any system
+    // bucket: collStats, dbStats, getDatabaseVersion, getShardVersion and indexStats.
+    authzSession->assumePrivilegesForBuiltinRole(RoleName("clusterMonitor", "admin"));
+
+    ASSERT_TRUE(authzSession->isAuthorizedForActionsOnResource(kAnySystemBucketResource,
+                                                               ActionType::collStats));
+    ASSERT_TRUE(authzSession->isAuthorizedForActionsOnResource(kAnySystemBucketResource,
+                                                               ActionType::dbStats));
+    ASSERT_TRUE(authzSession->isAuthorizedForActionsOnResource(kAnySystemBucketResource,
+                                                               ActionType::getDatabaseVersion));
+    ASSERT_TRUE(authzSession->isAuthorizedForActionsOnResource(kAnySystemBucketResource,
+                                                               ActionType::getShardVersion));
+    ASSERT_TRUE(authzSession->isAuthorizedForActionsOnResource(kAnySystemBucketResource,
+                                                               ActionType::indexStats));
 }
 
 TEST_F(SystemBucketsTest, CanCheckIfHasAnyPrivilegeInResourceDBForSystemBuckets) {
@@ -2190,6 +2024,28 @@ TEST_F(SystemBucketsTest, CanCheckIfHasAnyPrivilegeInResourceDBForSystemBuckets)
         Privilege(ResourcePattern::forAnySystemBuckets(boost::none), ActionType::find), testDB);
     ASSERT_TRUE(authzSession->isAuthorizedForAnyActionOnAnyResourceInDB(sb_db_test));
     ASSERT_TRUE(authzSession->isAuthorizedForAnyActionOnAnyResourceInDB(sb_db_other));
+}
+
+TEST_F(AuthorizationSessionTest, InternalSystemClientsBypassValidateRestrictions) {
+    // set up a direct client without transport session
+    auto client = getServiceContext()->getService()->makeClient("directClient");
+    // set Client user to be the internal __system user.
+    authzSession->grantInternalAuthorization(client.get());
+    auto opCtx = client->makeOperationContext();
+
+    ASSERT(authzSession->getAuthenticatedUser().has_value());
+    UserHandle currentUser = authzSession->getAuthenticatedUser().value();
+    ASSERT(currentUser.isValid());
+    ASSERT(!currentUser->isInvalidated());
+
+    // invalidate the __system user to force the next request to validate restrictions
+    currentUser->invalidate();
+    ASSERT(currentUser.isValid());
+    ASSERT(currentUser->isInvalidated());
+
+    // should not fail even though client does not have a transport session
+    authzSession->startRequest(opCtx.get());
+    ASSERT_OK(currentUser->validateRestrictions(opCtx.get()));
 }
 
 }  // namespace

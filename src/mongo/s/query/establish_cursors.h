@@ -81,7 +81,7 @@ std::vector<RemoteCursor> establishCursors(
     std::shared_ptr<executor::TaskExecutor> executor,
     const NamespaceString& nss,
     ReadPreferenceSetting readPref,
-    const std::vector<std::pair<ShardId, BSONObj>>& remotes,
+    const std::vector<AsyncRequestsSender::Request>& remotes,
     bool allowPartialResults,
     Shard::RetryPolicy retryPolicy = Shard::RetryPolicy::kIdempotent,
     std::vector<OperationKey> providedOpKeys = {},
@@ -121,6 +121,6 @@ void killRemoteCursor(OperationContext* opCtx,
 /**
  * Appends the given operation key to the given request.
  */
-BSONObj appendOpKey(const OperationKey& opKey, const BSONObj& request);
+void appendOpKey(const OperationKey& opKey, BSONObjBuilder* cmdBuilder);
 
 }  // namespace mongo

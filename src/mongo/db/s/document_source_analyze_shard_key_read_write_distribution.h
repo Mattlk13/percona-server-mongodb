@@ -62,7 +62,6 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/idl/idl_parser.h"
-#include "mongo/s/analyze_shard_key_util.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
@@ -77,25 +76,7 @@ public:
     class LiteParsed final : public LiteParsedDocumentSource {
     public:
         static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
-                                                 const BSONElement& specElem) {
-            uassert(ErrorCodes::IllegalOperation,
-                    str::stream() << kStageName << " is not supported on a standalone mongod",
-                    repl::ReplicationCoordinator::get(getGlobalServiceContext())
-                        ->getSettings()
-                        .isReplSet());
-            uassert(ErrorCodes::IllegalOperation,
-                    str::stream() << kStageName << " is not supported on a multitenant replica set",
-                    !gMultitenancySupport);
-            uassert(6875700,
-                    str::stream() << kStageName
-                                  << " must take a nested object but found: " << specElem,
-                    specElem.type() == BSONType::Object);
-            uassertStatusOK(validateNamespace(nss));
-
-            auto spec = DocumentSourceAnalyzeShardKeyReadWriteDistributionSpec::parse(
-                IDLParserContext(kStageName), specElem.embeddedObject());
-            return std::make_unique<LiteParsed>(specElem.fieldName(), nss, std::move(spec));
-        }
+                                                 const BSONElement& specElem);
 
         explicit LiteParsed(std::string parseTimeName,
                             NamespaceString nss,
@@ -116,7 +97,7 @@ public:
             return true;
         }
 
-        void assertSupportsMultiDocumentTransaction() const {
+        void assertSupportsMultiDocumentTransaction() const override {
             transactionNotSupported(kStageName);
         }
 
@@ -129,7 +110,7 @@ public:
         DocumentSourceAnalyzeShardKeyReadWriteDistributionSpec spec)
         : DocumentSource(kStageName, pExpCtx), _spec(std::move(spec)) {}
 
-    virtual ~DocumentSourceAnalyzeShardKeyReadWriteDistribution() = default;
+    ~DocumentSourceAnalyzeShardKeyReadWriteDistribution() override = default;
 
     StageConstraints constraints(
         Pipeline::SplitState = Pipeline::SplitState::kUnsplit) const override {
@@ -154,7 +135,7 @@ public:
         return kStageName.rawData();
     }
 
-    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final override;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     void addVariableRefs(std::set<Variables::Id>* refs) const final {}
 

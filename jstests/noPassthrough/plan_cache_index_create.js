@@ -3,12 +3,10 @@
  * index available to queries that had a cached plan prior to the build.
  * @tags: [
  *   requires_replication,
- *   # TODO SERVER-67607: Test plan cache with CQF enabled.
- *   cqf_experimental_incompatible,
  * ]
  */
 import {getCachedPlan} from "jstests/libs/analyze_plan.js";
-import {checkSBEEnabled} from "jstests/libs/sbe_util.js";
+import {checkSbeFullyEnabled} from "jstests/libs/sbe_util.js";
 
 const dbName = "test";
 const collName = "coll";
@@ -161,7 +159,7 @@ rst.initiate();
 const primaryDB = rst.getPrimary().getDB(dbName);
 const secondaryDB = rst.getSecondary().getDB(dbName);
 
-if (checkSBEEnabled(primaryDB)) {
+if (checkSbeFullyEnabled(primaryDB)) {
     jsTest.log("Skipping test because SBE is enabled");
     rst.stopSet();
     quit();

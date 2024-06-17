@@ -37,9 +37,9 @@
 #include <boost/smart_ptr/intrusive_ref_counter.hpp>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <iterator>
 #include <memory>
+#include <span>
 #include <variant>
 #include <vector>
 
@@ -49,9 +49,14 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/bson/util/bsoncolumn_helpers.h"
+#include "mongo/bson/util/bsoncolumn_interleaved.h"
+#include "mongo/bson/util/bsoncolumn_util.h"
 #include "mongo/bson/util/simple8b.h"
+#include "mongo/bson/util/simple8b_type_util.h"
 #include "mongo/platform/int128.h"
-#include "mongo/stdx/variant.h"
+#include "mongo/util/overloaded_visitor.h"
 
 namespace mongo {
 
@@ -80,10 +85,9 @@ namespace mongo {
  * also applies to functions declared 'const'.
  */
 class BSONColumn {
-private:
-    class ElementStorage;
-
 public:
+    using ElementStorage = bsoncolumn::ElementStorage;
+
     BSONColumn(const char* buffer, size_t size);
     explicit BSONColumn(BSONElement bin);
     explicit BSONColumn(BSONBinData bin);
@@ -101,6 +105,9 @@ public:
     class Iterator {
     public:
         friend class BSONColumn;
+
+        // Constructs a begin iterator
+        Iterator(boost::intrusive_ptr<ElementStorage> allocator, const char* pos, const char* end);
 
         // typedefs expected in iterators
         using iterator_category = std::input_iterator_tag;
@@ -138,8 +145,8 @@ public:
         }
 
     private:
-        // Constructs a begin iterator
-        Iterator(boost::intrusive_ptr<ElementStorage> allocator, const char* pos, const char* end);
+        template <class BufBuilderType, class BSONObjType, class Allocator>
+        friend class BSONColumnBuilder;
 
         // Initialize sub-object interleaving from current control byte position. Must be on a
         // interleaved start byte.
@@ -147,15 +154,6 @@ public:
 
         // Handles EOO when in regular mode. Iterator is set to end.
         void _handleEOO();
-
-        // Checks if control byte is literal
-        static bool _isLiteral(char control);
-
-        // Checks if control byte is interleaved mode start
-        static bool _isInterleavedStart(char control);
-
-        // Returns number of Simple-8b blocks from control byte
-        static uint8_t _numSimple8bBlocks(char control);
 
         // Sentinel to represent end iterator
         static constexpr uint32_t kEndIndex = 0xFFFFFFFF;
@@ -172,7 +170,7 @@ public:
         // End of BSONColumn memory block, we may not dereference any memory past this.
         const char* _end = nullptr;
 
-        // Allocator to use when materializing elements
+        // ElementStorage to use when materializing elements
         boost::intrusive_ptr<ElementStorage> _allocator;
 
         /**
@@ -189,17 +187,26 @@ public:
             struct Decoder64 {
                 Decoder64();
 
+                BSONElement materialize(ElementStorage& allocator,
+                                        BSONElement last,
+                                        StringData fieldName) const;
+
                 Simple8b<uint64_t>::Iterator pos;
                 int64_t lastEncodedValue = 0;
                 int64_t lastEncodedValueForDeltaOfDelta = 0;
                 uint8_t scaleIndex;
-                bool deltaOfDelta;
+                bool deltaOfDelta = false;
             };
 
             /**
              * Internal decoding state for types using 128bit aritmetic
              */
             struct Decoder128 {
+                BSONElement materialize(ElementStorage& allocator,
+                                        BSONElement last,
+                                        StringData fieldName) const;
+
+
                 Simple8b<uint128_t>::Iterator pos;
                 int128_t lastEncodedValue = 0;
             };
@@ -223,7 +230,7 @@ public:
 
             // Last encoded values used to calculate delta and delta-of-delta
             BSONElement lastValue;
-            stdx::variant<Decoder64, Decoder128> decoder = Decoder64{};
+            std::variant<Decoder64, Decoder128> decoder = Decoder64{};
         };
 
         /**
@@ -258,7 +265,7 @@ public:
         void _incrementRegular(Regular& regular);
         void _incrementInterleaved(Interleaved& interleaved);
 
-        stdx::variant<Regular, Interleaved> _mode = Regular{};
+        std::variant<Regular, Interleaved> _mode = Regular{};
     };
 
     /**
@@ -324,130 +331,10 @@ public:
 
 private:
     /**
-     * BSONElement storage, owns materialised BSONElement returned by BSONColumn.
-     * Allocates memory in blocks which double in size as they grow.
-     */
-    class ElementStorage
-        : public boost::intrusive_ref_counter<ElementStorage, boost::thread_unsafe_counter> {
-    public:
-        /**
-         * "Writable" BSONElement. Provides access to a writable pointer for writing the value of
-         * the BSONElement. Users must write valid BSON data depending on the requested BSON type.
-         */
-        class Element {
-        public:
-            Element(char* buffer, int nameSize, int valueSize);
-
-            /**
-             * Returns a pointer for writing a BSONElement value.
-             */
-            char* value();
-
-            /**
-             * Size for the pointer returned by value()
-             */
-            int size() const;
-
-            /**
-             * Constructs a BSONElement from the owned buffer.
-             */
-            BSONElement element() const;
-
-        private:
-            char* _buffer;
-            int _nameSize;
-            int _valueSize;
-        };
-
-        /**
-         * RAII Helper to manage contiguous mode. Starts on construction and leaves on destruction.
-         */
-        class ContiguousBlock {
-        public:
-            ContiguousBlock(ElementStorage& storage);
-            ~ContiguousBlock();
-
-            // Return pointer to contigous block and the block size
-            std::pair<const char*, int> done();
-
-        private:
-            ElementStorage& _storage;
-            bool _finished = false;
-        };
-
-        /**
-         * Allocates provided number of bytes. Returns buffer that is safe to write up to that
-         * amount. Any subsequent call to allocate() or deallocate() invalidates the returned
-         * buffer.
-         */
-        char* allocate(int bytes);
-
-        /**
-         * Allocates a BSONElement of provided type and value size. Field name is set to empty
-         * string.
-         */
-        Element allocate(BSONType type, StringData fieldName, int valueSize);
-
-        /**
-         * Deallocates provided number of bytes. Moves back the pointer of used memory so it can be
-         * re-used by the next allocate() call.
-         */
-        void deallocate(int bytes);
-
-        /**
-         * Starts contiguous mode. All allocations will be in a contiguous memory block. When
-         * allocate() need to grow contents from previous memory block is copied.
-         */
-        ContiguousBlock startContiguous();
-
-        /**
-         * Returns writable pointer to the beginning of contiguous memory block. Any call to
-         * allocate() will invalidate this pointer.
-         */
-        char* contiguous() const {
-            return _block.get() + _contiguousPos;
-        }
-
-        /**
-         * Returns pointer to the end of current memory block. Any call to allocate() will
-         * invalidate this pointer.
-         */
-        const char* position() const {
-            return _block.get() + _pos;
-        }
-
-    private:
-        // Starts contiguous mode
-        void _beginContiguous();
-
-        // Ends contiguous mode, returns size of block
-        int _endContiguous();
-
-        // Full memory blocks that are kept alive.
-        std::vector<std::unique_ptr<char[]>> _blocks;
-
-        // Current memory block
-        std::unique_ptr<char[]> _block;
-
-        // Capacity of current memory block
-        int _capacity = 0;
-
-        // Position to first unused byte in current memory block
-        int _pos = 0;
-
-        // Position to beginning of contiguous block if enabled.
-        int _contiguousPos = 0;
-
-        bool _contiguousEnabled = false;
-    };
-
-    /**
      * Validates the BSONColumn on construction, should be the last call in the constructor when all
      * members are initialized.
      */
     void _initialValidate();
-
-    struct SubObjectAllocator;
 
     const char* _binary;
     int _size;
@@ -462,5 +349,275 @@ private:
 inline BSONColumn::Iterator::DecodingState::DecodingState() = default;
 inline BSONColumn::Iterator::DecodingState::Decoder64::Decoder64() = default;
 
+namespace bsoncolumn {
 
+/**
+ * Code below is work in progress, do not use.
+ */
+
+/**
+ * Implements Appendable and utilizes a user-defined Materializer to receive output of
+ * BSONColumn decoding and fill a container of user-defined elements.  Container can
+ * be user-defined or any STL container can be used.
+ */
+template <class CMaterializer, class Container>
+requires Materializer<CMaterializer>
+class Collector {
+    using Element = typename CMaterializer::Element;
+
+public:
+    Collector(Container& collection, boost::intrusive_ptr<ElementStorage> allocator)
+        : _collection(collection), _allocator(std::move(allocator)) {}
+
+    static constexpr bool kCollectsPositionInfo = PositionInfoAppender<Container>;
+
+    void append(bool val) {
+        _last = CMaterializer::materialize(*_allocator, val);
+        _collection.push_back(_last);
+    }
+
+    void append(int32_t val) {
+        _last = CMaterializer::materialize(*_allocator, val);
+        _collection.push_back(_last);
+    }
+
+    void append(int64_t val) {
+        _last = CMaterializer::materialize(*_allocator, val);
+        _collection.push_back(_last);
+    }
+
+    void append(Decimal128 val) {
+        _last = CMaterializer::materialize(*_allocator, val);
+        _collection.push_back(_last);
+    }
+
+    void append(double val) {
+        _last = CMaterializer::materialize(*_allocator, val);
+        _collection.push_back(_last);
+    }
+
+    void append(Timestamp val) {
+        _last = CMaterializer::materialize(*_allocator, val);
+        _collection.push_back(_last);
+    }
+
+    void append(Date_t val) {
+        _last = CMaterializer::materialize(*_allocator, val);
+        _collection.push_back(_last);
+    }
+
+    void append(OID val) {
+        _last = CMaterializer::materialize(*_allocator, val);
+        _collection.push_back(_last);
+    }
+
+    void append(StringData val) {
+        _last = CMaterializer::materialize(*_allocator, val);
+        _collection.push_back(_last);
+    }
+
+    void append(const BSONBinData& val) {
+        _last = CMaterializer::materialize(*_allocator, val);
+        _collection.push_back(_last);
+    }
+
+    void append(const BSONCode& val) {
+        _last = CMaterializer::materialize(*_allocator, val);
+        _collection.push_back(_last);
+    }
+
+    template <typename T>
+    void append(const BSONElement& val) {
+        _last = CMaterializer::template materialize<T>(*_allocator, val);
+        _collection.push_back(_last);
+    }
+
+    void appendPreallocated(const BSONElement& val) {
+        _last = CMaterializer::materializePreallocated(val);
+        _collection.push_back(_last);
+    }
+
+    // Does not update _last, should not be repeated by appendLast()
+    void appendMissing() {
+        _collection.push_back(CMaterializer::materializeMissing(*_allocator));
+    }
+
+    // Appends last value that was not Missing
+    void appendLast() {
+        _collection.push_back(_last);
+    }
+
+    // Sets the last value without appending anything.
+    template <typename T>
+    void setLast(const BSONElement& val) {
+        _last = CMaterializer::template materialize<T>(*_allocator, val);
+    }
+
+    void appendPositionInfo(int32_t n) {
+        // If the 'Container' doesn't request position information, this will be a no-op.
+        if constexpr (kCollectsPositionInfo) {
+            _collection.appendPositionInfo(n);
+        }
+    }
+
+    ElementStorage& getAllocator() {
+        return *_allocator;
+    }
+
+private:
+    Container& _collection;
+    boost::intrusive_ptr<ElementStorage> _allocator;
+    Element _last = CMaterializer::materializeMissing(*_allocator);
+};
+
+class BSONColumnBlockBased {
+
+public:
+    BSONColumnBlockBased(const char* buffer, size_t size);
+    explicit BSONColumnBlockBased(BSONBinData bin);
+
+    /**
+     * Decompress entire BSONColumn
+     *
+     */
+    template <class Buffer>
+    requires Appendable<Buffer>
+    void decompress(Buffer& buffer) const;
+
+    /**
+     * Wrapper that expects the caller to define a Materializer and
+     * a Container to receive a collection of elements from block decoding
+     */
+    template <class CMaterializer, class Container>
+    requires Materializer<CMaterializer>
+    void decompress(Container& collection, boost::intrusive_ptr<ElementStorage> allocator) const {
+        Collector<CMaterializer, Container> collector(collection, allocator);
+        decompress(collector);
+    }
+
+    /**
+     * Version of decompress that accepts multiple paths decompressed to separate buffers.
+     */
+    template <class CMaterializer, class Container, typename Path>
+    requires Materializer<CMaterializer>
+    void decompress(boost::intrusive_ptr<ElementStorage> allocator,
+                    std::span<std::pair<Path, Container&>> paths) const;
+
+    /*
+     * Decompress entire BSONColumn using the iteration-based implementation. This is used for
+     * testing and production uses should eventually be replaced.
+     */
+    template <class Buffer>
+    requires Appendable<Buffer>
+    void decompressIterative(Buffer& buffer, boost::intrusive_ptr<ElementStorage> allocator) const {
+        BSONColumn::Iterator it(allocator, _binary, _binary + _size);
+        for (; it.more(); ++it) {
+            buffer.appendPreallocated(*it);
+        }
+    }
+
+    /**
+     * Wrapper that expects the caller to define a Materializer and a Container to receive a
+     * collection of elements from block decoding. This calls the iteration-based implementation.
+     * This is used for testing and production uses should eventually be replaced.
+     */
+    template <class CMaterializer, class Container>
+    requires Materializer<CMaterializer>
+    void decompressIterative(Container& collection,
+                             boost::intrusive_ptr<ElementStorage> allocator) const {
+        Collector<CMaterializer, Container> collector(collection, allocator);
+        decompressIterative(collector, std::move(allocator));
+    }
+
+    /**
+     * Return first non-missing element stored in this BSONColumn
+     */
+    BSONElement first() const;
+
+    /**
+     * Return last non-missing element stored in this BSONColumn
+     */
+    BSONElement last() const;
+
+    /**
+     * Return 'min' element in this BSONColumn.
+     *
+     * TODO: Do we need to specify ComparisonRulesSet here?
+     */
+    BSONElement min(const StringDataComparator* comparator = nullptr) const;
+
+    /**
+     * Return 'max' element in this BSONColumn.
+     *
+     * TODO: Do we need to specify ComparisonRulesSet here?
+     */
+    BSONElement max(const StringDataComparator* comparator = nullptr) const;
+
+    /**
+     * Return sum of all elements stored in this BSONColumn.
+     *
+     * The BSONColumn must only contain NumberInt, NumberLong, NumberDouble, NumberDecimal types,
+     * throws otherwise.
+     */
+    BSONElement sum() const;
+
+    /**
+     * Element lookup by index
+     *
+     * Returns EOO if index represent skipped element.
+     * Returns boost::none if index is out of bounds.
+     */
+    boost::optional<BSONElement> operator[](size_t index) const;
+
+    /**
+     * Number of elements stored (including 'missing') in this BSONColumn
+     */
+    size_t size() const;
+
+    /**
+     * Returns true if 'type' is stored within the BSONColumn. Traverses any internal objects if
+     * 'type' is a scalar.
+     */
+    bool contains(BSONType type) const;
+
+private:
+    const char* _binary;
+    size_t _size;
+};
+
+/**
+ * Version of decompress() that accepts multiple paths decompressed to separate buffers.
+ */
+template <class CMaterializer, class Container, typename Path>
+requires Materializer<CMaterializer>
+void BSONColumnBlockBased::decompress(boost::intrusive_ptr<ElementStorage> allocator,
+                                      std::span<std::pair<Path, Container&>> paths) const {
+    // The Collector class wraps a reference to a buffer passed in by the caller.
+    // BlockBasedInterleavedDecompressor expects references to collectors, so create a vector where
+    // we allocate them.
+    std::vector<Collector<CMaterializer, Container>> ownedCollectors;
+    // Create a vector of pairs of paths and references to collectors, to be passed to the
+    // decompressor.
+    std::vector<std::pair<Path, Collector<CMaterializer, Container>&>> pathCollectors;
+    ownedCollectors.reserve(paths.size());
+    pathCollectors.reserve(paths.size());
+    for (auto&& p : paths) {
+        ownedCollectors.emplace_back(p.second, allocator);
+        pathCollectors.push_back({p.first, ownedCollectors.back()});
+    }
+
+    const char* control = _binary;
+    const char* end = _binary + _size;
+    while (*control != EOO) {
+        BlockBasedInterleavedDecompressor decompressor{*allocator, control, end};
+        invariant(bsoncolumn::isInterleavedStartControlByte(*control),
+                  "non-interleaved data is not yet handled via this API");
+        control = decompressor.decompress(std::span{pathCollectors});
+        invariant(control < end);
+    }
+}
+
+}  // namespace bsoncolumn
 }  // namespace mongo
+
+#include "bsoncolumn.inl"

@@ -3,6 +3,7 @@
  *
  * @tags: [requires_fcv_70]
  */
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
 import {extractUUIDFromObject} from "jstests/libs/uuid_util.js";
 import {
     AnalyzeShardKeyUtil
@@ -61,16 +62,25 @@ function runTest(readPreference) {
     const res0 = assert.commandWorked(st.s1.adminCommand(analyzeShardKeyCmdObj));
     AnalyzeShardKeyUtil.assertKeyCharacteristicsMetrics(res0.keyCharacteristics, expectedMetrics);
 
-    // Make shard1 the primary shard instead by running the movePrimary command against mongos0.
-    assert.commandWorked(st.s0.adminCommand({movePrimary: dbName, to: st.shard1.name}));
+    // Database versioning tests only make sense when all collections are not tracked.
+    const isTrackUnshardedUponCreationEnabled = FeatureFlagUtil.isPresentAndEnabled(
+        st.s.getDB('admin'), "TrackUnshardedCollectionsUponCreation");
+    if (!isTrackUnshardedUponCreationEnabled) {
+        // Make shard1 the primary shard instead using mongos0 to make mongos1 stale.
+        assert.commandWorked(st.s0.adminCommand({movePrimary: dbName, to: st.shard1.name}));
 
-    // Rerun the analyzeShardKey command against mongos1. Since it does not know that the primary
-    // shard has changed, it would forward the analyzeShardKey command to shard0. Without database
-    // versioning, no StaleDbVersion error would be thrown and so the analyzeShardKey command would
-    // run on shard0 instead of on shard1. As a result, the command would fail with a
-    // NamespaceNotFound error.
-    const res1 = assert.commandWorked(st.s1.adminCommand(analyzeShardKeyCmdObj));
-    AnalyzeShardKeyUtil.assertKeyCharacteristicsMetrics(res1.keyCharacteristics, expectedMetrics);
+        // Rerun the analyzeShardKey command against mongos1. Since it does not know that the
+        // primary shard has changed, it would forward the analyzeShardKey command to shard0.
+        // Without database versioning, no StaleDbVersion error would be thrown and so the
+        // analyzeShardKey command would run on shard0 instead of on shard1. As a result, the
+        // command would fail with a NamespaceNotFound error.
+        const res1 = assert.commandWorked(st.s1.adminCommand(analyzeShardKeyCmdObj));
+        AnalyzeShardKeyUtil.assertKeyCharacteristicsMetrics(res1.keyCharacteristics,
+                                                            expectedMetrics);
+
+        // Move the primary back to shard 0 so that the next test has the placement it expects.
+        assert.commandWorked(st.s0.adminCommand({movePrimary: dbName, to: st.shard0.name}));
+    }
 
     // Shard the collection and make it have two chunks:
     // shard0: [MinKey, 0]

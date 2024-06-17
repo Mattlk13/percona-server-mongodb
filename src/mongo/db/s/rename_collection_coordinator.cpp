@@ -58,6 +58,7 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/database_name.h"
+#include "mongo/db/list_collections_gen.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/ops/write_ops_gen.h"
 #include "mongo/db/ops/write_ops_parsers.h"
@@ -71,7 +72,6 @@
 #include "mongo/db/s/sharding_ddl_util.h"
 #include "mongo/db/s/sharding_logging.h"
 #include "mongo/db/s/sharding_recovery_service.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/session/logical_session_id.h"
 #include "mongo/db/session/logical_session_id_gen.h"
 #include "mongo/db/shard_id.h"
@@ -103,6 +103,7 @@
 #include "mongo/s/router_role.h"
 #include "mongo/s/shard_version.h"
 #include "mongo/s/sharding_feature_flags_gen.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/util/future_impl.h"
@@ -145,6 +146,147 @@ boost::optional<UUID> getCollectionUUID(OperationContext* opCtx,
             collPtr);
 
     return collPtr->uuid();
+}
+
+/**
+ * Checks that both collections are part of the same database when the source collection is sharded
+ * or must have the same database primary shard when the source collection is unsharded.
+ */
+void checkDatabaseRestrictions(OperationContext* opCtx,
+                               const NamespaceString& fromNss,
+                               const boost::optional<CollectionType>& fromCollType,
+                               const NamespaceString& toNss) {
+    if (!fromCollType || fromCollType->getUnsplittable().value_or(false)) {
+        // TODO (SERVER-84243): Replace with the dedicated cache for filtering information and avoid
+        // to refresh.
+        const auto toDB = uassertStatusOK(
+            Grid::get(opCtx)->catalogCache()->getDatabaseWithRefresh(opCtx, toNss.dbName()));
+
+        uassert(ErrorCodes::CommandFailed,
+                "Source and destination collections must be on same shard",
+                ShardingState::get(opCtx)->shardId() == toDB->getPrimary());
+    } else {
+        uassert(ErrorCodes::CommandFailed,
+                str::stream() << "Source and destination collections must be on "
+                                 "the same database because "
+                              << fromNss.toStringForErrorMsg() << " is sharded.",
+                fromNss.db_forSharding() == toNss.db_forSharding());
+    }
+}
+
+/**
+ * Checks that the collection UUID is the same in every shard knowing the collection.
+ */
+void checkCollectionUUIDConsistencyAcrossShards(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const UUID& collectionUuid,
+    const std::vector<mongo::ShardId>& shardIds,
+    std::shared_ptr<executor::ScopedTaskExecutor> executor) {
+    const BSONObj filterObj = BSON("name" << nss.coll());
+    ListCollections command;
+    command.setFilter(filterObj);
+    command.setDbName(nss.dbName());
+    auto opts = std::make_shared<async_rpc::AsyncRPCOptions<ListCollections>>(
+        **executor, CancellationToken::uncancelable(), command);
+    auto responses = sharding_ddl_util::sendAuthenticatedCommandToShards(opCtx, opts, shardIds);
+
+    struct MismatchedShard {
+        std::string shardId;
+        std::string uuid;
+    };
+
+    std::vector<MismatchedShard> mismatches;
+
+    for (const auto& cmdResponse : responses) {
+        auto responseData = uassertStatusOK(cmdResponse.swResponse);
+        auto collectionVector = responseData.data.firstElement()["firstBatch"].Array();
+        auto shardId = cmdResponse.shardId;
+
+        if (collectionVector.empty()) {
+            // Collection does not exist on the shard
+            continue;
+        }
+
+        auto bsonCollectionUuid = collectionVector.front()["info"]["uuid"];
+        if (collectionUuid.data() != bsonCollectionUuid.uuid()) {
+            mismatches.push_back({shardId.toString(), bsonCollectionUuid.toString()});
+        }
+    }
+
+    if (!mismatches.empty()) {
+        std::stringstream errorMessage;
+        errorMessage << "The collection " << nss.toStringForErrorMsg()
+                     << " with expected UUID: " << collectionUuid.toString()
+                     << " has different UUIDs on the following shards: [";
+
+        for (const auto& mismatch : mismatches) {
+            errorMessage << "{ " << mismatch.shardId << ":" << mismatch.uuid << " },";
+        }
+        errorMessage << "]";
+        uasserted(ErrorCodes::InvalidUUID, errorMessage.str());
+    }
+}
+
+/**
+ * Checks that the collection does not exist in any shard when `dropTarget` is set to false.
+ */
+void checkTargetCollectionDoesNotExistInCluster(
+    OperationContext* opCtx,
+    const NamespaceString& toNss,
+    const std::vector<mongo::ShardId>& shardIds,
+    std::shared_ptr<executor::ScopedTaskExecutor> executor) {
+    const BSONObj filterObj = BSON("name" << toNss.coll());
+    ListCollections command;
+    command.setFilter(filterObj);
+    command.setDbName(toNss.dbName());
+    auto opts = std::make_shared<async_rpc::AsyncRPCOptions<ListCollections>>(
+        **executor, CancellationToken::uncancelable(), command);
+    auto responses = sharding_ddl_util::sendAuthenticatedCommandToShards(opCtx, opts, shardIds);
+
+    std::vector<std::string> shardsContainingTargetCollection;
+    for (const auto& cmdResponse : responses) {
+        uassertStatusOK(cmdResponse.swResponse);
+        auto responseData = uassertStatusOK(cmdResponse.swResponse);
+        auto collectionVector = responseData.data.firstElement()["firstBatch"].Array();
+
+        if (!collectionVector.empty()) {
+            shardsContainingTargetCollection.push_back(cmdResponse.shardId.toString());
+        }
+    }
+
+    if (!shardsContainingTargetCollection.empty()) {
+        std::stringstream errorMessage;
+        errorMessage << "The collection " << toNss.toStringForErrorMsg()
+                     << " already exists in the following shards: [";
+        std::move(shardsContainingTargetCollection.begin(),
+                  shardsContainingTargetCollection.end(),
+                  std::ostream_iterator<std::string>(errorMessage, ", "));
+        errorMessage << "]";
+        uasserted(ErrorCodes::NamespaceExists, errorMessage.str());
+    }
+}
+
+/**
+ * Ensures that 1) the source collection UUID is consistent on every shard and 2) the target
+ * collection is not present on any shard when `dropTarget` is false.
+ */
+void checkCatalogConsistencyAcrossShards(OperationContext* opCtx,
+                                         const NamespaceString& fromNss,
+                                         const boost::optional<CollectionType>& fromCollType,
+                                         const NamespaceString& toNss,
+                                         const bool dropTarget,
+                                         std::shared_ptr<executor::ScopedTaskExecutor> executor) {
+
+    auto participants = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
+
+    auto sourceCollUuid = *getCollectionUUID(opCtx, fromNss, fromCollType);
+    checkCollectionUUIDConsistencyAcrossShards(
+        opCtx, fromNss, sourceCollUuid, participants, executor);
+
+    if (!dropTarget) {
+        checkTargetCollectionDoesNotExistInCluster(opCtx, toNss, participants, executor);
+    }
 }
 
 void renameIndexMetadataInShards(OperationContext* opCtx,
@@ -605,7 +747,8 @@ void checkExpectedTargetCollectionOptionsMatch(OperationContext* opCtx,
         return coll ? coll->getCollectionOptions().toBSON() : BSONObj();
     }();
 
-    checkTargetCollectionOptionsMatch(targetNss, expectedOptions, collectionOptions);
+    uassertStatusOK(
+        checkTargetCollectionOptionsMatch(targetNss, expectedOptions, collectionOptions));
 }
 
 void checkExpectedTargetIndexesMatch(OperationContext* opCtx,
@@ -624,11 +767,10 @@ void checkExpectedTargetIndexesMatch(OperationContext* opCtx,
                          }
                          return uassertStatusOK(response).docs;
                      });
-
-    checkTargetCollectionIndexesMatch(
+    uassertStatusOK(checkTargetCollectionIndexesMatch(
         targetNss,
         std::list<BSONObj>{expectedIndexes.begin(), expectedIndexes.end()},
-        std::list<BSONObj>{currentIndexes.begin(), currentIndexes.end()});
+        std::list<BSONObj>{currentIndexes.begin(), currentIndexes.end()}));
 }
 }  // namespace
 
@@ -649,6 +791,11 @@ void RenameCollectionCoordinator::checkIfOptionsConflict(const BSONObj& doc) con
                           << originalNss().toStringForErrorMsg()
                           << " is being executed with different parameters: " << selfReq,
             SimpleBSONObjComparator::kInstance.evaluate(selfReq == otherReq));
+}
+
+logv2::DynamicAttributes RenameCollectionCoordinator::getCoordinatorLogAttrs() const {
+    return logv2::DynamicAttributes{getBasicCoordinatorAttrs(),
+                                    "destinationNamespace"_attr = _request.getTo()};
 }
 
 std::set<NamespaceString> RenameCollectionCoordinator::_getAdditionalLocksToAcquire(
@@ -786,15 +933,13 @@ ExecutorFuture<void> RenameCollectionCoordinator::_runImpl(
                         }
                     }
 
-                    sharding_ddl_util::checkRenamePreconditions(opCtx,
-                                                                fromNss,
-                                                                optSourceCollType,
-                                                                toNss,
-                                                                optTargetCollType,
-                                                                _doc.getDropTarget());
+                    sharding_ddl_util::checkRenamePreconditions(
+                        opCtx, toNss, optTargetCollType, _doc.getDropTarget());
 
-                    sharding_ddl_util::checkCatalogConsistencyAcrossShardsForRename(
-                        opCtx, fromNss, toNss, _doc.getDropTarget(), executor);
+                    checkDatabaseRestrictions(opCtx, fromNss, optSourceCollType, toNss);
+
+                    checkCatalogConsistencyAcrossShards(
+                        opCtx, fromNss, optSourceCollType, toNss, _doc.getDropTarget(), executor);
 
                     // Check that the target collection is not sharded, if requested.
                     if (_doc.getRenameCollectionRequest().getTargetMustNotBeSharded().get_value_or(
@@ -1010,7 +1155,7 @@ ExecutorFuture<void> RenameCollectionCoordinator::_runImpl(
                     fromNss, _doc.getSourceUUID().value());
                 unblockParticipantRequest.setDbName(fromNss.dbName());
                 unblockParticipantRequest.setRenameCollectionRequest(_request);
-                auto participants = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
+                auto participants = getAllShardsAndConfigServerIds(opCtx);
 
                 async_rpc::GenericArgs args;
                 async_rpc::AsyncRPCCommandHelpers::appendMajorityWriteConcern(args);

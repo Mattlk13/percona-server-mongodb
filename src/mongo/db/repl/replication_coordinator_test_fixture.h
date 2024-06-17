@@ -111,7 +111,7 @@ public:
 
 protected:
     explicit ReplCoordTest(Options options = Options{}.useMockClock(true));
-    virtual ~ReplCoordTest();
+    ~ReplCoordTest() override;
 
     /**
      * Asserts that calling start(configDoc, selfHost) successfully initiates the
@@ -138,36 +138,52 @@ protected:
         return _repl.get();
     }
 
+    /**
+     * These are the setters to advance lastWritten/lastApplied/lastDurable timestamp in replication
+     * coordinator. Note that the call will be ignored if the input timestamp is not greater than
+     * the current one in ReplicationCoordinatorImpl(that's what "Forward" means), while the call
+     * won't be ignored in ReplicationCoordinatorMock.
+     */
+    void replCoordSetMyLastWrittenOpTime(const OpTime& opTime, Date_t wallTime = Date_t()) {
+        if (wallTime == Date_t()) {
+            wallTime = Date_t() + Seconds(opTime.getSecs());
+        }
+        getReplCoord()->setMyLastWrittenOpTimeAndWallTimeForward({opTime, wallTime});
+    }
+
     void replCoordSetMyLastAppliedOpTime(const OpTime& opTime, Date_t wallTime = Date_t()) {
         if (wallTime == Date_t()) {
             wallTime = Date_t() + Seconds(opTime.getSecs());
         }
-        getReplCoord()->setMyLastAppliedOpTimeAndWallTime({opTime, wallTime});
-    }
-
-    void replCoordSetMyLastAppliedOpTimeForward(const OpTime& opTime, Date_t wallTime = Date_t()) {
-        if (wallTime == Date_t()) {
-            wallTime = Date_t() + Seconds(opTime.getSecs());
-        }
-        getReplCoord()->setMyLastAppliedOpTimeAndWallTimeForward({opTime, wallTime}, true);
+        getReplCoord()->setMyLastAppliedOpTimeAndWallTimeForward({opTime, wallTime});
     }
 
     void replCoordSetMyLastDurableOpTime(const OpTime& opTime, Date_t wallTime = Date_t()) {
         if (wallTime == Date_t()) {
             wallTime = Date_t() + Seconds(opTime.getSecs());
         }
-        getReplCoord()->setMyLastDurableOpTimeAndWallTime({opTime, wallTime});
-    }
-
-    void replCoordSetMyLastDurableOpTimeForward(const OpTime& opTime, Date_t wallTime = Date_t()) {
-        if (wallTime == Date_t()) {
-            wallTime = Date_t() + Seconds(opTime.getSecs());
-        }
         getReplCoord()->setMyLastDurableOpTimeAndWallTimeForward({opTime, wallTime});
     }
 
-    void replCoordSetMyLastAppliedAndDurableOpTime(const OpTime& opTime,
-                                                   Date_t wallTime = Date_t()) {
+    void replCoordSetMyLastDurableAndLastWrittenOpTime(const OpTime& opTime,
+                                                       Date_t wallTime = Date_t()) {
+        if (wallTime == Date_t()) {
+            wallTime = Date_t() + Seconds(opTime.getSecs());
+        }
+        getReplCoord()->setMyLastDurableAndLastWrittenOpTimeAndWallTimeForward({opTime, wallTime});
+    }
+
+    void replCoordSetMyLastAppliedAndLastWrittenOpTime(const OpTime& opTime,
+                                                       Date_t wallTime = Date_t()) {
+        if (wallTime == Date_t()) {
+            wallTime = Date_t() + Seconds(opTime.getSecs());
+        }
+        getReplCoord()->setMyLastAppliedAndLastWrittenOpTimeAndWallTimeForward({opTime, wallTime});
+    }
+
+    void replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(const OpTime& opTime,
+                                                             Date_t wallTime = Date_t()) {
+        replCoordSetMyLastWrittenOpTime(opTime, wallTime);
         replCoordSetMyLastAppliedOpTime(opTime, wallTime);
         replCoordSetMyLastDurableOpTime(opTime, wallTime);
     }

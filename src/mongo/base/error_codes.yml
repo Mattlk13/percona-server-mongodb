@@ -236,7 +236,7 @@ error_codes:
     - {code: 190,name: MasterSlaveConnectionFailure}
     - {code: 191,name: OBSOLETE_BalancerLostDistributedLock}
     - {code: 192,name: FailPointEnabled}
-    - {code: 193,name: NoShardingEnabled}
+    - {code: 193,name: NoShardingEnabled_OBSOLETE}
     - {code: 194,name: BalancerInterrupted}
     - {code: 195,name: ViewPipelineMaxSizeExceeded}
     - {code: 197,name: InvalidIndexSpecificationOption}
@@ -360,11 +360,6 @@ error_codes:
     - {code: 302,name: OCSPCertificateStatusUnknown}
     - {code: 303,name: SplitHorizonChange,categories: [CloseConnectionError]}
 
-    # This code should only be used upon finding that a shard has been marked stale in the sharding
-    # catalog cache, and as such does not belong in the StaleShardVersionError or
-    # NeedRetargettingError categories.
-    - {code: 304,name: ShardInvalidatedForTargeting,extra: ShardInvalidatedForTargetingInfo}
-
     - {code: 306,name: ReadThroughCacheLookupCanceled,categories: [InternalOnly]}
 
     - {code: 307,name: RangeDeletionAbandonedBecauseTaskDocumentDoesNotExist}
@@ -426,9 +421,6 @@ error_codes:
     - {code: 341, name: ReshardCollectionAborted}
     - {code: 342, name: ReshardingCriticalSectionTimeout}
 
-    # ShardCannotRefreshDueToLocksHeld will be retried by the shards. Note that it is not under the
-    # NeedRetargettingError, meaning MongoS will pass it through to the client, because there is no
-    # case where it would be possible for MongoS to retry where MongoD couldn't.
     - {code: 343, name: ShardCannotRefreshDueToLocksHeld,
                   extra: ShardCannotRefreshDueToLocksHeldInfo}
 
@@ -534,6 +526,20 @@ error_codes:
     - {code: 404, name: LDAPRoleAcquisitionError}
 
     - {code: 405, name: CannotCreateChunkDistribution}
+
+    - {code: 406, name: MigrationBlockingOperationCoordinatorCleaningUp}
+    
+    - {code: 407,name: PooledConnectionAcquisitionExceededTimeLimit,categories: [ExceededTimeLimitError,RetriableError]}
+
+    - {code: 408, name: TimeseriesBucketCompressionFailed, extra: 'timeseries::BucketCompressionFailure'}
+
+    - {code: 409, name: CannotInsertTimeseriesBucketsWithMixedSchema}
+
+    - {code: 410, name: TimeseriesBucketFrozen, categories: [InternalOnly]}
+
+    - {code: 411, name: QueryRejectedBySettings}
+
+    - {code: 412, name: UpdatesStillPending, categories: [RetriableError]}
 
     # Error codes 4000-8999 are reserved.
 

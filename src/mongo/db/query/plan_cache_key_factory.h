@@ -84,10 +84,18 @@ Key make(const CanonicalQuery& query, const CollectionPtr& collection) {
 }
 
 /**
+ * Similar to above, a factory helper to make a SBE plan cache key, but used for find queries that
+ * might involve multiple collections.
+ */
+sbe::PlanCacheKey make(const CanonicalQuery& query,
+                       const MultipleCollectionAccessor& collections,
+                       canonical_query_encoder::Optimizer optimizer);
+
+/**
  * Similar to above, a factory helper to make a SBE plan cache key, but used for agg queries that
  * might involve multiple collections.
  */
-sbe::PlanCacheKey make(const CanonicalQuery& query, const MultipleCollectionAccessor& collections);
+sbe::PlanCacheKey make(const Pipeline& query, const MultipleCollectionAccessor& collections);
 
 }  // namespace plan_cache_key_factory
 }  // namespace mongo

@@ -52,7 +52,6 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -71,13 +70,13 @@
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/compiler.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/overloaded_visitor.h"  // IWYU pragma: keep
@@ -187,31 +186,31 @@ bool containsClusteredIndex(const CollectionPtr& collection, const IndexArgument
     invariant(collection && collection->isClustered());
 
     auto clusteredIndexSpec = collection->getClusteredInfo()->getIndexSpec();
-    return stdx::visit(
-        OverloadedVisitor{[&](const std::string& indexName) -> bool {
-                              // While the clusteredIndex's name is optional during user
-                              // creation, it should always be filled in by default on the
-                              // collection object.
-                              auto clusteredIndexName = clusteredIndexSpec.getName();
-                              invariant(clusteredIndexName.has_value());
+    return visit(OverloadedVisitor{[&](const std::string& indexName) -> bool {
+                                       // While the clusteredIndex's name is optional during user
+                                       // creation, it should always be filled in by default on the
+                                       // collection object.
+                                       auto clusteredIndexName = clusteredIndexSpec.getName();
+                                       invariant(clusteredIndexName.has_value());
 
-                              return clusteredIndexName.value() == indexName;
-                          },
-                          [&](const std::vector<std::string>& indexNames) -> bool {
-                              // While the clusteredIndex's name is optional during user
-                              // creation, it should always be filled in by default on the
-                              // collection object.
-                              auto clusteredIndexName = clusteredIndexSpec.getName();
-                              invariant(clusteredIndexName.has_value());
+                                       return clusteredIndexName.value() == indexName;
+                                   },
+                                   [&](const std::vector<std::string>& indexNames) -> bool {
+                                       // While the clusteredIndex's name is optional during user
+                                       // creation, it should always be filled in by default on the
+                                       // collection object.
+                                       auto clusteredIndexName = clusteredIndexSpec.getName();
+                                       invariant(clusteredIndexName.has_value());
 
-                              return std::find(indexNames.begin(),
-                                               indexNames.end(),
-                                               clusteredIndexName.value()) != indexNames.end();
-                          },
-                          [&](const BSONObj& indexKey) -> bool {
-                              return clusteredIndexSpec.getKey().woCompare(indexKey) == 0;
-                          }},
-        index);
+                                       return std::find(indexNames.begin(),
+                                                        indexNames.end(),
+                                                        clusteredIndexName.value()) !=
+                                           indexNames.end();
+                                   },
+                                   [&](const BSONObj& indexKey) -> bool {
+                                       return clusteredIndexSpec.getKey().woCompare(indexKey) == 0;
+                                   }},
+                 index);
 }
 
 /**
@@ -221,9 +220,10 @@ bool containsClusteredIndex(const CollectionPtr& collection, const IndexArgument
 StatusWith<std::vector<std::string>> getIndexNames(OperationContext* opCtx,
                                                    const CollectionPtr& collection,
                                                    const IndexArgument& index) {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_IX));
+    invariant(
+        shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(collection->ns(), MODE_IX));
 
-    return stdx::visit(
+    return visit(
         OverloadedVisitor{
             [](const std::string& arg) -> StatusWith<std::vector<std::string>> { return {{arg}}; },
             [](const std::vector<std::string>& arg) -> StatusWith<std::vector<std::string>> {
@@ -325,7 +325,8 @@ void dropReadyIndexes(OperationContext* opCtx,
                       const std::vector<std::string>& indexNames,
                       DropIndexesReply* reply,
                       bool forceDropShardKeyIndex) {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_X));
+    invariant(
+        shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(collection->ns(), MODE_X));
 
     if (indexNames.empty()) {
         return;
@@ -355,7 +356,7 @@ void dropReadyIndexes(OperationContext* opCtx,
                     const auto& shardKey = collDescription.getShardKeyPattern();
                     const bool skipDropIndex = skipDroppingHashedShardKeyIndex ||
                         !(gFeatureFlagShardKeyIndexOptionalHashedSharding.isEnabled(
-                              serverGlobalParams.featureCompatibility) &&
+                              serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) &&
                           shardKey.isHashedPattern());
                     if (isCompatibleWithShardKey(opCtx,
                                                  CollectionPtr(collection),
@@ -464,15 +465,14 @@ DropIndexesReply dropIndexes(OperationContext* opCtx,
               "CMD: dropIndexes",
               logAttrs(nss),
               "uuid"_attr = collectionUUID,
-              "indexes"_attr =
-                  stdx::visit(OverloadedVisitor{[](const std::string& arg) { return arg; },
-                                                [](const std::vector<std::string>& arg) {
-                                                    return boost::algorithm::join(arg, ",");
-                                                },
-                                                [](const BSONObj& arg) {
-                                                    return arg.toString();
-                                                }},
-                              index));
+              "indexes"_attr = visit(OverloadedVisitor{[](const std::string& arg) { return arg; },
+                                                       [](const std::vector<std::string>& arg) {
+                                                           return boost::algorithm::join(arg, ",");
+                                                       },
+                                                       [](const BSONObj& arg) {
+                                                           return arg.toString();
+                                                       }},
+                                     index));
     }
 
     if ((*collection)->isClustered() &&
@@ -483,8 +483,7 @@ DropIndexesReply dropIndexes(OperationContext* opCtx,
     DropIndexesReply reply;
     reply.setNIndexesWas((*collection)->getIndexCatalog()->numIndexesTotal());
 
-    const bool isWildcard =
-        stdx::holds_alternative<std::string>(index) && stdx::get<std::string>(index) == "*";
+    const bool isWildcard = holds_alternative<std::string>(index) && get<std::string>(index) == "*";
 
     IndexBuildsCoordinator* indexBuildsCoord = IndexBuildsCoordinator::get(opCtx);
 
@@ -517,7 +516,7 @@ DropIndexesReply dropIndexes(OperationContext* opCtx,
 
         // Abandon the snapshot as the index catalog will compare the in-memory state to the
         // disk state, which may have changed when we released the lock temporarily.
-        opCtx->recoveryUnit()->abandonSnapshot();
+        shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
 
         // Take an exclusive lock on the collection now to be able to perform index catalog
         // writes when removing ready indexes from disk.
@@ -631,6 +630,7 @@ Status dropIndexesForApplyOps(OperationContext* opCtx,
     auto cmdObjWithDb = bob.obj();
     auto parsed = DropIndexes::parse(IDLParserContext{"dropIndexes",
                                                       false /* apiStrict */,
+                                                      auth::ValidatedTenancyScope::get(opCtx),
                                                       nss.tenantId(),
                                                       SerializationContext::stateStorageRequest()},
                                      cmdObjWithDb);

@@ -41,12 +41,16 @@ namespace mongo {
  */
 class ServiceEntryPointMongod final : public ServiceEntryPointImpl {
 public:
-    using ServiceEntryPointImpl::ServiceEntryPointImpl;
+    ServiceEntryPointMongod();
+    ~ServiceEntryPointMongod() override;
     Future<DbResponse> handleRequest(OperationContext* opCtx,
                                      const Message& request) noexcept final;
 
 private:
+    Future<DbResponse> _replicaSetEndpointHandleRequest(OperationContext* opCtx,
+                                                        const Message& m) noexcept;
     class Hooks;
+    std::unique_ptr<Hooks> _hooks;
 };
 
 }  // namespace mongo

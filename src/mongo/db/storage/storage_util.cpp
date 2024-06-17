@@ -46,6 +46,7 @@
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_util.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -91,14 +92,14 @@ auto removeEmptyDirectory =
         }
     };
 
-BSONObj toBSON(const stdx::variant<Timestamp, StorageEngine::CheckpointIteration>& x) {
-    return stdx::visit(OverloadedVisitor{[](const Timestamp& ts) { return ts.toBSON(); },
-                                         [](const StorageEngine::CheckpointIteration& iter) {
-                                             auto underlyingValue = uint64_t{iter};
-                                             return BSON("checkpointIteration"
-                                                         << std::to_string(underlyingValue));
-                                         }},
-                       x);
+BSONObj toBSON(const std::variant<Timestamp, StorageEngine::CheckpointIteration>& x) {
+    return visit(OverloadedVisitor{[](const Timestamp& ts) { return ts.toBSON(); },
+                                   [](const StorageEngine::CheckpointIteration& iter) {
+                                       auto underlyingValue = uint64_t{iter};
+                                       return BSON("checkpointIteration"
+                                                   << std::to_string(underlyingValue));
+                                   }},
+                 x);
 }
 }  // namespace
 
@@ -133,7 +134,7 @@ void removeIndex(OperationContext* opCtx,
     //
     // Index creation (and deletion) are allowed in multi-document transactions that use the same
     // RecoveryUnit throughout but not the same OperationContext.
-    auto recoveryUnit = opCtx->recoveryUnit();
+    auto recoveryUnit = shard_role_details::getRecoveryUnit(opCtx);
     auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
 
     const bool isTwoPhaseDrop =
@@ -147,7 +148,7 @@ void removeIndex(OperationContext* opCtx,
 
     // Schedule the second phase of drop to delete the data when it is no longer in use, if the
     // first phase is successfully committed.
-    opCtx->recoveryUnit()->onCommitForTwoPhaseDrop(
+    shard_role_details::getRecoveryUnit(opCtx)->onCommitForTwoPhaseDrop(
         [svcCtx = opCtx->getServiceContext(),
          recoveryUnit,
          storageEngine,
@@ -168,7 +169,7 @@ void removeIndex(OperationContext* opCtx,
                 };
 
             if (isTwoPhaseDrop) {
-                stdx::variant<Timestamp, StorageEngine::CheckpointIteration> dropTime;
+                std::variant<Timestamp, StorageEngine::CheckpointIteration> dropTime;
                 if (!commitTimestamp) {
                     // Standalone mode and unreplicated drops will not provide a timestamp. Use the
                     // checkpoint iteration instead.
@@ -217,13 +218,13 @@ Status dropCollection(OperationContext* opCtx,
     //
     // Create (and drop) collection are allowed in multi-document transactions that use the same
     // RecoveryUnit throughout but not the same OperationContext.
-    auto recoveryUnit = opCtx->recoveryUnit();
+    auto recoveryUnit = shard_role_details::getRecoveryUnit(opCtx);
     auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
 
 
     // Schedule the second phase of drop to delete the data when it is no longer in use, if the
     // first phase is successfully committed.
-    opCtx->recoveryUnit()->onCommitForTwoPhaseDrop(
+    shard_role_details::getRecoveryUnit(opCtx)->onCommitForTwoPhaseDrop(
         [svcCtx = opCtx->getServiceContext(), recoveryUnit, storageEngine, nss, ident](
             OperationContext*, boost::optional<Timestamp> commitTimestamp) {
             StorageEngine::DropIdentCallback onDrop =
@@ -238,7 +239,7 @@ Status dropCollection(OperationContext* opCtx,
                 };
 
             if (storageEngine->supportsPendingDrops()) {
-                stdx::variant<Timestamp, StorageEngine::CheckpointIteration> dropTime;
+                std::variant<Timestamp, StorageEngine::CheckpointIteration> dropTime;
                 if (!commitTimestamp) {
                     // Standalone mode and unreplicated drops will not provide a timestamp. Use the
                     // checkpoint iteration instead.

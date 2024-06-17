@@ -96,16 +96,6 @@ namespace dps = ::mongo::dotted_path_support;
 using std::vector;
 namespace {
 
-std::unique_ptr<AuthorizationSession> authorizationSessionCreateImpl(
-    AuthorizationManager* authzManager) {
-    return std::make_unique<AuthorizationSessionImpl>(
-        AuthzSessionExternalState::create(authzManager),
-        AuthorizationSessionImpl::InstallMockForTestingOrAuthImpl{});
-}
-
-auto authorizationSessionCreateRegistration =
-    MONGO_WEAK_FUNCTION_REGISTRATION(AuthorizationSession::create, authorizationSessionCreateImpl);
-
 constexpr StringData SYSTEM_BUCKETS_PREFIX = "system.buckets."_sd;
 
 bool checkContracts() {
@@ -183,7 +173,6 @@ MONGO_FAIL_POINT_DEFINE(allowMultipleUsersWithApiStrict);
 AuthorizationSessionImpl::AuthorizationSessionImpl(
     std::unique_ptr<AuthzSessionExternalState> externalState, InstallMockForTestingOrAuthImpl)
     : _externalState(std::move(externalState)),
-      _impersonationFlag(false),
       _contract(TestingProctor::instance().isEnabled()),
       _mayBypassWriteBlockingMode(false),
       _mayUseTenant(false) {}
@@ -214,7 +203,7 @@ void AuthorizationSessionImpl::startRequest(OperationContext* opCtx) {
     } else {
         // For non-security token users, check if expiration has passed and move session into
         // expired state if so.
-        if (_expirationTime &&
+        if (_authenticatedUser && _expirationTime &&
             _expirationTime.value() <= opCtx->getServiceContext()->getFastClockSource()->now()) {
             _expiredUserName = std::exchange(_authenticatedUser, boost::none).value()->getName();
             _expirationTime = boost::none;
@@ -278,7 +267,7 @@ Status AuthorizationSessionImpl::addAndAuthorizeUser(OperationContext* opCtx,
         }
     }
 
-    AuthorizationManager* authzManager = AuthorizationManager::get(opCtx->getServiceContext());
+    AuthorizationManager* authzManager = AuthorizationManager::get(opCtx->getService());
     auto user = uassertStatusOK(authzManager->acquireUser(opCtx, userRequest));
 
     auto restrictionStatus = user->validateRestrictions(opCtx);
@@ -320,6 +309,7 @@ Status AuthorizationSessionImpl::addAndAuthorizeUser(OperationContext* opCtx,
     _authenticatedUser = std::move(user);
     _expirationTime = std::move(expirationTime);
     _expiredUserName = boost::none;
+    _loginTime = Date_t::now();
 
     // If there are any users and roles in the impersonation data, clear it out.
     clearImpersonatedUserData();
@@ -364,6 +354,7 @@ void AuthorizationSessionImpl::logoutSecurityTokenUser(Client* client) {
     // security tokens don't represent a permanent login.
     clearImpersonatedUserData();
     _updateInternalAuthorizationState();
+    _loginTime = boost::none;
 }
 
 void AuthorizationSessionImpl::logoutAllDatabases(Client* client, StringData reason) {
@@ -378,14 +369,15 @@ void AuthorizationSessionImpl::logoutAllDatabases(Client* client, StringData rea
 
     if (authenticatedUser) {
         auto names = BSON_ARRAY(authenticatedUser.value()->getName().toBSON());
-        audit::logLogout(client, reason, names, BSONArray());
+        audit::logLogout(client, reason, names, BSONArray(), _loginTime);
     } else if (expiredUserName) {
         auto names = BSON_ARRAY(expiredUserName.value().toBSON());
-        audit::logLogout(client, reason, names, BSONArray());
+        audit::logLogout(client, reason, names, BSONArray(), _loginTime);
     } else {
         return;
     }
 
+    _loginTime = boost::none;
     _expirationTime = boost::none;
 
     clearImpersonatedUserData();
@@ -504,10 +496,6 @@ boost::optional<TenantId> AuthorizationSessionImpl::getUserTenantId() const {
 bool AuthorizationSessionImpl::isAuthorizedToParseNamespaceElement(const BSONElement& element) {
     const bool isUUID = element.type() == BinData && element.binDataType() == BinDataType::newUUID;
     _contract.addAccessCheck(AccessCheckEnum::kIsAuthorizedToParseNamespaceElement);
-
-    uassert(ErrorCodes::InvalidNamespace,
-            "Failed to parse namespace element",
-            element.type() == String || isUUID);
 
     if (isUUID) {
         return isAuthorizedForActionsOnResource(
@@ -682,7 +670,8 @@ void AuthorizationSessionImpl::_refreshUserInfoAsNeeded(OperationContext* opCtx)
                 clearUser();
                 LOGV2(20245,
                       "Removed deleted user from session cache of user information",
-                      "user"_attr = name);
+                      "user"_attr = name,
+                      "error"_attr = status);
                 return;
             }
             case ErrorCodes::UnsupportedFormat: {
@@ -887,16 +876,15 @@ bool AuthorizationSessionImpl::_isAuthorizedForPrivilege(const Privilege& privil
 
 void AuthorizationSessionImpl::setImpersonatedUserData(const UserName& username,
                                                        const std::vector<RoleName>& roles) {
-    _impersonatedUserName = username;
+    _impersonatedUserName = std::make_shared<UserName>(username);
     _impersonatedRoleNames = roles;
-    _impersonationFlag = true;
 }
 
 bool AuthorizationSessionImpl::isCoauthorizedWithClient(Client* opClient, WithLock opClientLock) {
     _contract.addAccessCheck(AccessCheckEnum::kIsCoauthorizedWithClient);
     auto getUserName = [](AuthorizationSession* authSession) {
-        if (authSession->isImpersonating()) {
-            return authSession->getImpersonatedUserName();
+        if (auto impersonatedUsername = authSession->getImpersonatedUserName()) {
+            return impersonatedUsername;
         } else {
             return authSession->getAuthenticatedUserName();
         }
@@ -921,7 +909,10 @@ bool AuthorizationSessionImpl::isCoauthorizedWith(const boost::optional<UserName
 boost::optional<UserName> AuthorizationSessionImpl::getImpersonatedUserName() {
     _contract.addAccessCheck(AccessCheckEnum::kGetImpersonatedUserName);
 
-    return _impersonatedUserName;
+    if (auto impersonatedUserName = std::atomic_load(&_impersonatedUserName)) {
+        return *impersonatedUserName;
+    }
+    return boost::none;
 }
 
 RoleNameIterator AuthorizationSessionImpl::getImpersonatedRoleNames() {
@@ -938,14 +929,13 @@ bool AuthorizationSessionImpl::isUsingLocalhostBypass() {
 
 // Clear the vectors of impersonated usernames and roles.
 void AuthorizationSessionImpl::clearImpersonatedUserData() {
-    _impersonatedUserName = boost::none;
+    _impersonatedUserName.reset();
     _impersonatedRoleNames.clear();
-    _impersonationFlag = false;
 }
 
 
 bool AuthorizationSessionImpl::isImpersonating() const {
-    return _impersonationFlag;
+    return _impersonatedUserName != nullptr;
 }
 
 auto AuthorizationSessionImpl::checkCursorSessionPrivilege(
@@ -1043,6 +1033,11 @@ void AuthorizationSessionImpl::verifyContract(const AuthorizationContract* contr
     // Implicitly checked often to keep useTenant checks fast
     tempContract.addPrivilege(
         Privilege(ResourcePattern::forClusterResource(boost::none), ActionType::useTenant));
+
+
+    // makeLogicalSessionId checks for impersonate privileges
+    tempContract.addPrivilege(
+        Privilege(ResourcePattern::forClusterResource(boost::none), ActionType::impersonate));
 
     // Needed for internal sessions started by the server.
     tempContract.addPrivilege(Privilege(ResourcePattern::forClusterResource(boost::none),

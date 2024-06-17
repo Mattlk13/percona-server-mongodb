@@ -41,12 +41,14 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/oid.h"
+#include "mongo/bson/util/bsoncolumnbuilder.h"
 #include "mongo/db/operation_id.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/timeseries/bucket_catalog/bucket_identifiers.h"
 #include "mongo/db/timeseries/bucket_catalog/bucket_state_registry.h"
 #include "mongo/db/timeseries/bucket_catalog/execution_stats.h"
 #include "mongo/db/timeseries/bucket_catalog/flat_bson.h"
+#include "mongo/db/timeseries/bucket_catalog/measurement_map.h"
 #include "mongo/db/timeseries/bucket_catalog/rollover.h"
 #include "mongo/db/timeseries/bucket_catalog/write_batch.h"
 #include "mongo/db/timeseries/bucket_compression.h"
@@ -62,6 +64,9 @@ namespace mongo::timeseries::bucket_catalog {
  * The in-memory representation of a time-series bucket document. Maintains all the information
  * needed to add additional measurements, but does not generally store the full contents of the
  * document that have already been committed to disk.
+ *
+ * The order of members of this struct have been optimized for memory alignment, and therefore
+ * a low memory footprint. Take extra care if modifying the order or adding or removing fields.
  */
 struct Bucket {
 private:
@@ -69,10 +74,18 @@ private:
     static constexpr std::size_t kNumStaticNewFields = 10;
 
 public:
+    // Before we hit our bucket minimum count, we will allow for large measurements to be inserted
+    // into buckets. Instead of packing the bucket to the BSON size limit, 16MB, we'll limit the max
+    // bucket size to 12MB. This is to leave some space in the bucket if we need to add new internal
+    // fields to existing, full buckets.
+    static constexpr int32_t kLargeMeasurementsMaxBucketSize =
+        BSONObjMaxUserSize - (4 * 1024 * 1024);
+
     using NewFieldNames = boost::container::small_vector<StringMapHashedKey, kNumStaticNewFields>;
 
-    Bucket(const BucketId& bucketId,
-           const BucketKey& bucketKey,
+    Bucket(TrackingContext&,
+           const BucketId& bucketId,
+           BucketKey bucketKey,
            StringData timeField,
            Date_t minTime,
            BucketStateRegistry& bucketStateRegistry);
@@ -84,39 +97,29 @@ public:
     Bucket& operator=(const Bucket&) = delete;
     Bucket& operator=(Bucket&&) = delete;
 
-    // The bucket ID for the underlying document
-    const BucketId bucketId;
+    // Whether the measurements in the bucket are sorted by timestamp or not.
+    // True by default, if a v2 buckets gets promoted to v3 this is set to false.
+    // It should not be used for v1 buckets.
+    bool bucketIsSortedByTime = true;
 
-    // The key (i.e. (namespace, metadata)) for this bucket.
-    const BucketKey key;
+    // Whether this bucket was kept open after exceeding the bucket max size to improve
+    // bucketing performance for large measurements.
+    bool keptOpenDueToLargeMeasurements = false;
 
-    // Time field for the measurements that have been inserted into the bucket.
-    const std::string timeField;
+    // Whether this bucket has a measurement that crossed the large measurement threshold. When this
+    // threshold is crossed, we use the uncompressed size towards the bucket size limit for all
+    // incoming measurements.
+    bool crossedLargeMeasurementThreshold = false;
 
-    // Minimum timestamp over contained measurements
-    const Date_t minTime;
+    // Whether the bucket was created while the always used compressed buckets feature flag was
+    // enabled.
+    // TODO SERVER-70605: remove this boolean.
+    const bool usingAlwaysCompressedBuckets;
 
-    // A reference so we can clean up some linked state from the destructor.
-    BucketStateRegistry& bucketStateRegistry;
-
-    // The last era in which this bucket checked whether it was cleared.
-    BucketStateRegistry::Era lastChecked;
-
-    // Top-level hashed field names of the measurements that have been inserted into the bucket.
-    StringSet fieldNames;
-
-    // Top-level hashed new field names that have not yet been committed into the bucket.
-    StringSet uncommittedFieldNames;
-
-    // The minimum and maximum values for each field in the bucket.
-    MinMax minmax;
-
-    // The reference schema for measurements in this bucket. May reflect schema of uncommitted
-    // measurements.
-    Schema schema;
-
-    // The total size in bytes of the bucket's BSON serialization, including measurements to be
-    // inserted.
+    // For always compressed, the total compressed size in bytes of the bucket's BSON serialization,
+    // not including measurements to be inserted until a WriteBatch is committed. With the feature
+    // flag off, the total uncompressed size in bytes of the bucket's BSON serialization, including
+    // measurements to be inserted.
     int32_t size = 0;
 
     // The total number of measurements in the bucket, including uncommitted measurements and
@@ -131,27 +134,55 @@ public:
     // due to time range.
     RolloverAction rolloverAction = RolloverAction::kNone;
 
-    // Whether this bucket was kept open after exceeding the bucket max size to improve
-    // bucketing performance for large measurements.
-    bool keptOpenDueToLargeMeasurements = false;
+    // Minimum timestamp over contained measurements.
+    const Date_t minTime;
+
+    // The last era in which this bucket checked whether it was cleared.
+    BucketStateRegistry::Era lastChecked;
+
+    // A reference so we can clean up some linked state from the destructor.
+    BucketStateRegistry& bucketStateRegistry;
 
     // The batch that has been prepared and is currently in the process of being committed, if
     // any.
     std::shared_ptr<WriteBatch> preparedBatch;
 
-    // Batches, per operation, that haven't been committed or aborted yet.
-    stdx::unordered_map<OperationId, std::shared_ptr<WriteBatch>> batches;
-
     // If the bucket is in idleBuckets, then its position is recorded here.
-    using IdleList = std::list<Bucket*>;
+    using IdleList = tracked_list<Bucket*>;
     boost::optional<IdleList::iterator> idleListEntry = boost::none;
 
-    // Approximate memory usage of this bucket.
-    uint64_t memoryUsage = sizeof(*this);
+    // The bucket ID for the underlying document
+    const BucketId bucketId;
 
-    // If set, bucket is compressed on disk, and first prepared batch will need to decompress it
-    // before updating.
-    boost::optional<DecompressionResult> decompressed;
+    // Time field for the measurements that have been inserted into the bucket.
+    const tracked_string timeField;
+
+    // The key (i.e. (namespace, metadata)) for this bucket.
+    const BucketKey key;
+
+    // Top-level hashed field names of the measurements that have been inserted into the bucket.
+    // TODO(SERVER-70605): Remove to avoid extra overhead. These are stored as keys in
+    // measurementMap.
+    TrackedStringSet fieldNames;
+
+    // Top-level hashed new field names that have not yet been committed into the bucket.
+    TrackedStringSet uncommittedFieldNames;
+
+    // Batches, per operation, that haven't been committed or aborted yet.
+    tracked_unordered_map<OperationId, std::shared_ptr<WriteBatch>> batches;
+
+    // The minimum and maximum values for each field in the bucket.
+    MinMax minmax;
+
+    // The reference schema for measurements in this bucket. May reflect schema of uncommitted
+    // measurements.
+    Schema schema;
+
+    /**
+     * In-memory state of each committed data field. Enables fewer complete round-trips of
+     * decompression + compression.
+     */
+    MeasurementMap measurementMap;
 };
 
 /**
@@ -174,17 +205,24 @@ bool schemaIncompatible(Bucket& bucket,
  * Determines the effect of adding 'doc' to this bucket. If adding 'doc' causes this bucket
  * to overflow, we will create a new bucket and recalculate the change to the bucket size
  * and data fields.
+ *
+ * For always compressed, it is impossible to know how well a measurement will compress in the
+ * existing bucket ahead of time. We skip adding the element size to the calculation. The cost of
+ * adding one more measurement over the limit won't be much, especially as it will get compressed on
+ * commit. After committing, the Bucket is updated with the compressed size.
  */
-void calculateBucketFieldsAndSizeChange(const Bucket& bucket,
+void calculateBucketFieldsAndSizeChange(TrackingContext&,
+                                        const Bucket& bucket,
                                         const BSONObj& doc,
                                         boost::optional<StringData> metaField,
                                         Bucket::NewFieldNames& newFieldNamesToBeInserted,
-                                        int32_t& sizeToBeAdded);
+                                        Sizes& sizesToBeAdded);
 
 /**
  * Return a pointer to the current, open batch for the operation. Opens a new batch if none exists.
  */
-std::shared_ptr<WriteBatch> activeBatch(Bucket& bucket,
+std::shared_ptr<WriteBatch> activeBatch(TrackingContext& trackingContext,
+                                        Bucket& bucket,
                                         OperationId opId,
                                         std::uint8_t stripe,
                                         ExecutionStatsController& stats);

@@ -3,10 +3,12 @@
  * Compound Wildcard Indexes objey index filters.
  *
  * @tags: [
- *   not_allowed_with_security_token,
+ *   not_allowed_with_signed_security_token,
  *   does_not_support_stepdowns,
  *   does_not_support_transactions,
  *   requires_fcv_70,
+ *   # Plan cache state is node-local and will not get migrated alongside user data
+ *   assumes_balancer_off,
  * ]
  */
 

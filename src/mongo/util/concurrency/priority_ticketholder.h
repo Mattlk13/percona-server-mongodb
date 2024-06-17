@@ -31,20 +31,15 @@
 #include <array>
 #include <boost/optional/optional.hpp>
 #include <cstdint>
-#include <queue>
 #include <type_traits>
 
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/mutex.h"
-#include "mongo/stdx/condition_variable.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/admission_context.h"
-#include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/concurrency/ticket_pool.h"
 #include "mongo/util/concurrency/ticketholder.h"
-#include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -65,16 +60,17 @@ class Ticket;
  */
 class PriorityTicketHolder : public TicketHolder {
 public:
-    explicit PriorityTicketHolder(int32_t numTickets,
+    explicit PriorityTicketHolder(ServiceContext* serviceContext,
+                                  int32_t numTickets,
                                   int32_t lowPriorityBypassThreshold,
-                                  ServiceContext* serviceContext);
+                                  bool trackPeakUsed);
     ~PriorityTicketHolder() override{};
 
-    int32_t available() const override final;
+    int32_t available() const final;
 
-    int64_t queued() const override final;
+    int64_t queued() const final;
 
-    int64_t numFinishedProcessing() const override final;
+    int64_t numFinishedProcessing() const final;
 
     std::int64_t expedited() const;
 
@@ -83,22 +79,19 @@ public:
     void updateLowPriorityAdmissionBypassThreshold(int32_t newBypassThreshold);
 
 private:
-    boost::optional<Ticket> _tryAcquireImpl(AdmissionContext* admCtx) override final;
+    boost::optional<Ticket> _tryAcquireImpl(AdmissionContext* admCtx) final;
 
-    boost::optional<Ticket> _waitForTicketUntilImpl(OperationContext* opCtx,
+    boost::optional<Ticket> _waitForTicketUntilImpl(Interruptible& interruptible,
                                                     AdmissionContext* admCtx,
-                                                    Date_t until) override final;
+                                                    Date_t until) final;
 
-    void _releaseToTicketPoolImpl(AdmissionContext* admCtx) noexcept override final;
+    void _releaseToTicketPoolImpl(AdmissionContext* admCtx) noexcept final;
 
-    void _resize(int32_t newSize, int32_t oldSize) noexcept override final;
+    QueueStats& _getQueueStatsToUse(AdmissionContext::Priority priority) noexcept final;
 
-    QueueStats& _getQueueStatsToUse(const AdmissionContext* admCtx) noexcept override final;
+    void _appendImplStats(BSONObjBuilder& b) const final;
 
-    void _appendImplStats(BSONObjBuilder& b) const override final;
-
-    static QueueType _getQueueType(const AdmissionContext* admCtx) {
-        auto priority = admCtx->getPriority();
+    static QueueType _getQueueType(AdmissionContext::Priority priority) {
         switch (priority) {
             case AdmissionContext::Priority::kLow:
                 return QueueType::kLowPriority;

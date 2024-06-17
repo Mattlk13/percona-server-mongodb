@@ -51,7 +51,6 @@
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/index_builds_coordinator.h"
@@ -65,6 +64,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
@@ -122,7 +122,7 @@ void _finishDropDatabase(OperationContext* opCtx,
                          Database* db,
                          std::size_t numCollections,
                          bool abortIndexBuilds) {
-    invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_X));
+    invariant(shard_role_details::getLocker(opCtx)->isDbLockedForMode(dbName, MODE_X));
 
     // If DatabaseHolder::dropDb() fails, we should reset the drop-pending state on Database.
     ScopeGuard dropPendingGuard([db, opCtx] { db->setDropPending(opCtx, false); });
@@ -164,7 +164,7 @@ Status _dropDatabase(OperationContext* opCtx, const DatabaseName& dbName, bool a
     // As this code can potentially require replication we disallow holding locks entirely. Holding
     // of any locks is disallowed while awaiting replication because this can potentially block for
     // long time while doing network activity.
-    invariant(!opCtx->lockState()->isLocked());
+    invariant(!shard_role_details::getLocker(opCtx)->isLocked());
 
     uassert(ErrorCodes::IllegalOperation,
             "Cannot drop a database in read-only mode",
@@ -234,7 +234,8 @@ Status _dropDatabase(OperationContext* opCtx, const DatabaseName& dbName, bool a
                     [dbName, opCtx, &dropPendingGuard, tenantLockMode] {
                         // This scope guard must succeed in acquiring locks and reverting the drop
                         // pending state even when the failure is due to an interruption.
-                        UninterruptibleLockGuard noInterrupt(opCtx->lockState());  // NOLINT.
+                        UninterruptibleLockGuard noInterrupt(  // NOLINT.
+                            shard_role_details::getLocker(opCtx));
                         AutoGetDb autoDB(
                             opCtx, dbName, MODE_X /* database lock mode*/, tenantLockMode);
                         if (auto db = autoDB.getDb()) {
@@ -265,7 +266,7 @@ Status _dropDatabase(OperationContext* opCtx, const DatabaseName& dbName, bool a
                 // Abandon the snapshot as the index catalog will compare the in-memory state to the
                 // disk state, which may have changed when we released the collection lock
                 // temporarily.
-                opCtx->recoveryUnit()->abandonSnapshot();
+                shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
 
                 status = _checkNssAndReplState(opCtx, db, dbName);
                 if (!status.isOK()) {
@@ -303,15 +304,16 @@ Status _dropDatabase(OperationContext* opCtx, const DatabaseName& dbName, bool a
         auto systemProfilePtr = catalog->lookupCollectionByNamespace(
             opCtx, NamespaceString::makeSystemDotProfileNamespace(dbName));
         if (systemProfilePtr) {
-            const Timestamp commitTs = opCtx->recoveryUnit()->getCommitTimestamp();
+            const Timestamp commitTs =
+                shard_role_details::getRecoveryUnit(opCtx)->getCommitTimestamp();
             if (!commitTs.isNull()) {
-                opCtx->recoveryUnit()->clearCommitTimestamp();
+                shard_role_details::getRecoveryUnit(opCtx)->clearCommitTimestamp();
             }
 
             // Ensure this block exits with the same commit timestamp state that it was called with.
             ScopeGuard addCommitTimestamp([&opCtx, commitTs] {
                 if (!commitTs.isNull()) {
-                    opCtx->recoveryUnit()->setCommitTimestamp(commitTs);
+                    shard_role_details::getRecoveryUnit(opCtx)->setCommitTimestamp(commitTs);
                 }
             });
 
@@ -321,7 +323,7 @@ Status _dropDatabase(OperationContext* opCtx, const DatabaseName& dbName, bool a
                   logAttrs(dbName),
                   "namespace"_attr = nss);
 
-            invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+            invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
             writeConflictRetry(opCtx, "dropDatabase_system.profile_collection", nss, [&] {
                 WriteUnitOfWork wunit(opCtx);
                 fassert(7574001, db->dropCollectionEvenIfSystem(opCtx, nss));
@@ -406,7 +408,7 @@ Status _dropDatabase(OperationContext* opCtx, const DatabaseName& dbName, bool a
     ScopeGuard dropPendingGuardWhileUnlocked([dbName, opCtx] {
         // This scope guard must succeed in acquiring locks and reverting the drop pending state
         // even when the failure is due to an interruption.
-        UninterruptibleLockGuard noInterrupt(opCtx->lockState());  // NOLINT.
+        UninterruptibleLockGuard noInterrupt(shard_role_details::getLocker(opCtx));  // NOLINT.
 
         AutoGetDb autoDB(opCtx, dbName, MODE_IX);
         if (auto db = autoDB.getDb()) {
@@ -415,7 +417,7 @@ Status _dropDatabase(OperationContext* opCtx, const DatabaseName& dbName, bool a
     });
 
     // Verify again that we haven't obtained any other locks before replication.
-    invariant(!opCtx->lockState()->isLocked());
+    invariant(!shard_role_details::getLocker(opCtx)->isLocked());
 
     auto awaitOpTime = [&]() {
         if (numCollectionsToDrop > 0U) {

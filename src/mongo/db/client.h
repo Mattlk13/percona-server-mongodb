@@ -65,7 +65,6 @@
 
 namespace mongo {
 
-class Locker;
 class OperationContext;
 class ThreadClient;
 
@@ -135,6 +134,8 @@ public:
 
     static Client* getCurrent();
 
+    ~Client() override;
+
     bool getIsLocalHostConnection() {
         if (!hasRemote()) {
             return false;
@@ -152,10 +153,24 @@ public:
     }
 
     /**
+     * Overwrites the Service for this client. To be used by the replica set endpoint only.
+     */
+    Service* setService(Service* service) {
+        return _service = service;
+    }
+
+    /**
      * Returns the Service that owns this client.
      */
     Service* getService() const {
         return _service;
+    }
+
+    /**
+     * Returns true if this client is connected to the router port of a mongod with router role.
+     */
+    bool isRouterClient() const {
+        return _isRouterClient;
     }
 
     /**
@@ -181,14 +196,15 @@ public:
     }
 
     std::string clientAddress(bool includePort = false) const;
+
     const std::string& desc() const {
         return _desc;
     }
 
     void reportState(BSONObjBuilder& builder);
 
-    // Ensures stability of the client's OperationContext. When the client is locked,
-    // the OperationContext and the Locker within it will not disappear.
+    // Ensures stability of everything under the client object, most notably the associated
+    // OperationContext.
     void lock() {
         _lock.lock();
     }
@@ -288,12 +304,6 @@ public:
     }
 
     /**
-     * Safely swaps the locker in the OperationContext, releasing the old locker to the caller.
-     * Locks this Client to do this safely.
-     */
-    std::unique_ptr<Locker> swapLockState(std::unique_ptr<Locker> locker);
-
-    /**
      * Checks if there is an active currentOp associated with this client.
      * The definition of active varies between User and System connections.
      * Note that the caller must hold the client lock.
@@ -380,19 +390,24 @@ public:
 
     TagMask getTags() const;
 
+    /**
+     * Returns the associated port for this client.
+     */
+    int getLocalPort() const;
+
 private:
     friend class ServiceContext;
     friend class ThreadClient;
+
     Client(std::string desc, Service* service, std::shared_ptr<transport::Session> session);
 
     /**
      * Sets the active operation context on this client to "opCtx".
      */
-    void _setOperationContext(OperationContext* opCtx) {
-        _opCtx = opCtx;
-    }
+    void _setOperationContext(OperationContext* opCtx);
 
     Service* _service;
+
     const std::shared_ptr<transport::Session> _session;
 
     // Description for the client (e.g. conn8)
@@ -420,6 +435,9 @@ private:
     // Whether this client used { helloOk: true } when opening its connection, indicating that
     // it supports the hello command.
     bool _supportsHello = false;
+
+    // Whether this client is connected to the router port of a mongod with router role.
+    const bool _isRouterClient = false;
 
     UUID _uuid;
 
@@ -494,20 +512,19 @@ private:
  */
 class AlternativeClientRegion {
 public:
-    explicit AlternativeClientRegion(ServiceContext::UniqueClient& clientToUse)
-        : _alternateClient(&clientToUse) {
-        invariant(clientToUse);
-        if (Client::getCurrent()) {
-            _originalClient = Client::releaseCurrent();
-        }
-        Client::setCurrent(std::move(*_alternateClient));
-    }
+    explicit AlternativeClientRegion(ServiceContext::UniqueClient& clientToUse);
 
-    ~AlternativeClientRegion() {
-        *_alternateClient = Client::releaseCurrent();
-        if (_originalClient) {
-            Client::setCurrent(std::move(_originalClient));
-        }
+    ~AlternativeClientRegion();
+    AlternativeClientRegion(const AlternativeClientRegion&) = delete;
+    AlternativeClientRegion(AlternativeClientRegion&&) = delete;
+    void operator=(const AlternativeClientRegion&) = delete;
+
+    Client* get() const;
+    Client* operator->() const {
+        return get();
+    }
+    Client& operator*() const {
+        return *get();
     }
 
 private:
@@ -515,9 +532,9 @@ private:
     ServiceContext::UniqueClient* const _alternateClient;
 };
 
-
 /** get the Client object for this thread. */
 Client& cc();
 
 bool haveClient();
+
 }  // namespace mongo

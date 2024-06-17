@@ -50,6 +50,7 @@
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/element.h"
 #include "mongo/crypto/fle_field_schema_gen.h"
+#include "mongo/db/admission/execution_admission_context.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_operation_source.h"
@@ -58,7 +59,6 @@
 #include "mongo/db/commands/update_metrics.h"
 #include "mongo/db/commands/write_commands_common.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/fle_crud.h"
 #include "mongo/db/namespace_string.h"
@@ -82,7 +82,7 @@
 #include "mongo/db/query/explain_options.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_yield_policy.h"
-#include "mongo/db/query/query_settings_gen.h"
+#include "mongo/db/query/query_settings/query_settings_gen.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
@@ -115,6 +115,7 @@ namespace mongo {
 namespace {
 
 MONGO_FAIL_POINT_DEFINE(hangInsertBeforeWrite);
+MONGO_FAIL_POINT_DEFINE(hangUpdateBeforeWrite);
 
 void redactTooLongLog(mutablebson::Document* cmdObj, StringData fieldName) {
     namespace mmb = mutablebson;
@@ -172,8 +173,10 @@ void populateReply(OperationContext* opCtx,
         const auto& lastResult = result.results.back();
 
         if (lastResult == ErrorCodes::StaleDbVersion ||
+            lastResult == ErrorCodes::ShardCannotRefreshDueToLocksHeld ||
             ErrorCodes::isStaleShardVersionError(lastResult.getStatus()) ||
-            ErrorCodes::isTenantMigrationError(lastResult.getStatus())) {
+            ErrorCodes::isTenantMigrationError(lastResult.getStatus()) ||
+            lastResult == ErrorCodes::CannotImplicitlyCreateCollection) {
             // For ordered:false commands we need to duplicate these error results for all ops
             // after we stopped. See handleError() in write_ops_exec.cpp for more info.
             //
@@ -262,6 +265,7 @@ public:
     bool allowedInTransactions() const final {
         return true;
     }
+
     class Invocation final : public InvocationBaseGen {
     public:
         Invocation(OperationContext* opCtx,
@@ -272,6 +276,10 @@ public:
         }
 
         bool supportsWriteConcern() const final {
+            return true;
+        }
+
+        bool isSubjectToIngressAdmissionControl() const override {
             return true;
         }
 
@@ -316,10 +324,10 @@ public:
                 }
             }
 
-            boost::optional<ScopedAdmissionPriorityForLock> priority;
+            boost::optional<ScopedAdmissionPriority<ExecutionAdmissionContext>> priority;
             if (request().getNamespace() == NamespaceString::kConfigSampledQueriesNamespace ||
                 request().getNamespace() == NamespaceString::kConfigSampledQueriesDiffNamespace) {
-                priority.emplace(opCtx->lockState(), AdmissionContext::Priority::kLow);
+                priority.emplace(opCtx, AdmissionContext::Priority::kLow);
             }
 
             if (hangInsertBeforeWrite.shouldFail([&](const BSONObj& data) {
@@ -420,6 +428,10 @@ public:
             return true;
         }
 
+        bool isSubjectToIngressAdmissionControl() const override {
+            return true;
+        }
+
         NamespaceString ns() const final {
             return request().getNamespace();
         }
@@ -434,7 +446,7 @@ public:
 
         void appendMirrorableRequest(BSONObjBuilder* bob) const override {
             auto extractQueryDetails = [](const BSONObj& update, BSONObjBuilder* bob) -> void {
-                // "filter", "hint", and "collation" fields are optional.
+                // "filter", "sort", "hint", and "collation" fields are optional.
                 if (update.isEmpty())
                     return;
 
@@ -443,6 +455,8 @@ public:
 
                 if (update.hasField("q"))
                     bob->append("filter", update["q"].Obj());
+                if (update.hasField("sort") && !update["sort"].Obj().isEmpty())
+                    bob->append("sort", update["sort"].Obj());
                 if (update.hasField("hint") && !update["hint"].Obj().isEmpty())
                     bob->append("hint", update["hint"].Obj());
                 if (update.hasField("collation") && !update["collation"].Obj().isEmpty())
@@ -504,8 +518,9 @@ public:
             write_ops_exec::WriteResult reply;
             // For retryable updates on time-series collections, we needs to run them in
             // transactions to ensure the multiple writes are replicated atomically.
-            if (isTimeseriesViewRequest && opCtx->isRetryableWrite() &&
-                !opCtx->inMultiDocumentTransaction()) {
+            bool isTimeseriesRetryableUpdate = isTimeseriesViewRequest &&
+                opCtx->isRetryableWrite() && !opCtx->inMultiDocumentTransaction();
+            if (isTimeseriesRetryableUpdate) {
                 auto executor = serverGlobalParams.clusterRole.has(ClusterRole::None)
                     ? ReplicaSetNodeProcessInterface::getReplicaSetNodeExecutor(
                           opCtx->getServiceContext())
@@ -523,6 +538,13 @@ public:
                 write_ops_exec::runTimeseriesRetryableUpdates(
                     opCtx, bucketNs, request(), executor, &reply);
             } else {
+                if (hangUpdateBeforeWrite.shouldFail([&](const BSONObj& data) {
+                        const auto fpNss = NamespaceStringUtil::parseFailPointData(data, "ns"_sd);
+                        return fpNss == request().getNamespace();
+                    })) {
+                    hangUpdateBeforeWrite.pauseWhileSet();
+                }
+
                 reply = write_ops_exec::performUpdates(opCtx, request(), source);
             }
 
@@ -550,11 +572,15 @@ public:
                           PopulateReplyHooks{singleWriteHandler, postProcessHandler});
 
             // Collect metrics.
-            for (auto&& update : request().getUpdates()) {
-                incrementUpdateMetrics(update.getU(),
-                                       request().getNamespace(),
-                                       CmdUpdate::updateMetrics,
-                                       update.getArrayFilters());
+            // For time-series retryable updates, the metrics are already incremented when running
+            // the internal transaction. Avoids updating them twice.
+            if (!isTimeseriesRetryableUpdate) {
+                for (auto&& update : request().getUpdates()) {
+                    incrementUpdateMetrics(update.getU(),
+                                           request().getNamespace(),
+                                           _getUpdateMetrics(),
+                                           update.getArrayFilters());
+                }
             }
 
             return updateReply;
@@ -564,6 +590,10 @@ public:
         }
 
     private:
+        UpdateMetrics& _getUpdateMetrics() const {
+            return *static_cast<const CmdUpdate&>(*definition())._updateMetrics;
+        }
+
         void doCheckAuthorization(OperationContext* opCtx) const final try {
             auth::checkAuthForUpdateCommand(AuthorizationSession::get(opCtx->getClient()),
                                             request().getBypassDocumentValidation(),
@@ -621,12 +651,16 @@ public:
         BSONObj _updateOpObj;
     };
 
+protected:
+    void doInitializeClusterRole(ClusterRole role) override {
+        write_ops::UpdateCmdVersion1Gen<CmdUpdate>::doInitializeClusterRole(role);
+        _updateMetrics.emplace(getName(), role);
+    }
+
     // Update related command execution metrics.
-    static UpdateMetrics updateMetrics;
+    mutable boost::optional<UpdateMetrics> _updateMetrics;
 };
 MONGO_REGISTER_COMMAND(CmdUpdate).forShard();
-
-UpdateMetrics CmdUpdate::updateMetrics{"update"};
 
 class CmdDelete final : public write_ops::DeleteCmdVersion1Gen<CmdDelete> {
 public:
@@ -676,6 +710,10 @@ public:
         }
 
         bool supportsWriteConcern() const final {
+            return true;
+        }
+
+        bool isSubjectToIngressAdmissionControl() const override {
             return true;
         }
 

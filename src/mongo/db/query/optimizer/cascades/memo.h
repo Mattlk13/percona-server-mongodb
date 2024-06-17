@@ -193,13 +193,15 @@ public:
         Context(const Metadata* metadata,
                 const DebugInfo* debugInfo,
                 const LogicalPropsInterface* logicalPropsDerivation,
-                const CardinalityEstimator* cardinalityEstimator);
+                const CardinalityEstimator* cardinalityEstimator,
+                const QueryParameterMap* queryParameters);
 
         // None of those should be null.
         const Metadata* _metadata;
         const DebugInfo* _debugInfo;
         const LogicalPropsInterface* _logicalPropsDerivation;
         const CardinalityEstimator* _cardinalityEstimator;
+        const QueryParameterMap* _queryParameters;
     };
 
     struct Stats {
@@ -209,6 +211,10 @@ public:
         size_t _physPlanExplorationCount = 0;
         // Number of checks to winner's circle.
         size_t _physMemoCheckCount = 0;
+        // The estimated cost of the winning plan.
+        boost::optional<CostType> _estimatedCost;
+        // The cardinality estimate of the Root node of the winning plan.
+        boost::optional<CEType> _ce;
     };
 
     struct GroupIdVectorHash {
@@ -275,6 +281,8 @@ public:
     void clear();
 
     const Stats& getStats() const;
+    void setStatsCE(const CEType& ce);
+    void setStatsEstimatedCost(const CostType& cost);
     size_t getLogicalNodeCount() const;
     size_t getPhysicalNodeCount() const;
 
@@ -322,7 +330,8 @@ private:
     };
     // For every individually estimated sargable predicate, cache its CE. We also include the input
     // groupId in the cache key.
-    opt::unordered_map<std::pair<GroupIdType, PartialSchemaEntry>, CEType, Hasher> _estimatesCache;
+    opt::unordered_map<std::pair<GroupIdType, PartialSchemaEntry>, CERecord, Hasher>
+        _estimatesCache;
 
     // Used to find nodes using particular groups as inputs.
     InputGroupsToNodeIdMap _inputGroupsToNodeIdMap;

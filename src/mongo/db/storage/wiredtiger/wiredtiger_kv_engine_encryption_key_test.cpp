@@ -356,7 +356,6 @@ protected:
         auto client = _svcCtx->getService()->makeClient("opCtx");
         auto opCtx = client->makeOperationContext();
         auto engine = std::make_unique<WiredTigerKVEngine>(
-            opCtx.get(),
             "wiredTiger",
             _tempDir->path(),
             _clockSource.get(),
@@ -366,7 +365,7 @@ protected:
             false,
             false,
             FakeMasterKeyProviderFactory(_vaultServer, _kmipServer));
-        engine->notifyStartupComplete();
+        engine->notifyStorageStartupRecoveryComplete();
         return engine;
     }
 

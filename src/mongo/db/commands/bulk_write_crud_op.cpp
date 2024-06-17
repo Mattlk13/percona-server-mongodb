@@ -30,21 +30,17 @@
 #include "mongo/db/commands/bulk_write_crud_op.h"
 
 #include "mongo/db/auth/action_type.h"
-#include "mongo/stdx/variant.h"
 
 namespace mongo {
 
-BulkWriteCRUDOp::BulkWriteCRUDOp(const stdx::variant<mongo::BulkWriteInsertOp,
-                                                     mongo::BulkWriteUpdateOp,
-                                                     mongo::BulkWriteDeleteOp>& op)
-    : _op{op}, _type{op.index()} {}
+BulkWriteCRUDOp::BulkWriteCRUDOp(const BulkWriteOpVariant& op) : _op{op}, _type{op.index()} {}
 
 BulkWriteCRUDOp::OpType BulkWriteCRUDOp::getType() const {
     return _type;
 }
 
 unsigned int BulkWriteCRUDOp::getNsInfoIdx() const {
-    return stdx::visit(
+    return visit(
         OverloadedVisitor{[](const mongo::BulkWriteInsertOp& value) { return value.getInsert(); },
                           [](const mongo::BulkWriteUpdateOp& value) { return value.getUpdate(); },
                           [](const mongo::BulkWriteDeleteOp& value) {
@@ -55,37 +51,42 @@ unsigned int BulkWriteCRUDOp::getNsInfoIdx() const {
 
 ActionSet BulkWriteCRUDOp::getActions() const {
     ActionSet newActions;
-    stdx::visit(OverloadedVisitor{[&newActions](const mongo::BulkWriteInsertOp& value) {
-                                      newActions.addAction(ActionType::insert);
-                                  },
-                                  [&newActions](const mongo::BulkWriteUpdateOp& value) {
-                                      if (value.getUpsert()) {
-                                          newActions.addAction(ActionType::insert);
-                                      }
-                                      newActions.addAction(ActionType::update);
-                                  },
-                                  [&newActions](const mongo::BulkWriteDeleteOp& value) {
-                                      newActions.addAction(ActionType::remove);
-                                  }},
-                _op);
+    switch (_type) {
+        case kInsert:
+            newActions.addAction(ActionType::insert);
+            break;
+        case kUpdate: {
+            if (getUpdate()->getUpsert()) {
+                newActions.addAction(ActionType::insert);
+            }
+            newActions.addAction(ActionType::update);
+            break;
+        }
+        case kDelete:
+            newActions.addAction(ActionType::remove);
+            break;
+        default:
+            MONGO_UNREACHABLE;
+            break;
+    }
 
     return newActions;
 }
 
 const mongo::BulkWriteInsertOp* BulkWriteCRUDOp::getInsert() const {
-    return stdx::get_if<BulkWriteCRUDOp::OpType::kInsert>(&_op);
+    return get_if<BulkWriteCRUDOp::OpType::kInsert>(&_op);
 }
 
 const mongo::BulkWriteUpdateOp* BulkWriteCRUDOp::getUpdate() const {
-    return stdx::get_if<BulkWriteCRUDOp::OpType::kUpdate>(&_op);
+    return get_if<BulkWriteCRUDOp::OpType::kUpdate>(&_op);
 }
 
 const mongo::BulkWriteDeleteOp* BulkWriteCRUDOp::getDelete() const {
-    return stdx::get_if<BulkWriteCRUDOp::OpType::kDelete>(&_op);
+    return get_if<BulkWriteCRUDOp::OpType::kDelete>(&_op);
 }
 
 mongo::BSONObj BulkWriteCRUDOp::toBSON() const {
-    return stdx::visit(
+    return visit(
         OverloadedVisitor{[](const mongo::BulkWriteInsertOp& value) { return value.toBSON(); },
                           [](const mongo::BulkWriteUpdateOp& value) { return value.toBSON(); },
                           [](const mongo::BulkWriteDeleteOp& value) {

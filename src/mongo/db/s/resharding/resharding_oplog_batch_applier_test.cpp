@@ -59,14 +59,13 @@
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/op_observer/op_observer_impl.h"
 #include "mongo/db/op_observer/op_observer_registry.h"
-#include "mongo/db/op_observer/oplog_writer_impl.h"
+#include "mongo/db/op_observer/operation_logger_impl.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/persistent_task_store.h"
 #include "mongo/db/query/collation/collator_interface.h"
@@ -104,6 +103,7 @@
 #include "mongo/db/timeseries/timeseries_gen.h"
 #include "mongo/db/transaction/session_catalog_mongod_transaction_interface_impl.h"
 #include "mongo/db/transaction/transaction_participant.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/vector_clock_metadata_hook.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_factory.h"
@@ -138,8 +138,6 @@ public:
 
         auto serviceContext = getServiceContext();
 
-        // Initialize sharding components as a shard server.
-        serverGlobalParams.clusterRole = ClusterRole::ShardServer;
 
         {
             auto opCtx = makeOperationContext();
@@ -168,7 +166,7 @@ public:
             invariant(opObserverRegistry);
 
             opObserverRegistry->addObserver(
-                std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterImpl>()));
+                std::make_unique<OpObserverImpl>(std::make_unique<OperationLoggerImpl>()));
             opObserverRegistry->addObserver(
                 std::make_unique<MigrationChunkClonerSourceOpObserver>());
         }
@@ -258,8 +256,10 @@ public:
         auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
         auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
-        txnParticipant.beginOrContinue(
-            opCtx, {txnNumber}, false /* autocommit */, true /* startTransaction */);
+        txnParticipant.beginOrContinue(opCtx,
+                                       {txnNumber},
+                                       false /* autocommit */,
+                                       TransactionParticipant::TransactionActions::kStart);
 
         txnParticipant.unstashTransactionResources(opCtx, "prepareTransaction");
 
@@ -272,8 +272,8 @@ public:
             auto opTime = repl::getNextOpTime(opCtx);
             wuow.release();
 
-            opCtx->recoveryUnit()->abortUnitOfWork();
-            opCtx->lockState()->endWriteUnitOfWork();
+            shard_role_details::getRecoveryUnit(opCtx)->abortUnitOfWork();
+            shard_role_details::getLocker(opCtx)->endWriteUnitOfWork();
 
             return opTime;
         }();
@@ -291,8 +291,10 @@ public:
         auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
         auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
-        txnParticipant.beginOrContinue(
-            opCtx, {txnNumber}, false /* autocommit */, boost::none /* startTransaction */);
+        txnParticipant.beginOrContinue(opCtx,
+                                       {txnNumber},
+                                       false /* autocommit */,
+                                       TransactionParticipant::TransactionActions::kContinue);
 
         txnParticipant.unstashTransactionResources(opCtx, "abortTransaction");
         txnParticipant.abortTransaction(opCtx);
@@ -424,13 +426,15 @@ private:
     const ShardId _otherDonorId{"otherDonorId"};
 
     const NamespaceString _outputNss =
-        resharding::constructTemporaryReshardingNss(_sourceNss.db_forTest(), _sourceUUID);
+        resharding::constructTemporaryReshardingNss(_sourceNss, _sourceUUID);
     const NamespaceString _myStashNss =
         resharding::getLocalConflictStashNamespace(_sourceUUID, _myDonorId);
     const NamespaceString _otherStashNss =
         resharding::getLocalConflictStashNamespace(_sourceUUID, _otherDonorId);
     const NamespaceString _myOplogBufferNss =
         resharding::getLocalOplogBufferNamespace(_sourceUUID, _myDonorId);
+
+    service_context_test::ShardRoleOverride _shardRole;
 
     std::unique_ptr<ReshardingMetrics> _metrics;
     std::unique_ptr<ReshardingOplogApplierMetrics> _applierMetrics;

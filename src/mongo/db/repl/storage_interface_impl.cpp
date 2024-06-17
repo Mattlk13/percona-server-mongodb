@@ -45,6 +45,7 @@
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/admission/execution_admission_context.h"
 #include "mongo/db/catalog/clustered_collection_options_gen.h"
 #include "mongo/db/catalog/collection_catalog_helper.h"
 #include "mongo/db/catalog/collection_write_path.h"
@@ -57,7 +58,6 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/db_raii.h"
@@ -364,7 +364,7 @@ Status insertDocumentsSingleBatch(OperationContext* opCtx,
                                   std::vector<InsertStatement>::const_iterator begin,
                                   std::vector<InsertStatement>::const_iterator end) {
     boost::optional<AutoGetCollection> autoColl;
-    boost::optional<AutoGetOplog> autoOplog;
+    boost::optional<AutoGetOplogFastPath> autoOplog;
     const CollectionPtr* collection;
 
     if (nsOrUUID.isNamespaceString() && nsOrUUID.nss().isOplog()) {
@@ -456,7 +456,7 @@ Status StorageInterfaceImpl::createOplog(OperationContext* opCtx, const Namespac
 }
 
 StatusWith<size_t> StorageInterfaceImpl::getOplogMaxSize(OperationContext* opCtx) {
-    AutoGetOplog oplogRead(opCtx, OplogAccessMode::kRead);
+    AutoGetOplogFastPath oplogRead(opCtx, OplogAccessMode::kRead);
     const auto& oplog = oplogRead.getCollection();
     if (!oplog) {
         return {ErrorCodes::NamespaceNotFound, "Your oplog doesn't exist."};
@@ -635,7 +635,7 @@ Status StorageInterfaceImpl::setIndexIsMultikey(OperationContext* opCtx,
         const auto& collection = *collectionResult.getValue();
 
         WriteUnitOfWork wunit(opCtx);
-        auto tsResult = opCtx->recoveryUnit()->setTimestamp(ts);
+        auto tsResult = shard_role_details::getRecoveryUnit(opCtx)->setTimestamp(ts);
         if (!tsResult.isOK()) {
             return tsResult;
         }
@@ -992,7 +992,6 @@ StatusWith<BSONObj> makeUpsertQuery(const BSONElement& idKey) {
 Status _updateWithQuery(OperationContext* opCtx,
                         const UpdateRequest& request,
                         const Timestamp& ts) {
-    invariant(!request.isMulti());  // We only want to update one document for performance.
     invariant(!request.shouldReturnAnyDocs());
     invariant(PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY == request.getYieldPolicy());
 
@@ -1021,8 +1020,8 @@ Status _updateWithQuery(OperationContext* opCtx,
 
         WriteUnitOfWork wuow(opCtx);
         if (!ts.isNull()) {
-            uassertStatusOK(opCtx->recoveryUnit()->setTimestamp(ts));
-            opCtx->recoveryUnit()->setOrderedCommit(false);
+            uassertStatusOK(shard_role_details::getRecoveryUnit(opCtx)->setTimestamp(ts));
+            shard_role_details::getRecoveryUnit(opCtx)->setOrderedCommit(false);
         }
 
         auto planExecutorResult = mongo::getExecutorUpdate(
@@ -1130,6 +1129,7 @@ Status StorageInterfaceImpl::putSingleton(OperationContext* opCtx,
     request.setUpdateModification(
         write_ops::UpdateModification::parseFromClassicUpdate(update.obj));
     request.setUpsert(true);
+    invariant(!request.isMulti());  // We only want to update one document for performance.
     return _updateWithQuery(opCtx, request, update.timestamp);
 }
 
@@ -1142,6 +1142,21 @@ Status StorageInterfaceImpl::updateSingleton(OperationContext* opCtx,
     request.setQuery(query);
     request.setUpdateModification(
         write_ops::UpdateModification::parseFromClassicUpdate(update.obj));
+    invariant(!request.isUpsert());
+    invariant(!request.isMulti());  // We only want to update one document for performance.
+    return _updateWithQuery(opCtx, request, update.timestamp);
+}
+
+Status StorageInterfaceImpl::updateDocuments(OperationContext* opCtx,
+                                             const NamespaceString& nss,
+                                             const BSONObj& query,
+                                             const TimestampedBSONObj& update) {
+    auto request = UpdateRequest();
+    request.setNamespaceString(nss);
+    request.setQuery(query);
+    request.setUpdateModification(
+        write_ops::UpdateModification::parseFromClassicUpdate(update.obj));
+    request.setMulti(true);
     invariant(!request.isUpsert());
     return _updateWithQuery(opCtx, request, update.timestamp);
 }
@@ -1200,34 +1215,32 @@ Status StorageInterfaceImpl::deleteByFilter(OperationContext* opCtx,
     });
 }
 
-boost::optional<BSONObj> StorageInterfaceImpl::findOplogEntryLessThanOrEqualToTimestamp(
+boost::optional<OpTimeAndWallTime> StorageInterfaceImpl::findOplogOpTimeLessThanOrEqualToTimestamp(
     OperationContext* opCtx, const CollectionPtr& oplog, const Timestamp& timestamp) {
     invariant(oplog);
-    invariant(opCtx->lockState()->isLocked());
-
-    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec = InternalPlanner::collectionScan(
-        opCtx, &oplog, PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY, InternalPlanner::BACKWARD);
+    invariant(shard_role_details::getLocker(opCtx)->isLocked());
 
     // A record id in the oplog collection is equivalent to the document's timestamp field.
     RecordId desiredRecordId = RecordId(timestamp.asULL());
-
-    // Iterate the collection in reverse until the desiredRecordId, or one less than, is found.
-    BSONObj bson;
-    RecordId recordId;
-    PlanExecutor::ExecState state;
-    while (PlanExecutor::ADVANCED == (state = exec->getNext(&bson, &recordId))) {
-        if (recordId <= desiredRecordId) {
-            invariant(!bson.isEmpty(),
-                      "An empty oplog entry was returned while searching for an oplog entry <= " +
-                          timestamp.toString());
-            return bson.getOwned();
-        }
+    // Define a backward cursor so that the seek operation returns the first recordId less than or
+    // equal to the 'desiredRecordId', if it exists.
+    auto cursor = oplog->getRecordStore()->getCursor(opCtx, false /* forward */);
+    if (auto record =
+            cursor->seek(desiredRecordId, SeekableRecordCursor::BoundInclusion::kInclude)) {
+        invariant(record->id <= desiredRecordId,
+                  "RecordId returned from seek (" + record->id.toString() +
+                      ") is greater than the desired recordId (" + desiredRecordId.toString() +
+                      ").");
+        return fassert(
+            8694200,
+            OpTimeAndWallTime::parseOpTimeAndWallTimeFromOplogEntry(record->data.toBson()));
     }
 
     return boost::none;
 }
 
-boost::optional<BSONObj> StorageInterfaceImpl::findOplogEntryLessThanOrEqualToTimestampRetryOnWCE(
+boost::optional<OpTimeAndWallTime>
+StorageInterfaceImpl::findOplogOpTimeLessThanOrEqualToTimestampRetryOnWCE(
     OperationContext* opCtx, const CollectionPtr& oplogCollection, const Timestamp& timestamp) {
     // Oplog reads are specially done under only MODE_IS global locks, without database or
     // collection level intent locks. Therefore, reads can run concurrently with validate cmds that
@@ -1242,7 +1255,7 @@ boost::optional<BSONObj> StorageInterfaceImpl::findOplogEntryLessThanOrEqualToTi
     int retries = 0;
     while (true) {
         try {
-            return findOplogEntryLessThanOrEqualToTimestamp(opCtx, oplogCollection, timestamp);
+            return findOplogOpTimeLessThanOrEqualToTimestamp(opCtx, oplogCollection, timestamp);
         } catch (const StorageUnavailableException&) {
             // This will log a message about the conflict initially and then every 5 seconds, with
             // the current rather arbitrary settings.
@@ -1264,7 +1277,7 @@ boost::optional<BSONObj> StorageInterfaceImpl::findOplogEntryLessThanOrEqualToTi
 
 Timestamp StorageInterfaceImpl::getEarliestOplogTimestamp(OperationContext* opCtx) {
     auto statusWithTimestamp = [&]() {
-        AutoGetOplog oplogRead(opCtx, OplogAccessMode::kRead);
+        AutoGetOplogFastPath oplogRead(opCtx, OplogAccessMode::kRead);
         return oplogRead.getCollection()->getRecordStore()->getEarliestOplogTimestamp(opCtx);
     }();
 
@@ -1272,7 +1285,7 @@ Timestamp StorageInterfaceImpl::getEarliestOplogTimestamp(OperationContext* opCt
     // level (above the storage engine) logic to fetch the earliest oplog entry timestamp.
     if (statusWithTimestamp.getStatus() == ErrorCodes::OplogOperationUnsupported) {
         // Reset the snapshot so that it is ensured to see the latest oplog entries.
-        opCtx->recoveryUnit()->abandonSnapshot();
+        shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
 
         BSONObj oplogEntryBSON;
         tassert(5869100,
@@ -1302,7 +1315,7 @@ Timestamp StorageInterfaceImpl::getEarliestOplogTimestamp(OperationContext* opCt
 
 Timestamp StorageInterfaceImpl::getLatestOplogTimestamp(OperationContext* opCtx) {
     auto statusWithTimestamp = [&]() {
-        AutoGetOplog oplogRead(opCtx, OplogAccessMode::kRead);
+        AutoGetOplogFastPath oplogRead(opCtx, OplogAccessMode::kRead);
         return oplogRead.getCollection()->getRecordStore()->getLatestOplogTimestamp(opCtx);
     }();
 
@@ -1310,7 +1323,7 @@ Timestamp StorageInterfaceImpl::getLatestOplogTimestamp(OperationContext* opCtx)
     // level (above the storage engine) logic to fetch the latest oplog entry timestamp.
     if (statusWithTimestamp.getStatus() == ErrorCodes::OplogOperationUnsupported) {
         // Reset the snapshot so that it is ensured to see the latest oplog entries.
-        opCtx->recoveryUnit()->abandonSnapshot();
+        shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
 
         // Helpers::getLast will bypass the oplog visibility rules by doing a backwards collection
         // scan.
@@ -1427,6 +1440,11 @@ void StorageInterfaceImpl::setInitialDataTimestamp(ServiceContext* serviceCtx,
     serviceCtx->getStorageEngine()->setInitialDataTimestamp(snapshotName);
 }
 
+Timestamp StorageInterfaceImpl::getInitialDataTimestamp(ServiceContext* serviceCtx) const {
+    return serviceCtx->getStorageEngine()->getInitialDataTimestamp();
+}
+
+
 Timestamp StorageInterfaceImpl::recoverToStableTimestamp(OperationContext* opCtx) {
     auto serviceContext = opCtx->getServiceContext();
 
@@ -1477,10 +1495,10 @@ void StorageInterfaceImpl::waitForAllEarlierOplogWritesToBeVisible(OperationCont
                                                                    bool primaryOnly) {
     // Waiting for oplog writes to be visible in the oplog does not use any storage engine resources
     // and must not wait for ticket acquisition to avoid deadlocks with updating oplog visibility.
-    ScopedAdmissionPriorityForLock setTicketAquisition(opCtx->lockState(),
-                                                       AdmissionContext::Priority::kImmediate);
+    ScopedAdmissionPriority<ExecutionAdmissionContext> setTicketAquisition(
+        opCtx, AdmissionContext::Priority::kExempt);
 
-    AutoGetOplog oplogRead(opCtx, OplogAccessMode::kRead);
+    AutoGetOplogFastPath oplogRead(opCtx, OplogAccessMode::kRead);
     if (primaryOnly &&
         !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesForDatabase(opCtx,
                                                                               DatabaseName::kAdmin))
@@ -1495,10 +1513,10 @@ void StorageInterfaceImpl::oplogDiskLocRegister(OperationContext* opCtx,
                                                 bool orderedCommit) {
     // Setting the oplog visibility does not use any storage engine resources and must skip ticket
     // acquisition to avoid deadlocks with updating oplog visibility.
-    ScopedAdmissionPriorityForLock setTicketAquisition(opCtx->lockState(),
-                                                       AdmissionContext::Priority::kImmediate);
+    ScopedAdmissionPriority<ExecutionAdmissionContext> setTicketAquisition(
+        opCtx, AdmissionContext::Priority::kExempt);
 
-    AutoGetOplog oplogRead(opCtx, OplogAccessMode::kRead);
+    AutoGetOplogFastPath oplogRead(opCtx, OplogAccessMode::kRead);
     fassert(28557,
             oplogRead.getCollection()->getRecordStore()->oplogDiskLocRegister(
                 opCtx, ts, orderedCommit));
@@ -1523,7 +1541,8 @@ Timestamp StorageInterfaceImpl::getAllDurableTimestamp(ServiceContext* serviceCt
 }
 
 Timestamp StorageInterfaceImpl::getPointInTimeReadTimestamp(OperationContext* opCtx) const {
-    auto readTimestamp = opCtx->recoveryUnit()->getPointInTimeReadTimestamp(opCtx);
+    auto readTimestamp =
+        shard_role_details::getRecoveryUnit(opCtx)->getPointInTimeReadTimestamp(opCtx);
     invariant(readTimestamp);
     return *readTimestamp;
 }

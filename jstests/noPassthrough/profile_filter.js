@@ -104,7 +104,7 @@ function runTest(conn) {
         const exampleProfileDoc = db.system.profile.findOne();
         const profilerFields = Object.keys(exampleProfileDoc);
         const expectedMissingFields = [
-            "storage"  // storage stats are set after filtering and cannot be used for filtering
+            "storage",  // storage stats are set after filtering and cannot be used for filtering
         ];
         for (const field of profilerFields) {
             if (expectedMissingFields.includes(field))
@@ -114,7 +114,9 @@ function runTest(conn) {
             assert.commandWorked(
                 db.setProfilingLevel(isMongos ? 0 : 1, {filter: {[field]: {$exists: true}}}));
             const comment = 'profile_filter_input_has_field_' + field;
-            assert.eq(1, coll.find().limit(1).comment(comment).itcount());
+            // Use a $natural hint to force a collection scan without fast paths to ensure
+            // cost-estimation is done when 'tryBonsai' framework control is enabled.
+            assert.eq(100, coll.find().hint({$natural: 1}).comment(comment).itcount());
             // If the profile filter's input didn't contain `field`, then this operation wouldn't be
             // profiled.
             assert(db.system.profile.findOne({'command.comment': comment}),

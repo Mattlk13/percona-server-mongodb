@@ -222,7 +222,7 @@ public:
         OperationContext* const _opCtx;
         LockResult _result{LOCK_INVALID};
 
-        boost::optional<ResourceLock> _fcvLock;
+        boost::optional<ResourceLock> _multiDocTxnBarrier;
 
         InterruptBehavior _interruptBehavior;
         bool _skipRSTLLock;
@@ -378,6 +378,7 @@ public:
                        Date_t deadline = Date_t::max());
 
         CollectionLock(CollectionLock&&);
+        CollectionLock& operator=(CollectionLock&& other);
         ~CollectionLock();
 
     private:

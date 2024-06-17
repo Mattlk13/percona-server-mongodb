@@ -104,7 +104,7 @@ public:
     }
 
     using State =
-        stdx::variant<GlobalIndexCoordinatorStateEnumPlaceholder, GlobalIndexClonerStateEnum>;
+        std::variant<GlobalIndexCoordinatorStateEnumPlaceholder, GlobalIndexClonerStateEnum>;
 
     GlobalIndexMetrics(UUID instanceId,
                        BSONObj originatingCommand,
@@ -113,7 +113,7 @@ public:
                        Date_t startTime,
                        ClockSource* clockSource,
                        ShardingDataTransformCumulativeMetrics* cumulativeMetrics);
-    ~GlobalIndexMetrics();
+    ~GlobalIndexMetrics() override;
 
     static std::unique_ptr<GlobalIndexMetrics> makeInstance(UUID uuid,
                                                             NamespaceString nss,

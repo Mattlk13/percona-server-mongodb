@@ -1,7 +1,7 @@
 // @tags: [
 //   # The test runs a lot of commands that are not allowed with security token: addShard,
 //   # addShardToZone, appendOplogNote, applyOps, and so on.
-//   not_allowed_with_security_token,
+//   not_allowed_with_signed_security_token,
 //   assumes_unsharded_collection,
 //   assumes_superuser_permissions,
 //   does_not_support_stepdowns,
@@ -17,7 +17,8 @@
 //   directly_against_shardsvrs_incompatible,
 //   # This test has statements that do not support non-local read concern.
 //   does_not_support_causal_consistency,
-//   uses_compact
+//   uses_compact,
+//   creates_and_authenticates_user,
 // ]
 
 /*
@@ -114,7 +115,7 @@ let viewsCommandTests = {
     _configsvrCreateDatabase: {skip: isAnInternalCommand},
     _configsvrDropIndexCatalogEntry: {skip: isAnInternalCommand},
     _configsvrEnsureChunkVersionIsGreaterThan: {skip: isAnInternalCommand},
-    _configsvrGetHistoricalPlacement: {skip: isAnInternalCommand},  // TODO SERVER-73029 remove
+    _configsvrGetHistoricalPlacement: {skip: isAnInternalCommand},
     _configsvrMovePrimary: {skip: isAnInternalCommand},
     _configsvrMoveRange: {skip: isAnInternalCommand},
     _configsvrRefineCollectionShardKey: {skip: isAnInternalCommand},
@@ -156,17 +157,21 @@ let viewsCommandTests = {
     _recvChunkStatus: {skip: isAnInternalCommand},
     _refreshQueryAnalyzerConfiguration: {skip: isAnInternalCommand},
     _shardsvrAbortReshardCollection: {skip: isAnInternalCommand},
+    _shardsvrBeginMigrationBlockingOperation: {skip: isAnInternalCommand},
+    _shardsvrChangePrimary: {skip: isAnInternalCommand},
     _shardsvrCheckMetadataConsistency: {skip: isAnInternalCommand},
     _shardsvrCheckMetadataConsistencyParticipant: {skip: isAnInternalCommand},
     _shardsvrCleanupStructuredEncryptionData: {skip: isAnInternalCommand},
     _shardsvrCloneCatalogData: {skip: isAnInternalCommand},
     _shardsvrCompactStructuredEncryptionData: {skip: isAnInternalCommand},
+    _shardsvrConvertToCapped: {skip: isAnInternalCommand},
     _shardsvrCoordinateMultiUpdate: {skip: isAnInternalCommand},
     _shardsvrDropCollection: {skip: isAnInternalCommand},
     _shardsvrDropCollectionIfUUIDNotMatchingWithWriteConcern: {skip: isUnrelated},
     _shardsvrDropCollectionParticipant: {skip: isAnInternalCommand},
     _shardsvrDropIndexCatalogEntryParticipant: {skip: isAnInternalCommand},
     _shardsvrDropIndexes: {skip: isAnInternalCommand},
+    _shardsvrEndMigrationBlockingOperation: {skip: isAnInternalCommand},
     _shardsvrInsertGlobalIndexKey: {skip: isAnInternalCommand},
     _shardsvrDeleteGlobalIndexKey: {skip: isAnInternalCommand},
     _shardsvrWriteGlobalIndexKeys: {skip: isAnInternalCommand},
@@ -204,6 +209,7 @@ let viewsCommandTests = {
     _shardsvrSetAllowMigrations: {skip: isAnInternalCommand},
     _shardsvrSetClusterParameter: {skip: isAnInternalCommand},
     _shardsvrSetUserWriteBlockMode: {skip: isAnInternalCommand},
+    _shardsvrUntrackUnsplittableCollection: {skip: isAnInternalCommand},
     _shardsvrValidateShardKeyCandidate: {skip: isAnInternalCommand},
     _shardsvrCollMod: {skip: isAnInternalCommand},
     _shardsvrCollModParticipant: {skip: isAnInternalCommand},
@@ -217,6 +223,9 @@ let viewsCommandTests = {
     streams_getStats: {skip: isAnInternalCommand},
     streams_testOnlyInsert: {skip: isAnInternalCommand},
     streams_getMetrics: {skip: isAnInternalCommand},
+    streams_updateFeatureFlags: {skip: isAnInternalCommand},
+    streams_testOnlyGetFeatureFlags: {skip: isAnInternalCommand},
+    streams_writeCheckpoint: {skip: isAnInternalCommand},
     _transferMods: {skip: isAnInternalCommand},
     _vectorClockPersist: {skip: isAnInternalCommand},
     abortMoveCollection: {skip: isUnrelated},
@@ -240,6 +249,7 @@ let viewsCommandTests = {
         skipSharded: true,
     },
     authenticate: {skip: isUnrelated},
+    autoCompact: {skip: isUnrelated},
     autoSplitVector: {
         command: {
             splitVector: "test.view",
@@ -250,9 +260,6 @@ let viewsCommandTests = {
     },
     balancerCollectionStatus: {
         command: {balancerCollectionStatus: "test.view"},
-        setup: function(conn) {
-            assert.commandWorked(conn.adminCommand({enableSharding: "test"}));
-        },
         skipStandalone: true,
         expectFailure: true,
         isAdminCommand: true,
@@ -267,6 +274,7 @@ let viewsCommandTests = {
         command: {captrunc: "view", n: 2, inc: false},
         expectFailure: true,
     },
+    changePrimary: {skip: "Tested in sharding/change_primary.js"},
     checkMetadataConsistency: {
         command: {checkMetadataConsistency: "view"},
         expectFailure: false,
@@ -464,8 +472,11 @@ let viewsCommandTests = {
     getShardMap: {skip: isUnrelated},
     getShardVersion: {
         command: {getShardVersion: "test.view"},
-        expectFailure: true,
-        expectedErrorCode: ErrorCodes.NoShardingEnabled,
+        // This command is only expected to fail with the errors below when it is run against
+        // a standalone replica set mongod.
+        expectFailure: !TestData.testingReplicaSetEndpoint,
+        expectedErrorCode:
+            [ErrorCodes.ShardingStateNotInitialized, ErrorCodes.NoShardingEnabled_OBSOLETE],
         isAdminCommand: true,
         skipSharded: true,  // mongos is tested in views/views_sharded.js
     },
@@ -556,10 +567,7 @@ let viewsCommandTests = {
     },
     moveCollection: {
         command: {moveCollection: "test.view", toShard: "move_collection-rs"},
-        setup: function(conn) {
-            assert.commandWorked(conn.adminCommand({enableSharding: "test"}));
-        },
-        expectedErrorCode: [ErrorCodes.NamespaceNotFound],
+        expectedErrorCode: [ErrorCodes.NamespaceNotFound, ErrorCodes.IllegalOperation],
         skipStandalone: true,
         expectFailure: true,
         isAdminCommand: true,
@@ -634,9 +642,6 @@ let viewsCommandTests = {
     resetPlacementHistory: {skip: isUnrelated},
     reshardCollection: {
         command: {reshardCollection: "test.view", key: {_id: 1}},
-        setup: function(conn) {
-            assert.commandWorked(conn.adminCommand({enableSharding: "test"}));
-        },
         expectedErrorCode: [ErrorCodes.NamespaceNotSharded, ErrorCodes.NamespaceNotFound],
         skipStandalone: true,
         expectFailure: true,
@@ -659,9 +664,6 @@ let viewsCommandTests = {
     revokeRolesFromUser: {skip: isUnrelated},
     setAllowMigrations: {
         command: {setAllowMigrations: "test.view", allowMigrations: false},
-        setup: function(conn) {
-            assert.commandWorked(conn.adminCommand({enableSharding: "test"}));
-        },
         expectedErrorCode: ErrorCodes.NamespaceNotSharded,
         skipStandalone: true,
         expectFailure: true,
@@ -688,9 +690,6 @@ let viewsCommandTests = {
     setUserWriteBlockMode: {skip: isUnrelated},
     shardCollection: {
         command: {shardCollection: "test.view", key: {_id: 1}},
-        setup: function(conn) {
-            assert.commandWorked(conn.adminCommand({enableSharding: "test"}));
-        },
         skipStandalone: true,
         expectFailure: true,
         isAdminCommand: true,
@@ -717,7 +716,8 @@ let viewsCommandTests = {
         },
         skipSharded: true,
         expectFailure: true,
-        expectedErrorCode: ErrorCodes.NoShardingEnabled,
+        expectedErrorCode:
+            [ErrorCodes.ShardingStateNotInitialized, ErrorCodes.NoShardingEnabled_OBSOLETE],
         isAdminCommand: true,
     },
     splitVector: {
@@ -732,6 +732,7 @@ let viewsCommandTests = {
     startRecordingTraffic: {skip: isUnrelated},
     startSession: {skip: isAnInternalCommand},
     stopRecordingTraffic: {skip: isUnrelated},
+    sysprofile: {skip: isAnInternalCommand},
     testDeprecation: {skip: isAnInternalCommand},
     testDeprecationInVersion2: {skip: isAnInternalCommand},
     testInternalTransactions: {skip: isAnInternalCommand},
@@ -743,11 +744,9 @@ let viewsCommandTests = {
     top: {skip: "tested in views/views_stats.js"},
     transitionFromDedicatedConfigServer: {skip: isUnrelated},
     transitionToDedicatedConfigServer: {skip: isUnrelated},
+    transitionToShardedCluster: {skip: isUnrelated},
     unshardCollection: {
         command: {unshardCollection: "test.view", toShard: "unshard_collection-rs"},
-        setup: function(conn) {
-            assert.commandWorked(conn.adminCommand({enableSharding: "test"}));
-        },
         expectedErrorCode: [ErrorCodes.NamespaceNotSharded, ErrorCodes.NamespaceNotFound],
         skipStandalone: true,
         expectFailure: true,

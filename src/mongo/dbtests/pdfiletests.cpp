@@ -179,11 +179,11 @@ public:
 };
 }  // namespace Insert
 
-class All : public OldStyleSuiteSpecification {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("pdfile") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<Insert::InsertNoId>();
         add<Insert::UpdateDate>();
         add<Insert::UpdateDate2>();
@@ -191,7 +191,7 @@ public:
     }
 };
 
-OldStyleSuiteInitializer<All> myall;
+unittest::OldStyleSuiteInitializer<All> myall;
 
 }  // namespace PdfileTests
 }  // namespace mongo

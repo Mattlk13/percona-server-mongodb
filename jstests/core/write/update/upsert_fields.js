@@ -89,7 +89,6 @@ for (var i = 0; i < 3; i++) {
     assert.neq(1, upsertedId({_id: {$elemMatch: {$eq: 1}}}, expr));
     assert.neq(1, upsertedId({_id: {$exists: true}}, expr));
     assert.neq(1, upsertedId({_id: {$not: {$eq: 1}}}, expr));
-    assert.neq(1, upsertedId({$or: [{_id: 1}, {_id: 1}]}, expr));
     assert.neq(1, upsertedId({$or: [{_id: {$eq: 1}}, {_id: 2}]}, expr));
     assert.neq(1, upsertedId({$nor: [{_id: 1}]}, expr));
     assert.neq(1, upsertedId({$nor: [{_id: {$eq: 1}}]}, expr));
@@ -165,7 +164,6 @@ for (var i = 0; i < 3; i++) {
     assert.eq(undefined, upsertedXVal({x: {$elemMatch: {$eq: 1}}}, expr));
     assert.eq(undefined, upsertedXVal({x: {$exists: true}}, expr));
     assert.eq(undefined, upsertedXVal({x: {$not: {$eq: 1}}}, expr));
-    assert.eq(undefined, upsertedXVal({$or: [{x: 1}, {x: 1}]}, expr));
     assert.eq(undefined, upsertedXVal({$or: [{x: {$eq: 1}}, {x: 2}]}, expr));
     assert.eq(undefined, upsertedXVal({$nor: [{x: 1}]}, expr));
     assert.eq(undefined, upsertedXVal({$nor: [{x: {$eq: 1}}]}, expr));

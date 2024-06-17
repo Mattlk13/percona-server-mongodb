@@ -42,7 +42,6 @@
 
 #include "mongo/base/error_codes.h"
 #include "mongo/db/timeseries/bucket_catalog/bucket.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/with_lock.h"
 
@@ -89,7 +88,8 @@ bool isMemberOfClearedSet(BucketStateRegistry& registry, WithLock lock, Bucket* 
     for (auto it = registry.clearedSets.lower_bound(bucket->lastChecked + 1);
          it != registry.clearedSets.end();
          ++it) {
-        if (it->second(bucket->bucketId.ns)) {
+        if (std::find(it->second.begin(), it->second.end(), bucket->bucketId.collectionUUID) !=
+            it->second.end()) {
             return true;
         }
     }
@@ -106,14 +106,21 @@ void markIndividualBucketCleared(BucketStateRegistry& registry,
                                  WithLock catalogLock,
                                  const BucketId& bucketId) {
     auto it = registry.bucketStates.find(bucketId);
-    if (it == registry.bucketStates.end() ||
-        stdx::holds_alternative<DirectWriteCounter>(it->second)) {
+    if (it == registry.bucketStates.end() || holds_alternative<DirectWriteCounter>(it->second) ||
+        isBucketStateFrozen(it->second)) {
         return;
     }
     it->second = (isBucketStatePrepared(it->second)) ? BucketState::kPreparedAndCleared
                                                      : BucketState::kCleared;
 }
 }  // namespace
+
+BucketStateRegistry::BucketStateRegistry(TrackingContext& trackingContext)
+    : bucketsPerEra(make_tracked_map<Era, uint64_t>(trackingContext)),
+      bucketStates(make_tracked_unordered_map<BucketId,
+                                              std::variant<BucketState, DirectWriteCounter>,
+                                              BucketHasher>(trackingContext)),
+      clearedSets(make_tracked_map<Era, tracked_vector<UUID>>(trackingContext)) {}
 
 BucketStateRegistry::Era getCurrentEra(const BucketStateRegistry& registry) {
     stdx::lock_guard lk{registry.mutex};
@@ -142,10 +149,9 @@ BucketStateRegistry::Era getBucketCountForEra(BucketStateRegistry& registry,
     }
 }
 
-void clearSetOfBuckets(BucketStateRegistry& registry,
-                       BucketStateRegistry::ShouldClearFn&& shouldClear) {
+void clearSetOfBuckets(BucketStateRegistry& registry, tracked_vector<UUID> clearedCollectionUUIDs) {
     stdx::lock_guard lk{registry.mutex};
-    registry.clearedSets[++registry.currentEra] = std::move(shouldClear);
+    registry.clearedSets[++registry.currentEra] = std::move(clearedCollectionUUIDs);
 }
 
 std::uint64_t getClearedSetsCount(const BucketStateRegistry& registry) {
@@ -153,7 +159,7 @@ std::uint64_t getClearedSetsCount(const BucketStateRegistry& registry) {
     return registry.clearedSets.size();
 }
 
-boost::optional<stdx::variant<BucketState, DirectWriteCounter>> getBucketState(
+boost::optional<std::variant<BucketState, DirectWriteCounter>> getBucketState(
     BucketStateRegistry& registry, Bucket* bucket) {
     stdx::lock_guard catalogLock{registry.mutex};
 
@@ -170,7 +176,7 @@ boost::optional<stdx::variant<BucketState, DirectWriteCounter>> getBucketState(
     return it->second;
 }
 
-boost::optional<stdx::variant<BucketState, DirectWriteCounter>> getBucketState(
+boost::optional<std::variant<BucketState, DirectWriteCounter>> getBucketState(
     BucketStateRegistry& registry, const BucketId& bucketId) {
     stdx::lock_guard catalogLock{registry.mutex};
 
@@ -182,28 +188,38 @@ boost::optional<stdx::variant<BucketState, DirectWriteCounter>> getBucketState(
     return it->second;
 }
 
-bool isBucketStateCleared(stdx::variant<BucketState, DirectWriteCounter>& state) {
-    if (auto* bucketState = stdx::get_if<BucketState>(&state)) {
+bool isBucketStateCleared(std::variant<BucketState, DirectWriteCounter>& state) {
+    if (auto* bucketState = get_if<BucketState>(&state)) {
         return *bucketState == BucketState::kCleared ||
             *bucketState == BucketState::kPreparedAndCleared;
     }
     return false;
 }
 
-bool isBucketStatePrepared(stdx::variant<BucketState, DirectWriteCounter>& state) {
-    if (auto* bucketState = stdx::get_if<BucketState>(&state)) {
-        return *bucketState == BucketState::kPrepared ||
-            *bucketState == BucketState::kPreparedAndCleared;
+bool isBucketStateFrozen(std::variant<BucketState, DirectWriteCounter>& state) {
+    if (auto* bucketState = get_if<BucketState>(&state)) {
+        return *bucketState == BucketState::kFrozen ||
+            *bucketState == BucketState::kPreparedAndFrozen;
     }
     return false;
 }
 
-bool conflictsWithReopening(stdx::variant<BucketState, DirectWriteCounter>& state) {
-    return stdx::holds_alternative<DirectWriteCounter>(state);
+bool isBucketStatePrepared(std::variant<BucketState, DirectWriteCounter>& state) {
+    if (auto* bucketState = get_if<BucketState>(&state)) {
+        return *bucketState == BucketState::kPrepared ||
+            *bucketState == BucketState::kPreparedAndCleared ||
+            *bucketState == BucketState::kPreparedAndFrozen;
+    }
+    return false;
 }
 
-bool conflictsWithInsertions(stdx::variant<BucketState, DirectWriteCounter>& state) {
-    return conflictsWithReopening(state) || isBucketStateCleared(state);
+bool transientlyConflictsWithReopening(std::variant<BucketState, DirectWriteCounter>& state) {
+    return holds_alternative<DirectWriteCounter>(state);
+}
+
+bool conflictsWithInsertions(std::variant<BucketState, DirectWriteCounter>& state) {
+    return transientlyConflictsWithReopening(state) || isBucketStateCleared(state) ||
+        isBucketStateFrozen(state);
 }
 
 Status initializeBucketState(BucketStateRegistry& registry,
@@ -225,11 +241,14 @@ Status initializeBucketState(BucketStateRegistry& registry,
     if (it == registry.bucketStates.end()) {
         registry.bucketStates.emplace(bucketId, BucketState::kNormal);
         return Status::OK();
-    } else if (conflictsWithReopening(it->second)) {
-        // If the bucket is cleared or we are currently performing direct writes on it we cannot
-        // initialize the bucket to a normal state.
+    } else if (transientlyConflictsWithReopening(it->second)) {
+        // If we are currently performing direct writes on it we cannot initialize the bucket to a
+        // normal state.
         return {ErrorCodes::WriteConflict,
                 "Bucket initialization failed: conflict with an exisiting bucket"};
+    } else if (isBucketStateFrozen(it->second)) {
+        return {ErrorCodes::TimeseriesBucketFrozen,
+                "Bucket initialization failed: bucket is frozen"};
     }
 
     invariant(!isBucketStatePrepared(it->second));
@@ -275,18 +294,23 @@ StateChangeSuccessful unprepareBucketState(BucketStateRegistry& registry,
 
     auto it = registry.bucketStates.find(bucketId);
     invariant(it != registry.bucketStates.end());
-    invariant(stdx::holds_alternative<BucketState>(it->second));
+    invariant(holds_alternative<BucketState>(it->second));
     invariant(isBucketStatePrepared(it->second));
 
-    auto bucketState = stdx::get<BucketState>(it->second);
-    // There is also a chance the state got cleared, in which case we should keep the state as
-    // 'kCleared'.
-    it->second = (bucketState == BucketState::kPreparedAndCleared) ? BucketState::kCleared
-                                                                   : BucketState::kNormal;
+    auto bucketState = get<BucketState>(it->second);
+    // There is also a chance the state got cleared or frozen, in which case we should keep the
+    // state as 'kCleared' or 'kFrozen'.
+    if (bucketState == BucketState::kPreparedAndCleared) {
+        it->second = BucketState::kCleared;
+    } else if (bucketState == BucketState::kPreparedAndFrozen) {
+        it->second = BucketState::kFrozen;
+    } else {
+        it->second = BucketState::kNormal;
+    }
     return StateChangeSuccessful::kYes;
 }
 
-stdx::variant<BucketState, DirectWriteCounter> addDirectWrite(
+std::variant<BucketState, DirectWriteCounter> addDirectWrite(
     BucketStateRegistry& registry,
     const BucketId& bucketId,
     ContinueTrackingBucket continueTrackingBucket) {
@@ -306,14 +330,15 @@ stdx::variant<BucketState, DirectWriteCounter> addDirectWrite(
         newDirectWriteCount *= -1;
         registry.bucketStates.emplace(bucketId, newDirectWriteCount);
         return newDirectWriteCount;
-    } else if (auto* directWriteCount = stdx::get_if<DirectWriteCounter>(&it->second)) {
+    } else if (auto* directWriteCount = get_if<DirectWriteCounter>(&it->second)) {
         if (*directWriteCount > 0) {
             newDirectWriteCount = *directWriteCount + 1;
         } else {
             newDirectWriteCount = *directWriteCount - 1;
         }
-    } else if (isBucketStatePrepared(it->second)) {
-        // Cannot perform direct writes on prepared buckets.
+    } else if (isBucketStateFrozen(it->second) || isBucketStatePrepared(it->second)) {
+        // Frozen buckets are safe to receive direct writes. Cannot perform direct writes on
+        // prepared buckets.
         return it->second;
     }
 
@@ -331,10 +356,13 @@ void removeDirectWrite(BucketStateRegistry& registry, const BucketId& bucketId) 
 
     auto it = registry.bucketStates.find(bucketId);
     invariant(it != registry.bucketStates.end());
-    invariant(stdx::holds_alternative<DirectWriteCounter>(it->second));
+    if (isBucketStateFrozen(it->second)) {
+        return;
+    }
+    invariant(holds_alternative<DirectWriteCounter>(it->second));
 
     bool removingFinalDirectWrite = true;
-    auto directWriteCount = stdx::get<DirectWriteCounter>(it->second);
+    auto directWriteCount = get<DirectWriteCounter>(it->second);
     if (directWriteCount == 1) {
         it->second = BucketState::kCleared;
     } else if (directWriteCount == -1) {
@@ -365,18 +393,32 @@ void stopTrackingBucketState(BucketStateRegistry& registry, const BucketId& buck
         return;
     }
 
-    if (conflictsWithReopening(it->second)) {
+    if (transientlyConflictsWithReopening(it->second)) {
         // We cannot release the bucket state of pending direct writes.
-        auto directWriteCount = stdx::get<DirectWriteCounter>(it->second);
+        auto directWriteCount = get<DirectWriteCounter>(it->second);
         if (directWriteCount > 0) {
             // A negative value signals the immediate removal of the bucket state after the
             // completion of the direct writes.
             directWriteCount *= -1;
         }
         it->second = directWriteCount;
+    } else if (isBucketStateFrozen(it->second)) {
+        it->second = BucketState::kFrozen;
     } else {
         registry.bucketStates.erase(it);
     }
+}
+
+void freezeBucket(BucketStateRegistry& registry, const BucketId& bucketId) {
+    stdx::lock_guard catalogLock{registry.mutex};
+
+    auto it = registry.bucketStates.find(bucketId);
+    if (it == registry.bucketStates.end()) {
+        registry.bucketStates.emplace(bucketId, BucketState::kFrozen);
+        return;
+    }
+    it->second = (isBucketStatePrepared(it->second)) ? BucketState::kPreparedAndFrozen
+                                                     : BucketState::kFrozen;
 }
 
 void appendStats(const BucketStateRegistry& registry, BSONObjBuilder& base) {
@@ -392,12 +434,12 @@ void appendStats(const BucketStateRegistry& registry, BSONObjBuilder& base) {
                          static_cast<long long>(registry.clearedSets.size()));
 }
 
-std::string bucketStateToString(const stdx::variant<BucketState, DirectWriteCounter>& state) {
-    if (auto* directWriteCount = stdx::get_if<DirectWriteCounter>(&state)) {
+std::string bucketStateToString(const std::variant<BucketState, DirectWriteCounter>& state) {
+    if (auto* directWriteCount = get_if<DirectWriteCounter>(&state)) {
         return fmt::format("{{type: DirectWrite, value: {}}}", *directWriteCount);
     }
 
-    auto bucketState = stdx::get<BucketState>(state);
+    auto bucketState = get<BucketState>(state);
     switch (bucketState) {
         case BucketState::kNormal: {
             return "{{type: BucketState, value: kNormal}}";

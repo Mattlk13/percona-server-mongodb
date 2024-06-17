@@ -32,10 +32,10 @@
 #include "mongo/transport/session_manager.h"
 
 #include <string>
+#include <variant>
 #include <vector>
 
 #include "mongo/db/client.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/transport/client_transport_observer.h"
 #include "mongo/util/net/cidr.h"
 
@@ -50,9 +50,9 @@ namespace transport {
 class SessionManagerCommon : public SessionManager {
 public:
     explicit SessionManagerCommon(ServiceContext*);
-    SessionManagerCommon(ServiceContext*, std::unique_ptr<ClientTransportObserver> observer);
+    SessionManagerCommon(ServiceContext*, std::shared_ptr<ClientTransportObserver> observer);
     SessionManagerCommon(ServiceContext* svcCtx,
-                         std::vector<std::unique_ptr<ClientTransportObserver>> observers);
+                         std::vector<std::shared_ptr<ClientTransportObserver>> observers);
     ~SessionManagerCommon() override;
 
     void startSession(std::shared_ptr<Session> session) override;
@@ -60,14 +60,10 @@ public:
     void endSessionByClient(Client* client) override;
     void endAllSessionsNoTagMask();
 
-    Status start() override {
-        return Status::OK();
-    }
     bool shutdown(Milliseconds timeout) override;
     bool shutdownAndWait(Milliseconds timeout);
     bool waitForNoSessions(Milliseconds timeout);
 
-    void appendStats(BSONObjBuilder*) const override;
     std::size_t numOpenSessions() const override;
     std::size_t maxOpenSessions() const override {
         return _maxOpenSessions;
@@ -80,6 +76,12 @@ protected:
     /** Imbue the new Client with a ServiceExecutorContext. */
     virtual void configureServiceExecutorContext(Client* client,
                                                  bool isPrivilegedSession) const = 0;
+
+    /** Called upon client connection. Default behavior is to do nothing. */
+    virtual void onClientConnect(Client* client) {}
+
+    /** Called upon client disconnection. Default behavior is to do nothing. */
+    virtual void onClientDisconnect(Client* client) {}
 
     /** Total number of sessions created. */
     std::size_t numCreatedSessions() const;
@@ -96,14 +98,14 @@ protected:
     std::unique_ptr<Sessions> _sessions;
 
     // External observer which may receive client connect/disconnect events.
-    std::vector<std::unique_ptr<ClientTransportObserver>> _observers;
+    std::vector<std::shared_ptr<ClientTransportObserver>> _observers;
 };
 
 /**
  * Returns true if a session with remote/local addresses should be exempted from maxConns.
  */
 bool shouldOverrideMaxConns(const std::shared_ptr<Session>& session,
-                            const std::vector<stdx::variant<CIDR, std::string>>& exemptions);
+                            const std::vector<std::variant<CIDR, std::string>>& exemptions);
 
 }  // namespace transport
 }  // namespace mongo

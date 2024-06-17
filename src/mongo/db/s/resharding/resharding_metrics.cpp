@@ -46,7 +46,6 @@
 #include "mongo/db/s/resharding/resharding_util.h"
 #include "mongo/db/server_options.h"
 #include "mongo/s/resharding/resharding_feature_flag_gen.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/namespace_string_util.h"
 
@@ -244,20 +243,19 @@ std::unique_ptr<ReshardingMetrics> ReshardingMetrics::makeInstance(UUID instance
 }
 
 StringData ReshardingMetrics::getStateString() const noexcept {
-    return stdx::visit(
-        OverloadedVisitor{
-            [](CoordinatorStateEnum state) { return CoordinatorState_serializer(state); },
-            [](RecipientStateEnum state) { return RecipientState_serializer(state); },
-            [](DonorStateEnum state) {
-                return DonorState_serializer(state);
-            }},
-        getState());
+    return visit(OverloadedVisitor{
+                     [](CoordinatorStateEnum state) { return CoordinatorState_serializer(state); },
+                     [](RecipientStateEnum state) { return RecipientState_serializer(state); },
+                     [](DonorStateEnum state) {
+                         return DonorState_serializer(state);
+                     }},
+                 getState());
 }
 
 BSONObj ReshardingMetrics::reportForCurrentOp() const noexcept {
     BSONObjBuilder builder;
     if (resharding::gFeatureFlagReshardingImprovements.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
         reportDurationsForAllPhases<Seconds>(
             kTimedPhaseNamesMap, getClockSource(), &builder, Seconds{0});
         switch (_role) {
@@ -310,7 +308,7 @@ void ReshardingMetrics::restoreRecipientSpecificFields(
 void ReshardingMetrics::restoreCoordinatorSpecificFields(
     const ReshardingCoordinatorDocument& document) {
     if (resharding::gFeatureFlagReshardingImprovements.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
         auto isSameKeyResharding =
             document.getForceRedistribution() && *document.getForceRedistribution();
         setIsSameKeyResharding(isSameKeyResharding);
@@ -350,7 +348,7 @@ void ReshardingMetrics::restoreIndexBuildDurationFields(const ReshardingRecipien
 void ReshardingMetrics::reportOnCompletion(BSONObjBuilder* builder) {
     invariant(builder);
     if (resharding::gFeatureFlagReshardingImprovements.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
         reportDurationsForAllPhases<Seconds>(
             kTimedPhaseNamesMap, getClockSource(), builder, Seconds{0});
     } else {

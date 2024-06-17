@@ -133,7 +133,8 @@ public:
         auto version = versionField.Number();
         if (version == kTimeseriesControlUncompressedVersion) {
             return computeElementCountFromTimestampObjSize(time.objsize());
-        } else if (version == kTimeseriesControlCompressedVersion) {
+        } else if (version == kTimeseriesControlCompressedSortedVersion ||
+                   version == kTimeseriesControlCompressedUnsortedVersion) {
             auto countField = controlField.Obj()[kBucketControlCountFieldName];
             if (countField && isNumericBSONType(countField.type())) {
                 return static_cast<int>(countField.Number());
@@ -274,8 +275,9 @@ private:
     // included in the materialized measurements.
     void eraseMetaFromFieldSetAndDetermineIncludeMeta();
 
-    // Erase computed meta projection fields if they are present in the exclusion field set.
-    void eraseExcludedComputedMetaProjFields();
+    // Erase computed meta projection fields if they are present in the exclusion field set or if
+    // they are not present in the inclusion set.
+    void eraseUnneededComputedMetaProjFields();
 
     BucketSpec _spec;
 

@@ -52,6 +52,9 @@ struct MongosGlobalParams {
     bool scriptingEnabled = true;  // Use "security.javascriptEnabled" to set this variable. Or use
                                    // --noscripting which will set it to false.
 
+    bool upgradeBackCompat{false};    // --upgradeBackCompat
+    bool downgradeBackCompat{false};  // --downgradeBackCompat
+
     // The config server connection string
     ConnectionString configdbs;
 };

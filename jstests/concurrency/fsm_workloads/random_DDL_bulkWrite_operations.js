@@ -12,15 +12,13 @@
  *   does_not_support_stepdowns,
  *   # Can be removed once PM-1965-Milestone-1 is completed.
  *   does_not_support_transactions,
- *   # TODO SERVER-52419 Remove this tag.
- *   featureFlagBulkWriteCommand,
+ *   requires_fcv_80
  *  ]
  */
 
 import {
     uniformDistTransitions
 } from "jstests/concurrency/fsm_workload_helpers/state_transition_utils.js";
-import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
 import {extractUUIDFromObject} from "jstests/libs/uuid_util.js";
 
 export const $config = (function() {
@@ -212,18 +210,11 @@ export const $config = (function() {
             }
         },
         checkDatabaseMetadataConsistency: function(db, collName, connCache) {
-            if (this.skipMetadataChecks) {
-                return;
-            }
             jsTestLog('Check database metadata state');
             const inconsistencies = db.checkMetadataConsistency().toArray();
             assert.eq(0, inconsistencies.length, tojson(inconsistencies));
         },
         checkCollectionMetadataConsistency: function(db, collName, connCache) {
-            if (this.skipMetadataChecks) {
-                return;
-            }
-
             let tid = this.tid;
             while (tid === this.tid)
                 tid = Random.randInt(this.threadCount);
@@ -288,7 +279,9 @@ export const $config = (function() {
                 // Check if insert succeeded
                 var res = db.adminCommand(bulkWriteCmd);
                 assert.commandWorked(res);
-                assert.eq(res.numErrors, 0);
+                assert.eq(res.nErrors,
+                          0,
+                          "BulkWrite - Insert errored when not expected to: " + tojson(res));
 
                 jsTestLog('BulkWrite - Update tid:' + tid + ' currentTid:' + this.tid +
                           ' collection:' + collNames);
@@ -311,7 +304,7 @@ export const $config = (function() {
                     nsInfo: [{ns: fullNs1}, {ns: fullNs2}]
                 };
                 res = db.adminCommand(bulkWriteCmd);
-                if (res.numErrors != 0) {
+                if (res.nErrors != 0) {
                     // Should only be possible for the first namespace to be renamed.
                     var err = res.cursor.firstBatch[0].code;
                     if (err == ErrorCodes.QueryPlanKilled) {
@@ -323,7 +316,9 @@ export const $config = (function() {
                     }
                 }
                 assert.commandWorked(res);
-                assert.eq(res.numErrors, 0);
+                assert.eq(res.nErrors,
+                          0,
+                          "BulkWrite - Update errored when not expected to: " + tojson(res));
 
                 // Delete Data
                 jsTestLog('BulkWrite - Remove tid:' + tid + ' currentTid:' + this.tid +
@@ -339,7 +334,9 @@ export const $config = (function() {
                 };
                 res = db.adminCommand(bulkWriteCmd);
                 assert.commandWorked(res);
-                assert.eq(res.numErrors, 0);
+                assert.eq(res.nErrors,
+                          0,
+                          "BulkWrite - Delete errored when not expected to: " + tojson(res));
                 // Check guarantees IF NO CONCURRENT DROP is running.
                 assert.eq(countDocuments(coll, {generation: generation}), 0);
             } finally {
@@ -350,10 +347,6 @@ export const $config = (function() {
     };
 
     let setup = function(db, collName, cluster) {
-        this.skipMetadataChecks =
-            // TODO SERVER-70396: remove this flag
-            !FeatureFlagUtil.isEnabled(db.getMongo(), 'CheckMetadataConsistency');
-
         for (let tid = 0; tid < this.threadCount; ++tid) {
             db[data.BulkWriteMutex].insert({tid: tid, mutex: 0});
         }

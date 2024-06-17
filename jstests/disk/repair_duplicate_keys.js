@@ -2,7 +2,9 @@
  * Tests that --repair deletes documents containing duplicate unique keys and inserts them into a
  * local lost and found collection.
  *
- * @tags: [requires_wiredtiger]
+ * @tags: [
+ *   requires_wiredtiger,
+ * ]
  */
 
 import {

@@ -50,7 +50,6 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/error_labels.h"
@@ -98,8 +97,8 @@ namespace mongo::resharding::data_copy {
 void ensureCollectionExists(OperationContext* opCtx,
                             const NamespaceString& nss,
                             const CollectionOptions& options) {
-    invariant(!opCtx->lockState()->isLocked());
-    invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(!shard_role_details::getLocker(opCtx)->isLocked());
+    invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
     writeConflictRetry(opCtx, "resharding::data_copy::ensureCollectionExists", nss, [&] {
         AutoGetCollection coll(opCtx, nss, MODE_IX);
@@ -116,8 +115,8 @@ void ensureCollectionExists(OperationContext* opCtx,
 void ensureCollectionDropped(OperationContext* opCtx,
                              const NamespaceString& nss,
                              const boost::optional<UUID>& uuid) {
-    invariant(!opCtx->lockState()->isLocked());
-    invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(!shard_role_details::getLocker(opCtx)->isLocked());
+    invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
     writeConflictRetry(opCtx, "resharding::data_copy::ensureCollectionDropped", nss, [&] {
         AutoGetCollection coll(opCtx, nss, MODE_X);
@@ -170,8 +169,8 @@ void ensureOplogCollectionsDropped(OperationContext* opCtx,
 
 void ensureTemporaryReshardingCollectionRenamed(OperationContext* opCtx,
                                                 const CommonReshardingMetadata& metadata) {
-    invariant(!opCtx->lockState()->isLocked());
-    invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(!shard_role_details::getLocker(opCtx)->isLocked());
+    invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
     // It is safe for resharding to drop and reacquire locks when checking for collection existence
     // because the coordinator will prevent two resharding operations from running for the same
@@ -440,8 +439,10 @@ boost::optional<SharedSemiFuture<void>> withSessionCheckedOut(OperationContext* 
     auto txnParticipant = TransactionParticipant::get(opCtx);
 
     try {
-        txnParticipant.beginOrContinue(
-            opCtx, {txnNumber}, boost::none /* autocommit */, boost::none /* startTransaction */);
+        txnParticipant.beginOrContinue(opCtx,
+                                       {txnNumber},
+                                       boost::none /* autocommit */,
+                                       TransactionParticipant::TransactionActions::kNone);
 
         if (stmtId && txnParticipant.checkStatementExecuted(opCtx, *stmtId)) {
             // Skip the incoming statement because it has already been logged locally.
@@ -516,8 +517,10 @@ void runWithTransactionFromOpCtx(OperationContext* opCtx,
         }
     });
 
-    txnParticipant.beginOrContinue(
-        opCtx, {txnNumber}, false /* autocommit */, true /* startTransaction */);
+    txnParticipant.beginOrContinue(opCtx,
+                                   {txnNumber},
+                                   false /* autocommit */,
+                                   TransactionParticipant::TransactionActions::kStart);
     txnParticipant.unstashTransactionResources(opCtx, "reshardingOplogApplication");
 
     func(opCtx);
@@ -567,7 +570,7 @@ void updateSessionRecord(OperationContext* opCtx,
         "resharding::data_copy::updateSessionRecord",
         NamespaceString::kSessionTransactionsTableNamespace,
         [&] {
-            AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
+            AutoGetOplogFastPath oplogWrite(opCtx, OplogAccessMode::kWrite);
 
             WriteUnitOfWork wuow(opCtx);
             repl::OpTime opTime = repl::logOp(opCtx, &oplogEntry);

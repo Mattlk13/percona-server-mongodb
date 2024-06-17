@@ -39,9 +39,10 @@
 #include "mongo/db/query/optimizer/algebra/operator.h"
 #include "mongo/db/query/optimizer/comparison_op.h"
 #include "mongo/db/query/optimizer/defs.h"
+#include "mongo/db/query/optimizer/explain.h"
+#include "mongo/db/query/optimizer/rewrites/proj_spec_lower.h"
 #include "mongo/db/query/optimizer/utils/strong_alias.h"
 #include "mongo/util/assert_util.h"
-
 
 namespace mongo::optimizer {
 
@@ -49,16 +50,23 @@ static ABT fillEmpty(ABT n, ABT emptyVal) {
     return make<BinaryOp>(Operations::FillEmpty, std::move(n), std::move(emptyVal));
 }
 
-bool EvalPathLowering::optimize(ABT& n, bool rebuild) {
-    _changed = false;
+bool EvalPathLowering::optimize(ABT& n) {
+    // Try to lower directly into a function call to makeBsonObj.
+    auto inputArgs = generateMakeObjArgs(n);
+    if (inputArgs.empty()) {
+        algebra::transport<true>(n, *this);
 
-    algebra::transport<true>(n, *this);
+    } else {
+        // We were able to generate arguments for a makeObj/makeBsonObj call! Now we need to lower
+        // them. We want to lower all arguments as usual. Note that we are intentionally lowering
+        // path components like PathLambda to LambdaAbstractions here.
+        for (auto& arg : inputArgs) {
+            algebra::transport<true>(arg, *this);
+        }
 
-    // This is needed for cases in which EvalPathLowering is called from a context other than during
-    // PathLowering. If the ABT is modified in a way that adds variable references and definitions
-    // the environment must be updated.
-    if (_changed && rebuild) {
-        _env.rebuild(n);
+        // TODO SERVER-62830: detect if we need to lower to makeObj instead.
+        n = make<FunctionCall>("makeBsonObj", std::move(inputArgs));
+        _changed = true;
     }
 
     return _changed;
@@ -241,17 +249,10 @@ void EvalPathLowering::transport(ABT& n, const EvalPath&, ABT& path, ABT& input)
     _changed = true;
 }
 
-bool EvalFilterLowering::optimize(ABT& n, bool rebuild) {
+bool EvalFilterLowering::optimize(ABT& n) {
     _changed = false;
 
     algebra::transport<true>(n, *this);
-
-    // This is needed for cases in which EvalFilterLowering is called from a context other than
-    // during PathLowering. If the ABT is modified in a way that adds variable references or
-    // definitions the environment must be updated.
-    if (_changed && rebuild) {
-        _env.rebuild(n);
-    }
 
     return _changed;
 }
@@ -291,24 +292,17 @@ void EvalFilterLowering::transport(ABT& n, const PathCompare& cmp, ABT& c) {
         // the non-array case in the lowering below.
         n = make<LambdaAbstraction>(
             name,
-            make<If>(make<FunctionCall>("isArray", makeSeq(c)),
+            make<If>(make<BinaryOp>(Operations::Or,
+                                    make<FunctionCall>("isArray", makeSeq(c)),
+                                    make<FunctionCall>("isInListData", makeSeq(c))),
                      make<BinaryOp>(Operations::EqMember, make<Variable>(name), c),
                      make<BinaryOp>(Operations::Eq,
                                     make<BinaryOp>(Operations::Cmp3w, make<Variable>(name), c),
                                     Constant::int64(0))));
     } else {
-        // All ABT comparisons (eq/neq, gt/lt, gte/lte) work across types, but SBE equivalents will
-        // return Nothing if the types do not match. We can express a type-agnostic comparison in an
-        // SBE compatible way using cmp3w (<=>), which works with any two values of any types in
-        // SBE. cmp(X, Y) is equivalent to cmp(X <=> Y, 0) in ABT, but will return a boolean rather
-        // than Nothing in SBE.
         n = make<LambdaAbstraction>(
             name,
-            make<BinaryOp>(cmp.op(),
-                           make<BinaryOp>(Operations::Cmp3w,
-                                          make<Variable>(name),
-                                          std::exchange(c, make<Blackhole>())),
-                           Constant::int64(0)));
+            make<BinaryOp>(cmp.op(), make<Variable>(name), std::exchange(c, make<Blackhole>())));
     }
 
     _changed = true;
@@ -430,11 +424,11 @@ void EvalFilterLowering::transport(ABT& n, const EvalFilter&, ABT& path, ABT& in
 }
 
 void PathLowering::transport(ABT& n, const EvalPath&, ABT&, ABT&) {
-    _changed = _changed || _project.optimize(n, false /*rebuild*/);
+    _changed = _changed || _project.optimize(n);
 }
 
 void PathLowering::transport(ABT& n, const EvalFilter&, ABT&, ABT&) {
-    _changed = _changed || _filter.optimize(n, false /*rebuild*/);
+    _changed = _changed || _filter.optimize(n);
 }
 
 bool PathLowering::optimize(ABT& n) {

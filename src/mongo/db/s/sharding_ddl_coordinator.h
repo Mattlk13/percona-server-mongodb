@@ -46,7 +46,6 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/persistent_task_store.h"
@@ -61,6 +60,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/session/internal_session_pool.h"
 #include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/executor/scoped_task_executor.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/idl/idl_parser.h"
@@ -87,7 +87,7 @@ class ShardingDDLCoordinator
 public:
     explicit ShardingDDLCoordinator(ShardingDDLCoordinatorService* service, const BSONObj& coorDoc);
 
-    ~ShardingDDLCoordinator();
+    ~ShardingDDLCoordinator() override;
 
     /**
      * Whether this coordinator is allowed to start when user write blocking is enabled, even if the
@@ -152,6 +152,19 @@ protected:
     virtual ShardingDDLCoordinatorMetadata const& metadata() const = 0;
     virtual void setMetadata(ShardingDDLCoordinatorMetadata&& metadata) = 0;
 
+    /**
+     * Returns a set of basic coordinator attributes to be used for logging.
+     */
+    logv2::DynamicAttributes getBasicCoordinatorAttrs() const;
+
+    /**
+     * Returns the set of attributes to be used for coordinator logging. Implementations must be
+     * sure to return a DynamicAttributes object that starts with the attributes returned by
+     * getBasicCoordinatorAttrs().
+     */
+    virtual logv2::DynamicAttributes getCoordinatorLogAttrs() const {
+        return getBasicCoordinatorAttrs();
+    }
     /*
      * Performs a noop write on all shards and the configsvr using the sessionId and txnNumber
      * specified in 'osi'.
@@ -192,7 +205,7 @@ protected:
 
 private:
     SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
-                         const CancellationToken& token) noexcept override final;
+                         const CancellationToken& token) noexcept final;
 
     virtual ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                           const CancellationToken& token) noexcept = 0;
@@ -202,7 +215,7 @@ private:
         const CancellationToken& token,
         const Status& status) noexcept;
 
-    void interrupt(Status status) override final;
+    void interrupt(Status status) final;
 
     bool _removeDocument(OperationContext* opCtx);
 
@@ -235,7 +248,7 @@ private:
     std::unique_ptr<Locker> _locker;
 
     std::stack<DDLLockManager::ScopedBaseDDLLock> _scopedLocks;
-    std::unique_ptr<ShardingDDLCoordinatorExternalState> _externalState;
+    std::shared_ptr<ShardingDDLCoordinatorExternalState> _externalState;
 
     friend class ShardingDDLCoordinatorTest;
 };
@@ -312,6 +325,23 @@ protected:
         return bob;
     }
 
+    /**
+     * Returns all shards, including the config server. Config servers are special because they
+     * are more likely to be removed as a shard and added back again later. This is mainly used
+     * for ensuring that the config server release the critical sections/locks created by the
+     * ddl operation.
+     */
+    std::vector<ShardId> getAllShardsAndConfigServerIds(OperationContext* opCtx) {
+        auto shardIds = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
+
+        auto iter = std::find(shardIds.begin(), shardIds.end(), ShardId::kConfigServerId);
+        if (iter == shardIds.end()) {
+            shardIds.emplace_back(ShardId::kConfigServerId);
+        }
+
+        return shardIds;
+    }
+
     const std::string _coordinatorName;
     const BSONObj _initialState;
     mutable Mutex _docMutex = MONGO_MAKE_LATCH("ShardingDDLCoordinator::_docMutex");
@@ -348,11 +378,13 @@ protected:
         };
     }
 
+    auto _getDoc() const {
+        stdx::lock_guard lk{_docMutex};
+        return _doc;
+    }
+
     virtual void _enterPhase(const Phase& newPhase) {
-        auto newDoc = [&] {
-            stdx::lock_guard lk{_docMutex};
-            return _doc;
-        }();
+        auto newDoc = _getDoc();
 
         newDoc.setPhase(newPhase);
 
@@ -437,7 +469,7 @@ protected:
         return getCurrentSession();
     }
 
-    virtual boost::optional<Status> getAbortReason() const override {
+    boost::optional<Status> getAbortReason() const override {
         const auto& status = _doc.getAbortReason();
         invariant(!status || !status->isOK(), "when persisted, status must be an error");
         return status;
@@ -454,10 +486,7 @@ protected:
                    "phase"_attr = serializePhase(_doc.getPhase()),
                    "reason"_attr = redact(status));
 
-        auto newDoc = [&] {
-            stdx::lock_guard lk{_docMutex};
-            return _doc;
-        }();
+        auto newDoc = _getDoc();
 
         auto coordinatorMetadata = newDoc.getShardingDDLCoordinatorMetadata();
         coordinatorMetadata.setAbortReason(status);
@@ -471,10 +500,7 @@ protected:
 private:
     // lazily acquire Logical Session ID and a txn number
     void _updateSession(OperationContext* opCtx) {
-        auto newDoc = [&] {
-            stdx::lock_guard lk{_docMutex};
-            return _doc;
-        }();
+        auto newDoc = _getDoc();
         auto newShardingDDLCoordinatorMetadata = newDoc.getShardingDDLCoordinatorMetadata();
 
         auto optSession = newShardingDDLCoordinatorMetadata.getSession();

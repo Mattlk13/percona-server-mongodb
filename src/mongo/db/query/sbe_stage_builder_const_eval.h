@@ -48,17 +48,15 @@ class CollatorInterface;
 namespace mongo::stage_builder {
 
 /**
- * Constant folding rewrite that supports custom collation for ABTs that are build by
- * sbe_stage_builder_expression.cpp.
- * Based on optimizer::ConstEval, but without EvaluationNode, FilterNode, PathTraverse, PathCompose*
- * because this nodes are not used in sbe_stage_builder_expression.
+ * 'ExpressionConstEval' is a constant-folding rewrite designed to be used by the SBE stage builder.
+ * This class was originally adapted from optimizer::ConstEval.
  *
- * TODO: Remove and replace with optimizer::ConstEval when it will support collation
+ * Note that ExpressionConstEval assumes 'ComparisonOpSemantics::kTypeBracketing' semantics for
+ * comparison ops.
  */
 class ExpressionConstEval {
 public:
-    ExpressionConstEval(optimizer::VariableEnvironment& env, const CollatorInterface* collator)
-        : _env(env), _collator(collator) {}
+    ExpressionConstEval(const CollatorInterface* collator) : _collator(collator) {}
 
     template <typename T, typename... Ts>
     void transport(optimizer::ABT&, const T&, Ts&&...) {}
@@ -108,7 +106,7 @@ private:
 
     void swapAndUpdate(optimizer::ABT& n, optimizer::ABT newN);
 
-    optimizer::VariableEnvironment& _env;
+    optimizer::DefinitionsMap _variableDefinitions;
     const CollatorInterface* _collator;
 
     optimizer::opt::unordered_set<const optimizer::Variable*> _singleRef;
@@ -120,8 +118,8 @@ private:
     // We collect old ABTs in order to avoid the ABA problem.
     std::vector<optimizer::ABT> _staleABTs;
 
-    bool _inRefBlock{false};
     size_t _inCostlyCtx{0};
+    bool _inRefBlock{false};
     bool _changed{false};
 };
 

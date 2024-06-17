@@ -7,6 +7,11 @@
  * checked for whether one thread removed the same document as another thread.
  *
  * This workload was designed to reproduce SERVER-18304.
+ *
+ * @tags: [
+ *   # PM-1632 was delivered in 7.1.
+ *   requires_fcv_71,
+ * ]
  */
 
 import {isMongod} from "jstests/concurrency/fsm_workload_helpers/server_types.js";
@@ -15,7 +20,7 @@ export const $config = (function() {
     var data = {
         // Use the workload name as the database name, since the workload name is assumed to be
         // unique.
-        uniqueDBName: 'findAndModify_remove_queue',
+        uniqueDBName: jsTestName(),
 
         newDocForInsert: function newDocForInsert(i) {
             return {_id: i, rand: Random.rand()};

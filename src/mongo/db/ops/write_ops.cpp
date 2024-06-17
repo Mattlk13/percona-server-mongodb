@@ -60,7 +60,6 @@
 #include "mongo/db/update/update_oplog_entry_version.h"
 #include "mongo/idl/idl_parser.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/overloaded_visitor.h"  // IWYU pragma: keep
 #include "mongo/util/str.h"
@@ -283,6 +282,7 @@ int getUpdateSizeEstimate(const BSONObj& q,
                           const bool includeUpsertSupplied,
                           const boost::optional<mongo::BSONObj>& collation,
                           const boost::optional<std::vector<mongo::BSONObj>>& arrayFilters,
+                          const boost::optional<mongo::BSONObj>& sort,
                           const mongo::BSONObj& hint,
                           const boost::optional<UUID>& sampleId,
                           const bool includeAllowShardKeyUpdatesWithoutFullShardKeyInQuery) {
@@ -317,6 +317,11 @@ int getUpdateSizeEstimate(const BSONObj& q,
     if (arrayFilters) {
         estSize +=
             getArrayFiltersFieldSize(arrayFilters.get(), UpdateOpEntry::kArrayFiltersFieldName);
+    }
+
+    // Add the size of the 'sort' field, if present.
+    if (sort) {
+        estSize += UpdateOpEntry::kSortFieldName.size() + sort->objsize() + kPerElementOverhead;
     }
 
     // Add the size of the 'hint' field, if present.
@@ -356,6 +361,7 @@ int getBulkWriteUpdateSizeEstimate(const BSONObj& filter,
                                    const bool includeUpsertSupplied,
                                    const boost::optional<mongo::BSONObj>& collation,
                                    const boost::optional<std::vector<mongo::BSONObj>>& arrayFilters,
+                                   const boost::optional<mongo::BSONObj>& sort,
                                    const BSONObj& hint,
                                    const boost::optional<UUID>& sampleId) {
     int estSize = static_cast<int>(BSONObj::kMinBSONLength);
@@ -394,6 +400,11 @@ int getBulkWriteUpdateSizeEstimate(const BSONObj& filter,
     if (arrayFilters) {
         estSize +=
             getArrayFiltersFieldSize(arrayFilters.get(), BulkWriteUpdateOp::kArrayFiltersFieldName);
+    }
+
+    // Add the size of the 'sort' field, if present.
+    if (sort) {
+        estSize += BulkWriteUpdateOp::kSortFieldName.size() + sort->objsize() + kPerElementOverhead;
     }
 
     // Add the size of the 'hint' field, if present.
@@ -494,6 +505,7 @@ bool verifySizeEstimate(const write_ops::UpdateOpEntry& update) {
                update.getUpsertSupplied().has_value(),
                update.getCollation(),
                update.getArrayFilters(),
+               update.getSort(),
                update.getHint(),
                update.getSampleId(),
                update.getAllowShardKeyUpdatesWithoutFullShardKeyInQuery().has_value()) >=
@@ -527,6 +539,7 @@ bool verifySizeEstimate(const UpdateCommandRequest& updateReq,
                     update.getUpsertSupplied().has_value(),
                     update.getCollation(),
                     update.getArrayFilters(),
+                    update.getSort(),
                     update.getHint(),
                     update.getSampleId(),
                     update.getAllowShardKeyUpdatesWithoutFullShardKeyInQuery().has_value()) +
@@ -568,13 +581,6 @@ int getInsertHeaderSizeEstimate(const InsertCommandRequest& insertReq) {
 
     size += InsertCommandRequest::kCommandName.size() + kPerElementOverhead +
         insertReq.getNamespace().size() + 1 /* ns string null terminator */;
-
-    // Handle $tenant. Note that $tenant is injected as a hidden field into all IDL commands, unlike
-    // other passthrough fields.
-    if (auto tenant = insertReq.getDollarTenant(); tenant.has_value()) {
-        size += InsertCommandRequest::kDollarTenantFieldName.size() + OID::kOIDSize +
-            kPerElementOverhead;
-    }
     return size;
 }
 
@@ -586,13 +592,6 @@ int getUpdateHeaderSizeEstimate(const UpdateCommandRequest& updateReq) {
 
     size += write_ops::UpdateCommandRequest::kUpdatesFieldName.size() + kPerElementOverhead +
         static_cast<int>(BSONObj::kMinBSONLength);
-
-    // Handle $tenant. Note that $tenant is injected as a hidden field into all IDL commands, unlike
-    // other passthrough fields.
-    if (auto tenant = updateReq.getDollarTenant(); tenant.has_value()) {
-        size += UpdateCommandRequest::kDollarTenantFieldName.size() + OID::kOIDSize +
-            kPerElementOverhead;
-    }
 
     // Handle legacy runtime constants.
     if (auto runtimeConstants = updateReq.getLegacyRuntimeConstants();
@@ -616,13 +615,6 @@ int getDeleteHeaderSizeEstimate(const DeleteCommandRequest& deleteReq) {
 
     size += write_ops::DeleteCommandRequest::kDeletesFieldName.size() + kPerElementOverhead +
         static_cast<int>(BSONObj::kMinBSONLength);
-
-    // Handle $tenant. Note that $tenant is injected as a hidden field into all IDL commands, unlike
-    // other passthrough fields.
-    if (auto tenant = deleteReq.getDollarTenant(); tenant.has_value()) {
-        size += DeleteCommandRequest::kDollarTenantFieldName.size() + OID::kOIDSize +
-            kPerElementOverhead;
-    }
 
     // Handle legacy runtime constants.
     if (auto runtimeConstants = deleteReq.getLegacyRuntimeConstants();
@@ -737,7 +729,7 @@ UpdateModification UpdateModification::parseFromBSON(BSONElement elem) {
 }
 
 int UpdateModification::objsize() const {
-    return stdx::visit(
+    return visit(
         OverloadedVisitor{
             [](const ReplacementUpdate& replacement) -> int { return replacement.bson.objsize(); },
             [](const ModifierUpdate& modifier) -> int { return modifier.bson.objsize(); },
@@ -757,7 +749,7 @@ int UpdateModification::objsize() const {
 }
 
 UpdateModification::Type UpdateModification::type() const {
-    return stdx::visit(
+    return visit(
         OverloadedVisitor{[](const ReplacementUpdate& replacement) { return Type::kReplacement; },
                           [](const ModifierUpdate& modifier) { return Type::kModifier; },
                           [](const PipelineUpdate& pipelineUpdate) { return Type::kPipeline; },
@@ -774,24 +766,24 @@ UpdateModification::Type UpdateModification::type() const {
  */
 void UpdateModification::serializeToBSON(StringData fieldName, BSONObjBuilder* bob) const {
 
-    stdx::visit(OverloadedVisitor{
-                    [fieldName, bob](const ReplacementUpdate& replacement) {
-                        *bob << fieldName << replacement.bson;
-                    },
-                    [fieldName, bob](const ModifierUpdate& modifier) {
-                        *bob << fieldName << modifier.bson;
-                    },
-                    [fieldName, bob](const PipelineUpdate& pipeline) {
-                        BSONArrayBuilder arrayBuilder(bob->subarrayStart(fieldName));
-                        for (auto&& stage : pipeline) {
-                            arrayBuilder << stage;
-                        }
-                        arrayBuilder.doneFast();
-                    },
-                    [fieldName, bob](const DeltaUpdate& delta) { *bob << fieldName << delta.diff; },
-                    [](const TransformUpdate& transform) {
-                    }},
-                _update);
+    visit(OverloadedVisitor{
+              [fieldName, bob](const ReplacementUpdate& replacement) {
+                  *bob << fieldName << replacement.bson;
+              },
+              [fieldName, bob](const ModifierUpdate& modifier) {
+                  *bob << fieldName << modifier.bson;
+              },
+              [fieldName, bob](const PipelineUpdate& pipeline) {
+                  BSONArrayBuilder arrayBuilder(bob->subarrayStart(fieldName));
+                  for (auto&& stage : pipeline) {
+                      arrayBuilder << stage;
+                  }
+                  arrayBuilder.doneFast();
+              },
+              [fieldName, bob](const DeltaUpdate& delta) { *bob << fieldName << delta.diff; },
+              [](const TransformUpdate& transform) {
+              }},
+          _update);
 }
 
 WriteError::WriteError(int32_t index, Status status) : _index(index), _status(std::move(status)) {}

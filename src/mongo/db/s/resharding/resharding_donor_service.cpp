@@ -74,7 +74,6 @@
 #include "mongo/db/s/resharding/resharding_util.h"
 #include "mongo/db/s/sharding_index_catalog_ddl_util.h"
 #include "mongo/db/s/sharding_recovery_service.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/shard_role.h"
 #include "mongo/db/storage/recovery_unit.h"
@@ -95,6 +94,7 @@
 #include "mongo/s/resharding/resharding_feature_flag_gen.h"
 #include "mongo/s/shard_version.h"
 #include "mongo/s/sharding_feature_flags_gen.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/util/assert_util.h"
@@ -120,6 +120,7 @@ MONGO_FAIL_POINT_DEFINE(reshardingPauseDonorBeforeCatalogCacheRefresh);
 MONGO_FAIL_POINT_DEFINE(reshardingPauseDonorAfterBlockingReads);
 MONGO_FAIL_POINT_DEFINE(reshardingDonorFailsAfterTransitionToDonatingOplogEntries);
 MONGO_FAIL_POINT_DEFINE(removeDonorDocFailpoint);
+MONGO_FAIL_POINT_DEFINE(reshardingDonorFailsBeforeObtainingTimestamp);
 
 using namespace fmt::literals;
 
@@ -141,7 +142,7 @@ Timestamp generateMinFetchTimestamp(OperationContext* opCtx, const NamespaceStri
             AutoGetDb db(opCtx, sourceNss.dbName(), MODE_IX);
             Lock::CollectionLock collLock(opCtx, sourceNss, MODE_S);
 
-            AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
+            AutoGetOplogFastPath oplogWrite(opCtx, OplogAccessMode::kWrite);
 
             const std::string msg = str::stream()
                 << "All future oplog entries on the namespace " << sourceNss.toStringForErrorMsg()
@@ -162,18 +163,6 @@ Timestamp generateMinFetchTimestamp(OperationContext* opCtx, const NamespaceStri
 
     auto generatedOpTime = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
     return generatedOpTime.getTimestamp();
-}
-
-/**
- * Returns whether it is possible for the donor to be in 'state' when resharding will indefinitely
- * abort.
- */
-bool inPotentialAbortScenario(const DonorStateEnum& state) {
-    // Regardless of whether resharding will abort or commit, the donor will eventually reach state
-    // kDone.
-    // Additionally, if the donor is in state kError, it is guaranteed that the coordinator will
-    // eventually begin the abort process.
-    return state == DonorStateEnum::kError || state == DonorStateEnum::kDone;
 }
 
 /**
@@ -233,7 +222,7 @@ public:
 
     void clearFilteringMetadata(OperationContext* opCtx,
                                 const NamespaceString& sourceNss,
-                                const NamespaceString& tempReshardingNss) {
+                                const NamespaceString& tempReshardingNss) override {
         stdx::unordered_set<NamespaceString> namespacesToRefresh{sourceNss, tempReshardingNss};
         resharding::clearFilteringMetadata(
             opCtx, namespacesToRefresh, true /* scheduleAsyncRefresh */);
@@ -272,13 +261,8 @@ ReshardingDonorService::DonorStateMachine::DonorStateMachine(
       _donorMetricsToRestore{donorDoc.getMetrics() ? donorDoc.getMetrics().value()
                                                    : ReshardingDonorMetrics()},
       _externalState{std::move(externalState)},
-      _markKilledExecutor(std::make_shared<ThreadPool>([] {
-          ThreadPool::Options options;
-          options.poolName = "ReshardingDonorCancelableOpCtxPool";
-          options.minThreads = 1;
-          options.maxThreads = 1;
-          return options;
-      }())),
+      _markKilledExecutor{
+          resharding::makeThreadPoolForMarkKilledExecutor("ReshardingDonorCancelableOpCtxPool")},
       _critSecReason(BSON("command"
                           << "resharding_donor"
                           << "collection"
@@ -387,7 +371,7 @@ ExecutorFuture<void> ReshardingDonorService::DonorStateMachine::_notifyCoordinat
     return resharding::WithAutomaticRetry([this, executor] {
                auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
                if (resharding::gFeatureFlagReshardingImprovements.isEnabled(
-                       serverGlobalParams.featureCompatibility)) {
+                       serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
                    _metrics->fillDonorCtxOnCompletion(_donorCtx);
                }
                return _updateCoordinator(opCtx.get(), executor);
@@ -432,7 +416,7 @@ ExecutorFuture<void> ReshardingDonorService::DonorStateMachine::_finishReshardin
                    }
 
                    // If aborted, the donor must be allowed to transition to done from any state.
-                   _transitionState(DonorStateEnum::kDone);
+                   _transitionToDone(aborted);
                }
 
                {
@@ -607,15 +591,14 @@ SharedSemiFuture<void> ReshardingDonorService::DonorStateMachine::awaitCriticalS
 
 void ReshardingDonorService::DonorStateMachine::
     _onPreparingToDonateCalculateTimestampThenTransitionToDonatingInitialData() {
-    if (_donorCtx.getState() > DonorStateEnum::kPreparingToDonate) {
-        if (!inPotentialAbortScenario(_donorCtx.getState())) {
-            // The invariants won't hold if an unrecoverable error is encountered before the donor
-            // makes enough progress to transition to kDonatingInitialData and then a failover
-            // occurs.
-            invariant(_donorCtx.getMinFetchTimestamp());
-            invariant(_donorCtx.getBytesToClone());
-            invariant(_donorCtx.getDocumentsToClone());
-        }
+    if (_donorCtx.getState() > DonorStateEnum::kPreparingToDonate &&
+        _donorCtx.getState() != DonorStateEnum::kError) {
+        // The invariants won't hold if an unrecoverable error is encountered before the donor
+        // makes enough progress to transition to kDonatingInitialData and then a failover
+        // occurs.
+        invariant(_donorCtx.getMinFetchTimestamp());
+        invariant(_donorCtx.getBytesToClone());
+        invariant(_donorCtx.getDocumentsToClone());
         return;
     }
 
@@ -650,6 +633,12 @@ void ReshardingDonorService::DonorStateMachine::
         _externalState->waitForCollectionFlush(opCtx.get(), _metadata.getTempReshardingNss());
     }
 
+    reshardingDonorFailsBeforeObtainingTimestamp.execute([&](const BSONObj& data) {
+        auto errmsgElem = data["errmsg"];
+        StringData errmsg = errmsgElem ? errmsgElem.checkAndGetStringData() : "Failing for test"_sd;
+        uasserted(ErrorCodes::InternalError, errmsg);
+    });
+
     Timestamp minFetchTimestamp = [this] {
         auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
         return generateMinFetchTimestamp(opCtx.get(), _metadata.getSourceNss());
@@ -681,7 +670,7 @@ void ReshardingDonorService::DonorStateMachine::
         auto oplog = generateOplogEntry();
         writeConflictRetry(
             rawOpCtx, "ReshardingBeginOplog", NamespaceString::kRsOplogNamespace, [&] {
-                AutoGetOplog oplogWrite(rawOpCtx, OplogAccessMode::kWrite);
+                AutoGetOplogFastPath oplogWrite(rawOpCtx, OplogAccessMode::kWrite);
                 WriteUnitOfWork wunit(rawOpCtx);
                 const auto& oplogOpTime = repl::logOp(rawOpCtx, &oplog);
                 uassert(5052101,
@@ -720,7 +709,15 @@ ExecutorFuture<void> ReshardingDonorService::DonorStateMachine::
         })
         .thenRunOn(**executor)
         .then([this]() { _transitionState(DonorStateEnum::kDonatingOplogEntries); })
-        .onCompletion([=](Status s) {
+        .onCompletion([=, this](Status status) {
+            if (!status.isOK()) {
+                LOGV2_ERROR(8639700,
+                            "Failed to transition the donor shard's state to `donating`",
+                            "reshardingUUID"_attr = _metadata.getReshardingUUID(),
+                            "error"_attr = redact(status));
+                return status;
+            }
+
             reshardingDonorFailsAfterTransitionToDonatingOplogEntries.execute(
                 [&](const BSONObj& data) {
                     auto errmsgElem = data["errmsg"];
@@ -728,6 +725,7 @@ ExecutorFuture<void> ReshardingDonorService::DonorStateMachine::
                         errmsgElem ? errmsgElem.checkAndGetStringData() : "Failing for test"_sd;
                     uasserted(ErrorCodes::InternalError, errmsg);
                 });
+            return status;
         });
 }
 
@@ -801,7 +799,7 @@ void ReshardingDonorService::DonorStateMachine::
                     "ReshardingBlockWritesOplog",
                     NamespaceString::kRsOplogNamespace,
                     [&] {
-                        AutoGetOplog oplogWrite(rawOpCtx, OplogAccessMode::kWrite);
+                        AutoGetOplogFastPath oplogWrite(rawOpCtx, OplogAccessMode::kWrite);
                         WriteUnitOfWork wunit(rawOpCtx);
                         const auto& oplogOpTime = repl::logOp(rawOpCtx, &oplog);
                         uassert(5279507,
@@ -881,14 +879,14 @@ void ReshardingDonorService::DonorStateMachine::_dropOriginalCollectionThenTrans
         WriteBlockBypass::get(opCtx.get()).set(true);
 
         if (feature_flags::gGlobalIndexesShardingCatalog.isEnabled(
-                serverGlobalParams.featureCompatibility)) {
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
             dropCollectionShardingIndexCatalog(opCtx.get(), _metadata.getSourceNss());
         }
         resharding::data_copy::ensureCollectionDropped(
             opCtx.get(), _metadata.getSourceNss(), _metadata.getSourceUUID());
     }
 
-    _transitionState(DonorStateEnum::kDone);
+    _transitionToDone(false /* aborted */);
 }
 
 void ReshardingDonorService::DonorStateMachine::_transitionState(DonorStateEnum newState) {
@@ -932,6 +930,16 @@ void ReshardingDonorService::DonorStateMachine::_transitionToError(Status abortR
     auto newDonorCtx = _donorCtx;
     newDonorCtx.setState(DonorStateEnum::kError);
     resharding::emplaceTruncatedAbortReasonIfExists(newDonorCtx, abortReason);
+    _transitionState(std::move(newDonorCtx));
+}
+
+void ReshardingDonorService::DonorStateMachine::_transitionToDone(bool aborted) {
+    auto newDonorCtx = _donorCtx;
+    newDonorCtx.setState(DonorStateEnum::kDone);
+    if (aborted) {
+        resharding::emplaceTruncatedAbortReasonIfExists(newDonorCtx,
+                                                        resharding::coordinatorAbortedError());
+    }
     _transitionState(std::move(newDonorCtx));
 }
 
@@ -1098,11 +1106,12 @@ void ReshardingDonorService::DonorStateMachine::_removeDonorDocument(
 
         WriteUnitOfWork wuow(opCtx.get());
 
-        opCtx->recoveryUnit()->onCommit(
-            [this, stepdownToken, aborted](OperationContext*, boost::optional<Timestamp>) {
-                stdx::lock_guard<Latch> lk(_mutex);
-                _completionPromise.emplaceValue();
-            });
+        shard_role_details::getRecoveryUnit(opCtx.get())
+            ->onCommit(
+                [this, stepdownToken, aborted](OperationContext*, boost::optional<Timestamp>) {
+                    stdx::lock_guard<Latch> lk(_mutex);
+                    _completionPromise.emplaceValue();
+                });
 
         deleteObjects(opCtx.get(),
                       coll,
@@ -1119,6 +1128,13 @@ CancellationToken ReshardingDonorService::DonorStateMachine::_initAbortSource(
     {
         stdx::lock_guard<Latch> lk(_mutex);
         _abortSource = CancellationSource(stepdownToken);
+    }
+
+    if (_donorCtx.getState() == DonorStateEnum::kDone && _donorCtx.getAbortReason()) {
+        // A donor in state kDone with an abortReason is indication that the coordinator
+        // has persisted the decision and called abort on all participants. Canceling the
+        // _abortSource to avoid repeating the future chain.
+        _abortSource->cancel();
     }
 
     if (auto future = _coordinatorHasDecisionPersisted.getFuture(); future.isReady()) {

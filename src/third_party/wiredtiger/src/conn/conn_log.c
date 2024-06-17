@@ -40,7 +40,7 @@ __logmgr_sync_cfg(WT_SESSION_IMPL *session, const char **cfg)
         FLD_SET(txn_logsync, WT_LOG_FSYNC);
     else if (WT_STRING_MATCH("none", cval.str, cval.len))
         FLD_SET(txn_logsync, WT_LOG_FLUSH);
-    WT_PUBLISH(conn->txn_logsync, txn_logsync);
+    WT_RELEASE_WRITE_WITH_BARRIER(conn->txn_logsync, txn_logsync);
     return (0);
 }
 
@@ -601,8 +601,13 @@ __log_file_server(void *arg)
         /*
          * If there is a log file to close, make sure any outstanding write operations have
          * completed, then fsync and close it.
+         *
+         * The read from the log close file handle is ordered with the read from the log close lsn.
+         * Writers will set the log close lsn first and then the log close file handle, so we need
+         * to read them in the reverse order to see a consistent state.
          */
-        if ((close_fh = log->log_close_fh) != NULL) {
+        WT_ACQUIRE_READ_WITH_BARRIER(close_fh, log->log_close_fh);
+        if (close_fh != NULL) {
             WT_ERR(__wt_log_extract_lognum(session, close_fh->name, &filenum));
             /*
              * The closing file handle should have a correct close LSN.
@@ -634,7 +639,8 @@ __log_file_server(void *arg)
                  */
                 if (conn->hot_backup_start == 0 && conn->log_cursors == 0) {
                     WT_WITH_HOTBACKUP_READ_LOCK(session,
-                      ret = __wt_ftruncate(session, close_fh, close_end_lsn.l.offset), NULL);
+                      ret = __wt_ftruncate(session, close_fh, __wt_lsn_offset(&close_end_lsn)),
+                      NULL);
                     WT_ERR_ERROR_OK(ret, ENOTSUP, false);
                 }
                 WT_SET_LSN(&close_end_lsn, close_end_lsn.l.file + 1, 0);
@@ -674,7 +680,7 @@ typedef struct {
 #define WT_WRLSN_ENTRY_CMP_LT(entry1, entry2)        \
     ((entry1).lsn.l.file < (entry2).lsn.l.file ||    \
       ((entry1).lsn.l.file == (entry2).lsn.l.file && \
-        (entry1).lsn.l.offset < (entry2).lsn.l.offset))
+        __wt_lsn_offset(&(entry1).lsn) < __wt_lsn_offset(&(entry2).lsn)))
 
 /*
  * __wt_log_wrlsn --
@@ -691,7 +697,7 @@ __wt_log_wrlsn(WT_SESSION_IMPL *session, int *yield)
     WT_LOG_WRLSN_ENTRY written[WT_SLOT_POOL];
     WT_LSN save_lsn;
     size_t written_i;
-    uint32_t i, save_i;
+    uint32_t i, save_i, slot_last_offset;
 
     conn = S2C(session);
     log = conn->log;
@@ -750,7 +756,8 @@ restart:
                 /*
                  * If we get here we have a slot to coalesce and free.
                  */
-                coalescing->slot_last_offset = slot->slot_last_offset;
+                __wt_atomic_storeiv64(
+                  &coalescing->slot_last_offset, __wt_atomic_loadiv64(&slot->slot_last_offset));
                 WT_ASSIGN_LSN(&coalescing->slot_end_lsn, &slot->slot_end_lsn);
                 WT_STAT_CONN_INCR(session, log_slot_coalesced);
                 /*
@@ -778,8 +785,9 @@ restart:
                  * LSN refers to the beginning of a real record. The last offset in a slot is kept
                  * so that the checkpoint LSN is close to the end of the record.
                  */
-                if (slot->slot_start_lsn.l.offset != slot->slot_last_offset)
-                    slot->slot_start_lsn.l.offset = (uint32_t)slot->slot_last_offset;
+                slot_last_offset = (uint32_t)__wt_atomic_loadiv64(&slot->slot_last_offset);
+                if (__wt_lsn_offset(&slot->slot_start_lsn) != slot_last_offset)
+                    __wt_atomic_store32(&slot->slot_start_lsn.l.offset, slot_last_offset);
                 WT_ASSIGN_LSN(&log->write_start_lsn, &slot->slot_start_lsn);
                 WT_ASSIGN_LSN(&log->write_lsn, &slot->slot_end_lsn);
                 __wt_cond_signal(session, log->log_write_cond);
@@ -828,7 +836,7 @@ __log_wrlsn_server(void *arg)
         else
             WT_STAT_CONN_INCR(session, log_write_lsn_skip);
         prev = log->alloc_lsn;
-        did_work = yield == 0;
+        did_work = (yield == 0);
 
         /*
          * If __wt_log_wrlsn did work we want to yield instead of sleep.
@@ -842,7 +850,7 @@ __log_wrlsn_server(void *arg)
      * On close we need to do this one more time because there could be straggling log writes that
      * need to be written.
      */
-    WT_ERR(__wt_log_force_write(session, 1, NULL));
+    WT_ERR(__wt_log_force_write(session, true, NULL));
     __wt_log_wrlsn(session, NULL);
     if (0) {
 err:
@@ -897,7 +905,7 @@ __log_server(void *arg)
          */
         if (conn->log_force_write_wait == 0 ||
           force_write_timediff >= conn->log_force_write_wait * WT_THOUSAND) {
-            WT_ERR_ERROR_OK(__wt_log_force_write(session, 0, &did_work), EBUSY, false);
+            WT_ERR_ERROR_OK(__wt_log_force_write(session, false, &did_work), EBUSY, false);
             force_write_time_start = __wt_clock(session);
         }
         /*
@@ -956,6 +964,7 @@ __wt_logmgr_create(WT_SESSION_IMPL *session)
 {
     WT_CONNECTION_IMPL *conn;
     WT_LOG *log;
+    uint64_t now;
 
     conn = S2C(session);
 
@@ -1001,6 +1010,9 @@ __wt_logmgr_create(WT_SESSION_IMPL *session)
     WT_RET(__wt_log_open(session));
     WT_RET(__wt_log_slot_init(session, true));
 
+    /* Write the start log record on creation, which is before recovery is run. */
+    __wt_seconds(session, &now);
+    WT_RET(__wt_log_printf(session, "SYSTEM: Log manager created at %" PRIu64, now));
     return (0);
 }
 
@@ -1012,6 +1024,7 @@ int
 __wt_logmgr_open(WT_SESSION_IMPL *session)
 {
     WT_CONNECTION_IMPL *conn;
+    uint64_t now;
     uint32_t session_flags;
 
     conn = S2C(session);
@@ -1073,6 +1086,10 @@ __wt_logmgr_open(WT_SESSION_IMPL *session)
         conn->log_tid_set = true;
     }
 
+    /* Write another startup log record with timestamp after recovery completes. */
+    __wt_seconds(session, &now);
+    WT_RET(__wt_log_printf(
+      session, "SYSTEM: Log manager threads started post-recovery at %" PRIu64, now));
     return (0);
 }
 

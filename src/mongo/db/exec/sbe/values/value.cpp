@@ -49,6 +49,7 @@
 #include "mongo/db/exec/sbe/values/block_interface.h"
 #include "mongo/db/exec/sbe/values/bson.h"
 #include "mongo/db/exec/sbe/values/cell_interface.h"
+#include "mongo/db/exec/sbe/values/generic_compare.h"
 #include "mongo/db/exec/sbe/values/slot.h"
 #include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/exec/sbe/values/value_builder.h"
@@ -235,6 +236,9 @@ void releaseValueDeep(TypeTags tag, Value val) noexcept {
         case TypeTags::Object:
             delete getObjectView(val);
             break;
+        case TypeTags::MultiMap:
+            delete getMultiMapView(val);
+            break;
         case TypeTags::ObjectId:
             delete getObjectIdView(val);
             break;
@@ -391,7 +395,7 @@ inline std::size_t hashObjectId(const uint8_t* objId) noexcept {
 std::size_t hashValue(TypeTags tag, Value val, const CollatorInterface* collator) noexcept {
     switch (tag) {
         case TypeTags::NumberInt32:
-            return abslHash(bitcastTo<int32_t>(val));
+            return abslHash(static_cast<int64_t>(bitcastTo<int32_t>(val)));
         case TypeTags::RecordId:
             return getRecordIdView(val)->hash();
         case TypeTags::NumberInt64:
@@ -481,6 +485,16 @@ std::size_t hashValue(TypeTags tag, Value val, const CollatorInterface* collator
 
             return res;
         }
+        case TypeTags::MultiMap: {
+            auto multiMap = getMultiMapView(val);
+            auto res = hashInit();
+
+            for (const auto& [key, value] : multiMap->values()) {
+                res = hashCombine(res, hashValue(key.first, key.second, collator));
+                res = hashCombine(res, hashValue(value.first, value.second, collator));
+            }
+            return res;
+        }
         case TypeTags::bsonBinData: {
             auto size = getBSONBinDataSize(tag, val);
             if (size < 8) {
@@ -527,20 +541,6 @@ std::size_t hashValue(TypeTags tag, Value val, const CollatorInterface* collator
     }
 
     return 0;
-}
-
-/**
- * Performs a three-way comparison for any type that has < and == operators. Additionally,
- * guarantees that the result will be exactlty -1, 0, or 1, which is important, because not all
- * comparison functions make that guarantee.
- *
- * The StringData::compare(basic_string_view s) function, for example, only promises that it
- * will return a value less than 0 in the case that 'this' is less than 's,' whereas we want to
- * return exactly -1.
- */
-template <typename T>
-int32_t compareHelper(const T lhs, const T rhs) noexcept {
-    return lhs < rhs ? -1 : (lhs == rhs ? 0 : 1);
 }
 
 /*
@@ -665,6 +665,14 @@ std::pair<TypeTags, Value> compareValue(TypeTags lhsTag,
         } else {
             return {TypeTags::NumberInt32, bitcastFrom<int32_t>(1)};
         }
+    } else if (lhsTag == TypeTags::MultiMap && rhsTag == TypeTags::MultiMap) {
+        auto lhsMap = getMultiMapView(lhsValue);
+        auto rhsMap = getMultiMapView(rhsValue);
+        if (*lhsMap == *rhsMap) {
+            return {TypeTags::NumberInt32, bitcastFrom<int32_t>(0)};
+        }
+        // If they are not equal then we cannot say if one is smaller than the other.
+        return {TypeTags::Nothing, 0};
     } else if (isObject(lhsTag) && isObject(rhsTag)) {
         auto lhsObj = ObjectEnumerator{lhsTag, lhsValue};
         auto rhsObj = ObjectEnumerator{rhsTag, rhsValue};
@@ -728,7 +736,7 @@ std::pair<TypeTags, Value> compareValue(TypeTags lhsTag,
         return {TypeTags::NumberInt32, bitcastFrom<int32_t>(0)};
     } else if (lhsTag == TypeTags::RecordId && rhsTag == TypeTags::RecordId) {
         int32_t result = getRecordIdView(lhsValue)->compare(*getRecordIdView(rhsValue));
-        return {TypeTags::NumberInt32, bitcastFrom<int32_t>(result)};
+        return {TypeTags::NumberInt32, bitcastFrom<int32_t>(compareHelper(result, 0))};
     } else if (lhsTag == TypeTags::bsonRegex && rhsTag == TypeTags::bsonRegex) {
         auto lhsRegex = getBsonRegexView(lhsValue);
         auto rhsRegex = getBsonRegexView(rhsValue);
@@ -973,6 +981,66 @@ bool operator==(const ArraySet& lhs, const ArraySet& rhs) {
 
 bool operator!=(const ArraySet& lhs, const ArraySet& rhs) {
     return !(lhs == rhs);
+}
+
+bool operator==(const MultiMap& lhs, const MultiMap& rhs) {
+    return lhs.values() == rhs.values();
+}
+
+bool operator!=(const MultiMap& lhs, const MultiMap& rhs) {
+    return !(lhs == rhs);
+}
+
+std::pair<TypeTags, Value> genericEq(TypeTags lhsTag,
+                                     Value lhsVal,
+                                     TypeTags rhsTag,
+                                     Value rhsVal,
+                                     const StringDataComparator* comparator) {
+    return genericCompare<std::equal_to<>>(lhsTag, lhsVal, rhsTag, rhsVal, comparator);
+}
+
+std::pair<TypeTags, Value> genericNeq(TypeTags lhsTag,
+                                      Value lhsVal,
+                                      TypeTags rhsTag,
+                                      Value rhsVal,
+                                      const StringDataComparator* comparator) {
+    auto [tag, val] = genericEq(lhsTag, lhsVal, rhsTag, rhsVal, comparator);
+    // genericEq() will return either Boolean or Nothing. If it returns Boolean, negate
+    // 'val' before returning it.
+    val = tag == TypeTags::Boolean ? bitcastFrom<bool>(!bitcastTo<bool>(val)) : val;
+    return {tag, val};
+}
+
+std::pair<TypeTags, Value> genericLt(TypeTags lhsTag,
+                                     Value lhsVal,
+                                     TypeTags rhsTag,
+                                     Value rhsVal,
+                                     const StringDataComparator* comparator) {
+    return genericCompare<std::less<>>(lhsTag, lhsVal, rhsTag, rhsVal, comparator);
+}
+
+std::pair<TypeTags, Value> genericLte(TypeTags lhsTag,
+                                      Value lhsVal,
+                                      TypeTags rhsTag,
+                                      Value rhsVal,
+                                      const StringDataComparator* comparator) {
+    return genericCompare<std::less_equal<>>(lhsTag, lhsVal, rhsTag, rhsVal, comparator);
+}
+
+std::pair<TypeTags, Value> genericGt(TypeTags lhsTag,
+                                     Value lhsVal,
+                                     TypeTags rhsTag,
+                                     Value rhsVal,
+                                     const StringDataComparator* comparator) {
+    return genericCompare<std::greater<>>(lhsTag, lhsVal, rhsTag, rhsVal, comparator);
+}
+
+std::pair<TypeTags, Value> genericGte(TypeTags lhsTag,
+                                      Value lhsVal,
+                                      TypeTags rhsTag,
+                                      Value rhsVal,
+                                      const StringDataComparator* comparator) {
+    return genericCompare<std::greater_equal<>>(lhsTag, lhsVal, rhsTag, rhsVal, comparator);
 }
 }  // namespace value
 }  // namespace sbe

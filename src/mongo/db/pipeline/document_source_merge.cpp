@@ -59,7 +59,6 @@
 #include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_component.h"
-#include "mongo/s/grid.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/namespace_string_util.h"
@@ -83,9 +82,6 @@ using WhenMatched = MergeStrategyDescriptor::WhenMatched;
 using WhenNotMatched = MergeStrategyDescriptor::WhenNotMatched;
 
 constexpr auto kStageName = DocumentSourceMerge::kStageName;
-constexpr auto kDefaultWhenMatched = WhenMatched::kMerge;
-constexpr auto kDefaultWhenNotMatched = WhenNotMatched::kInsert;
-
 const auto kDefaultPipelineLet = BSON("new"
                                       << "$$ROOT");
 
@@ -115,8 +111,13 @@ DocumentSourceMergeSpec parseMergeSpecAndResolveTargetNamespace(
     if (spec.type() == BSONType::String) {
         targetNss = NamespaceStringUtil::deserialize(defaultDb, spec.valueStringData());
     } else {
+        const auto tenantId = defaultDb.tenantId();
+        const auto vts = tenantId
+            ? boost::make_optional(auth::ValidatedTenancyScopeFactory::create(
+                  *tenantId, auth::ValidatedTenancyScopeFactory::TrustedForInnerOpMsgRequestTag{}))
+            : boost::none;
         mergeSpec = DocumentSourceMergeSpec::parse(
-            IDLParserContext(kStageName, false /* apiStrict */, defaultDb.tenantId(), sc),
+            IDLParserContext(kStageName, false /* apiStrict */, vts, tenantId, sc),
             spec.embeddedObject());
         targetNss = mergeSpec.getTargetNss();
         if (targetNss.coll().empty()) {
@@ -217,13 +218,14 @@ DocumentSourceMerge::DocumentSourceMerge(NamespaceString outputNs,
                                          boost::optional<std::vector<BSONObj>> pipeline,
                                          std::set<FieldPath> mergeOnFields,
                                          boost::optional<ChunkVersion> collectionPlacementVersion)
-    : DocumentSourceWriter(kStageName.rawData(), outputNs, expCtx), _outputNs(std::move(outputNs)) {
+    : DocumentSourceWriter(kStageName.rawData(), std::move(outputNs), expCtx),
+      _mergeOnFields(std::move(mergeOnFields)),
+      _mergeOnFieldsIncludesId(_mergeOnFields.count("_id") == 1) {
     _mergeProcessor.emplace(expCtx,
                             whenMatched,
                             whenNotMatched,
                             std::move(letVariables),
                             std::move(pipeline),
-                            std::move(mergeOnFields),
                             std::move(collectionPlacementVersion));
 }
 
@@ -330,13 +332,13 @@ StageConstraints DocumentSourceMerge::constraints(Pipeline::SplitState pipeState
                             LookupRequirement::kNotAllowed,
                             UnionRequirement::kNotAllowed};
     if (pipeState == Pipeline::SplitState::kSplitForMerge) {
-        result.mergeShardId = _getMergeShardId();
+        result.mergeShardId = getMergeShardId();
     }
     return result;
 }
 
 boost::optional<DocumentSource::DistributedPlanLogic> DocumentSourceMerge::distributedPlanLogic() {
-    return _getMergeShardId() ? DocumentSourceWriter::distributedPlanLogic() : boost::none;
+    return getMergeShardId() ? DocumentSourceWriter::distributedPlanLogic() : boost::none;
 }
 
 Value DocumentSourceMerge::serialize(const SerializationOptions& opts) const {
@@ -362,7 +364,7 @@ Value DocumentSourceMerge::serialize(const SerializationOptions& opts) const {
             if (!pipeline.has_value()) {
                 return boost::none;
             }
-            auto expCtxWithLetVariables = pExpCtx->copyWith(pExpCtx->ns);
+            auto expCtxWithLetVariables = pExpCtx->copyWith(getOutputNs());
             if (spec.getLet()) {
                 BSONObjBuilder cleanLetSpecBuilder;
                 for (auto&& [name, expr] : *letVariables) {
@@ -376,7 +378,7 @@ Value DocumentSourceMerge::serialize(const SerializationOptions& opts) const {
     spec.setWhenNotMatched(descriptor.mode.second);
     spec.setOn([&]() {
         std::vector<std::string> mergeOnFields;
-        for (const auto& path : _mergeProcessor->getMergeOnFields()) {
+        for (const auto& path : _mergeOnFields) {
             mergeOnFields.push_back(path.fullPath());
         }
         return mergeOnFields;
@@ -387,7 +389,8 @@ Value DocumentSourceMerge::serialize(const SerializationOptions& opts) const {
 
 std::pair<DocumentSourceMerge::BatchObject, int> DocumentSourceMerge::makeBatchObject(
     Document doc) const {
-    auto batchObject = _mergeProcessor->makeBatchObject(std::move(doc));
+    auto batchObject =
+        _mergeProcessor->makeBatchObject(std::move(doc), _mergeOnFields, _mergeOnFieldsIncludesId);
     auto upsertType = _mergeProcessor->getMergeStrategyDescriptor().upsertType;
 
     tassert(6628901, "_writeSizeEstimator should be initialized", _writeSizeEstimator);
@@ -406,11 +409,10 @@ void DocumentSourceMerge::flush(BatchedCommandRequest bcr, BatchedObjects batch)
     } catch (const ExceptionFor<ErrorCodes::DuplicateKey>& ex) {
         // A DuplicateKey error could be due to a collision on the 'on' fields or on any other
         // unique index.
-        const auto& mergeOnFields = _mergeProcessor->getMergeOnFields();
         auto dupKeyPattern = ex->getKeyPattern();
         bool dupKeyFromMatchingOnFields =
-            (static_cast<size_t>(dupKeyPattern.nFields()) == mergeOnFields.size()) &&
-            std::all_of(mergeOnFields.begin(), mergeOnFields.end(), [&](auto onField) {
+            (static_cast<size_t>(dupKeyPattern.nFields()) == _mergeOnFields.size()) &&
+            std::all_of(_mergeOnFields.begin(), _mergeOnFields.end(), [&](auto onField) {
                 return dupKeyPattern.hasField(onField.fullPath());
             });
 
@@ -445,23 +447,4 @@ void DocumentSourceMerge::waitWhileFailPointEnabled() {
         },
         getOutputNs());
 }
-
-boost::optional<ShardId> DocumentSourceMerge::_getMergeShardId() const {
-    // If output collection resides on a single shard, we should route $merge to it to perform local
-    // writes. Note that this decision is inherently racy and subject to become stale. This is okay
-    // because either choice will work correctly, we are simply applying a heuristic optimization.
-    auto [cm, _] = uassertStatusOK(Grid::get(pExpCtx->opCtx)
-                                       ->catalogCache()
-                                       ->getCollectionRoutingInfo(pExpCtx->opCtx, getOutputNs()));
-    if (cm.hasRoutingTable()) {
-        if (cm.isUnsplittable()) {
-            return cm.getMinKeyShardIdWithSimpleCollation();
-        } else {
-            return boost::none;
-        }
-    } else {
-        return cm.dbPrimary();
-    }
-}
-
 }  // namespace mongo

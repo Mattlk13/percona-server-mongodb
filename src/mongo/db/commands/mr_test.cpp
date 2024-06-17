@@ -77,6 +77,7 @@
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/op_msg.h"
@@ -302,6 +303,7 @@ public:
                    const CollectionPtr& coll,
                    std::vector<InsertStatement>::const_iterator begin,
                    std::vector<InsertStatement>::const_iterator end,
+                   const std::vector<RecordId>& recordIds,
                    std::vector<bool> fromMigrate,
                    bool defaultFromMigrate,
                    OpStateAccumulator* opAccumulator = nullptr) override;
@@ -361,6 +363,7 @@ void MapReduceOpObserver::onInserts(OperationContext* opCtx,
                                     const CollectionPtr& coll,
                                     std::vector<InsertStatement>::const_iterator begin,
                                     std::vector<InsertStatement>::const_iterator end,
+                                    const std::vector<RecordId>& recordIds,
                                     std::vector<bool> fromMigrate,
                                     bool defaultFromMigrate,
                                     OpStateAccumulator* opAccumulator) {
@@ -444,7 +447,7 @@ const NamespaceString MapReduceCommandTest::outputNss =
 
 void MapReduceCommandTest::setUp() {
     ServiceContextMongoDTest::setUp();
-    ScriptEngine::setup();
+    ScriptEngine::setup(ExecutionEnvironment::Server);
     auto service = getServiceContext();
     DBDirectClientFactory::get(service).registerImplementation(
         [](OperationContext* opCtx) { return std::make_unique<DBDirectClient>(opCtx); });
@@ -501,7 +504,9 @@ Status MapReduceCommandTest::_runCommand(StringData mapCode, StringData reduceCo
     auto command = CommandHelpers::findCommand(_opCtx.get(), "mapReduce");
     ASSERT(command) << "Unable to look up mapReduce command";
 
-    auto request = OpMsgRequest::fromDBAndBody(inputNss.dbName(), _makeCmdObj(mapCode, reduceCode));
+    auto request = OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::get(_opCtx.get()),
+                                               inputNss.dbName(),
+                                               _makeCmdObj(mapCode, reduceCode));
     auto replyBuilder = rpc::makeReplyBuilder(rpc::Protocol::kOpMsg);
     auto result = CommandHelpers::runCommandDirectly(_opCtx.get(), request);
     auto status = getStatusFromCommandResult(result);
@@ -566,7 +571,8 @@ TEST_F(MapReduceCommandTest, PrimaryStepDownPreventsTemporaryCollectionDrops) {
 
     // Temporary collections should still be present because the server will not accept writes after
     // stepping down.
-    _opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kLastApplied);
+    shard_role_details::getRecoveryUnit(_opCtx.get())
+        ->setTimestampReadSource(RecoveryUnit::ReadSource::kLastApplied);
     for (const auto& tempNss : _opObserver->tempNamespaces) {
         ASSERT_OK(_storage.getCollectionCount(_opCtx.get(), tempNss).getStatus())
             << "missing mapReduce temporary collection: " << tempNss.toStringForErrorMsg();

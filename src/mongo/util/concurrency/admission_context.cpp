@@ -28,6 +28,8 @@
  */
 
 #include "mongo/util/concurrency/admission_context.h"
+
+#include "mongo/db/operation_context.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -35,8 +37,63 @@ namespace mongo {
 namespace {
 static constexpr StringData kLowString = "low"_sd;
 static constexpr StringData kNormalString = "normal"_sd;
-static constexpr StringData kImmediateString = "immediate"_sd;
+static constexpr StringData kExemptString = "exempt"_sd;
 }  // namespace
+
+AdmissionContext::AdmissionContext(const AdmissionContext& other)
+    : _admissions(other._admissions.load()),
+      _priority(other._priority.load()),
+      _totalTimeQueuedMicros(other._totalTimeQueuedMicros.load()),
+      _startQueueingTime(other._startQueueingTime.load()) {}
+
+AdmissionContext& AdmissionContext::operator=(const AdmissionContext& other) {
+    _admissions.store(other._admissions.load());
+    _priority.store(other._priority.load());
+    _totalTimeQueuedMicros.store(other._totalTimeQueuedMicros.load());
+    _startQueueingTime.store(other._startQueueingTime.load());
+    return *this;
+}
+
+Microseconds AdmissionContext::totalTimeQueuedMicros() const {
+    return Microseconds{_totalTimeQueuedMicros.loadRelaxed()};
+}
+
+boost::optional<TickSource::Tick> AdmissionContext::startQueueingTime() const {
+    TickSource::Tick startQueueingTime = _startQueueingTime.loadRelaxed();
+    if (startQueueingTime == kNotQueueing) {
+        return boost::none;
+    }
+
+    return startQueueingTime;
+}
+
+int AdmissionContext::getAdmissions() const {
+    return _admissions.loadRelaxed();
+}
+
+AdmissionContext::Priority AdmissionContext::getPriority() const {
+    return _priority.loadRelaxed();
+}
+
+void AdmissionContext::recordAdmission() {
+    _admissions.fetchAndAdd(1);
+}
+
+ScopedAdmissionPriorityBase::ScopedAdmissionPriorityBase(OperationContext* opCtx,
+                                                         AdmissionContext& admCtx,
+                                                         AdmissionContext::Priority priority)
+    : _opCtx(opCtx), _admCtx(&admCtx), _originalPriority(admCtx.getPriority()) {
+    uassert(ErrorCodes::IllegalOperation,
+            "It is illegal for an operation to demote a high priority to a lower priority "
+            "operation",
+            _originalPriority != AdmissionContext::Priority::kExempt ||
+                priority == AdmissionContext::Priority::kExempt);
+    _admCtx->_priority.store(priority);
+}
+
+ScopedAdmissionPriorityBase::~ScopedAdmissionPriorityBase() {
+    _admCtx->_priority.store(_originalPriority);
+}
 
 StringData toString(AdmissionContext::Priority priority) {
     switch (priority) {
@@ -44,9 +101,24 @@ StringData toString(AdmissionContext::Priority priority) {
             return kLowString;
         case AdmissionContext::Priority::kNormal:
             return kNormalString;
-        case AdmissionContext::Priority::kImmediate:
-            return kImmediateString;
+        case AdmissionContext::Priority::kExempt:
+            return kExemptString;
     }
     MONGO_UNREACHABLE;
 }
+
+WaitingForAdmissionGuard::WaitingForAdmissionGuard(AdmissionContext* admCtx, TickSource* tickSource)
+    : _admCtx(admCtx), _tickSource(tickSource) {
+    invariant(_admCtx->_startQueueingTime.swap(_tickSource->getTicks()) ==
+              AdmissionContext::kNotQueueing);
+}
+
+WaitingForAdmissionGuard::~WaitingForAdmissionGuard() {
+    auto startQueueingTime = _admCtx->_startQueueingTime.loadRelaxed();
+    invariant(startQueueingTime != AdmissionContext::kNotQueueing);
+    _admCtx->_totalTimeQueuedMicros.fetchAndAdd(durationCount<Microseconds>(
+        _tickSource->ticksTo<Microseconds>(_tickSource->getTicks() - startQueueingTime)));
+    _admCtx->_startQueueingTime.store(AdmissionContext::kNotQueueing);
+}
+
 }  // namespace mongo

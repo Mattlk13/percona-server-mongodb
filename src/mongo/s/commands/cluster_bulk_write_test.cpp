@@ -27,16 +27,12 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/commands.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/commands/bulk_write_gen.h"
 #include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/s/commands/cluster_command_test_fixture.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
-
 
 namespace mongo {
 namespace {
@@ -63,7 +59,12 @@ protected:
             auto cursor = BulkWriteCommandResponseCursor(
                 0, replyItems, NamespaceString::makeBulkWriteNSS(boost::none));
             bob.append("cursor", cursor.toBSON());
-            bob.append("numErrors", 0);
+            bob.append("nErrors", 0);
+            bob.append("nInserted", 0);
+            bob.append("nDeleted", 0);
+            bob.append("nMatched", 0);
+            bob.append("nModified", 0);
+            bob.append("nUpserted", 0);
             appendTxnResponseMetadata(bob);
             return bob.obj();
         });
@@ -81,7 +82,12 @@ protected:
             auto cursor = BulkWriteCommandResponseCursor(
                 0, replyItems, NamespaceString::makeBulkWriteNSS(boost::none));
             bob.append("cursor", cursor.toBSON());
-            bob.append("numErrors", 0);
+            bob.append("nErrors", 0);
+            bob.append("nInserted", 0);
+            bob.append("nDeleted", 0);
+            bob.append("nMatched", 0);
+            bob.append("nModified", 0);
+            bob.append("nUpserted", 0);
             appendTxnResponseMetadata(bob);
             return bob.obj();
         });

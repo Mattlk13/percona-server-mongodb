@@ -72,7 +72,8 @@ void OplogBufferMock::shutdown(OperationContext* opCtx) {
 
 void OplogBufferMock::push(OperationContext* opCtx,
                            Batch::const_iterator begin,
-                           Batch::const_iterator end) {
+                           Batch::const_iterator end,
+                           boost::optional<std::size_t> bytes) {
     stdx::lock_guard<Latch> lk(_mutex);
     invariant(_hasStartedUp);
     invariant(!_hasShutDown);
@@ -194,10 +195,44 @@ Status OplogBufferMock::seekToTimestamp(OperationContext* opCtx,
 /**
  * Generates an insert oplog entry with the given number used for the timestamp.
  */
-OplogEntry makeInsertOplogEntry(int t, const NamespaceString& nss, boost::optional<UUID> uuid) {
+OplogEntry makeInsertOplogEntry(int t,
+                                const NamespaceString& nss,
+                                boost::optional<UUID> uuid,
+                                std::int64_t version) {
     BSONObj oField = BSON("_id" << t << "a" << t);
     return {DurableOplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
                               OpTypeEnum::kInsert,         // op type
+                              nss,                         // namespace
+                              uuid,                        // uuid
+                              boost::none,                 // fromMigrate
+                              boost::none,                 // checkExistenceForDiffInsert
+                              version,                     // version
+                              oField,                      // o
+                              boost::none,                 // o2
+                              {},                          // sessionInfo
+                              boost::none,                 // upsert
+                              Date_t() + Seconds(t),       // wall clock time
+                              {},                          // statement ids
+                              boost::none,    // optime of previous write within same transaction
+                              boost::none,    // pre-image optime
+                              boost::none,    // post-image optime
+                              boost::none,    // ShardId of resharding recipient
+                              boost::none,    // _id
+                              boost::none)};  // needsRetryImage
+}
+
+/**
+ * Generates a dbcheck batch oplog entry with the given number used for the timestamp.
+ */
+OplogEntry makeDBCheckBatchEntry(int t, const NamespaceString& nss, boost::optional<UUID> uuid) {
+    BSONObj oField =
+        BSON("dbCheck" << nss.ns_forTest() << "type"
+                       << "batch"
+                       << "md5"
+                       << "9e6d9948e85826fa992fd5c819d02dd6"
+                       << "minKey" << 1 << "maxKey" << 3 << "readTimestamp" << Timestamp(t, 1));
+    return {DurableOplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
+                              OpTypeEnum::kCommand,        // op type
                               nss,                         // namespace
                               uuid,                        // uuid
                               boost::none,                 // fromMigrate
@@ -249,7 +284,7 @@ OplogEntry makeUpdateOplogEntry(int t,
                               boost::none)};  // needsRetryImage
 }
 
-OplogEntry makeNoopOplogEntry(int t, const StringData& msg) {
+OplogEntry makeNoopOplogEntry(int t, StringData msg) {
     BSONObj oField = BSON("msg" << msg << "count" << t);
     return {DurableOplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
                               OpTypeEnum::kNoop,           // op type
@@ -447,6 +482,57 @@ OplogEntry makeLargeTransactionOplogEntries(int t,
 }
 
 /**
+ * Creates oplog entries that are meant to be all parts of a batched retryable write. This function
+ * does the following:
+ *
+ * 1. We add multiOpType: 1 to all entries.
+ * 2. We add a statement ID to all entries.
+ * 3. If we intend to make the first oplog entry of the write, we add a Null prevOptime to
+ *    denote that there is no entry that comes before this one.
+ */
+OplogEntry makeLargeRetryableWriteOplogEntries(int t,
+                                               bool isFirst,
+                                               const OperationSessionInfo& sessionInfo,
+                                               StmtId startingStmtId,
+                                               const std::vector<OplogEntry> innerOps) {
+    auto nss = NamespaceString::createNamespaceString_forTest(DatabaseName::kAdmin).getCommandNS();
+    OpTime prevWriteOpTime = isFirst ? OpTime() : OpTime(Timestamp(t - 1, 1), 1);
+    BSONObj oField;
+    BSONObjBuilder oFieldBuilder;
+    BSONArrayBuilder applyOpsBuilder = oFieldBuilder.subarrayStart("applyOps");
+    for (const auto& op : innerOps) {
+        applyOpsBuilder.append(op.getDurableReplOperation().toBSON().addField(
+            BSON("stmtId" << startingStmtId).firstElement()));
+        startingStmtId++;
+    }
+    applyOpsBuilder.doneFast();
+    oField = oFieldBuilder.obj();
+    auto durableEntry =
+        DurableOplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
+                          OpTypeEnum::kCommand,        // op type
+                          nss,                         // namespace
+                          boost::none,                 // uuid
+                          boost::none,                 // fromMigrate
+                          boost::none,                 // checkExistenceForDiffInsert
+                          OplogEntry::kOplogVersion,   // version
+                          oField,                      // o
+                          boost::none,                 // o2
+                          sessionInfo,                 // sessionInfo
+                          boost::none,                 // upsert
+                          Date_t() + Seconds(t),       // wall clock time
+                          {},                          // statement ids
+                          prevWriteOpTime,  // optime of previous write within same transaction
+                          boost::none,      // pre-image optime
+                          boost::none,      // post-image optime
+                          boost::none,      // ShardId of resharding recipient
+                          boost::none,      // _id
+                          boost::none);     // needsRetryImage
+    return unittest::assertGet(OplogEntry::parse(durableEntry.toBSON().addField(
+        BSON(OplogEntry::kMultiOpTypeFieldName << MultiOplogEntryType::kApplyOpsAppliedSeparately)
+            .firstElement())));
+}
+
+/**
  * Generates a mock large-transaction which has more than one oplog entry.
  */
 std::vector<OplogEntry> makeMultiEntryTransactionOplogEntries(int t,
@@ -483,6 +569,24 @@ std::vector<OplogEntry> makeMultiEntryTransactionOplogEntries(
             i + 1,
             count,
             i < innerOps.size() ? innerOps[i] : std::vector<OplogEntry>()));
+    }
+    return vec;
+}
+
+/**
+ * Generates a mock applyOps retryable write which contains the operations in innerOps.
+ */
+std::vector<OplogEntry> makeRetryableApplyOpsOplogEntries(
+    int t,
+    const DatabaseName& dbName,
+    const OperationSessionInfo& sessionInfo,
+    std::vector<std::vector<OplogEntry>> innerOps) {
+    StmtId nextStmtId{0};
+    std::vector<OplogEntry> vec;
+    for (std::size_t i = 0; i < innerOps.size(); i++) {
+        vec.push_back(makeLargeRetryableWriteOplogEntries(
+            t + i, i == 0, sessionInfo, nextStmtId, innerOps[i]));
+        nextStmtId += innerOps[i].size();
     }
     return vec;
 }

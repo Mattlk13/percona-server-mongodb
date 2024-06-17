@@ -64,9 +64,9 @@ lto_index_actions = [
 
 def _impl(ctx):
     action_configs = [
-        action_config(action_name = "objcopy_embed_data", tools = [tool(path = ctx.attr.tool_paths["objcopy"])])
+        action_config(action_name = "objcopy_embed_data", tools = [tool(path = ctx.attr.tool_paths["objcopy"])]),
     ] + [
-        action_config(action_name = ACTION_NAMES.llvm_cov, tools = [tool(path = ctx.attr.tool_paths["llvm-cov"])])
+        action_config(action_name = ACTION_NAMES.llvm_cov, tools = [tool(path = ctx.attr.tool_paths["llvm-cov"])]),
     ] + [
         action_config(action_name = name, enabled = True, tools = [tool(path = ctx.attr.tool_paths["gcc"])])
         for name in all_c_compile_actions
@@ -147,7 +147,7 @@ def _impl(ctx):
                     flag_group(
                         flags = [
                             "-std=c11",
-                        ]
+                        ],
                     ),
                 ],
             ),
@@ -158,7 +158,7 @@ def _impl(ctx):
                         flags = [
                             "-std=c++20",
                             "-nostdinc++",
-                        ]
+                        ],
                     ),
                 ],
             ),
@@ -289,7 +289,7 @@ def _impl(ctx):
         enabled = True,
         flag_sets = [
             flag_set(
-                actions = all_compile_actions,
+                actions = all_compile_actions + all_link_actions,
                 flag_groups = [flag_group(flags = [
                     "-B{}".format(bin_dir)
                     for bin_dir in ctx.attr.bin_dirs
@@ -374,12 +374,12 @@ def _impl(ctx):
 
     supports_pic_feature = feature(
         name = "supports_pic",
-        enabled = True,
+        enabled = False,
     )
 
     pic_feature = feature(
         name = "pic",
-        enabled = True,
+        enabled = False,
         flag_sets = [
             flag_set(
                 actions = [
@@ -394,6 +394,29 @@ def _impl(ctx):
                 flag_groups = [
                     flag_group(flags = ["-fPIC"], expand_if_available = "pic"),
                 ],
+            ),
+        ],
+    )
+
+    pie_feature = feature(
+        name = "pie",
+        enabled = False,
+        flag_sets = [
+            flag_set(
+                actions = [
+                    ACTION_NAMES.assemble,
+                    ACTION_NAMES.preprocess_assemble,
+                    ACTION_NAMES.linkstamp_compile,
+                    ACTION_NAMES.c_compile,
+                    ACTION_NAMES.cpp_compile,
+                    ACTION_NAMES.cpp_module_codegen,
+                    ACTION_NAMES.cpp_module_compile,
+                ],
+                flag_groups = [flag_group(flags = ["-fPIE"])],
+            ),
+            flag_set(
+                actions = all_link_actions,
+                flag_groups = [flag_group(flags = ["-pie"])],
             ),
         ],
     )
@@ -444,6 +467,85 @@ def _impl(ctx):
         ],
     )
 
+    enable_debug_info_feature = feature(
+        name = "enable_debug_info",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                # This needs to only be set in the cpp compile actions to avoid generating debug info when
+                # building assembly files since the assembler doesn't support gdwarf64.
+                actions = all_cpp_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-g2",
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    dwarf4_feature = feature(
+        name = "dwarf-4",
+        enabled = False,
+        flag_sets = [
+            flag_set(
+                # This needs to only be set in the cpp compile actions to avoid generating debug info when
+                # building assembly files since the assembler doesn't support gdwarf64.
+                actions = all_cpp_compile_actions,
+                flag_groups = [flag_group(flags = ["-gdwarf-4"])],
+            ),
+        ],
+    )
+
+    dwarf5_feature = feature(
+        name = "dwarf-5",
+        enabled = False,
+        flag_sets = [
+            flag_set(
+                # This needs to only be set in the cpp compile actions to avoid generating debug info when
+                # building assembly files since the assembler doesn't support gdwarf64.
+                actions = all_cpp_compile_actions,
+                flag_groups = [flag_group(flags = ["-gdwarf-5"])],
+            ),
+        ],
+    )
+
+    dwarf32_feature = feature(
+        name = "dwarf32",
+        enabled = False,
+        flag_sets = [
+            flag_set(
+                # This needs to only be set in the cpp compile actions to avoid generating debug info when
+                # building assembly files since the assembler doesn't support gdwarf64.
+                actions = all_cpp_compile_actions,
+                flag_groups = [flag_group(flags = ["-gdwarf32"])],
+            ),
+            flag_set(
+                actions = all_link_actions,
+                flag_groups = [flag_group(flags = ["-gdwarf32"])],
+            ),
+        ],
+    )
+
+    dwarf64_feature = feature(
+        name = "dwarf64",
+        enabled = False,
+        flag_sets = [
+            flag_set(
+                # This needs to only be set in the cpp compile actions to avoid generating debug info when
+                # building assembly files since the assembler doesn't support gdwarf64.
+                actions = all_cpp_compile_actions,
+                flag_groups = [flag_group(flags = ["-gdwarf64"])],
+            ),
+            flag_set(
+                actions = all_link_actions,
+                flag_groups = [flag_group(flags = ["-gdwarf64"])],
+            ),
+        ],
+    )
+
     features = [
         bin_dirs_feature,
         default_compile_flags_feature,
@@ -452,6 +554,7 @@ def _impl(ctx):
         supports_dynamic_linker_feature,
         supports_pic_feature,
         pic_feature,
+        pie_feature,
         per_object_debug_info_feature,
         preprocessor_defines_feature,
         objcopy_embed_flags_feature,
@@ -467,6 +570,11 @@ def _impl(ctx):
         includes_feature,
         dependency_file_feature,
         verbose_feature,
+        enable_debug_info_feature,
+        dwarf4_feature,
+        dwarf5_feature,
+        dwarf32_feature,
+        dwarf64_feature,
     ]
 
     return [
@@ -490,7 +598,7 @@ def _impl(ctx):
             tool_paths = [
                 tool_path(name = name, path = path)
                 for name, path in ctx.attr.tool_paths.items()
-            ]
+            ],
         ),
     ]
 

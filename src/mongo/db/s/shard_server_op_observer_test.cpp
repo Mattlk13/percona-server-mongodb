@@ -37,11 +37,12 @@
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/replica_set_endpoint_sharding_state.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_shard.h"
+#include "mongo/s/sharding_state.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
@@ -55,7 +56,7 @@ protected:
     explicit ShardServerOpObserverReplicaSetEndpointTest(Options options = {})
         : ServiceContextMongoDTest(options.useReplSettings(true)) {}
 
-    virtual void setUp() override {
+    void setUp() override {
         // Set up mongod.
         ServiceContextMongoDTest::setUp();
 
@@ -80,8 +81,9 @@ protected:
                NamespaceString nss,
                boost::optional<UUID> uuid = boost::none) const {
         writeConflictRetry(opCtx, "deleteAll", nss, [&] {
-            opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
-            opCtx->recoveryUnit()->abandonSnapshot();
+            shard_role_details::getRecoveryUnit(opCtx)->setTimestampReadSource(
+                RecoveryUnit::ReadSource::kNoTimestamp);
+            shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
 
             WriteUnitOfWork wunit(opCtx);
             AutoGetCollection collRaii(opCtx, nss, MODE_X);
@@ -127,6 +129,7 @@ protected:
                              *coll,
                              insert.begin(),
                              insert.end(),
+                             /*recordIds*/ {},
                              /*fromMigrate=*/std::vector<bool>(insert.size(), false),
                              /*defaultFromMigrate=*/false);
         wuow.commit();
@@ -211,7 +214,8 @@ private:
 };
 
 TEST_F(ShardServerOpObserverReplicaSetEndpointTest, ConfigShardsOnInserts_NotConfigShard) {
-    serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::ConfigServer};
+    serverGlobalParams.clusterRole = {
+        ClusterRole::ShardServer, ClusterRole::ConfigServer, ClusterRole::RouterServer};
 
     auto opCtxHolder = cc().makeOperationContext();
     auto opCtx = opCtxHolder.get();
@@ -224,7 +228,8 @@ TEST_F(ShardServerOpObserverReplicaSetEndpointTest, ConfigShardsOnInserts_NotCon
 
 TEST_F(ShardServerOpObserverReplicaSetEndpointTest,
        ConfigShardsOnInserts_ConfigShard_OnConfigServer_FeatureFlagEnabled) {
-    serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::ConfigServer};
+    serverGlobalParams.clusterRole = {
+        ClusterRole::ShardServer, ClusterRole::ConfigServer, ClusterRole::RouterServer};
 
     auto opCtxHolder = cc().makeOperationContext();
     auto opCtx = opCtxHolder.get();
@@ -237,7 +242,8 @@ TEST_F(ShardServerOpObserverReplicaSetEndpointTest,
 
 TEST_F(ShardServerOpObserverReplicaSetEndpointTest,
        ConfigShardsOnInserts_ConfigShard_OnConfigServer_FeatureFlagDisabled) {
-    serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::ConfigServer};
+    serverGlobalParams.clusterRole = {
+        ClusterRole::ShardServer, ClusterRole::ConfigServer, ClusterRole::RouterServer};
     RAIIServerParameterControllerForTest replicaSetEndpointController{
         "featureFlagReplicaSetEndpoint", false};
 
@@ -254,7 +260,7 @@ TEST_F(ShardServerOpObserverReplicaSetEndpointTest,
        ConfigShardsOnInserts_ConfigShard_NotOnConfigServer_FeatureFlagEnabled) {
     // The config.shards collection should only exist on the config server but testing here for
     // completion.
-    serverGlobalParams.clusterRole = {ClusterRole::ShardServer};
+    serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::RouterServer};
 
     auto opCtxHolder = cc().makeOperationContext();
     auto opCtx = opCtxHolder.get();
@@ -267,7 +273,8 @@ TEST_F(ShardServerOpObserverReplicaSetEndpointTest,
 
 TEST_F(ShardServerOpObserverReplicaSetEndpointTest,
        ConfigShardOnDelete_ConfigShard_FeatureFlagEnabled) {
-    serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::ConfigServer};
+    serverGlobalParams.clusterRole = {
+        ClusterRole::ShardServer, ClusterRole::ConfigServer, ClusterRole::RouterServer};
 
     auto opCtxHolder = cc().makeOperationContext();
     auto opCtx = opCtxHolder.get();
@@ -281,7 +288,8 @@ TEST_F(ShardServerOpObserverReplicaSetEndpointTest,
 
 TEST_F(ShardServerOpObserverReplicaSetEndpointTest,
        ConfigShardOnDelete_ConfigShard_FeatureFlagDisabled) {
-    serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::ConfigServer};
+    serverGlobalParams.clusterRole = {
+        ClusterRole::ShardServer, ClusterRole::ConfigServer, ClusterRole::RouterServer};
     RAIIServerParameterControllerForTest replicaSetEndpointController{
         "featureFlagReplicaSetEndpoint", false};
 
@@ -297,7 +305,8 @@ TEST_F(ShardServerOpObserverReplicaSetEndpointTest,
 
 TEST_F(ShardServerOpObserverReplicaSetEndpointTest,
        ConfigShardsOnDelete_NotConfigShard_FeatureFlagEnabled) {
-    serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::ConfigServer};
+    serverGlobalParams.clusterRole = {
+        ClusterRole::ShardServer, ClusterRole::ConfigServer, ClusterRole::RouterServer};
 
     auto opCtxHolder = cc().makeOperationContext();
     auto opCtx = opCtxHolder.get();
@@ -311,7 +320,8 @@ TEST_F(ShardServerOpObserverReplicaSetEndpointTest,
 
 TEST_F(ShardServerOpObserverReplicaSetEndpointTest,
        ConfigShardsOnUpdate_DoesNotUnsetIsConfigShard_FeatureFlagEnabled) {
-    serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::ConfigServer};
+    serverGlobalParams.clusterRole = {
+        ClusterRole::ShardServer, ClusterRole::ConfigServer, ClusterRole::RouterServer};
 
     auto opCtxHolder = cc().makeOperationContext();
     auto opCtx = opCtxHolder.get();
@@ -325,7 +335,9 @@ TEST_F(ShardServerOpObserverReplicaSetEndpointTest,
 
 TEST_F(ShardServerOpObserverReplicaSetEndpointTest,
        ConfigShardsOnUpdate_DoesNotSetIsConfigShard_FeatureFlagEnabled) {
-    serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::ConfigServer};
+    serverGlobalParams.clusterRole = {
+
+        ClusterRole::ShardServer, ClusterRole::ConfigServer, ClusterRole::RouterServer};
 
     auto opCtxHolder = cc().makeOperationContext();
     auto opCtx = opCtxHolder.get();
@@ -338,7 +350,8 @@ TEST_F(ShardServerOpObserverReplicaSetEndpointTest,
 
 TEST_F(ShardServerOpObserverReplicaSetEndpointTest,
        ConfigShardsOnInserts_InvalidDoc_FeatureFlagEnabled) {
-    serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::ConfigServer};
+    serverGlobalParams.clusterRole = {
+        ClusterRole::ShardServer, ClusterRole::ConfigServer, ClusterRole::RouterServer};
 
     auto opCtxHolder = cc().makeOperationContext();
     auto opCtx = opCtxHolder.get();
@@ -351,7 +364,8 @@ TEST_F(ShardServerOpObserverReplicaSetEndpointTest,
 
 TEST_F(ShardServerOpObserverReplicaSetEndpointTest,
        ConfigShardsOnDelete_InvalidDoc_FeatureFlagEnabled) {
-    serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::ConfigServer};
+    serverGlobalParams.clusterRole = {
+        ClusterRole::ShardServer, ClusterRole::ConfigServer, ClusterRole::RouterServer};
 
     auto opCtxHolder = cc().makeOperationContext();
     auto opCtx = opCtxHolder.get();
@@ -365,7 +379,8 @@ TEST_F(ShardServerOpObserverReplicaSetEndpointTest,
 
 TEST_F(ShardServerOpObserverReplicaSetEndpointTest,
        ConfigShardsOnUpdate_InvalidDoc_FeatureFlagEnabled) {
-    serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::ConfigServer};
+    serverGlobalParams.clusterRole = {
+        ClusterRole::ShardServer, ClusterRole::ConfigServer, ClusterRole::RouterServer};
 
     auto opCtxHolder = cc().makeOperationContext();
     auto opCtx = opCtxHolder.get();

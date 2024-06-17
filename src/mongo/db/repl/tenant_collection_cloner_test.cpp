@@ -113,6 +113,7 @@ public:
                    const CollectionPtr& coll,
                    std::vector<InsertStatement>::const_iterator begin,
                    std::vector<InsertStatement>::const_iterator end,
+                   const std::vector<RecordId>& recordIds,
                    std::vector<bool> fromMigrate,
                    bool defaultFromMigrate,
                    OpStateAccumulator* opAccumulator = nullptr) final {
@@ -167,7 +168,7 @@ protected:
             _term++;
             ASSERT_OK(replCoord->setFollowerMode(MemberState::RS_PRIMARY));
             ASSERT_OK(replCoord->updateTerm(opCtx.get(), _term));
-            replCoord->setMyLastAppliedOpTimeAndWallTime(
+            replCoord->setMyLastAppliedOpTimeAndWallTimeForward(
                 OpTimeAndWallTime(OpTime(Timestamp(1, 1), _term), Date_t()));
         }
     }

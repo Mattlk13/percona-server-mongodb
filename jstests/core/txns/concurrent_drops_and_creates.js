@@ -4,16 +4,22 @@
  *
  * @tags: [
  *   # The test runs commands that are not allowed with security token: endSession.
- *   not_allowed_with_security_token,
+ *   not_allowed_with_signed_security_token,
  *   assumes_no_implicit_collection_creation_after_drop,
  *   uses_snapshot_read_concern,
  *   uses_transactions,
  * ]
  */
-// TODO (SERVER-39704): Remove the following load after SERVER-397074 is completed
+// TODO (SERVER-39704): Remove the following load after SERVER-39704 is completed
 import {
     retryOnceOnTransientAndRestartTxnOnMongos
 } from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+
+// TODO SERVER-86104: adapt the test for tracked collections
+if (FeatureFlagUtil.isPresentAndEnabled(db, "TrackUnshardedCollectionsUponCreation")) {
+    quit();
+}
 
 const dbName1 = "test1";
 const dbName2 = "test2";
@@ -61,7 +67,7 @@ sessionOutsideTxn.advanceClusterTime(session.getClusterTime());
 assert.commandWorked(testDB2.runCommand({drop: collNameB, writeConcern: {w: "majority"}}));
 
 // This test cause a StaleConfig error on sharding so no command will succeed.
-if (!session.getClient().isMongos()) {
+if (!session.getClient().isMongos() && !TestData.testingReplicaSetEndpoint) {
     // We can perform reads on the dropped collection as it existed when we started the transaction.
     assert.commandWorked(sessionDB2.runCommand({find: sessionCollB.getName()}));
 

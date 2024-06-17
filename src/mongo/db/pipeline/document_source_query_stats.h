@@ -54,7 +54,7 @@
 #include "mongo/db/pipeline/stage_constraints.h"
 #include "mongo/db/pipeline/variables.h"
 #include "mongo/db/query/query_shape/serialization_options.h"
-#include "mongo/db/query/query_stats/key_generator.h"
+#include "mongo/db/query/query_stats/key.h"
 #include "mongo/db/query/query_stats/query_stats.h"
 #include "mongo/db/query/query_stats/transform_algorithm_gen.h"
 #include "mongo/db/tenant_id.h"
@@ -103,7 +103,7 @@ public:
             return true;
         }
 
-        void assertSupportsMultiDocumentTransaction() const {
+        void assertSupportsMultiDocumentTransaction() const override {
             transactionNotSupported(kStageName);
         }
 
@@ -119,7 +119,7 @@ public:
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
-    virtual ~DocumentSourceQueryStats() = default;
+    ~DocumentSourceQueryStats() override = default;
 
     StageConstraints constraints(
         Pipeline::SplitState = Pipeline::SplitState::kUnsplit) const override {
@@ -145,7 +145,7 @@ public:
         return kStageName.rawData();
     }
 
-    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final override;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     void addVariableRefs(std::set<Variables::Id>* refs) const final {}
 
@@ -170,7 +170,7 @@ private:
 
         bool isValidPartitionId(QueryStatsStore::PartitionId maxNumPartitions) const;
 
-        const Timestamp& getReadTimestamp() const;
+        const Date_t& getReadTimestamp() const;
 
         bool empty() const;
 
@@ -179,7 +179,7 @@ private:
         std::deque<QueryStatsEntry> statsEntries;
 
     private:
-        Timestamp _readTimestamp;
+        Date_t _readTimestamp;
         QueryStatsStore::PartitionId _partitionId;
         bool _isLoaded{false};
     };
@@ -198,7 +198,7 @@ private:
 
     GetNextResult doGetNext() final;
 
-    boost::optional<Document> toDocument(const Timestamp& partitionReadTime,
+    boost::optional<Document> toDocument(const Date_t& partitionReadTime,
                                          const QueryStatsEntry& queryStatsEntry) const;
 
     // The current partition copied from query stats store to avoid holding lock during reads.

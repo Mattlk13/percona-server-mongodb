@@ -34,6 +34,8 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/storage_options.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/decorable.h"
 
@@ -85,7 +87,13 @@ bool ReplicationCoordinator::isOplogDisabledFor(OperationContext* opCtx,
         return true;
     }
 
-    fassert(28626, opCtx->recoveryUnit());
+    // Magic restore performs writes to replicated collections (e.g in the config DB) that we don't
+    // want replicated via the oplog.
+    if (storageGlobalParams.magicRestore) {
+        return true;
+    }
+
+    fassert(28626, shard_role_details::getRecoveryUnit(opCtx));
 
     return false;
 }

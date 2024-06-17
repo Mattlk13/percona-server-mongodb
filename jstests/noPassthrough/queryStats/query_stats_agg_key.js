@@ -3,17 +3,21 @@
  * and none are missing.
  * @tags: [requires_fcv_72]
  */
-import {runCommandAndValidateQueryStats} from "jstests/libs/query_stats_utils.js";
+import {
+    runCommandAndValidateQueryStats,
+    withQueryStatsEnabled
+} from "jstests/libs/query_stats_utils.js";
 
-let aggregateCommandObj = {
-    aggregate: jsTestName(),
+const collName = jsTestName();
+const aggregateCommandObj = {
+    aggregate: collName,
     pipeline: [{"$out": "collOut"}],
-    explain: true,
     allowDiskUse: false,
     cursor: {batchSize: 2},
-    maxTimeMS: 500,
+    maxTimeMS: 50 * 1000,
     bypassDocumentValidation: false,
     readConcern: {level: "local"},
+    writeConcern: {w: 1},
     collation: {locale: "en_US", strength: 2},
     hint: {"v": 1},
     comment: "",
@@ -24,7 +28,7 @@ let aggregateCommandObj = {
 };
 
 const queryShapeAggregateFields =
-    ["cmdNs", "command", "pipeline", "explain", "allowDiskUse", "collation", "let"];
+    ["cmdNs", "command", "pipeline", "allowDiskUse", "collation", "let"];
 
 // The outer fields not nested inside queryShape.
 const queryStatsAggregateKeyFields = [
@@ -41,35 +45,19 @@ const queryStatsAggregateKeyFields = [
     "client",
     "hint",
     "readConcern",
+    "writeConcern",
     "cursor.batchSize",
 ];
 
-runCommandAndValidateQueryStats({
-    commandName: "aggregate",
-    commandObj: aggregateCommandObj,
-    shapeFields: queryShapeAggregateFields,
-    keyFields: queryStatsAggregateKeyFields
-});
+withQueryStatsEnabled(collName, (coll) => {
+    // Have to create an index for hint not to fail.
+    assert.commandWorked(coll.createIndex({v: 1}));
 
-// Can't have writeConcern with explain, so checking separately.
-let writeConcernCommandObj =
-    {aggregate: jsTestName(), pipeline: [{"$out": "collOut"}], cursor: {}, writeConcern: {w: 1}};
-
-const writeConcernFields = ["cmdNs", "command", "pipeline"];
-
-// The outer fields not nested inside queryShape.
-const writeConcernKeyFields = [
-    "queryShape",
-    "cursor",
-    "writeConcern",
-    "client",
-    "collectionType",
-    "otherNss",
-];
-
-runCommandAndValidateQueryStats({
-    commandName: "aggregate",
-    commandObj: writeConcernCommandObj,
-    shapeFields: writeConcernFields,
-    keyFields: writeConcernKeyFields
+    runCommandAndValidateQueryStats({
+        coll: coll,
+        commandName: "aggregate",
+        commandObj: aggregateCommandObj,
+        shapeFields: queryShapeAggregateFields,
+        keyFields: queryStatsAggregateKeyFields
+    });
 });

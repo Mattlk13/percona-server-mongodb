@@ -89,7 +89,7 @@ AggregateCommandRequest asAggregateCommandRequest(const FindCommandRequest& find
 
     // Some options are disallowed when resharding improvements are disabled.
     if (!resharding::gFeatureFlagReshardingImprovements.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
         uassert(ErrorCodes::InvalidPipelineOperator,
                 str::stream() << "Option " << FindCommandRequest::kRequestResumeTokenFieldName
                               << " not supported in aggregation.",
@@ -129,8 +129,18 @@ AggregateCommandRequest asAggregateCommandRequest(const FindCommandRequest& find
 
     // The aggregation 'cursor' option is always set, regardless of the presence of batchSize.
     SimpleCursorOptions cursor;
-    if (findCommand.getBatchSize()) {
-        cursor.setBatchSize(findCommand.getBatchSize());
+    if (auto batchSize = findCommand.getBatchSize()) {
+        // If the find command specifies `singleBatch`, 'limit' is required to be 1 (as checked
+        // above). If 'batchSize' is also 1, an open cursor will be returned, contradicting the
+        // 'singleBatch' option. We set 'batchSize' to 2 as a workaround to ensure no cursor is
+        // returned.
+        // TODO SERVER-83077 This workaround will be unnecessary if a full batch of size 1 doesn't
+        // open a cursor.
+        if (findCommand.getSingleBatch() && *batchSize == 1LL) {
+            cursor.setBatchSize(2);
+        } else {
+            cursor.setBatchSize(*batchSize);
+        }
     }
     result.setCursor(std::move(cursor));
 
@@ -143,6 +153,9 @@ AggregateCommandRequest asAggregateCommandRequest(const FindCommandRequest& find
     }
     if (!findCommand.getHint().isEmpty()) {
         result.setHint(findCommand.getHint().getOwned());
+    }
+    if (findCommand.getQuerySettings()) {
+        result.setQuerySettings(findCommand.getQuerySettings());
     }
     if (findCommand.getReadConcern()) {
         result.setReadConcern(findCommand.getReadConcern()->getOwned());
@@ -158,13 +171,14 @@ AggregateCommandRequest asAggregateCommandRequest(const FindCommandRequest& find
         result.setLet(findCommand.getLet()->getOwned());
     }
     if (resharding::gFeatureFlagReshardingImprovements.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
         result.setRequestResumeToken(findCommand.getRequestResumeToken());
 
         if (!findCommand.getResumeAfter().isEmpty()) {
             result.setResumeAfter(findCommand.getResumeAfter().getOwned());
         }
     }
+    result.setIncludeQueryStatsMetrics(findCommand.getIncludeQueryStatsMetrics());
 
     return result;
 }

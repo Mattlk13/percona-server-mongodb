@@ -184,7 +184,6 @@ std::set<ShardId> getShardsToTarget(OperationContext* opCtx,
     return allShardsContainingChunksForNs;
 }
 
-// TODO: SERVER-75760 Remove this validation since mongos should be doing this upfront.
 void validateFindAndModifyCommand(const write_ops::FindAndModifyCommandRequest& request) {
     uassert(ErrorCodes::FailedToParse,
             "Either an update or remove=true must be specified",
@@ -271,7 +270,7 @@ ParsedCommandInfo parseWriteRequest(OperationContext* opCtx, const OpMsgRequest&
     // For bulkWrite request, we set the nss when we parse the bulkWrite command.
     if (commandName != BulkWriteCommandRequest::kCommandName) {
         parsedInfo.nss =
-            CommandHelpers::parseNsCollectionRequired(writeReq.getDbName(), writeCmdObj);
+            CommandHelpers::parseNsCollectionRequired(writeReq.parseDbName(), writeCmdObj);
     }
 
     if (commandName == BulkWriteCommandRequest::kCommandName) {
@@ -398,10 +397,6 @@ public:
         using InvocationBase::InvocationBase;
 
         Response typedRun(OperationContext* opCtx) {
-            uassert(ErrorCodes::IllegalOperation,
-                    "_clusterQueryWithoutShardKey can only be run on Mongos",
-                    serverGlobalParams.clusterRole.hasExclusively(ClusterRole::RouterServer));
-
             LOGV2_DEBUG(6962300,
                         2,
                         "Running read phase for a write without a shard key.",
@@ -411,7 +406,8 @@ public:
 
             // Parse into OpMsgRequest to append the $db field, which is required for command
             // parsing.
-            const auto opMsgRequest = OpMsgRequest::fromDBAndBody(ns().dbName(), writeCmdObj);
+            const auto opMsgRequest = OpMsgRequestBuilder::create(
+                auth::ValidatedTenancyScope::get(opCtx), ns().dbName(), writeCmdObj);
             auto parsedInfoFromRequest = parseWriteRequest(opCtx, opMsgRequest);
             const auto& nss = parsedInfoFromRequest.nss;
 
@@ -432,11 +428,13 @@ public:
                 }
             }
 
+            const auto& collectionUUID = cri.cm.getUUID();
             const auto& timeseriesFields = cri.cm.isSharded() &&
                     cri.cm.getTimeseriesFields().has_value() &&
                     parsedInfoFromRequest.isTimeseriesNamespace
                 ? cri.cm.getTimeseriesFields()
                 : boost::none;
+
             auto cmdObj =
                 createAggregateCmdObj(opCtx, parsedInfoFromRequest, nss, timeseriesFields);
 
@@ -531,6 +529,7 @@ public:
                 auto [upsertDoc, userUpsertDoc] = write_without_shard_key::generateUpsertDocument(
                     opCtx,
                     parsedInfoFromRequest.updateRequest.get(),
+                    collectionUUID,
                     timeseriesFields
                         ? boost::make_optional(timeseriesFields->getTimeseriesOptions())
                         : boost::none,
@@ -550,10 +549,11 @@ public:
         void explain(OperationContext* opCtx,
                      ExplainOptions::Verbosity verbosity,
                      rpc::ReplyBuilderInterface* result) override {
+            auto vts = auth::ValidatedTenancyScope::get(opCtx);
             const auto writeCmdObj = [&] {
                 const auto explainCmdObj = request().getWriteCmd();
                 const auto opMsgRequestExplainCmd =
-                    OpMsgRequest::fromDBAndBody(ns().dbName(), explainCmdObj);
+                    OpMsgRequestBuilder::create(vts, ns().dbName(), explainCmdObj);
                 auto explainRequest = ExplainCommandRequest::parse(
                     IDLParserContext("_clusterQueryWithoutShardKeyExplain"),
                     opMsgRequestExplainCmd.body);
@@ -563,7 +563,7 @@ public:
             // Parse into OpMsgRequest to append the $db field, which is required for command
             // parsing.
             const auto opMsgRequestWriteCmd =
-                OpMsgRequest::fromDBAndBody(ns().dbName(), writeCmdObj);
+                OpMsgRequestBuilder::create(vts, ns().dbName(), writeCmdObj);
             auto parsedInfoFromRequest = parseWriteRequest(opCtx, opMsgRequestWriteCmd);
 
             // Get all shard ids for shards that have chunks in the desired namespace.
@@ -606,7 +606,7 @@ public:
 
             auto bodyBuilder = result->getBodyBuilder();
             uassertStatusOK(ClusterExplain::buildExplainResult(
-                opCtx,
+                ExpressionContext::makeBlankExpressionContext(opCtx, nss),
                 responses,
                 parsedInfoFromRequest.sort ? ClusterExplain::kMergeSortFromShards
                                            : ClusterExplain::kMergeFromShards,
@@ -651,7 +651,7 @@ public:
     // compliant, when they technically should not be. To satisfy this requirement,
     // this command is marked as part of the Stable API, but is not truly a part of
     // it, since it is an internal-only command.
-    const std::set<std::string>& apiVersions() const {
+    const std::set<std::string>& apiVersions() const override {
         return kApiVersions1;
     }
 };

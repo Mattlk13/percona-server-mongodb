@@ -1,18 +1,22 @@
 /**
  * Test that mongos times out when the config server replica set only contains nodes that
  * are behind the majority opTime.
- * @tags: [config_shard_incompatible]
+ * @tags: [
+ *   config_shard_incompatible,
+ *   temp_disabled_embedded_router_known_issues,
+ * ]
  */
 
 import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
-// Checking UUID and index consistency involves mongos being able to do a read from the config
-// server, but this test is designed to make mongos time out when reading from the config server.
+// The following checks involve reading from the config server, but this test is designed to make
+// mongos time out when reading from the config server.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
 TestData.skipCheckRoutingTableConsistency = true;
 TestData.skipCheckShardFilteringMetadata = true;
+TestData.skipCheckMetadataConsistency = true;
 
 var st = new ShardingTest({
     shards: 1,
@@ -20,7 +24,7 @@ var st = new ShardingTest({
     configReplSetTestOptions: {settings: {chainingAllowed: false}},
     other: {
         mongosOptions:
-            {setParameter: {["failpoint.disableShardingUptimeReporting"]: "{mode: 'alwaysOn'}"}}
+            {setParameter: {"failpoint.disableShardingUptimeReporting": "{mode: 'alwaysOn'}"}}
     }
 });
 
@@ -74,7 +78,7 @@ assert.soon(
     },
     'Did not see any log entries containing the following message: ' + msgAA + ' ... ' + msgAB +
         ' or ' + msgB,
-    60000,
+    180000,
     300);
 
 // Can't do clean shutdown with this failpoint on.

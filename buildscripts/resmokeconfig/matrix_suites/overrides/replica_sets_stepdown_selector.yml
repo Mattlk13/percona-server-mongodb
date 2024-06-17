@@ -26,7 +26,6 @@
         # Stepdown commands during fsync lock will fail.
         - jstests/core/**/currentop.js
         - jstests/core/**/fsync.js
-        - jstests/core/**/killop_drop_collection.js
 
         # Expect drops/creates to fail or have a certain response:
         - jstests/core/**/explain_upsert.js
@@ -59,6 +58,13 @@
     exclude_files:
       - jstests/fle2/**/*.js
       - src/mongo/db/modules/*/jstests/fle2/**/*.js
+
+- name: kill_primary_jscore_passthrough_exclude_files_aggregation
+  value:
+    selector:
+      exclude_files:
+        - jstests/aggregation/**/*.js
+
 
 - name: reconfig_kill_primary_jscore_passthrough_exclude_files
   value:
@@ -95,7 +101,6 @@
         # Stepdown commands during fsync lock will fail.
         - jstests/core/**/currentop.js
         - jstests/core/**/fsync.js
-        - jstests/core/**/killop_drop_collection.js
 
         # Spawns new mongo shells, which don't retry connecting on stepdown errors.
         - jstests/core/**/shell_connection_strings.js

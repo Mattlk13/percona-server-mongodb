@@ -41,6 +41,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/ftdc/compressor.h"
 #include "mongo/db/ftdc/config.h"
+#include "mongo/db/ftdc/metadata_compressor.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/util/time_support.h"
 
@@ -68,7 +69,8 @@ class FTDCFileWriter {
     FTDCFileWriter& operator=(const FTDCFileWriter&) = delete;
 
 public:
-    FTDCFileWriter(const FTDCConfig* config) : _config(config), _compressor(_config) {}
+    FTDCFileWriter(const FTDCConfig* config, UseMultiServiceSchema multiservice)
+        : _config(config), _compressor(_config), _metadataCompressor(multiservice) {}
     ~FTDCFileWriter();
 
     /**
@@ -85,6 +87,11 @@ public:
      * Write a sample to interim and/or archive log as needed.
      */
     Status writeSample(const BSONObj& sample, Date_t date);
+
+    /**
+     * Write a periodic metadata sample to the archive log as needed.
+     */
+    Status writePeriodicMetadataSample(const BSONObj& sample, Date_t date);
 
     /**
      * Close all the files and shutdown cleanly by zeroing the beginning of the interim file.
@@ -140,6 +147,9 @@ private:
 
     // FTDC compressor
     FTDCCompressor _compressor;
+
+    // FTDC periodic metadata compressor
+    FTDCMetadataCompressor _metadataCompressor;
 
     // Size of archive file
     std::size_t _size{0};

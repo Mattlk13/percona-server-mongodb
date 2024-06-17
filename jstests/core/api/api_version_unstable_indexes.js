@@ -10,11 +10,11 @@
  *   requires_fcv_63,
  *   tenant_migration_incompatible,
  *   does_not_support_stepdowns,
- *   not_allowed_with_security_token
+ *   not_allowed_with_signed_security_token
  * ]
  */
 
-import {getWinningPlan, planHasStage} from "jstests/libs/analyze_plan.js";
+import {getQueryPlanner, getWinningPlan, planHasStage} from "jstests/libs/analyze_plan.js";
 import {setUpServerForColumnStoreIndexTest} from "jstests/libs/columnstore_util.js";
 import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
@@ -34,10 +34,10 @@ assert.commandWorked(coll.createIndex({subject: "text"}));
 assert.commandWorked(coll.createIndex({"views": 1}, {sparse: true}));
 
 // The "text" index, "subject_text", can be used normally.
-if (!FixtureHelpers.isMongos(testDb)) {
+if (!FixtureHelpers.isMongos(testDb) && !TestData.testingReplicaSetEndpoint) {
     const explainRes = assert.commandWorked(
         testDb.runCommand({explain: {"find": collName, "filter": {$text: {$search: "coffee"}}}}));
-    assert.eq(getWinningPlan(explainRes.queryPlanner).indexName, "subject_text", explainRes);
+    assert.eq(getWinningPlan(getQueryPlanner(explainRes)).indexName, "subject_text", explainRes);
 }
 
 // No "text" index can be used for $text search as the "text" index is excluded from API version 1.
@@ -58,10 +58,11 @@ assert.commandFailedWithCode(testDb.runCommand({
 }),
                              ErrorCodes.BadValue);
 
-if (!FixtureHelpers.isMongos(testDb)) {
+if (!FixtureHelpers.isMongos(testDb) && !TestData.testingReplicaSetEndpoint) {
     const explainRes = assert.commandWorked(testDb.runCommand(
         {explain: {"find": collName, "filter": {views: 50}, "hint": {views: 1}}}));
-    assert.eq(getWinningPlan(explainRes.queryPlanner).inputStage.indexName, "views_1", explainRes);
+    assert.eq(
+        getWinningPlan(getQueryPlanner(explainRes)).inputStage.indexName, "views_1", explainRes);
 }
 
 if (setUpServerForColumnStoreIndexTest(testDb)) {

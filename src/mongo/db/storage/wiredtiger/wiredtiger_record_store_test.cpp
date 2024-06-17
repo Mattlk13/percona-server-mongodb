@@ -62,6 +62,7 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/unittest/barrier.h"
@@ -547,7 +548,7 @@ TEST(WiredTigerRecordStoreTest, OplogTruncateMarkers_UpdateRecord) {
 
         WriteUnitOfWork wuow(opCtx.get());
         // Explicitly sets the timestamp to ensure ordered writes.
-        ASSERT_OK(opCtx->recoveryUnit()->setTimestamp(Timestamp(1, 3)));
+        ASSERT_OK(shard_role_details::getRecoveryUnit(opCtx.get())->setTimestamp(Timestamp(1, 3)));
         ASSERT_OK(
             rs->updateRecord(opCtx.get(), RecordId(1, 1), changed1.objdata(), changed1.objsize()));
         ASSERT_OK(
@@ -1297,7 +1298,8 @@ TEST(WiredTigerRecordStoreTest, CursorInActiveTxnAfterSeek) {
         uow.commit();
     }
 
-    // Cursors should always ensure they are in an active transaction when seekExact() is called.
+    // Cursors should always ensure they are in an active transaction when seekExact() or seek() is
+    // called.
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         Lock::GlobalLock globalLock(opCtx.get(), MODE_X);
@@ -1317,6 +1319,15 @@ TEST(WiredTigerRecordStoreTest, CursorInActiveTxnAfterSeek) {
         // If a cursor is used after a WUOW commits, it should implicitly start a new transaction.
         ASSERT(cursor->seekExact(rid1));
         ASSERT_TRUE(ru->isActive());
+
+        // End the transaction and test seek()
+        {
+            WriteUnitOfWork wuow(opCtx.get());
+            wuow.commit();
+        }
+        ASSERT_FALSE(ru->isActive());
+        ASSERT(cursor->seek(rid1, SeekableRecordCursor::BoundInclusion::kInclude));
+        ASSERT_TRUE(ru->isActive());
     }
 }
 
@@ -1332,7 +1343,7 @@ TEST(WiredTigerRecordStoreTest, ClusteredRecordStore) {
     const NamespaceString nss = NamespaceString::createNamespaceString_forTest(ns);
     const std::string uri = WiredTigerKVEngine::kTableUriPrefix + ns;
     const StatusWith<std::string> result =
-        WiredTigerRecordStore::generateCreateString(kWiredTigerEngineName,
+        WiredTigerRecordStore::generateCreateString(std::string{kWiredTigerEngineName},
                                                     nss,
                                                     "",
                                                     CollectionOptions(),
@@ -1345,7 +1356,7 @@ TEST(WiredTigerRecordStoreTest, ClusteredRecordStore) {
     {
         WriteUnitOfWork uow(opCtx.get());
         WiredTigerRecoveryUnit* ru =
-            checked_cast<WiredTigerRecoveryUnit*>(opCtx.get()->recoveryUnit());
+            checked_cast<WiredTigerRecoveryUnit*>(shard_role_details::getRecoveryUnit(opCtx.get()));
         WT_SESSION* s = ru->getSession()->getSession();
         invariantWTOK(s->create(s, uri.c_str(), config.c_str()), s);
         uow.commit();
@@ -1355,7 +1366,7 @@ TEST(WiredTigerRecordStoreTest, ClusteredRecordStore) {
     params.nss = nss;
     params.uuid = boost::none;
     params.ident = ns;
-    params.engineName = kWiredTigerEngineName;
+    params.engineName = std::string{kWiredTigerEngineName};
     params.isCapped = false;
     params.keyFormat = KeyFormat::String;
     params.overwrite = false;
@@ -1366,7 +1377,7 @@ TEST(WiredTigerRecordStoreTest, ClusteredRecordStore) {
     params.forceUpdateWithFullDocument = false;
 
     const auto wtKvEngine = dynamic_cast<WiredTigerKVEngine*>(harnessHelper->getEngine());
-    auto rs = std::make_unique<StandardWiredTigerRecordStore>(wtKvEngine, opCtx.get(), params);
+    auto rs = std::make_unique<WiredTigerRecordStore>(wtKvEngine, opCtx.get(), params);
     rs->postConstructorInit(opCtx.get(), nss);
 
     const auto id = StringData{"1"};
@@ -1431,9 +1442,9 @@ TEST(WiredTigerRecordStoreTest, SizeInfoAccurateAfterRollbackWithDelete) {
         WriteUnitOfWork txn(ctx.get());
         // Registered changes are executed in reverse order.
         rs->deleteRecord(ctx.get(), rid);
-        ctx.get()->recoveryUnit()->onRollback(
+        shard_role_details::getRecoveryUnit(ctx.get())->onRollback(
             [&](OperationContext*) { deleted->countDownAndWait(); });
-        ctx.get()->recoveryUnit()->onRollback(
+        shard_role_details::getRecoveryUnit(ctx.get())->onRollback(
             [&](OperationContext*) { aborted->countDownAndWait(); });
     });
 
@@ -1450,6 +1461,69 @@ TEST(WiredTigerRecordStoreTest, SizeInfoAccurateAfterRollbackWithDelete) {
     abortedThread.join();
     ASSERT_EQ(0, rs->numRecords(ctx.get()));
     ASSERT_EQ(0, rs->dataSize(ctx.get()));
+}
+
+// Makes sure that when records are inserted with provided recordIds, the
+// WiredTigerRecordStore correctly keeps track of the largest recordId it
+// has seen in the in-memory variable.
+// TODO (SERVER-88375): Revise / delete this test after the recordId tracking
+// problem has been properly solved.
+TEST(WiredTigerRecordStoreTest, LargestRecordIdSeenIsCorrectWhenGivenRecordIds) {
+    const auto harnessHelper(newRecordStoreHarnessHelper());
+    std::unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
+
+    std::vector<RecordId> reservedRids;
+    RecordId rid;
+
+    ServiceContext::UniqueOperationContext ctx(harnessHelper->newOperationContext());
+    Lock::GlobalLock globalLock(ctx.get(), MODE_IX);
+
+    {
+        // Insert a single record with recordId 7.
+        WriteUnitOfWork uow(ctx.get());
+        rid = rs->insertRecord(ctx.get(), RecordId(7), "a", 2, Timestamp()).getValue();
+        uow.commit();
+    }
+
+    // The next recordId reserved is higher than 7.
+    rs->reserveRecordIds(ctx.get(), &reservedRids, 1);
+    ASSERT_GT(reservedRids[0].getLong(), RecordId(7).getLong());
+    ASSERT_EQ(1, rs->numRecords(ctx.get()));
+
+    // Insert a few records at once, where the recordIds are not in order. And ensure that
+    // we still reserve recordIds from the right point afterwards.
+    std::vector<Record> recordsToInsert;
+    std::vector<Timestamp> timestamps{Timestamp(), Timestamp()};
+    recordsToInsert.push_back(Record{RecordId(14), RecordData()});
+    recordsToInsert.push_back(Record{RecordId(13), RecordData()});
+    {
+        WriteUnitOfWork uow(ctx.get());
+        ASSERT_OK(rs->insertRecords(ctx.get(), &recordsToInsert, timestamps));
+        uow.commit();
+    }
+
+    // The next recordId reserved is higher than 14.
+    reservedRids.clear();
+    rs->reserveRecordIds(ctx.get(), &reservedRids, 1);
+    ASSERT_GT(reservedRids[0].getLong(), RecordId(14).getLong());
+    ASSERT_EQ(3, rs->numRecords(ctx.get()));
+
+    // Insert a few records at once, where the recordIds are in order. And ensure that
+    // we still reserve recordIds from the right point afterwards.
+    recordsToInsert.clear();
+    recordsToInsert.push_back(Record{RecordId(19), RecordData()});
+    recordsToInsert.push_back(Record{RecordId(20), RecordData()});
+    {
+        WriteUnitOfWork uow(ctx.get());
+        ASSERT_OK(rs->insertRecords(ctx.get(), &recordsToInsert, timestamps));
+        uow.commit();
+    }
+
+    // The next recordId reserved is higher than 20.
+    reservedRids.clear();
+    rs->reserveRecordIds(ctx.get(), &reservedRids, 1);
+    ASSERT_GT(reservedRids[0].getLong(), RecordId(20).getLong());
+    ASSERT_EQ(5, rs->numRecords(ctx.get()));
 }
 
 }  // namespace

@@ -60,15 +60,19 @@
  * Now, to the actual process.  First, we checkpoint the database: there are
  * potentially many dirty blocks in the cache, and we want to write them out
  * and then discard previous checkpoints so we have as many blocks as possible
- * on the file's "available for reuse" list when we start compaction.
+ * on the file's "available for reuse" list when we start compaction. Note that
+ * this step is skipped for background compaction to limit the number of
+ * generated checkpoints. As this step comes before checking if compaction is
+ * possible, background compaction could potentially generate an unnecessary
+ * checkpoint every time it processes a file.
  *
  * Then, we compact the high-level object.
  *
- * Compacting the object is done 10% at a time, that is, we try and move blocks
- * from the last 10% of the file into the beginning of the file (the 10% is
- * hard coded in the block manager).  The reason for this is because we are
- * walking the file in logical order, not block offset order, and we can fail
- * to compact a file if we write the wrong blocks first.
+ * Compacting the object is done 20% or 10% at a time, that is, we try and move blocks
+ * from the last 20% or 10% of the file into the beginning of the file. This incremental step is
+ * hard-coded in the block manager.  The reason for this is because we are walking the file in
+ * logical order, not block offset order, and we can fail to compact a file if we write the wrong
+ * blocks first.
  *
  * For example, imagine a file with 10 blocks in the first 10% of a file, 1,000
  * blocks in the 3rd quartile of the file, and 10 blocks in the last 10% of the
@@ -80,7 +84,7 @@
  * on.  Note the block manager uses a first-fit block selection algorithm
  * during compaction to maximize block movement.
  *
- * After each 10% compaction, we checkpoint two more times (seriously, twice).
+ * After each iteration of compaction, we checkpoint two more times (seriously, twice).
  * The second and third checkpoints are because the block manager checkpoints
  * in two steps: blocks made available for reuse during a checkpoint are put on
  * a special checkpoint-available list and only moved to the real available
@@ -96,7 +100,9 @@
  * file, which would prevent any file truncation.  When the metadata is updated
  * for the second checkpoint, the blocks freed by compaction become available
  * for the third checkpoint, so the third checkpoint's blocks are written
- * towards the beginning of the file, and then the file can be truncated.
+ * towards the beginning of the file, and then the file can be truncated. Since
+ * the second checkpoint made the btree clean, mark it as dirty again to ensure
+ * the third checkpoint rewrites blocks too. Otherwise, the btree is skipped.
  */
 
 /*
@@ -260,17 +266,12 @@ __wt_session_compact_check_interrupted(WT_SESSION_IMPL *session)
 
 /*
  * __compact_checkpoint --
- *     This function does wait and force checkpoint.
+ *     This function waits and triggers a checkpoint.
  */
 static int
 __compact_checkpoint(WT_SESSION_IMPL *session)
 {
-    /*
-     * Force compaction checkpoints: we don't want to skip it because the work we need to have done
-     * is done in the underlying block manager.
-     */
-    const char *checkpoint_cfg[] = {
-      WT_CONFIG_BASE(session, WT_SESSION_checkpoint), "force=1", NULL};
+    const char *checkpoint_cfg[] = {WT_CONFIG_BASE(session, WT_SESSION_checkpoint), NULL, NULL};
 
     /* Checkpoints may take a lot of time, check if compaction has been interrupted. */
     WT_RET(__wt_session_compact_check_interrupted(session));
@@ -288,7 +289,9 @@ __compact_worker(WT_SESSION_IMPL *session)
 {
     WT_DECL_RET;
     u_int i, loop;
-    bool another_pass;
+    bool another_pass, background_compaction;
+
+    background_compaction = session == S2C(session)->background_compact.session;
 
     /*
      * Reset the handles' compaction skip flag (we don't bother setting or resetting it when we
@@ -298,9 +301,11 @@ __compact_worker(WT_SESSION_IMPL *session)
         session->op_handle[i]->compact_skip = false;
 
     /*
-     * Perform an initial checkpoint (see this file's leading comment for details).
+     * Perform an initial checkpoint unless this is background compaction. See this file's leading
+     * comment for details.
      */
-    WT_ERR(__compact_checkpoint(session));
+    if (!background_compaction)
+        WT_ERR(__compact_checkpoint(session));
 
     /*
      * We compact 10% of a file on each pass (but the overall size of the file is decreasing each
@@ -308,19 +313,20 @@ __compact_worker(WT_SESSION_IMPL *session)
      * clearly more than we need); quit if we make no progress.
      */
     for (loop = 0; loop < 100; ++loop) {
+        WT_STAT_CONN_SET(session, session_table_compact_passes, loop);
+
         /* Step through the list of files being compacted. */
         for (another_pass = false, i = 0; i < session->op_handle_next; ++i) {
             /* Skip objects where there's no more work. */
             if (session->op_handle[i]->compact_skip)
                 continue;
 
-            __wt_timing_stress(session, WT_TIMING_STRESS_COMPACT_SLOW);
+            __wt_timing_stress(session, WT_TIMING_STRESS_COMPACT_SLOW, NULL);
             __wt_verbose_debug2(
               session, WT_VERB_COMPACT, "%s: compact pass %u", session->op_handle[i]->name, loop);
 
             session->compact_state = WT_COMPACT_RUNNING;
             WT_WITH_DHANDLE(session, session->op_handle[i], ret = __wt_compact(session));
-            WT_ERR_ERROR_OK(ret, EBUSY, true);
             /*
              * If successful and we did work, schedule another pass. If successful and we did no
              * work, skip this file in the future.
@@ -341,31 +347,52 @@ __compact_worker(WT_SESSION_IMPL *session)
              *
              * Just quit if eviction is the problem.
              */
-            if (ret == EBUSY) {
+            else if (ret == EBUSY) {
                 if (__wt_cache_stuck(session)) {
                     WT_STAT_CONN_INCR(session, session_table_compact_fail_cache_pressure);
-                    WT_ERR_MSG(session, EBUSY, "compaction halted by eviction pressure");
+                    WT_ERR_MSG(session, EBUSY,
+                      "Compaction halted at data handle %s by eviction pressure. Returning EBUSY.",
+                      session->op_handle[i]->name);
                 }
-                ret = 0;
-                another_pass = true;
 
-                __wt_verbose_info(session, WT_VERB_COMPACT, "%s",
-                  "Data handle compaction failed with EBUSY but the cache is not stuck. "
-                  "Will give it another go.");
+                WT_STAT_CONN_INCR(session, session_table_compact_conflicting_checkpoint);
+
+                __wt_verbose_info(session, WT_VERB_COMPACT,
+                  "The compaction of the data handle %s returned EBUSY due to an in-progress "
+                  "conflicting checkpoint.%s",
+                  session->op_handle[i]->name,
+                  background_compaction ? "" : " Compaction of this data handle will be retried.");
+
+                ret = 0;
+
+                /* Don't retry in the case of background compaction, move on. */
+                if (!background_compaction)
+                    another_pass = true;
+
             }
+
+            /* Compaction was interrupted internally. */
+            else if (ret == ECANCELED)
+                ret = 0;
+            WT_ERR(ret);
         }
+
         if (!another_pass)
             break;
 
         /*
-         * Perform two checkpoints (see this file's leading comment for details).
+         * Perform two checkpoints. Mark the trees impacted by compaction to ensure the last
+         * checkpoint processes them (see this file's leading comment for details).
          */
         WT_ERR(__compact_checkpoint(session));
+        for (i = 0; i < session->op_handle_next; ++i)
+            WT_WITH_DHANDLE(session, session->op_handle[i], __wt_tree_modify_set(session));
         WT_ERR(__compact_checkpoint(session));
     }
 
 err:
     session->compact_state = WT_COMPACT_NONE;
+    WT_STAT_CONN_SET(session, session_table_compact_passes, 0);
 
     return (ret);
 }
@@ -404,7 +431,7 @@ __wt_session_compact(WT_SESSION *wt_session, const char *uri, const char *config
     ignore_cache_size_set = false;
 
     session = (WT_SESSION_IMPL *)wt_session;
-    SESSION_API_CALL(session, compact, config, cfg);
+    SESSION_API_CALL(session, ret, compact, config, cfg);
 
     /* Trigger the background server. */
     if ((ret = __wt_config_getones(session, config, "background", &cval) == 0)) {
@@ -426,6 +453,11 @@ __wt_session_compact(WT_SESSION *wt_session, const char *uri, const char *config
             if (ret == 0)
                 WT_ERR_MSG(session, EINVAL,
                   "exclude configuration cannot be set when disabling the background compaction "
+                  "server.");
+            WT_ERR_NOTFOUND_OK(__wt_config_getones(session, config, "run_once", &cval), true);
+            if (ret == 0)
+                WT_ERR_MSG(session, EINVAL,
+                  "run_once configuration cannot be set when disabling the background compaction "
                   "server.");
             WT_ERR_NOTFOUND_OK(__wt_config_getones(session, config, "timeout", &cval), true);
             if (ret == 0)
@@ -498,6 +530,11 @@ __wt_session_compact(WT_SESSION *wt_session, const char *uri, const char *config
     WT_ERR(__wt_config_gets(session, cfg, "timeout", &cval));
     session->compact->max_time = (uint64_t)cval.val;
     __wt_epoch(session, &session->compact->begin);
+    session->compact->last_progress = session->compact->begin;
+
+    /* Configure dry run mode to only run estimation phase. */
+    WT_ERR(__wt_config_gets(session, cfg, "dryrun", &cval));
+    session->compact->dryrun = (bool)cval.val;
 
     /*
      * Find the types of data sources being compacted. This could involve opening indexes for a

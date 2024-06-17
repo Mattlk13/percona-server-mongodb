@@ -58,7 +58,6 @@
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/feature_flag.h"
@@ -131,6 +130,7 @@
 #include "mongo/util/namespace_string_util.h"
 #include "mongo/util/out_of_line_executor.h"
 #include "mongo/util/producer_consumer_queue.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
 
@@ -163,10 +163,11 @@ BSONObj makeLocalReadConcernWithAfterClusterTime(Timestamp afterClusterTime) {
 void checkOutSessionAndVerifyTxnState(OperationContext* opCtx) {
     auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
     mongoDSessionCatalog->checkOutUnscopedSession(opCtx);
-    TransactionParticipant::get(opCtx).beginOrContinue(opCtx,
-                                                       {*opCtx->getTxnNumber()},
-                                                       boost::none /* autocommit */,
-                                                       boost::none /* startTransaction */);
+    TransactionParticipant::get(opCtx).beginOrContinue(
+        opCtx,
+        {*opCtx->getTxnNumber()},
+        boost::none /* autocommit */,
+        TransactionParticipant::TransactionActions::kNone);
 }
 
 template <typename Callable>
@@ -659,7 +660,7 @@ repl::OpTime MigrationDestinationManager::fetchAndApplyBatch(
                 }
             }
         } catch (...) {
-            stdx::lock_guard<Client> lk(*opCtx->getClient());
+            ClientLock lk(opCtx->getClient());
             opCtx->getServiceContext()->killOperation(lk, opCtx, ErrorCodes::Error(51008));
             LOGV2(21999, "Batch application failed", "error"_attr = redact(exceptionToStatus()));
         }
@@ -723,8 +724,8 @@ void MigrationDestinationManager::abortWithoutSessionIdCheck() {
 Status MigrationDestinationManager::startCommit(const MigrationSessionId& sessionId) {
     stdx::unique_lock<Latch> lock(_mutex);
 
-    const auto convergenceTimeout =
-        Shard::kDefaultConfigCommandTimeout + Shard::kDefaultConfigCommandTimeout / 4;
+    const auto convergenceTimeout = Milliseconds(defaultConfigCommandTimeoutMS.load()) +
+        Milliseconds(defaultConfigCommandTimeoutMS.load()) / 4;
 
     // The donor may have started the commit while the recipient is still busy processing
     // the last batch of mods sent in the catch up phase. Allow some time for synching up.
@@ -848,7 +849,7 @@ Status MigrationDestinationManager::exitCriticalSection(OperationContext* opCtx,
 
 MigrationDestinationManager::IndexesAndIdIndex MigrationDestinationManager::getCollectionIndexes(
     OperationContext* opCtx,
-    const NamespaceStringOrUUID& nssOrUUID,
+    const NamespaceString& nss,
     const ShardId& fromShardId,
     const boost::optional<CollectionRoutingInfo>& cri,
     boost::optional<Timestamp> afterClusterTime) {
@@ -861,10 +862,9 @@ MigrationDestinationManager::IndexesAndIdIndex MigrationDestinationManager::getC
     // Get the collection indexes and options from the donor shard.
 
     // Do not hold any locks while issuing remote calls.
-    invariant(!opCtx->lockState()->isLocked());
+    invariant(!shard_role_details::getLocker(opCtx)->isLocked());
 
-    auto cmd = nssOrUUID.isNamespaceString() ? BSON("listIndexes" << nssOrUUID.nss().coll())
-                                             : BSON("listIndexes" << nssOrUUID.uuid());
+    auto cmd = BSON("listIndexes" << nss.coll());
     if (cri) {
         cmd = appendShardVersion(cmd, cri->getShardVersion(fromShardId));
     }
@@ -876,7 +876,7 @@ MigrationDestinationManager::IndexesAndIdIndex MigrationDestinationManager::getC
     auto indexes = uassertStatusOK(
         fromShard->runExhaustiveCursorCommand(opCtx,
                                               ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                                              nssOrUUID.dbName(),
+                                              nss.dbName(),
                                               cmd,
                                               Milliseconds(-1)));
     for (auto&& spec : indexes.docs) {
@@ -896,11 +896,22 @@ MigrationDestinationManager::IndexesAndIdIndex MigrationDestinationManager::getC
     return {donorIndexSpecs, donorIdIndexSpec};
 }
 
+
+MigrationDestinationManager::CollectionOptionsAndUUID
+MigrationDestinationManager::getCollectionOptions(OperationContext* opCtx,
+                                                  const NamespaceStringOrUUID& nssOrUUID,
+                                                  boost::optional<Timestamp> afterClusterTime) {
+    const auto dbInfo =
+        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, nssOrUUID.dbName()));
+    return getCollectionOptions(
+        opCtx, nssOrUUID, dbInfo->getPrimary(), dbInfo->getVersion(), afterClusterTime);
+}
+
 MigrationDestinationManager::CollectionOptionsAndUUID
 MigrationDestinationManager::getCollectionOptions(OperationContext* opCtx,
                                                   const NamespaceStringOrUUID& nssOrUUID,
                                                   const ShardId& fromShardId,
-                                                  const boost::optional<ChunkManager>& cm,
+                                                  const boost::optional<DatabaseVersion>& dbVersion,
                                                   boost::optional<Timestamp> afterClusterTime) {
     auto fromShard =
         uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, fromShardId));
@@ -910,9 +921,11 @@ MigrationDestinationManager::getCollectionOptions(OperationContext* opCtx,
     auto cmd = nssOrUUID.isNamespaceString()
         ? BSON("listCollections" << 1 << "filter" << BSON("name" << nssOrUUID.nss().coll()))
         : BSON("listCollections" << 1 << "filter" << BSON("info.uuid" << nssOrUUID.uuid()));
-    if (cm) {
-        cmd = appendDbVersionIfPresent(cmd, cm->dbVersion());
+
+    if (dbVersion) {
+        cmd = appendDbVersionIfPresent(cmd, *dbVersion);
     }
+
     if (afterClusterTime) {
         cmd = cmd.addFields(makeLocalReadConcernWithAfterClusterTime(*afterClusterTime));
     }
@@ -1168,7 +1181,7 @@ void MigrationDestinationManager::_migrateThread(CancellationToken cancellationT
             CancelableOperationContext(client->makeOperationContext(), cancellationToken, executor);
         auto opCtx = uniqueOpCtx.get();
 
-        if (AuthorizationManager::get(opCtx->getServiceContext())->isAuthEnabled()) {
+        if (AuthorizationManager::get(opCtx->getService())->isAuthEnabled()) {
             AuthorizationSession::get(opCtx->getClient())->grantInternalAuthorization(opCtx);
         }
 
@@ -1202,7 +1215,7 @@ void MigrationDestinationManager::_migrateThread(CancellationToken cancellationT
             txnParticipant.beginOrContinue(opCtx,
                                            {*opCtx->getTxnNumber()},
                                            boost::none /* autocommit */,
-                                           boost::none /* startTransaction */);
+                                           TransactionParticipant::TransactionActions::kNone);
             _migrateDriver(opCtx, skipToCritSecTaken || recovering);
         } catch (...) {
             _setStateFail(str::stream() << "migrate failed: " << redact(exceptionToStatus()));
@@ -1245,12 +1258,19 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
     invariant(!_min.isEmpty());
     invariant(!_max.isEmpty());
 
-    boost::optional<MoveTimingHelper> timing;
     boost::optional<Timer> timeInCriticalSection;
+    boost::optional<MoveTimingHelper> timing;
+    mongo::ScopeGuard timingSetMsgGuard{[this, &timing] {
+        // Set the error message to MoveTimingHelper just before it is destroyed. The destructor
+        // sends that message (among other things) to the ShardingLogging.
+        if (timing) {
+            stdx::lock_guard<Latch> sl(_mutex);
+            timing->setCmdErrMsg(_errmsg);
+        }
+    }};
 
     if (!skipToCritSecTaken) {
-        timing.emplace(
-            outerOpCtx, "to", _nss, _min, _max, 8 /* steps */, &_errmsg, _toShard, _fromShard);
+        timing.emplace(outerOpCtx, "to", _nss, _min, _max, 8 /* steps */, _toShard, _fromShard);
 
         LOGV2(22000,
               "Starting receiving end of chunk migration",
@@ -1369,7 +1389,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
 
             // Get the global indexes and install them.
             if (feature_flags::gGlobalIndexesShardingCatalog.isEnabled(
-                    serverGlobalParams.featureCompatibility)) {
+                    serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
                 replaceShardingIndexCatalogInShardIfNeeded(
                     altOpCtx.get(), _nss, donorCollectionOptionsAndIndexes.uuid);
             }

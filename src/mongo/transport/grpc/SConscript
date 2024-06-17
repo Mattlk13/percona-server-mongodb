@@ -10,7 +10,7 @@ env.Library(
     source=[
         'client.cpp',
         'client_cache.cpp',
-        'grpc_parameters.idl',
+        'grpc_feature_flag.idl',
         'grpc_session_manager.cpp',
         'grpc_transport_layer_impl.cpp',
         'server.cpp',
@@ -19,6 +19,8 @@ env.Library(
         'wire_version_provider.cpp',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/client/connection_string',
+        '$BUILD_DIR/mongo/db/commands/server_status_core',
         '$BUILD_DIR/mongo/db/server_base',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/wire_version',
@@ -32,6 +34,18 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/third_party/shim_grpc',
+    ],
+)
+
+env.Library(
+    target='grpc_transport_server_options',
+    source=[
+        'grpc_parameters.idl',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/server_base',
+        '$BUILD_DIR/mongo/util/options_parser/options_parser',
     ],
 )
 
@@ -72,6 +86,7 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/service_context_test_fixture',
         '$BUILD_DIR/mongo/db/wire_version',
         '$BUILD_DIR/mongo/rpc/message',
+        '$BUILD_DIR/mongo/transport/service_executor',
         '$BUILD_DIR/mongo/util/clock_source_mock',
         '$BUILD_DIR/mongo/util/periodic_runner_factory',
         '$BUILD_DIR/third_party/shim_grpc',

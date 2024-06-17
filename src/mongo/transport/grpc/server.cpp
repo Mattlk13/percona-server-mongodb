@@ -37,7 +37,7 @@
 
 #include <src/core/lib/security/credentials/ssl/ssl_credentials.h>
 #include <src/core/lib/security/security_connector/ssl_utils.h>
-#include <src/core/tsi/ssl_transport_security.cc>
+#include <src/core/tsi/ssl_transport_security.h>
 #include <src/cpp/server/secure_server_credentials.h>
 
 #include "mongo/base/error_codes.h"
@@ -62,7 +62,7 @@ Server::~Server() {
 
 namespace {
 StatusWith<Server::Certificates> _readCertificatesFromDisk(boost::optional<StringData> tlsCAFile,
-                                                           StringData tlsPEMKeyFile) {
+                                                           StringData tlsCertificateKeyFile) {
     Server::Certificates certs;
     if (tlsCAFile) {
         StatusWith<std::string> swCAFileContents = ssl_util::readPEMFile(tlsCAFile.get());
@@ -77,7 +77,7 @@ StatusWith<Server::Certificates> _readCertificatesFromDisk(boost::optional<Strin
     }
 
     try {
-        certs.keyCertPair = util::parsePEMKeyFile(tlsPEMKeyFile);
+        certs.keyCertPair = util::parsePEMKeyFile(tlsCertificateKeyFile);
     } catch (const DBException& e) {
         return e.toStatus();
     }
@@ -166,8 +166,8 @@ std::shared_ptr<::grpc::ServerCredentials> Server::_makeServerCredentialsWithFet
     auto certState = std::make_unique<CertificateState>();
 
     // Load the initial certificates into the certificate state cache.
-    auto newCertificates =
-        uassertStatusOK(_readCertificatesFromDisk(*_options.tlsCAFile, _options.tlsPEMKeyFile));
+    auto newCertificates = uassertStatusOK(
+        _readCertificatesFromDisk(*_options.tlsCAFile, _options.tlsCertificateKeyFile));
     certState->cache = newCertificates;
 
     grpc_ssl_server_credentials_options* opts =
@@ -184,7 +184,8 @@ std::shared_ptr<::grpc::ServerCredentials> Server::_makeServerCredentialsWithFet
 }
 
 Status Server::rotateCertificates() {
-    auto swNewCertificates = _readCertificatesFromDisk(*_options.tlsCAFile, _options.tlsPEMKeyFile);
+    auto swNewCertificates =
+        _readCertificatesFromDisk(*_options.tlsCAFile, _options.tlsCertificateKeyFile);
     if (!swNewCertificates.isOK()) {
         return swNewCertificates.getStatus();
     }
@@ -212,9 +213,15 @@ void Server::start() {
 
     ::grpc::ServerBuilder builder;
 
-    for (auto& address : _options.addresses) {
-        auto credentials = _makeServerCredentialsWithFetcher();
-        builder.AddListeningPort(util::formatHostAndPortForGRPC(address), credentials);
+    std::vector<int> boundPorts(_options.addresses.size());
+    for (size_t i = 0; i < _options.addresses.size(); i++) {
+        auto grpcAddr = util::toGRPCFormattedURI(_options.addresses[i]);
+
+        if (util::isUnixSchemeGRPCFormattedURI(grpcAddr)) {
+            builder.AddListeningPort(grpcAddr, ::grpc::InsecureServerCredentials());
+        } else {
+            builder.AddListeningPort(grpcAddr, _makeServerCredentialsWithFetcher(), &boundPorts[i]);
+        }
     }
     for (auto& service : _services) {
         builder.RegisterService(service.get());
@@ -236,6 +243,14 @@ void Server::start() {
                             "services"_attr = _services);
     }
 
+    for (size_t i = 0; i < boundPorts.size(); i++) {
+        auto& hostAndPort = _options.addresses[i];
+        if (isUnixDomainSocket(hostAndPort.host())) {
+            continue;
+        }
+        hostAndPort = HostAndPort(hostAndPort.host(), boundPorts[i]);
+    }
+
     LOGV2_INFO(7401305,
                "Started gRPC server",
                "addresses"_attr = _options.addresses,
@@ -245,6 +260,11 @@ void Server::start() {
 bool Server::isRunning() const {
     stdx::lock_guard lk(_mutex);
     return _server && !_shutdown;
+}
+
+const std::vector<HostAndPort>& Server::getListeningAddresses() const {
+    invariant(_server);
+    return _options.addresses;
 }
 
 void Server::shutdown() {
@@ -264,6 +284,14 @@ void Server::shutdown() {
     _server->Shutdown();
     LOGV2_DEBUG(7401307, 1, "gRPC server shutdown complete");
     _services.clear();
+}
+
+void Server::stopAcceptingRequests() {
+    stdx::lock_guard lk(_mutex);
+
+    for (auto& service : _services) {
+        service->stopAcceptingRequests();
+    }
 }
 
 }  // namespace mongo::transport::grpc

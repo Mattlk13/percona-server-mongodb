@@ -46,7 +46,6 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/basic_types.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/cursor_id.h"
 #include "mongo/db/generic_cursor_gen.h"
@@ -57,7 +56,7 @@
 #include "mongo/db/query/find_command.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/query_request_helper.h"
-#include "mongo/db/query/query_stats/key_generator.h"
+#include "mongo/db/query/query_stats/key.h"
 #include "mongo/db/query/tailable_mode_gen.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/repl/optime.h"
@@ -391,7 +390,7 @@ private:
      * Cursors must be unpinned and deregistered from the CursorManager before they can be
      * destroyed.
      */
-    ~ClientCursor();
+    ~ClientCursor() override;
 
     /**
      * Disposes this ClientCursor's PlanExecutor. Must be called before deleting a ClientCursor to
@@ -644,5 +643,7 @@ void startClientCursorMonitor();
  * getMore requests), so these should only be called from those request paths.
  */
 void collectQueryStatsMongod(OperationContext* opCtx, ClientCursorPin& cursor);
-void collectQueryStatsMongod(OperationContext* opCtx, std::unique_ptr<query_stats::Key> key);
+void collectQueryStatsMongod(OperationContext* opCtx,
+                             const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                             std::unique_ptr<query_stats::Key> key);
 }  // namespace mongo

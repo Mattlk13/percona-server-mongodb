@@ -30,6 +30,9 @@
 #include "mongo/tools/workload_simulation/throughput_probing/ticketed_workload_driver.h"
 
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/admission/execution_admission_context.h"
+#include "mongo/db/client.h"
+#include "mongo/db/operation_context.h"
 
 namespace mongo::workload_simulation {
 
@@ -154,11 +157,10 @@ BSONObj TicketedWorkloadDriver::metrics() const {
 void TicketedWorkloadDriver::_read(int32_t i) {
     auto client = _svcCtx->getService()->makeClient("reader_" + std::to_string(i));
     auto opCtx = client->makeOperationContext();
-    AdmissionContext admCtx;
-    admCtx.setPriority(AdmissionContext::Priority::kNormal);
 
     while (_readRunning.load() >= i) {
-        Ticket ticket = _readTicketHolder->waitForTicket(opCtx.get(), &admCtx);
+        auto& admCtx = ExecutionAdmissionContext::get(opCtx.get());
+        Ticket ticket = _readTicketHolder->waitForTicket(*opCtx, &admCtx);
         _doRead(opCtx.get(), &admCtx);
     }
 }
@@ -166,11 +168,10 @@ void TicketedWorkloadDriver::_read(int32_t i) {
 void TicketedWorkloadDriver::_write(int32_t i) {
     auto client = _svcCtx->getService()->makeClient("writer_" + std::to_string(i));
     auto opCtx = client->makeOperationContext();
-    AdmissionContext admCtx;
-    admCtx.setPriority(AdmissionContext::Priority::kNormal);
 
     while (_writeRunning.load() >= i) {
-        Ticket ticket = _writeTicketHolder->waitForTicket(opCtx.get(), &admCtx);
+        auto& admCtx = ExecutionAdmissionContext::get(opCtx.get());
+        Ticket ticket = _writeTicketHolder->waitForTicket(*opCtx, &admCtx);
         _doWrite(opCtx.get(), &admCtx);
     }
 }

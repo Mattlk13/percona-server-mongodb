@@ -235,6 +235,8 @@ public:
      */
     bool isElectableNodeInSingleNodeReplicaSet() const;
 
+    // Returns _electionIdTerm.
+    long long getElectionIdTerm() const;
 
     ////////////////////////////////////////////////////////////
     //
@@ -322,10 +324,10 @@ public:
     void setFollowerMode(MemberState::MS newMode);
 
     /**
-     * Scan the memberData and determine the highest last applied or last
+     * Scan the memberData and determine the highest last written or last
      * durable optime present on a majority of servers; set _lastCommittedOpTime to this
      * new entry.
-     * Whether the last applied or last durable op time is used depends on whether
+     * Whether the last written or last durable op time is used depends on whether
      * the config getWriteConcernMajorityShouldJournal is set.
      * Returns true if the _lastCommittedOpTime was changed.
      */
@@ -334,9 +336,9 @@ public:
     /**
      * Updates _lastCommittedOpTime to be 'committedOpTime' if it is more recent than the current
      * last committed OpTime.  Returns true if _lastCommittedOpTime is changed. We ignore
-     * 'committedOpTime' if it has a different term than our lastApplied, unless
+     * 'committedOpTime' if it has a different term than our lastWritten, unless
      * 'fromSyncSource'=true, which guarantees we are on the same branch of history as
-     * 'committedOpTime', so we update our commit point to min(committedOpTime, lastApplied).
+     * 'committedOpTime', so we update our commit point to min(committedOpTime, lastWritten).
      * The 'forInitiate' flag is to force-advance our committedOpTime during the execution of
      * the replSetInitiate command.
      */
@@ -427,7 +429,7 @@ public:
     // replset.  Drivers interpret the hello fields according to the Server Discovery and
     // Monitoring Spec, see the "Parsing an isMaster response" section.
     void fillHelloForReplSet(std::shared_ptr<HelloResponse> response,
-                             const StringData& horizonString) const;
+                             StringData horizonString) const;
 
     // Produce member data for the serverStatus command and diagnostic logging.
     void fillMemberData(BSONObjBuilder* result);
@@ -504,14 +506,14 @@ public:
 
     /**
      *  Returns whether or not at least 'numNodes' have reached the given opTime with the same term.
-     * "durablyWritten" indicates whether the operation has to be durably applied.
+     * "durablyWritten" indicates whether the operation has to be durably written.
      */
     bool haveNumNodesReachedOpTime(const OpTime& opTime, int numNodes, bool durablyWritten);
 
     /**
      * Returns whether or not at least one node matching the tagPattern has reached the given opTime
      * with the same term.
-     * "durablyWritten" indicates whether the operation has to be durably applied.
+     * "durablyWritten" indicates whether the operation has to be durably written.
      */
     bool haveTaggedNodesReachedOpTime(const OpTime& opTime,
                                       const ReplSetTagPattern& tagPattern,
@@ -569,6 +571,23 @@ public:
      */
     void resetMemberTimeouts(Date_t now, const stdx::unordered_set<HostAndPort>& member_set);
 
+
+    /*
+     * Returns the last optime that this node has written oplog entry into memory.
+     */
+    OpTime getMyLastWrittenOpTime() const;
+    OpTimeAndWallTime getMyLastWrittenOpTimeAndWallTime() const;
+
+    /*
+     * Sets the last optime that this node has written oplog entry into memory. Fails with an
+     * invariant if 'isRollbackAllowed' is false and we're attempting to set the optime backwards.
+     * The Date_t 'now' is used to track liveness; setting a node's written optime updates its
+     * liveness information.
+     */
+    void setMyLastWrittenOpTimeAndWallTime(OpTimeAndWallTime opTimeAndWallTime,
+                                           Date_t now,
+                                           bool isRollbackAllowed);
+
     /*
      * Returns the last optime that this node has applied, whether or not it has been journaled.
      */
@@ -586,13 +605,13 @@ public:
                                            bool isRollbackAllowed);
 
     /*
-     * Returns the last optime that this node has applied and journaled.
+     * Returns the last optime that this node has written and journaled.
      */
     OpTime getMyLastDurableOpTime() const;
     OpTimeAndWallTime getMyLastDurableOpTimeAndWallTime() const;
 
     /*
-     * Sets the last optime that this node has applied and journaled. Fails with an invariant if
+     * Sets the last optime that this node has written and journaled. Fails with an invariant if
      * 'isRollbackAllowed' is false and we're attempting to set the optime backwards. The Date_t
      * 'now' is used to track liveness; setting a node's durable optime updates its liveness
      * information.
@@ -606,7 +625,8 @@ public:
      * replSetUpdatePosition command.
      *
      * Returns a Status if the position could not be set, false if the last optimes for the node
-     * did not change, or true if either the last applied or last durable optime did change.
+     * did not change, or true if either the last written, last applied or last durable optime did
+     * change.
      */
     StatusWith<bool> setLastOptimeForMember(const UpdatePositionArgs::UpdateInfo& args, Date_t now);
 
@@ -632,11 +652,6 @@ public:
     void voteForMyselfV1();
 
     /**
-     * Sets election id and election optime.
-     */
-    void setElectionInfo(OID electionId, Timestamp electionOpTime);
-
-    /**
      * Performs state updates associated with winning an election.
      *
      * It is an error to call this if the topology coordinator is not in candidate mode.
@@ -644,7 +659,7 @@ public:
      * Exactly one of either processWinElection or processLoseElection must be called if
      * processHeartbeatResponse returns StartElection, to exit candidate mode.
      */
-    void processWinElection(OID electionId, Timestamp electionOpTime);
+    void processWinElection(Timestamp electionOpTime);
 
     /**
      * Performs state updates associated with losing an election.
@@ -678,7 +693,7 @@ public:
      *      C1. 'force' is true and now > waitUntil
      *
      *      C2. A majority set of nodes, M, in the replica set have optimes greater than or
-     *      equal to the last applied optime of the primary.
+     *      equal to the last written optime of the primary.
      *
      *      C3. There exists at least one electable secondary node in the majority set M.
      *
@@ -796,8 +811,11 @@ public:
      */
     void incrementTopologyVersion();
 
-    // Scans through all members that are 'up' and returns the latest known optime.
-    OpTime latestKnownOpTime() const;
+    // Scans through all members that are 'up' and returns the latest known written optime.
+    OpTime latestKnownWrittenOpTime() const;
+
+    // Scans through all members that are 'up' and returns the latest known applied optime.
+    OpTime latestKnownAppliedOpTime() const;
 
     /**
      * Scans through all members that are 'up' and return the latest known optime, if we have
@@ -867,9 +885,6 @@ public:
 
     // Returns _electionTime.  Only used in unittests.
     Timestamp getElectionTime() const;
-
-    // Returns _electionId.  Only used in unittests.
-    OID getElectionId() const;
 
     // Returns the name for a role.  Only used in unittests.
     static std::string roleToString(TopologyCoordinator::Role role);
@@ -1114,15 +1129,19 @@ private:
     // Returns a string representation of the current replica set status for logging purposes.
     std::string _getReplSetStatusString();
 
+    // Returns the member's corresponding opTime for recency check
+    OpTime _getMemberOpTimeForRecencyCheck(const MemberData& memberData, bool durablyWritten);
+
     // This node's role in the replication protocol.
     Role _role;
 
     // This node's topology version. This is updated upon a significant topology change.
     TopologyVersion _topologyVersion;
 
-    // This is a unique id that is generated and set each time we transition to PRIMARY, as the
-    // result of an election.
-    OID _electionId;
+    // The term in which this node was elected primary.  Used to generate the election ID
+    // for 'hello' responses.
+    long long _electionIdTerm = repl::OpTime::kUninitializedTerm;
+
     // The time at which the current PRIMARY was elected.
     Timestamp _electionTime;
 
@@ -1159,8 +1178,8 @@ private:
 
     ReplSetConfig _rsConfig;  // The current config, including a vector of MemberConfigs
 
-    // Heartbeat, current applied/durable optime, and other state data for each member.  It is
-    // guaranteed that this vector will be maintained in the same order as the MemberConfigs in
+    // Heartbeat, current written/applied/durable optime, and other state data for each member.  It
+    // is guaranteed that this vector will be maintained in the same order as the MemberConfigs in
     // _currentConfig, therefore the member config index can be used to index into this vector as
     // well.
     std::vector<MemberData> _memberData;

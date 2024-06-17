@@ -65,7 +65,7 @@ TypeSignature TypeChecker::typeCheck(optimizer::ABT& node) {
     return node.visit(*this, false);
 }
 
-TypeSignature TypeChecker::getInferredType(optimizer::ProjectionName variable) {
+boost::optional<TypeSignature> TypeChecker::getInferredType(optimizer::ProjectionName variable) {
     // Walk the list of active bindings until the variable is found.
     for (auto it = _bindings.rbegin(); it != _bindings.rend(); it++) {
         auto findIt = it->find(variable);
@@ -73,15 +73,15 @@ TypeSignature TypeChecker::getInferredType(optimizer::ProjectionName variable) {
             return findIt->second;
         }
     }
-    // No explicit type defined, return the wildcard type.
-    return TypeSignature::kAnyScalarType;
+    // No explicit type defined.
+    return boost::none;
 }
 
 void TypeChecker::bind(optimizer::ProjectionName variable, TypeSignature type) {
     // Verify that the new type for the variable is compatible with the information deducted until
     // now.
-    TypeSignature curType = getInferredType(variable);
-    uassert(6950900, "Type checking error", type.isSubset(curType));
+    auto curType = getInferredType(variable);
+    uassert(6950900, "Type checking error", !curType || type.isSubset(*curType));
     // Store the association in the current binding level.
     _bindings.back()[variable] = type;
 }
@@ -109,15 +109,22 @@ TypeSignature TypeChecker::operator()(optimizer::ABT& n,
                                       optimizer::Variable& var,
                                       bool saveInference) {
     // Retrieve the current type of the variable.
-    return getInferredType(var.name());
+    return getInferredType(var.name()).value_or(TypeSignature::kAnyScalarType);
+}
+
+TypeSignature TypeChecker::operator()(optimizer::ABT& n,
+                                      optimizer::LambdaAbstraction& lambda,
+                                      bool saveInference) {
+    // The Lambda node returns the value of its 'body' child.
+    return lambda.getBody().visit(*this, false);
 }
 
 TypeSignature TypeChecker::operator()(optimizer::ABT& n, optimizer::Let& let, bool saveInference) {
     // Define the new variable with the type of the 'bind' expression type.
-    bind(let.varName(), const_cast<optimizer::ABT&>(let.bind()).visit(*this, false));
+    bind(let.varName(), let.bind().visit(*this, false));
 
     // The Let node returns the value of its 'in' child.
-    TypeSignature resultType = const_cast<optimizer::ABT&>(let.in()).visit(*this, false);
+    TypeSignature resultType = let.in().visit(*this, false);
 
     // The current binding must be the one where we defined the variable.
     invariant(_bindings.back().contains(let.varName()));
@@ -129,7 +136,7 @@ TypeSignature TypeChecker::operator()(optimizer::ABT& n, optimizer::Let& let, bo
 TypeSignature TypeChecker::operator()(optimizer::ABT& n,
                                       optimizer::UnaryOp& op,
                                       bool saveInference) {
-    TypeSignature childType = const_cast<optimizer::ABT&>(op.getChild()).visit(*this, false);
+    TypeSignature childType = op.getChild().visit(*this, false);
     switch (op.op()) {
         case optimizer::Operations::Not: {
             // The signature of Not is boolean plus Nothing if the operand can be Nothing.
@@ -147,13 +154,13 @@ TypeSignature TypeChecker::operator()(optimizer::ABT& n,
 // e.g. And(And(a,b), And(c,d)) will invoke the callback on a,b,c,d.
 template <typename Callback>
 void walkTreeInOrder(optimizer::BinaryOp* node, Callback callback) {
-    auto& left = const_cast<optimizer::ABT&>(node->getLeftChild());
+    auto& left = node->getLeftChild();
     if (auto ptr = left.cast<optimizer::BinaryOp>(); ptr && ptr->op() == node->op()) {
         walkTreeInOrder(ptr, callback);
     } else {
         callback(left);
     }
-    auto& right = const_cast<optimizer::ABT&>(node->getRightChild());
+    auto& right = node->getRightChild();
     if (auto ptr = right.cast<optimizer::BinaryOp>(); ptr && ptr->op() == node->op()) {
         walkTreeInOrder(ptr, callback);
     } else {
@@ -210,16 +217,16 @@ TypeSignature TypeChecker::operator()(optimizer::ABT& n,
                             : TypeSignature::kBooleanType;
     }
 
-    TypeSignature lhs = const_cast<optimizer::ABT&>(op.getLeftChild()).visit(*this, false);
-    TypeSignature rhs = const_cast<optimizer::ABT&>(op.getRightChild()).visit(*this, false);
+    TypeSignature lhs = op.getLeftChild().visit(*this, false);
+    TypeSignature rhs = op.getRightChild().visit(*this, false);
     switch (op.op()) {
         case optimizer::Operations::FillEmpty: {
-            // If the argument is already guaranteed not to be a Nothing, the fillEmpty can be
-            // removed.
-            if (!TypeSignature::kNothingType.isSubset(lhs)) {
-                swapAndUpdate(n,
-                              std::exchange(const_cast<optimizer::ABT&>(op.getLeftChild()),
-                                            optimizer::make<optimizer::Blackhole>()));
+            // If the argument is already guaranteed not to be a Nothing, or the replacement value
+            // is a Nothing itself, the fillEmpty can be removed.
+            if (!TypeSignature::kNothingType.isSubset(lhs) ||
+                rhs.isSubset(TypeSignature::kNothingType)) {
+                swapAndUpdate(
+                    n, std::exchange(op.getLeftChild(), optimizer::make<optimizer::Blackhole>()));
                 return lhs;
             }
             // The signature of FillEmtpy is the signature of the first argument, minus Nothing,
@@ -245,43 +252,42 @@ TypeSignature TypeChecker::operator()(optimizer::ABT& n,
         } break;
 
         case optimizer::Operations::Eq: {
-            // Equality: check if one of the terms is a boolean constant, and remove it
             if (op.getLeftChild().is<optimizer::Constant>() &&
                 !op.getRightChild().is<optimizer::Constant>()) {
                 // Ensure we don't have a constant on the left side.
-                std::swap(const_cast<optimizer::ABT&>(op.getLeftChild()),
-                          const_cast<optimizer::ABT&>(op.getRightChild()));
+                std::swap(op.getLeftChild(), op.getRightChild());
                 std::swap(lhs, rhs);
             }
+            // Equality: check if one of the terms is a boolean constant, and remove it
             if (!op.getLeftChild().is<optimizer::Constant>() &&
                 op.getRightChild().is<optimizer::Constant>() &&
                 lhs.isSubset(TypeSignature::kBooleanType.include(TypeSignature::kNothingType))) {
                 // If the left side is type checked as a boolean and the right side is the
                 // constant 'true', replace the comparison with just the left side; if it is
                 // 'false', replace it with a not(left side).
-                const auto [rhsTag, rhsVal] = const_cast<optimizer::ABT&>(op.getRightChild())
-                                                  .cast<optimizer::Constant>()
-                                                  ->get();
+                const auto [rhsTag, rhsVal] = op.getRightChild().cast<optimizer::Constant>()->get();
 
                 if (rhsTag == sbe::value::TypeTags::Boolean) {
                     if (sbe::value::bitcastTo<bool>(rhsVal)) {
                         swapAndUpdate(n,
-                                      std::exchange(const_cast<optimizer::ABT&>(op.getLeftChild()),
+                                      std::exchange(op.getLeftChild(),
                                                     optimizer::make<optimizer::Blackhole>()));
                     } else {
-                        swapAndUpdate(
-                            n,
-                            optimizer::make<optimizer::UnaryOp>(
-                                optimizer::Operations::Not,
-                                std::exchange(const_cast<optimizer::ABT&>(op.getLeftChild()),
-                                              optimizer::make<optimizer::Blackhole>())));
+                        swapAndUpdate(n,
+                                      optimizer::make<optimizer::UnaryOp>(
+                                          optimizer::Operations::Not,
+                                          std::exchange(op.getLeftChild(),
+                                                        optimizer::make<optimizer::Blackhole>())));
                     }
                 }
             }
-            // The signature of the Eq is boolean plus Nothing if either operands can be
-            // Nothing.
-            return TypeSignature::kBooleanType.include(
-                lhs.include(rhs).intersect(TypeSignature::kNothingType));
+            // The signature of the Eq is boolean plus Nothing when the types of the arguments are
+            // not comparable.
+            if (lhs.canCompareWith(rhs)) {
+                return TypeSignature::kBooleanType;
+            } else {
+                return TypeSignature::kBooleanType.include(TypeSignature::kNothingType);
+            }
         } break;
 
         case optimizer::Operations::Neq:
@@ -289,17 +295,24 @@ TypeSignature TypeChecker::operator()(optimizer::ABT& n,
         case optimizer::Operations::Gte:
         case optimizer::Operations::Lt:
         case optimizer::Operations::Lte: {
-            // The signature of comparison is boolean plus Nothing if either operands can be
-            // Nothing.
-            return TypeSignature::kBooleanType.include(
-                lhs.include(rhs).intersect(TypeSignature::kNothingType));
+            // The signature of comparison is boolean plus Nothing when the types of the arguments
+            // are not comparable.
+            if (lhs.canCompareWith(rhs)) {
+                return TypeSignature::kBooleanType;
+            } else {
+                return TypeSignature::kBooleanType.include(TypeSignature::kNothingType);
+            }
         } break;
 
         case optimizer::Operations::Cmp3w: {
-            // The signature of comparison is integer plus Nothing if either operands can be
-            // Nothing.
-            return getTypeSignature(sbe::value::TypeTags::NumberInt32)
-                .include(lhs.include(rhs).intersect(TypeSignature::kNothingType));
+            // The signature of comparison is integer plus Nothing when the types of the arguments
+            // are not comparable.
+            if (lhs.canCompareWith(rhs)) {
+                return getTypeSignature(sbe::value::TypeTags::NumberInt32);
+            } else {
+                return getTypeSignature(sbe::value::TypeTags::NumberInt32)
+                    .include(TypeSignature::kNothingType);
+            }
         } break;
 
         default:
@@ -332,120 +345,178 @@ TypeSignature TypeChecker::operator()(optimizer::ABT& n,
                                       optimizer::FunctionCall& op,
                                       bool saveInference) {
     size_t arity = op.nodes().size();
+    if (arity == 3 && (op.name() == "traverseF"s || op.name() == "traverseP"s) &&
+        op.nodes()[1].is<optimizer::LambdaAbstraction>()) {
+        // Always process the last argument for completeness, but ignore its computed type.
+        op.nodes()[2].visit(*this, false);
+
+        TypeSignature argType = op.nodes()[0].visit(*this, false);
+
+        // A traverseF/traverseP invoked with the first argument that is not an array will just
+        // invoke the lambda expression on it, so we can remove it if we are assured that it
+        // cannot possibly contain an array.
+        if (!argType.containsAny(TypeSignature::kArrayType)) {
+            auto lambda = op.nodes()[1].cast<optimizer::LambdaAbstraction>();
+            // Define the lambda variable with the type of the 'bind' expression type.
+            bind(lambda->varName(), argType);
+            // Process the lambda knowing that its argument will be exactly the type we got from
+            // processing the first argument.
+            TypeSignature lambdaType = op.nodes()[1].visit(*this, false);
+            // The current binding must be the one where we defined the variable.
+            invariant(_bindings.back().contains(lambda->varName()));
+            _bindings.back().erase(lambda->varName());
+
+            swapAndUpdate(
+                n,
+                optimizer::make<optimizer::Let>(
+                    lambda->varName(),
+                    std::exchange(op.nodes()[0], optimizer::make<optimizer::Blackhole>()),
+                    std::exchange(lambda->getBody(), optimizer::make<optimizer::Blackhole>())));
+            return lambdaType.include(argType.intersect(TypeSignature::kNothingType));
+        }
+
+        // The first argument could be an array, so the lambda will be invoked on multiple array
+        // items of unknown type.
+        op.nodes()[1].visit(*this, false);
+
+        // Return the declared type of the traverse function.
+        return op.name() == "traverseF"s
+            ? TypeSignature::kBooleanType.include(argType.intersect(TypeSignature::kNothingType))
+            : TypeSignature::kArrayType.include(argType);
+    }
     std::vector<TypeSignature> argTypes;
     argTypes.reserve(arity);
     for (auto& node : op.nodes()) {
         argTypes.emplace_back(node.visit(*this, false));
     }
-    if (op.name() == "exists" && arity == 1) {
-        // If the argument is already guaranteed not to be a Nothing or if it is a constant, we can
-        // evaluate it now.
-        if (!TypeSignature::kNothingType.isSubset(argTypes[0])) {
-            swapAndUpdate(n, optimizer::Constant::boolean(true));
-        } else if (saveInference && op.nodes()[0].cast<optimizer::Variable>()) {
-            // If this 'exists' is testing a variable and is part of an And, add a mask excluding
-            // Nothing from the type information of the variable.
-            auto& varName = op.nodes()[0].cast<optimizer::Variable>()->name();
-            bind(varName, getInferredType(varName).exclude(TypeSignature::kNothingType));
-        }
-        return TypeSignature::kBooleanType;
-    }
-
-    if (op.name() == "coerceToBool" && arity == 1) {
-        auto argSignature = argTypes[0];
-        // If the argument is already guaranteed to be a boolean or a Nothing, the coerceToBool is
-        // unnecessary.
-        if (argSignature.isSubset(
-                TypeSignature::kBooleanType.include(TypeSignature::kNothingType))) {
-            swapAndUpdate(n, std::exchange(op.nodes()[0], optimizer::make<optimizer::Blackhole>()));
-        }
-        return TypeSignature::kBooleanType.include(
-            argSignature.intersect(TypeSignature::kNothingType));
-    }
-
-    if (op.name() == "typeMatch" && arity == 2) {
-        auto argSignature = argTypes[0];
-        if (op.nodes()[1].is<optimizer::Constant>()) {
-            auto [tagMask, valMask] = op.nodes()[1].cast<optimizer::Constant>()->get();
-            if (tagMask == sbe::value::TypeTags::NumberInt32) {
-                auto bsonMask = static_cast<uint32_t>(sbe::value::bitcastTo<int32_t>(valMask));
-                if (!TypeSignature::kNothingType.isSubset(argSignature)) {
-                    // See if we can answer the typeMatch call only using type inference. The type
-                    // of the argument must be either completely inside or outside of the requested
-                    // type mask in order to constant fold this call. It also must not include the
-                    // possibility of being Nothing.
-                    auto argTypes = getBSONTypesFromSignature(argSignature);
-                    uint32_t argBsonTypeMask = 0;
-                    for (auto tag : argTypes) {
-                        argBsonTypeMask |= getBSONTypeMask(tag);
+    if (arity == 2) {
+        if (op.name() == "typeMatch"s) {
+            auto argSignature = argTypes[0];
+            if (op.nodes()[1].is<optimizer::Constant>()) {
+                auto [tagMask, valMask] = op.nodes()[1].cast<optimizer::Constant>()->get();
+                if (tagMask == sbe::value::TypeTags::NumberInt32) {
+                    auto bsonMask = static_cast<uint32_t>(sbe::value::bitcastTo<int32_t>(valMask));
+                    if (!TypeSignature::kNothingType.isSubset(argSignature)) {
+                        // See if we can answer the typeMatch call only using type inference. The
+                        // type of the argument must be either completely inside or outside of the
+                        // requested type mask in order to constant fold this call. It also must not
+                        // include the possibility of being Nothing.
+                        auto argTypes = getBSONTypesFromSignature(argSignature);
+                        uint32_t argBsonTypeMask = 0;
+                        for (auto tag : argTypes) {
+                            argBsonTypeMask |= getBSONTypeMask(tag);
+                        }
+                        if ((argBsonTypeMask & ~bsonMask) == 0) {
+                            swapAndUpdate(
+                                n, optimizer::Constant::boolean((argBsonTypeMask & bsonMask) != 0));
+                        } else if ((argBsonTypeMask & bsonMask) == 0) {
+                            swapAndUpdate(n, optimizer::Constant::boolean(false));
+                        }
+                        return TypeSignature::kBooleanType;
                     }
-                    if ((argBsonTypeMask & ~bsonMask) == 0) {
+                }
+            }
+            return TypeSignature::kBooleanType.include(
+                argSignature.intersect(TypeSignature::kNothingType));
+        }
+
+        if (op.name() == "convert"s) {
+            auto argSignature = argTypes[0];
+            if (op.nodes()[1].is<optimizer::Constant>()) {
+                auto [tagMask, valMask] = op.nodes()[1].cast<optimizer::Constant>()->get();
+                if (tagMask == sbe::value::TypeTags::NumberInt32) {
+                    sbe::value::TypeTags targetTypeTag =
+                        (sbe::value::TypeTags)sbe::value::bitcastTo<int32_t>(valMask);
+                    TypeSignature targetSignature = getTypeSignature(targetTypeTag);
+                    // If the argument is already of the requested type (or Nothing), remove the
+                    // 'convert' call.
+                    if (argSignature.isSubset(
+                            targetSignature.include(TypeSignature::kNothingType))) {
                         swapAndUpdate(
-                            n, optimizer::Constant::boolean((argBsonTypeMask & bsonMask) != 0));
-                    } else if ((argBsonTypeMask & bsonMask) == 0) {
-                        swapAndUpdate(n, optimizer::Constant::boolean(false));
+                            n,
+                            std::exchange(op.nodes()[0], optimizer::make<optimizer::Blackhole>()));
                     }
-                    return TypeSignature::kBooleanType;
+                    return targetSignature.include(
+                        argSignature.intersect(TypeSignature::kNothingType));
                 }
             }
+            return TypeSignature::kNumericType.include(
+                argSignature.intersect(TypeSignature::kNothingType));
         }
-        return TypeSignature::kBooleanType.include(
-            argSignature.intersect(TypeSignature::kNothingType));
-    }
 
-    if (op.name() == "convert" && arity == 2) {
-        auto argSignature = argTypes[0];
-        if (op.nodes()[1].is<optimizer::Constant>()) {
-            auto [tagMask, valMask] = op.nodes()[1].cast<optimizer::Constant>()->get();
-            if (tagMask == sbe::value::TypeTags::NumberInt32) {
-                sbe::value::TypeTags targetTypeTag =
-                    (sbe::value::TypeTags)sbe::value::bitcastTo<int32_t>(valMask);
-                TypeSignature targetSignature = getTypeSignature(targetTypeTag);
-                // If the argument is already of the requested type (or Nothing), remove the
-                // 'convert' call.
-                if (argSignature.isSubset(targetSignature.include(TypeSignature::kNothingType))) {
-                    swapAndUpdate(
-                        n, std::exchange(op.nodes()[0], optimizer::make<optimizer::Blackhole>()));
-                }
-                return targetSignature.include(argSignature.intersect(TypeSignature::kNothingType));
+        if (op.name() == "fail"s) {
+            // "fail" aborts the query and doesn't return any value
+            return TypeSignature{};
+        }
+    } else if (arity == 1) {
+        if (op.name() == "exists"s) {
+            // If the argument is already guaranteed not to be a Nothing or if it is a constant, we
+            // can evaluate it now.
+            if (!TypeSignature::kNothingType.isSubset(argTypes[0])) {
+                swapAndUpdate(n, optimizer::Constant::boolean(true));
+            } else if (saveInference && op.nodes()[0].cast<optimizer::Variable>()) {
+                // If this 'exists' is testing a variable and is part of an And, add a mask
+                // excluding Nothing from the type information of the variable.
+                auto& varName = op.nodes()[0].cast<optimizer::Variable>()->name();
+                auto varType = getInferredType(varName).value_or(TypeSignature::kAnyScalarType);
+
+                bind(varName, varType.exclude(TypeSignature::kNothingType));
             }
+            return TypeSignature::kBooleanType;
         }
-        return TypeSignature::kNumericType.include(
-            argSignature.intersect(TypeSignature::kNothingType));
+
+        if (op.name() == "coerceToBool"s) {
+            auto argSignature = argTypes[0];
+            // If the argument is already guaranteed to be a boolean or a Nothing, the coerceToBool
+            // is unnecessary.
+            if (argSignature.isSubset(
+                    TypeSignature::kBooleanType.include(TypeSignature::kNothingType))) {
+                swapAndUpdate(
+                    n, std::exchange(op.nodes()[0], optimizer::make<optimizer::Blackhole>()));
+            }
+            return TypeSignature::kBooleanType.include(
+                argSignature.intersect(TypeSignature::kNothingType));
+        }
+
+        if (op.name() == "isArray"s) {
+            return evaluateTypeTest(n, argTypes[0], TypeSignature::kArrayType);
+        }
+
+        if (op.name() == "isDate"s) {
+            return evaluateTypeTest(n, argTypes[0], getTypeSignature(sbe::value::TypeTags::Date));
+        }
+
+        if (op.name() == "isNull"s) {
+            return evaluateTypeTest(n, argTypes[0], getTypeSignature(sbe::value::TypeTags::Null));
+        }
+
+        if (op.name() == "isNumber"s) {
+            return evaluateTypeTest(n, argTypes[0], TypeSignature::kNumericType);
+        }
+
+        if (op.name() == "isObject"s) {
+            return evaluateTypeTest(n, argTypes[0], TypeSignature::kObjectType);
+        }
+
+        if (op.name() == "isString"s) {
+            return evaluateTypeTest(n, argTypes[0], TypeSignature::kStringType);
+        }
+
+        if (op.name() == "isTimestamp"s) {
+            return evaluateTypeTest(
+                n, argTypes[0], getTypeSignature(sbe::value::TypeTags::Timestamp));
+        }
     }
 
-    if (op.name() == "isArray" && arity == 1) {
-        return evaluateTypeTest(n, argTypes[0], TypeSignature::kArrayType);
-    }
-
-    if (op.name() == "isDate" && arity == 1) {
-        return evaluateTypeTest(n, argTypes[0], getTypeSignature(sbe::value::TypeTags::Date));
-    }
-
-    if (op.name() == "isNull" && arity == 1) {
-        return evaluateTypeTest(n, argTypes[0], getTypeSignature(sbe::value::TypeTags::Null));
-    }
-
-    if (op.name() == "isNumber" && arity == 1) {
-        return evaluateTypeTest(n, argTypes[0], TypeSignature::kNumericType);
-    }
-
-    if (op.name() == "isObject" && arity == 1) {
-        return evaluateTypeTest(n, argTypes[0], TypeSignature::kObjectType);
-    }
-
-    if (op.name() == "isString" && arity == 1) {
-        return evaluateTypeTest(n, argTypes[0], TypeSignature::kStringType);
-    }
-
-    if (op.name() == "isTimestamp" && arity == 1) {
-        return evaluateTypeTest(n, argTypes[0], getTypeSignature(sbe::value::TypeTags::Timestamp));
-    }
-
-    if ((op.name() == "dateTrunc" && arity == 6) || (op.name() == "dateAdd" && arity == 5)) {
+    if ((arity == 6 && op.name() == "dateTrunc"s) || (arity == 5 && op.name() == "dateAdd"s)) {
         // Always mark Nothing as a possible return type, as it can be reported due to invalid
         // arguments.
         return getTypeSignature(sbe::value::TypeTags::Date).include(TypeSignature::kNothingType);
+    }
+
+    if ((arity == 5 || arity == 6) && op.name() == "dateDiff"s) {
+        return getTypeSignature(sbe::value::TypeTags::NumberInt64)
+            .include(TypeSignature::kNothingType);
     }
     return TypeSignature::kAnyScalarType;
 }
@@ -455,13 +526,13 @@ TypeSignature TypeChecker::operator()(optimizer::ABT& n, optimizer::If& op, bool
     // assumption that the condition is either true or false.
     enterLocalBinding();
 
-    TypeSignature condType = const_cast<optimizer::ABT&>(op.getCondChild()).visit(*this, true);
-    TypeSignature thenType = const_cast<optimizer::ABT&>(op.getThenChild()).visit(*this, false);
+    TypeSignature condType = op.getCondChild().visit(*this, true);
+    TypeSignature thenType = op.getThenChild().visit(*this, false);
 
     // Remove the binding associated with the condition being true.
     exitLocalBinding();
 
-    TypeSignature elseType = const_cast<optimizer::ABT&>(op.getElseChild()).visit(*this, false);
+    TypeSignature elseType = op.getElseChild().visit(*this, false);
 
     // The signature of If is the mix of both branches, plus Nothing if the condition can produce
     // it.

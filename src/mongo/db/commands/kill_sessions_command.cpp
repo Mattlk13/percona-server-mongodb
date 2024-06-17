@@ -66,11 +66,10 @@ namespace {
 
 KillAllSessionsByPatternSet patternsForLoggedInUser(OperationContext* opCtx) {
     auto client = opCtx->getClient();
-    ServiceContext* serviceContext = client->getServiceContext();
 
     KillAllSessionsByPatternSet patterns;
 
-    if (AuthorizationManager::get(serviceContext)->isAuthEnabled()) {
+    if (AuthorizationManager::get(opCtx->getService())->isAuthEnabled()) {
         auto* as = AuthorizationSession::get(client);
         if (auto user = as->getAuthenticatedUser()) {
             auto item = makeKillAllSessionsByPattern(opCtx);
@@ -120,10 +119,10 @@ public:
         return false;
     }
 
-    virtual bool run(OperationContext* opCtx,
-                     const DatabaseName& dbName,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) override {
+    bool run(OperationContext* opCtx,
+             const DatabaseName& dbName,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
         IDLParserContext ctx("KillSessionsCmd");
         auto ksc = KillSessionsCmdFromClient::parse(ctx, cmdObj);
 

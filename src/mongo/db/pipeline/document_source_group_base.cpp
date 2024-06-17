@@ -171,7 +171,7 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceGroupBase::optimize() {
     auto& idExpressions = _groupProcessor.getMutableIdExpressions();
     auto expCtx = idExpressions[0]->getExpressionContext();
     auto origSbeCompatibility = expCtx->sbeCompatibility;
-    expCtx->sbeCompatibility = SbeCompatibility::fullyCompatible;
+    expCtx->sbeCompatibility = SbeCompatibility::noRequirements;
 
     // TODO: If all idExpressions are ExpressionConstants after optimization, then we know
     // there will be only one group. We should take advantage of that to avoid going through the
@@ -225,6 +225,8 @@ DocumentSource::GetModPathsReturn DocumentSourceGroupBase::getModifiedPaths() co
     // We preserve none of the fields, but any fields referenced as part of the group key are
     // logically just renamed.
     StringMap<std::string> renames;
+    StringSet idFields;
+    std::vector<std::string> listIdFields;
     const auto& idFieldNames = _groupProcessor.getIdFieldNames();
     const auto& idExpressions = _groupProcessor.getIdExpressions();
     for (std::size_t i = 0; i < idExpressions.size(); ++i) {
@@ -233,6 +235,32 @@ DocumentSource::GetModPathsReturn DocumentSourceGroupBase::getModifiedPaths() co
         auto computedPaths = idExp->getComputedPaths(pathToPutResultOfExpression);
         for (auto&& rename : computedPaths.renames) {
             renames[rename.first] = rename.second;
+            idFields.insert(rename.second);
+            listIdFields.push_back(rename.second);
+        }
+    }
+
+    const auto& accumulatedFields = _groupProcessor.getAccumulationStatements();
+    for (auto&& accumulatedField : accumulatedFields) {
+        const auto& accumulationExpr = accumulatedField.expr;
+        if (accumulationExpr.groupMatchOptimizationEligible) {
+            const auto& expr = accumulationExpr.argument.get();
+            auto& pathToPutResultOfExpression = accumulatedField.fieldName;
+            auto fieldPath = dynamic_cast<ExpressionFieldPath*>(expr);
+            if (fieldPath && fieldPath->isROOT()) {
+                for (auto&& idField : listIdFields) {
+                    // renames[to] = from
+                    renames[pathToPutResultOfExpression + "." + idField] = idField;
+                }
+            } else {
+                auto computedPaths = expr->getComputedPaths(pathToPutResultOfExpression);
+                for (auto&& rename : computedPaths.renames) {
+                    if (idFields.contains(rename.second)) {
+                        // renames[to] = from
+                        renames[rename.first] = rename.second;
+                    }
+                }
+            }
         }
     }
 
@@ -322,7 +350,7 @@ void DocumentSourceGroupBase::initializeFromBson(BSONElement elem) {
     BSONObj groupObj(elem.Obj());
     BSONObjIterator groupIterator(groupObj);
     VariablesParseState vps = pExpCtx->variablesParseState;
-    pExpCtx->sbeGroupCompatibility = SbeCompatibility::fullyCompatible;
+    pExpCtx->sbeGroupCompatibility = SbeCompatibility::noRequirements;
     while (groupIterator.more()) {
         BSONElement groupField(groupIterator.next());
         StringData pFieldName = groupField.fieldNameStringData();
@@ -383,17 +411,18 @@ bool DocumentSourceGroupBase::canRunInParallelBeforeWriteStage(
     return true;
 }
 
-std::unique_ptr<GroupFromFirstDocumentTransformation>
-DocumentSourceGroupBase::rewriteGroupAsTransformOnFirstDocument() const {
+bool DocumentSourceGroupBase::isEligibleForTransformOnFirstDocument(
+    GroupFromFirstDocumentTransformation::ExpectedInput& expectedInput,
+    std::string& groupId) const {
     const auto& idExpressions = _groupProcessor.getIdExpressions();
     if (idExpressions.size() != 1) {
         // This transformation is only intended for $group stages that group on a single field.
-        return nullptr;
+        return false;
     }
 
     auto fieldPathExpr = dynamic_cast<ExpressionFieldPath*>(idExpressions.front().get());
     if (!fieldPathExpr || fieldPathExpr->isVariableReference()) {
-        return nullptr;
+        return false;
     }
 
     const auto fieldPath = fieldPathExpr->getFieldPath();
@@ -405,19 +434,29 @@ DocumentSourceGroupBase::rewriteGroupAsTransformOnFirstDocument() const {
         tassert(5943200,
                 "Optimization attempted on group by always-dissimilar system variable",
                 fieldPath.getFieldName(0) == "CURRENT" || fieldPath.getFieldName(0) == "ROOT");
-        return nullptr;
+        return false;
     }
 
-    const auto groupId = fieldPath.tail().fullPath();
+    groupId = fieldPath.tail().fullPath();
 
     // We do this transformation only if there are all $first, all $last, or no accumulators.
-    GroupFromFirstDocumentTransformation::ExpectedInput expectedInput;
     const auto& accumulatedFields = _groupProcessor.getAccumulationStatements();
     if (accsNeedSameDoc(accumulatedFields, AccumulatorDocumentsNeeded::kFirstDocument)) {
         expectedInput = GroupFromFirstDocumentTransformation::ExpectedInput::kFirstDocument;
     } else if (accsNeedSameDoc(accumulatedFields, AccumulatorDocumentsNeeded::kLastDocument)) {
         expectedInput = GroupFromFirstDocumentTransformation::ExpectedInput::kLastDocument;
     } else {
+        return false;
+    }
+
+    return true;
+}
+
+std::unique_ptr<GroupFromFirstDocumentTransformation>
+DocumentSourceGroupBase::rewriteGroupAsTransformOnFirstDocument() const {
+    std::string groupId;
+    GroupFromFirstDocumentTransformation::ExpectedInput expectedInput;
+    if (!isEligibleForTransformOnFirstDocument(expectedInput, groupId)) {
         return nullptr;
     }
 
@@ -431,12 +470,12 @@ DocumentSourceGroupBase::rewriteGroupAsTransformOnFirstDocument() const {
         idField = ExpressionFieldPath::deprecatedCreate(pExpCtx.get(), groupId);
     } else {
         invariant(idFieldNames.size() == 1);
-        idField = ExpressionObject::create(pExpCtx.get(),
-                                           {{idFieldNames.front(), idExpressions.front()}});
+        idField = ExpressionObject::create(
+            pExpCtx.get(), {{idFieldNames.front(), _groupProcessor.getIdExpressions().front()}});
     }
     fields.emplace_back("_id", idField);
 
-    for (auto&& accumulator : accumulatedFields) {
+    for (auto&& accumulator : _groupProcessor.getAccumulationStatements()) {
         fields.emplace_back(accumulator.fieldName, accumulator.expr.argument);
 
         // Since we don't attempt this transformation for non-$first/$last accumulators,

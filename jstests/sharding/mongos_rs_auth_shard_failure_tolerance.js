@@ -11,12 +11,13 @@
 // (connection connected after shard change).
 //
 
-// Checking UUID and index consistency involves talking to shard primaries, but by the end of this
-// test, one shard does not have a primary.
+// The following checks involves talking to shard primaries, but by the end of this test, one shard
+// does not have a primary.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
 TestData.skipCheckShardFilteringMetadata = true;
+TestData.skipCheckMetadataConsistency = true;
 
 // Replica set nodes started with --shardsvr do not enable key generation until they are added to a
 // sharded cluster and reject commands with gossiped clusterTime from users without the
@@ -49,19 +50,16 @@ st.stopBalancer();
 
 assert.commandWorked(admin.runCommand({setParameter: 1, traceExceptions: true}));
 
+// Create the unsharded database with shard0 primary
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: 'fooUnsharded', primaryShard: st.shard0.shardName}));
+// Create the sharded database with shard1 primary
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: 'fooSharded', primaryShard: st.shard1.shardName}));
+
 var collSharded = mongos.getCollection("fooSharded.barSharded");
 var collUnsharded = mongos.getCollection("fooUnsharded.barUnsharded");
 
-// Create the unsharded database with shard0 primary
-assert.commandWorked(collUnsharded.insert({some: "doc"}));
-assert.commandWorked(collUnsharded.remove({}));
-assert.commandWorked(
-    admin.runCommand({movePrimary: collUnsharded.getDB().toString(), to: st.shard0.shardName}));
-
-// Create the sharded database with shard1 primary
-assert.commandWorked(admin.runCommand({enableSharding: collSharded.getDB().toString()}));
-assert.commandWorked(
-    admin.runCommand({movePrimary: collSharded.getDB().toString(), to: st.shard1.shardName}));
 assert.commandWorked(admin.runCommand({shardCollection: collSharded.toString(), key: {_id: 1}}));
 assert.commandWorked(admin.runCommand({split: collSharded.toString(), middle: {_id: 0}}));
 assert.commandWorked(admin.runCommand(

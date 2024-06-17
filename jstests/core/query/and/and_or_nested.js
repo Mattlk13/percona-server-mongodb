@@ -35,26 +35,25 @@ assert.commandWorked(coll.insert([
 runWithDifferentIndexes([[], [{a: 1}], [{b: 1}], [{a: 1}, {b: 1}], [{a: 1}, {c: 1}]], () => {
     assert(arrayEq(coll.find({$and: [{a: {$gt: 5}}, {c: {$gt: 4}}]}, {_id: 1}).toArray(),
                    [{_id: 5}, {_id: 9}, {_id: 12}]));
-
-    assert(arrayEq(coll.find({$or: [{a: {$gt: 6}}, {b: {$lt: 4}}]}, {_id: 1}).toArray(),
-                   [{_id: 1}, {_id: 5}, {_id: 9}, {_id: 10}, {_id: 11}, {_id: 12}, {_id: 13}]));
-
     assert(
         arrayEq(coll.find({$and: [{$or: [{a: {$gt: 5}}, {b: {$lt: 5}}]}, {c: {$lt: 6}}]}, {_id: 1})
                     .toArray(),
                 [{_id: 1}, {_id: 3}, {_id: 5}, {_id: 10}, {_id: 12}]));
-
-    assert(arrayEq(
-        coll.find({$or: [{$and: [{a: {$gt: 5}}, {c: {$gt: 2}}]}, {$and: [{b: {$lt: 5}}, {d: 1}]}]},
-                  {_id: 1})
-            .toArray(),
-        [{_id: 1}, {_id: 5}, {_id: 9}, {_id: 12}, {_id: 13}]));
 
     assert(arrayEq(coll.find({$or: [{b: {$gte: 7}}]}, {_id: 1}).toArray(),
                    [{_id: 3}, {_id: 4}, {_id: 8}]));
 
     assert(arrayEq(coll.find({$or: [{$and: [{b: {$gte: 7}}]}]}, {_id: 1}).toArray(),
                    [{_id: 3}, {_id: 4}, {_id: 8}]));
+
+    assert(arrayEq(coll.find({$or: [{a: {$gt: 6}}, {b: {$lt: 4}}]}, {_id: 1}).toArray(),
+                   [{_id: 1}, {_id: 5}, {_id: 9}, {_id: 10}, {_id: 11}, {_id: 12}, {_id: 13}]));
+
+    assert(arrayEq(
+        coll.find({$or: [{$and: [{a: {$gt: 5}}, {c: {$gt: 2}}]}, {$and: [{b: {$lt: 5}}, {d: 1}]}]},
+                  {_id: 1})
+            .toArray(),
+        [{_id: 1}, {_id: 5}, {_id: 9}, {_id: 12}, {_id: 13}]));
 
     assert(arrayEq(
         coll.find({$or: [{a: {$gt: 8}}, {$and: [{b: {$lt: 5}}, {$or: [{c: {$lt: 5}}, {d: 1}]}]}]},

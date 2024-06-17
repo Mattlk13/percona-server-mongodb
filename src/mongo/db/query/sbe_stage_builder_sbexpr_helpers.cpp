@@ -29,12 +29,13 @@
 
 #include "mongo/db/query/sbe_stage_builder_sbexpr_helpers.h"
 
+#include "mongo/db/exec/sbe/stages/agg_project.h"
 #include "mongo/db/query/sbe_stage_builder_abt_holder_impl.h"
 
 namespace mongo::stage_builder {
 namespace {
 inline bool hasABT(const SbExpr& e) {
-    return e.hasABT();
+    return !e.isEExpr() && e.canExtractABT();
 }
 
 inline bool hasABT(const SbExpr::Vector& exprs) {
@@ -112,25 +113,41 @@ inline optimizer::Operations getOptimizerOp(sbe::EPrimBinary::Op op) {
 }
 }  // namespace
 
-std::unique_ptr<sbe::EExpression> SbExprBuilder::extractExpr(SbExpr& e) {
-    return e.extractExpr(_state).expr;
-}
-
-sbe::EExpression::Vector SbExprBuilder::extractExpr(SbExpr::Vector& sbExprs) {
+sbe::EExpression::Vector SbExprBuilder::lower(SbExpr::Vector& sbExprs,
+                                              const VariableTypes* varTypes) {
     // Convert the SbExpr vector to an EExpression vector.
     sbe::EExpression::Vector exprs;
     for (auto& e : sbExprs) {
-        exprs.emplace_back(extractExpr(e));
+        exprs.emplace_back(lower(e, varTypes));
     }
 
     return exprs;
+}
+
+sbe::value::SlotVector SbExprBuilder::lower(const SbSlotVector& sbSlots, const VariableTypes*) {
+    sbe::value::SlotVector slotVec;
+    for (const auto& sbSlot : sbSlots) {
+        slotVec.push_back(sbSlot.getId());
+    }
+
+    return slotVec;
+}
+
+sbe::SlotExprPairVector SbExprBuilder::lower(SbExprSbSlotVector& sbSlotSbExprVec,
+                                             const VariableTypes* varTypes) {
+    sbe::SlotExprPairVector slotExprVec;
+    for (auto& [sbExpr, sbSlot] : sbSlotSbExprVec) {
+        slotExprVec.emplace_back(std::pair(sbSlot.getId(), sbExpr.extractExpr(_state, varTypes)));
+    }
+
+    return slotExprVec;
 }
 
 SbExpr SbExprBuilder::makeNot(SbExpr e) {
     if (hasABT(e)) {
         return abt::wrap(stage_builder::makeNot(extractABT(e)));
     } else {
-        return stage_builder::makeNot(extractExpr(e));
+        return stage_builder::makeNot(lower(e));
     }
 }
 
@@ -138,7 +155,7 @@ SbExpr SbExprBuilder::makeUnaryOp(sbe::EPrimUnary::Op unaryOp, SbExpr e) {
     if (hasABT(e)) {
         return abt::wrap(stage_builder::makeUnaryOp(getOptimizerOp(unaryOp), extractABT(e)));
     } else {
-        return stage_builder::makeUnaryOp(unaryOp, extractExpr(e));
+        return stage_builder::makeUnaryOp(unaryOp, lower(e));
     }
 }
 
@@ -146,7 +163,7 @@ SbExpr SbExprBuilder::makeUnaryOp(optimizer::Operations unaryOp, SbExpr e) {
     if (hasABT(e)) {
         return abt::wrap(stage_builder::makeUnaryOp(unaryOp, extractABT(e)));
     } else {
-        return stage_builder::makeUnaryOp(getEPrimUnaryOp(unaryOp), extractExpr(e));
+        return stage_builder::makeUnaryOp(getEPrimUnaryOp(unaryOp), lower(e));
     }
 }
 
@@ -155,7 +172,7 @@ SbExpr SbExprBuilder::makeBinaryOp(sbe::EPrimBinary::Op binaryOp, SbExpr lhs, Sb
         return abt::wrap(stage_builder::makeBinaryOp(
             getOptimizerOp(binaryOp), extractABT(lhs), extractABT(rhs)));
     } else {
-        return stage_builder::makeBinaryOp(binaryOp, extractExpr(lhs), extractExpr(rhs));
+        return stage_builder::makeBinaryOp(binaryOp, lower(lhs), lower(rhs));
     }
 }
 
@@ -163,8 +180,7 @@ SbExpr SbExprBuilder::makeBinaryOp(optimizer::Operations binaryOp, SbExpr lhs, S
     if (hasABT(lhs, rhs)) {
         return abt::wrap(stage_builder::makeBinaryOp(binaryOp, extractABT(lhs), extractABT(rhs)));
     } else {
-        return stage_builder::makeBinaryOp(
-            getEPrimBinaryOp(binaryOp), extractExpr(lhs), extractExpr(rhs));
+        return stage_builder::makeBinaryOp(getEPrimBinaryOp(binaryOp), lower(lhs), lower(rhs));
     }
 }
 
@@ -177,7 +193,7 @@ SbExpr SbExprBuilder::makeBinaryOpWithCollation(sbe::EPrimBinary::Op binaryOp,
     }
 
     return sbe::makeE<sbe::EPrimBinary>(
-        binaryOp, extractExpr(lhs), extractExpr(rhs), sbe::makeE<sbe::EVariable>(*collatorSlot));
+        binaryOp, lower(lhs), lower(rhs), sbe::makeE<sbe::EVariable>(*collatorSlot));
 }
 
 SbExpr SbExprBuilder::makeBinaryOpWithCollation(optimizer::Operations binaryOp,
@@ -189,8 +205,8 @@ SbExpr SbExprBuilder::makeBinaryOpWithCollation(optimizer::Operations binaryOp,
     }
 
     return sbe::makeE<sbe::EPrimBinary>(getEPrimBinaryOp(binaryOp),
-                                        extractExpr(lhs),
-                                        extractExpr(rhs),
+                                        lower(lhs),
+                                        lower(rhs),
                                         sbe::makeE<sbe::EVariable>(*collatorSlot));
 }
 
@@ -234,7 +250,7 @@ SbExpr SbExprBuilder::makeFunction(StringData name, SbExpr::Vector args) {
     if (hasABT(args)) {
         return abt::wrap(stage_builder::makeABTFunction(name, extractABT(args)));
     } else {
-        return stage_builder::makeFunction(name, extractExpr(args));
+        return stage_builder::makeFunction(name, lower(args));
     }
 }
 
@@ -243,8 +259,7 @@ SbExpr SbExprBuilder::makeIf(SbExpr condExpr, SbExpr thenExpr, SbExpr elseExpr) 
         return abt::wrap(stage_builder::makeIf(
             extractABT(condExpr), extractABT(thenExpr), extractABT(elseExpr)));
     } else {
-        return stage_builder::makeIf(
-            extractExpr(condExpr), extractExpr(thenExpr), extractExpr(elseExpr));
+        return stage_builder::makeIf(lower(condExpr), lower(thenExpr), lower(elseExpr));
     }
 }
 
@@ -252,7 +267,7 @@ SbExpr SbExprBuilder::makeLet(sbe::FrameId frameId, SbExpr::Vector binds, SbExpr
     if (hasABT(expr, binds)) {
         return abt::wrap(stage_builder::makeLet(frameId, extractABT(binds), extractABT(expr)));
     } else {
-        return stage_builder::makeLet(frameId, extractExpr(binds), extractExpr(expr));
+        return stage_builder::makeLet(frameId, lower(binds), lower(expr));
     }
 }
 
@@ -260,7 +275,7 @@ SbExpr SbExprBuilder::makeLocalLambda(sbe::FrameId frameId, SbExpr expr) {
     if (hasABT(expr)) {
         return abt::wrap(stage_builder::makeLocalLambda(frameId, extractABT(expr)));
     } else {
-        return stage_builder::makeLocalLambda(frameId, extractExpr(expr));
+        return stage_builder::makeLocalLambda(frameId, lower(expr));
     }
 }
 
@@ -268,7 +283,7 @@ SbExpr SbExprBuilder::makeNumericConvert(SbExpr expr, sbe::value::TypeTags tag) 
     if (hasABT(expr)) {
         return abt::wrap(stage_builder::makeNumericConvert(extractABT(expr), tag));
     } else {
-        return stage_builder::makeNumericConvert(extractExpr(expr), tag);
+        return stage_builder::makeNumericConvert(lower(expr), tag);
     }
 }
 
@@ -276,11 +291,19 @@ SbExpr SbExprBuilder::makeFail(ErrorCodes::Error error, StringData errorMessage)
     return abt::wrap(stage_builder::makeABTFail(error, errorMessage));
 }
 
+SbExpr SbExprBuilder::makeFillEmpty(SbExpr expr, SbExpr altExpr) {
+    if (hasABT(expr) && hasABT(altExpr)) {
+        return abt::wrap(stage_builder::makeFillEmpty(extractABT(expr), extractABT(altExpr)));
+    } else {
+        return stage_builder::makeFillEmpty(lower(expr), lower(altExpr));
+    }
+}
+
 SbExpr SbExprBuilder::makeFillEmptyFalse(SbExpr expr) {
     if (hasABT(expr)) {
         return abt::wrap(stage_builder::makeFillEmptyFalse(extractABT(expr)));
     } else {
-        return stage_builder::makeFillEmptyFalse(extractExpr(expr));
+        return stage_builder::makeFillEmptyFalse(lower(expr));
     }
 }
 
@@ -288,7 +311,7 @@ SbExpr SbExprBuilder::makeFillEmptyTrue(SbExpr expr) {
     if (hasABT(expr)) {
         return abt::wrap(stage_builder::makeFillEmptyTrue(extractABT(expr)));
     } else {
-        return stage_builder::makeFillEmptyTrue(extractExpr(expr));
+        return stage_builder::makeFillEmptyTrue(lower(expr));
     }
 }
 
@@ -296,7 +319,7 @@ SbExpr SbExprBuilder::makeFillEmptyNull(SbExpr expr) {
     if (hasABT(expr)) {
         return abt::wrap(stage_builder::makeFillEmptyNull(extractABT(expr)));
     } else {
-        return stage_builder::makeFillEmptyNull(extractExpr(expr));
+        return stage_builder::makeFillEmptyNull(lower(expr));
     }
 }
 
@@ -304,7 +327,7 @@ SbExpr SbExprBuilder::makeFillEmptyUndefined(SbExpr expr) {
     if (hasABT(expr)) {
         return abt::wrap(stage_builder::makeFillEmptyUndefined(extractABT(expr)));
     } else {
-        return stage_builder::makeFillEmptyUndefined(extractExpr(expr));
+        return stage_builder::makeFillEmptyUndefined(lower(expr));
     }
 }
 
@@ -313,7 +336,7 @@ SbExpr SbExprBuilder::makeIfNullExpr(SbExpr::Vector values) {
         return abt::wrap(
             stage_builder::makeIfNullExpr(extractABT(values), _state.frameIdGenerator));
     } else {
-        return stage_builder::makeIfNullExpr(extractExpr(values), _state.frameIdGenerator);
+        return stage_builder::makeIfNullExpr(lower(values), _state.frameIdGenerator);
     }
 }
 
@@ -321,9 +344,18 @@ SbExpr SbExprBuilder::generateNullOrMissing(SbExpr expr) {
     if (hasABT(expr)) {
         return abt::wrap(stage_builder::generateABTNullOrMissing(extractABT(expr)));
     } else {
-        return stage_builder::generateNullOrMissing(extractExpr(expr));
+        return stage_builder::generateNullOrMissing(lower(expr));
     }
 }
+
+SbExpr SbExprBuilder::generateNullMissingOrUndefined(SbExpr expr) {
+    if (hasABT(expr)) {
+        return abt::wrap(stage_builder::generateABTNullMissingOrUndefined(extractABT(expr)));
+    } else {
+        return stage_builder::generateNullMissingOrUndefined(lower(expr));
+    }
+}
+
 
 SbExpr SbExprBuilder::generatePositiveCheck(SbExpr expr) {
     return abt::wrap(stage_builder::generateABTPositiveCheck(extractABT(expr)));
@@ -331,6 +363,10 @@ SbExpr SbExprBuilder::generatePositiveCheck(SbExpr expr) {
 
 SbExpr SbExprBuilder::generateNullOrMissing(SbVar var) {
     return abt::wrap(stage_builder::generateABTNullOrMissing(var.getABTName()));
+}
+
+SbExpr SbExprBuilder::generateNullMissingOrUndefined(SbVar var) {
+    return abt::wrap(stage_builder::generateABTNullMissingOrUndefined(var.getABTName()));
 }
 
 SbExpr SbExprBuilder::generateNonStringCheck(SbVar var) {
@@ -380,5 +416,249 @@ SbExpr SbExprBuilder::generateInfinityCheck(SbVar var) {
 
 SbExpr SbExprBuilder::generateInvalidRoundPlaceArgCheck(SbVar var) {
     return abt::wrap(stage_builder::generateInvalidRoundPlaceArgCheck(var.getABTName()));
+}
+
+sbe::WindowStage::Window SbBuilder::lower(SbWindow& sbWindow, const VariableTypes* varTypes) {
+    sbe::WindowStage::Window window;
+
+    window.windowExprSlots = lower(sbWindow.windowExprSlots, varTypes);
+    window.frameFirstSlots = lower(sbWindow.frameFirstSlots, varTypes);
+    window.frameLastSlots = lower(sbWindow.frameLastSlots, varTypes);
+    window.initExprs = lower(sbWindow.initExprs, varTypes);
+    window.addExprs = lower(sbWindow.addExprs, varTypes);
+    window.removeExprs = lower(sbWindow.removeExprs, varTypes);
+    window.lowBoundExpr = lower(sbWindow.lowBoundExpr, varTypes);
+    window.highBoundExpr = lower(sbWindow.highBoundExpr, varTypes);
+
+    return window;
+}
+
+std::vector<sbe::WindowStage::Window> SbBuilder::lower(std::vector<SbWindow>& sbWindows,
+                                                       const VariableTypes* varTypes) {
+    std::vector<sbe::WindowStage::Window> windows;
+    for (auto& sbWindow : sbWindows) {
+        windows.emplace_back(lower(sbWindow, varTypes));
+    }
+
+    return windows;
+}
+
+std::pair<SbStage, SbSlotVector> SbBuilder::makeProject(SbStage stage,
+                                                        const VariableTypes* varTypes,
+                                                        SbExprOptSbSlotVector projects) {
+    sbe::SlotExprPairVector slotExprPairs;
+    SbSlotVector outSlots;
+
+    for (auto& [expr, optSlot] : projects) {
+        expr.optimize(_state, varTypes);
+
+        if (expr.isSlotExpr() && (!optSlot || expr.toSlot().getId() == optSlot->getId())) {
+            // If 'expr' is an SbSlot -AND- if 'optSlot' is equal to either 'expr.toSlot()' or
+            // boost::none, then we don't need to project anything and instead we can just store
+            // 'expr.toSlot()' directly into 'outSlots'.
+            outSlots.emplace_back(expr.toSlot());
+        } else {
+            // Otherwise, allocate a slot if needed, add a project to 'slotExprPairs' for this
+            // update, and then store the SbSlot (annotated with the type signature from 'expr')
+            // into 'outSlots'.
+            sbe::value::SlotId slot = optSlot ? optSlot->getId() : _state.slotId();
+            outSlots.emplace_back(slot, expr.getTypeSignature());
+            slotExprPairs.emplace_back(slot, expr.extractExpr(_state));
+        }
+    }
+
+    if (!slotExprPairs.empty()) {
+        return {sbe::makeS<sbe::ProjectStage>(std::move(stage), std::move(slotExprPairs), _nodeId),
+                std::move(outSlots)};
+    }
+
+    return {std::move(stage), std::move(outSlots)};
+}
+
+std::tuple<SbStage, SbSlotVector, SbSlotVector> SbBuilder::makeHashAgg(
+    SbStage stage,
+    const VariableTypes* varTypes,
+    const SbSlotVector& gbs,
+    SbAggExprVector sbAggExprs,
+    boost::optional<sbe::value::SlotId> collatorSlot,
+    bool allowDiskUse,
+    SbExprSbSlotVector mergingExprs,
+    PlanYieldPolicy* yieldPolicy) {
+    // In debug builds or when we explicitly set the query knob, we artificially force frequent
+    // spilling. This makes sure that our tests exercise the spilling algorithm and the associated
+    // logic for merging partial aggregates which otherwise would require large data sizes to
+    // exercise.
+    const bool forceIncreasedSpilling = allowDiskUse &&
+        (kDebugBuild || internalQuerySlotBasedExecutionHashAggForceIncreasedSpilling.load());
+
+    // For normal (non-block) HashAggStage, the group by "out" slots are the same as the incoming
+    // group by slots.
+    SbSlotVector groupByOutSlots = gbs;
+
+    // Copy unique slot IDs from 'gbs' to 'groupBySlots'.
+    sbe::value::SlotVector groupBySlots;
+    absl::flat_hash_set<sbe::value::SlotId> dedup;
+
+    for (const auto& sbSlot : gbs) {
+        auto slotId = sbSlot.getId();
+
+        if (dedup.insert(slotId).second) {
+            groupBySlots.emplace_back(slotId);
+        }
+    }
+
+    sbe::AggExprVector aggExprsVec;
+    SbSlotVector aggOutSlots;
+    for (auto& [sbAggExpr, optSbSlot] : sbAggExprs) {
+        auto sbSlot = optSbSlot ? *optSbSlot : SbSlot{_state.slotId()};
+        aggOutSlots.emplace_back(sbSlot);
+
+        auto exprPair = sbe::AggExprPair{sbAggExpr.init.extractExpr(_state, varTypes),
+                                         sbAggExpr.agg.extractExpr(_state, varTypes)};
+
+        aggExprsVec.emplace_back(std::pair(sbSlot.getId(), std::move(exprPair)));
+    }
+
+    sbe::SlotExprPairVector mergingExprsVec = lower(mergingExprs);
+
+    stage = sbe::makeS<sbe::HashAggStage>(std::move(stage),
+                                          std::move(groupBySlots),
+                                          std::move(aggExprsVec),
+                                          sbe::makeSV(),
+                                          true /* optimized close */,
+                                          collatorSlot,
+                                          allowDiskUse,
+                                          std::move(mergingExprsVec),
+                                          yieldPolicy,
+                                          _nodeId,
+                                          true /* participateInTrialRunTracking */,
+                                          forceIncreasedSpilling);
+
+    return {std::move(stage), std::move(groupByOutSlots), std::move(aggOutSlots)};
+}
+
+std::tuple<SbStage, SbSlotVector, SbSlotVector> SbBuilder::makeBlockHashAgg(
+    SbStage stage,
+    const VariableTypes* varTypes,
+    const SbSlotVector& gbs,
+    SbAggExprVector sbAggExprs,
+    SbSlot selectivityBitmapSlot,
+    const SbSlotVector& blockAccArgSbSlots,
+    SbSlot bitmapInternalSlot,
+    const SbSlotVector& accumulatorDataSbSlots,
+    bool allowDiskUse,
+    SbExprSbSlotVector mergingExprs,
+    PlanYieldPolicy* yieldPolicy) {
+    tassert(8448607, "Expected at least one group by slot to be provided", gbs.size() > 0);
+
+    const auto selectivityBitmapSlotId = selectivityBitmapSlot.getId();
+
+    sbe::AggExprTupleVector aggs;
+    SbSlotVector aggOutSlots;
+
+    for (auto& [sbAggExpr, optSbSlot] : sbAggExprs) {
+        auto sbSlot = optSbSlot ? *optSbSlot : SbSlot{_state.slotId()};
+        sbSlot.setTypeSignature(TypeSignature::kBlockType.include(TypeSignature::kAnyScalarType));
+
+        aggOutSlots.emplace_back(sbSlot);
+
+        std::unique_ptr<sbe::EExpression> init, blockAgg, agg;
+        if (sbAggExpr.init) {
+            init = sbAggExpr.init.extractExpr(_state, varTypes);
+        }
+        if (sbAggExpr.blockAgg) {
+            blockAgg = sbAggExpr.blockAgg.extractExpr(_state, varTypes);
+        }
+        agg = sbAggExpr.agg.extractExpr(_state, varTypes);
+
+        aggs.emplace_back(sbSlot.getId(),
+                          sbe::AggExprTuple{std::move(init), std::move(blockAgg), std::move(agg)});
+    }
+
+    // Copy unique slot IDs from 'gbs' to 'groupBySlots'.
+    sbe::value::SlotVector groupBySlots;
+    absl::flat_hash_set<sbe::value::SlotId> dedupedGbs;
+
+    for (const auto& sbSlot : gbs) {
+        auto slotId = sbSlot.getId();
+
+        if (dedupedGbs.insert(slotId).second) {
+            groupBySlots.emplace_back(slotId);
+        }
+    }
+
+    sbe::value::SlotVector blockAccArgSlots = lower(blockAccArgSbSlots);
+    sbe::value::SlotVector accumulatorDataSlots = lower(accumulatorDataSbSlots);
+    sbe::SlotExprPairVector mergingExprsVec = lower(mergingExprs);
+
+    const bool forceIncreasedSpilling = allowDiskUse &&
+        (kDebugBuild || internalQuerySlotBasedExecutionHashAggForceIncreasedSpilling.load());
+
+    stage = sbe::makeS<sbe::BlockHashAggStage>(std::move(stage),
+                                               std::move(groupBySlots),
+                                               selectivityBitmapSlotId,
+                                               std::move(blockAccArgSlots),
+                                               std::move(accumulatorDataSlots),
+                                               bitmapInternalSlot.getId(),
+                                               std::move(aggs),
+                                               allowDiskUse,
+                                               std::move(mergingExprsVec),
+                                               yieldPolicy,
+                                               _nodeId,
+                                               true /* participateInTrialRunTracking */,
+                                               forceIncreasedSpilling);
+
+    // For BlockHashAggStage, the group by "out" slots are the same as the incoming group by slots,
+    // except that each "out" slot will always be a block even if the corresponding incoming group
+    // by slot was scalar.
+    SbSlotVector groupByOutSlots;
+    for (size_t i = 0; i < gbs.size(); ++i) {
+        auto slotId = gbs[i].getId();
+        auto inputSig = gbs[i].getTypeSignature().value_or(TypeSignature::kAnyScalarType);
+        auto outputSig = TypeSignature::kBlockType.include(inputSig);
+
+        groupByOutSlots.push_back(SbSlot(slotId, outputSig));
+    }
+
+    return {std::move(stage), std::move(groupByOutSlots), std::move(aggOutSlots)};
+}
+
+std::tuple<SbStage, SbSlotVector> SbBuilder::makeAggProject(SbStage stage,
+                                                            const VariableTypes* varTypes,
+                                                            SbAggExprVector sbAggExprs) {
+    sbe::AggExprVector aggExprsVec;
+    SbSlotVector aggOutSlots;
+
+    for (auto& [sbAggExpr, optSbSlot] : sbAggExprs) {
+        auto sbSlot = optSbSlot ? *optSbSlot : SbSlot{_state.slotId()};
+        aggOutSlots.emplace_back(sbSlot);
+
+        auto exprPair = sbe::AggExprPair{sbAggExpr.init.extractExpr(_state, varTypes),
+                                         sbAggExpr.agg.extractExpr(_state, varTypes)};
+
+        aggExprsVec.emplace_back(std::pair(sbSlot.getId(), std::move(exprPair)));
+    }
+
+    stage = sbe::makeS<sbe::AggProjectStage>(std::move(stage), std::move(aggExprsVec), _nodeId);
+
+    return {std::move(stage), std::move(aggOutSlots)};
+}
+
+SbStage SbBuilder::makeWindow(SbStage stage,
+                              const VariableTypes* varTypes,
+                              const SbSlotVector& currSlots,
+                              const SbSlotVector& boundTestingSlots,
+                              size_t partitionSlotCount,
+                              std::vector<SbWindow> windows,
+                              boost::optional<sbe::value::SlotId> collatorSlot,
+                              bool allowDiskUse) {
+    return sbe::makeS<sbe::WindowStage>(std::move(stage),
+                                        lower(currSlots, varTypes),
+                                        lower(boundTestingSlots, varTypes),
+                                        partitionSlotCount,
+                                        lower(windows, varTypes),
+                                        collatorSlot,
+                                        allowDiskUse,
+                                        _nodeId);
 }
 }  // namespace mongo::stage_builder

@@ -92,7 +92,7 @@ class MongosProcessInterface : public CommonProcessInterface {
 public:
     using CommonProcessInterface::CommonProcessInterface;
 
-    virtual ~MongosProcessInterface() = default;
+    ~MongosProcessInterface() override = default;
 
     std::unique_ptr<WriteSizeEstimator> getWriteSizeEstimator(
         OperationContext* opCtx, const NamespaceString& ns) const final;
@@ -118,6 +118,11 @@ public:
     }
 
     bool isSharded(OperationContext* opCtx, const NamespaceString& nss) final;
+
+    boost::optional<ShardId> determineSpecificMergeShard(OperationContext* opCtx,
+                                                         const NamespaceString& ns) const final {
+        return CommonProcessInterface::findOwningShard(opCtx, ns);
+    }
 
     Status insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                   const NamespaceString& ns,
@@ -217,7 +222,8 @@ public:
 
     void createTempCollection(OperationContext* opCtx,
                               const NamespaceString& nss,
-                              const BSONObj& collectionOptions) final {
+                              const BSONObj& collectionOptions,
+                              boost::optional<ShardId> dataShard) final {
         MONGO_UNREACHABLE;
     }
 
@@ -253,6 +259,10 @@ public:
 
     std::string getShardName(OperationContext* opCtx) const final {
         MONGO_UNREACHABLE;
+    }
+
+    boost::optional<ShardId> getShardId(OperationContext*) const final {
+        return {};
     }
 
     bool inShardedEnvironment(OperationContext* opCtx) const final {
@@ -291,7 +301,7 @@ public:
 
     bool fieldsHaveSupportingUniqueIndex(const boost::intrusive_ptr<ExpressionContext>&,
                                          const NamespaceString&,
-                                         const std::set<FieldPath>& fieldPaths) const;
+                                         const std::set<FieldPath>& fieldPaths) const override;
 
     void checkRoutingInfoEpochOrThrow(const boost::intrusive_ptr<ExpressionContext>&,
                                       const NamespaceString&,
@@ -304,10 +314,6 @@ public:
         const NamespaceString& nss,
         const boost::optional<DatabaseVersion>& dbVersion) override {
         MONGO_UNREACHABLE;
-    }
-
-    std::unique_ptr<ResourceYielder> getResourceYielder(StringData cmdName) const override {
-        return nullptr;
     }
 
     std::pair<std::set<FieldPath>, boost::optional<ChunkVersion>>
@@ -323,12 +329,12 @@ public:
      * retry on network errors and also on StaleConfig errors to avoid restarting the entire
      * operation.
      */
-    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+    std::unique_ptr<Pipeline, PipelineDeleter> preparePipelineForExecution(
         Pipeline* pipeline,
         ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
         boost::optional<BSONObj> readConcern = boost::none) final;
 
-    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+    std::unique_ptr<Pipeline, PipelineDeleter> preparePipelineForExecution(
         const AggregateCommandRequest& aggRequest,
         Pipeline* pipeline,
         const boost::intrusive_ptr<ExpressionContext>& expCtx,

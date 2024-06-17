@@ -42,6 +42,7 @@
 #include <absl/container/node_hash_map.h>
 #include <boost/move/utility_core.hpp>
 #include <boost/optional/optional.hpp>
+#include <fmt/format.h>
 
 #include "mongo/db/query/optimizer/bool_expression.h"
 #include "mongo/db/query/optimizer/comparison_op.h"
@@ -186,12 +187,15 @@ public:
 
     template <size_t N>
     ProjectionName getNextId(const char (&prefix)[N]) {
-        if (std::holds_alternative<IdType>(_ids)) {
-            return ProjectionName{StringData(str::stream() << "p" << std::get<IdType>(_ids)++)};
-        } else {
-            return ProjectionName{StringData(
-                str::stream() << prefix << "_" << std::get<PrefixMapType>(_ids)[prefix]++)};
-        }
+        return ProjectionName{visit(
+            [&]<typename T>(T& v) -> std::string {
+                using namespace fmt::literals;
+                if constexpr (std::is_same_v<T, IdType>)
+                    return "p{}"_format(v++);
+                else if constexpr (std::is_same_v<T, PrefixMapType>)
+                    return "{}_{}"_format(prefix, v[prefix]++);
+            },
+            _ids)};
     }
 
     PrefixId(const PrefixId& other) = delete;
@@ -402,6 +406,12 @@ ResidualRequirementsWithOptionalCE::Node createResidualReqsWithCE(
 ResidualRequirementsWithOptionalCE::Node createResidualReqsWithEmptyCE(const PSRExpr::Node& reqs);
 
 /**
+ * Build ResidualRequirementsWithOptionalCE where each entry in 'residReqs' has boost::none CE.
+ */
+ResidualRequirementsWithOptionalCE::Node createResidualReqsWithEmptyCE(
+    const ResidualRequirements::Node& residReqs);
+
+/**
  * Sort requirements under a Conjunction by estimated cost.
  */
 void sortResidualRequirements(ResidualRequirementsWithOptionalCE::Node& residualReq);
@@ -482,20 +492,18 @@ PhysPlanBuilder lowerEqPrefixes(PrefixId& prefixId,
 bool hasProperIntervals(const PSRExpr::Node& reqs);
 
 /**
- * Builds the evaluation nodes necessary to retrieve all non-top-level fields from each shard key
- * path, and the filter node needed to perform shard filtering. Determines the CE of the nodes
- * according to the indexReqTarget.
- */
-void handleScanNodeRemoveOrphansRequirement(const IndexCollationSpec& shardKey,
-                                            PhysPlanBuilder& builder,
-                                            FieldProjectionMap& fieldProjectionMap,
-                                            IndexReqTarget indexReqTarget,
-                                            CEType groupCE,
-                                            PrefixId& prefixId);
-
-/**
  * Computes the number of plan elements present in the tree.
  */
 size_t countElements(const ABT& node);
+
+/**
+ * If the map {FieldNameType -> ProjectionName} doesn't contain the input fieldName, create a new
+ * temporary projection name, and add the new pair {FieldName -> tempProjectionName} to
+ * 'fieldProjMap'. This function is used when pushing fields down to an operator (a scan) so that
+ * the resulting field value is available through the temp projection to consumer operators.
+ */
+const ProjectionName& getExistingOrTempProjForFieldName(PrefixId& prefixId,
+                                                        const FieldNameType& fieldName,
+                                                        FieldProjectionMap& fieldProjMap);
 
 }  // namespace mongo::optimizer

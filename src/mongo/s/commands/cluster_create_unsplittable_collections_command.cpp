@@ -33,7 +33,6 @@
 #include "mongo/s/cluster_ddl.h"
 #include "mongo/s/commands/shard_collection_gen.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
-#include "mongo/s/sharding_feature_flags_gen.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
@@ -82,21 +81,13 @@ public:
                 "collection yet",
                 !nss.isFLE2StateCollection());
 
-            bool isTrackUnshardedEnabled =
-                feature_flags::gTrackUnshardedCollectionsOnShardingCatalog.isEnabled(
-                    serverGlobalParams.featureCompatibility);
-
-            uassert(ErrorCodes::IllegalOperation,
-                    "cannot create an unsplittable collection if "
-                    "featureFlagTrackUnshardedCollectionsOnShardingCatalog is unset",
-                    isTrackUnshardedEnabled);
-
             ShardsvrCreateCollection shardsvrCollRequest(nss);
             auto svrRequest = ShardsvrCreateCollectionRequest::parse(
                 IDLParserContext("createUnsplittableCollection"), req.toBSON({}));
             svrRequest.setShardKey(BSON("_id" << 1));
             svrRequest.setUnsplittable(true);
             svrRequest.setDataShard(req.getDataShard());
+            svrRequest.setTimeseries(req.getTimeseries());
             svrRequest.setIsFromCreateUnsplittableCollectionTestCommand(true);
             shardsvrCollRequest.setDbName(nss.dbName());
             shardsvrCollRequest.setShardsvrCreateCollectionRequest(svrRequest);

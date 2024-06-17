@@ -55,6 +55,8 @@ public:
                        NamespaceString nss,
                        boost::optional<ShardVersion> shardVersion,
                        boost::optional<DatabaseVersion> databaseVersion);
+    ScopedSetShardRole(const ScopedSetShardRole&) = delete;
+    ScopedSetShardRole(ScopedSetShardRole&&);
     ~ScopedSetShardRole();
 
 private:
@@ -66,13 +68,29 @@ private:
     boost::optional<DatabaseVersion> _databaseVersion;
 };
 
+// Stashes the shard role for the given namespace.
+// DON'T USE unless you understand very well what you're doing.
+class ScopedStashShardRole {
+public:
+    ScopedStashShardRole(OperationContext* opCtx, const NamespaceString& nss);
+
+    ScopedStashShardRole(const ScopedSetShardRole&) = delete;
+    ScopedStashShardRole(ScopedSetShardRole&&) = delete;
+
+    ~ScopedStashShardRole();
+
+private:
+    OperationContext* _opCtx;
+    NamespaceString _nss;
+    boost::optional<ShardVersion> _stashedShardVersion;
+    boost::optional<DatabaseVersion> _stashedDatabaseVersion;
+};
+
 /**
  * A decoration on OperationContext representing per-operation shard version metadata sent to mongod
  * from mongos as a command parameter.
  *
  * The metadata for a particular operation can be retrieved using the get() method.
- *
- * Note: This only supports storing the version for a single namespace.
  */
 class OperationShardingState {
     OperationShardingState(const OperationShardingState&) = delete;
@@ -93,6 +111,13 @@ public:
      * whether there is shard version declared for any namespace.
      */
     static bool isComingFromRouter(OperationContext* opCtx);
+
+    /**
+     * Similar to 'isComingFromRouter()' but also considers '_treatAsFromRouter'. This should be
+     * used when an operation intentionally skips setting shard versions but still wants to tell if
+     * it's sent from a router.
+     */
+    static bool shouldBeTreatedAsFromRouter(OperationContext* opCtx);
 
     /**
      * NOTE: DO NOT ADD any new usages of this class without including someone from the Sharding
@@ -125,14 +150,6 @@ public:
                              const NamespaceString& nss,
                              const boost::optional<ShardVersion>& shardVersion,
                              const boost::optional<DatabaseVersion>& dbVersion);
-
-    /**
-     * Used to clear the shard role from the opCtx for ddl operations which are not required to send
-     * the index version (ex. split, merge). These operations will do their own metadata checks
-     * rather than us the collection sharding runtime checks.
-     */
-    static void unsetShardRoleForLegacyDDLOperationsSentWithShardVersionIfNeeded(
-        OperationContext* opCtx, const NamespaceString& nss);
 
     /**
      * Returns the shard version (i.e. maximum chunk version) of a namespace being used by the
@@ -174,8 +191,13 @@ public:
      */
     boost::optional<Status> resetShardingOperationFailedStatus();
 
+    void setTreatAsFromRouter(bool treatAsFromRouter = true) {
+        _treatAsFromRouter = treatAsFromRouter;
+    }
+
 private:
     friend class ScopedSetShardRole;
+    friend class ScopedStashShardRole;
     friend class ShardServerOpObserver;  // For access to _allowCollectionCreation below
 
     // Specifies whether the request is allowed to create database/collection implicitly
@@ -209,6 +231,10 @@ private:
     // This value can only be set when a rerouting exception occurs during a write operation, and
     // must be handled before this object gets destructed.
     boost::optional<Status> _shardingOperationFailedStatus;
+
+    // Set when the operation comes from a router but intentionally skips setting the database or
+    // the shard version.
+    bool _treatAsFromRouter{false};
 };
 
 }  // namespace mongo

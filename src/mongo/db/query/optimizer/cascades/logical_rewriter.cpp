@@ -64,60 +64,18 @@
 
 namespace mongo::optimizer::cascades {
 
-LogicalRewriter::RewriteSet LogicalRewriter::_explorationSet = {
-    {LogicalRewriteType::GroupByExplore, 1},
-    {LogicalRewriteType::SargableSplit, 2},
-    {LogicalRewriteType::FilterRIDIntersectReorder, 2},
-    {LogicalRewriteType::EvaluationRIDIntersectReorder, 2}};
-
-LogicalRewriter::RewriteSet LogicalRewriter::_substitutionSet = {
-    {LogicalRewriteType::FilterEvaluationReorder, 1},
-    {LogicalRewriteType::FilterCollationReorder, 1},
-    {LogicalRewriteType::EvaluationCollationReorder, 1},
-    {LogicalRewriteType::EvaluationLimitSkipReorder, 1},
-
-    {LogicalRewriteType::FilterGroupByReorder, 1},
-    {LogicalRewriteType::GroupCollationReorder, 1},
-
-    {LogicalRewriteType::FilterUnwindReorder, 1},
-    {LogicalRewriteType::EvaluationUnwindReorder, 1},
-    {LogicalRewriteType::UnwindCollationReorder, 1},
-
-    {LogicalRewriteType::FilterExchangeReorder, 1},
-    {LogicalRewriteType::ExchangeEvaluationReorder, 1},
-
-    {LogicalRewriteType::FilterUnionReorder, 1},
-
-    {LogicalRewriteType::CollationMerge, 1},
-    {LogicalRewriteType::LimitSkipMerge, 1},
-
-    {LogicalRewriteType::SargableFilterReorder, 1},
-    {LogicalRewriteType::SargableEvaluationReorder, 1},
-    {LogicalRewriteType::SargableDisjunctiveReorder, 1},
-
-    {LogicalRewriteType::FilterValueScanPropagate, 1},
-    {LogicalRewriteType::EvaluationValueScanPropagate, 1},
-    {LogicalRewriteType::SargableValueScanPropagate, 1},
-    {LogicalRewriteType::CollationValueScanPropagate, 1},
-    {LogicalRewriteType::LimitSkipValueScanPropagate, 1},
-    {LogicalRewriteType::ExchangeValueScanPropagate, 1},
-
-    {LogicalRewriteType::LimitSkipSubstitute, 1},
-
-    {LogicalRewriteType::FilterSubstitute, 2},
-    {LogicalRewriteType::EvaluationSubstitute, 2},
-    {LogicalRewriteType::SargableMerge, 2}};
-
 LogicalRewriter::LogicalRewriter(const Metadata& metadata,
                                  Memo& memo,
                                  PrefixId& prefixId,
-                                 RewriteSet rewriteSet,
+                                 LogicalRewriteSet rewriteSet,
                                  const DebugInfo& debugInfo,
                                  const QueryHints& hints,
                                  const PathToIntervalFn& pathToInterval,
                                  const ConstFoldFn& constFold,
                                  const LogicalPropsInterface& logicalPropsDerivation,
-                                 const CardinalityEstimator& cardinalityEstimator)
+                                 const CardinalityEstimator& cardinalityEstimator,
+                                 const QueryParameterMap& queryParameters,
+                                 OptimizerCounterInfo& optCounterInfo)
     : _activeRewriteSet(std::move(rewriteSet)),
       _groupsPending(),
       _metadata(metadata),
@@ -128,7 +86,9 @@ LogicalRewriter::LogicalRewriter(const Metadata& metadata,
       _pathToInterval(pathToInterval),
       _constFold(constFold),
       _logicalPropsDerivation(logicalPropsDerivation),
-      _cardinalityEstimator(cardinalityEstimator) {
+      _cardinalityEstimator(cardinalityEstimator),
+      _queryParameters(queryParameters),
+      _optCounterInfo(optCounterInfo) {
     initializeRewrites();
 
     if (_activeRewriteSet.count(LogicalRewriteType::SargableSplit) > 0) {
@@ -160,12 +120,15 @@ std::pair<GroupIdType, NodeIdSet> LogicalRewriter::addNode(const ABT& node,
         targetGroupMap = {{node.ref(), targetGroupId}};
     }
 
-    const GroupIdType resultGroupId = _memo.integrate(
-        Memo::Context{&_metadata, &_debugInfo, &_logicalPropsDerivation, &_cardinalityEstimator},
-        node,
-        std::move(targetGroupMap),
-        insertedNodeIds,
-        rule);
+    const GroupIdType resultGroupId = _memo.integrate(Memo::Context{&_metadata,
+                                                                    &_debugInfo,
+                                                                    &_logicalPropsDerivation,
+                                                                    &_cardinalityEstimator,
+                                                                    &_queryParameters},
+                                                      node,
+                                                      std::move(targetGroupMap),
+                                                      insertedNodeIds,
+                                                      rule);
 
     uassert(6624046,
             "Result group is not the same as target group",
@@ -265,6 +228,10 @@ public:
 
     const auto& getConstFold() const {
         return _rewriter._constFold;
+    }
+
+    void setMaxPSRCountReached() {
+        _rewriter._optCounterInfo.maxPartialSchemaReqCountReached = true;
     }
 
 private:
@@ -666,6 +633,11 @@ struct SubstituteMerge<SargableNode, SargableNode> {
 };
 
 template <class Type>
+struct SubstituteSimplify {
+    void operator()(ABT::reference_type nodeRef, RewriteContext& ctx) = delete;
+};
+
+template <class Type>
 struct SubstituteConvert {
     void operator()(ABT::reference_type nodeRef, RewriteContext& ctx) = delete;
 };
@@ -731,7 +703,8 @@ static void convertFilterToSargableNode(ABT::reference_type node,
         return;
     }
     if (PSRExpr::numLeaves(conversion->_reqMap) > SargableNode::kMaxPartialSchemaReqs) {
-        // Too many requirements.
+        // Too many requirements. Record that we reached this state.
+        ctx.setMaxPSRCountReached();
         return;
     }
     if (psr::isNoop(conversion->_reqMap)) {
@@ -1091,7 +1064,8 @@ struct SubstituteConvert<FilterNode> {
             if (auto result = decomposeToFilterNodes(filterNode.getChild(),
                                                      evalFilter->getPath(),
                                                      evalFilter->getInput(),
-                                                     2 /*minDepth*/)) {
+                                                     2 /*minDepth*/,
+                                                     kMaxPathConjunctionDecomposition)) {
                 ctx.addNode(*result, true /*substitute*/);
                 return;
             }
@@ -1126,6 +1100,41 @@ struct SubstituteConvert<FilterNode> {
         }
 
         convertFilterToSargableNode(node, filterNode, ctx, scanProjName);
+    }
+};
+
+template <>
+struct SubstituteSimplify<FilterNode> {
+    void operator()(ABT::reference_type node, RewriteContext& ctx) {
+        // TODO SERVER-83835: Implement more granular rewrites.
+        const FilterNode& filterNode = *node.cast<FilterNode>();
+
+        using namespace properties;
+        const LogicalProps& props = ctx.getAboveLogicalProps();
+        if (!hasProperty<IndexingAvailability>(props)) {
+            return;
+        }
+        const auto& indexingAvailability = getPropertyConst<IndexingAvailability>(props);
+        const ProjectionName& scanProjName = indexingAvailability.getScanProjection();
+
+        const ScanDefinition& scanDef =
+            ctx.getMetadata()._scanDefs.at(indexingAvailability.getScanDefName());
+        if (!scanDef.exists()) {
+            return;
+        }
+        const MultikeynessTrie& trie = scanDef.getMultikeynessTrie();
+
+        if (simplifyFilterPath(filterNode, ctx, scanProjName, trie)) {
+            return;
+        }
+
+        if (ctx.getHints()._enableNotPushdown) {
+            if (auto filter = NotPushdown::simplify(filterNode.getFilter(), ctx.getPrefixId())) {
+                ctx.addNode(make<FilterNode>(std::move(*filter), filterNode.getChild()),
+                            true /*substitute*/);
+                return;
+            }
+        }
     }
 };
 
@@ -2135,6 +2144,8 @@ void LogicalRewriter::initializeRewrites() {
                     &LogicalRewriter::bindAboveBelow<SargableNode, SargableNode, SubstituteMerge>);
     registerRewrite(LogicalRewriteType::FilterSubstitute,
                     &LogicalRewriter::bindSingleNode<FilterNode, SubstituteConvert>);
+    registerRewrite(LogicalRewriteType::FilterSimplify,
+                    &LogicalRewriter::bindSingleNode<FilterNode, SubstituteSimplify>);
     registerRewrite(LogicalRewriteType::EvaluationSubstitute,
                     &LogicalRewriter::bindSingleNode<EvaluationNode, SubstituteConvert>);
 
@@ -2266,14 +2277,6 @@ void LogicalRewriter::bindSingleNode(const MemoLogicalNodeId nodeMemoId,
         RewriteContext ctx(*this, rule, nodeMemoId);
         R<Type>()(node, ctx);
     }
-}
-
-const LogicalRewriter::RewriteSet& LogicalRewriter::getExplorationSet() {
-    return _explorationSet;
-}
-
-const LogicalRewriter::RewriteSet& LogicalRewriter::getSubstitutionSet() {
-    return _substitutionSet;
 }
 
 }  // namespace mongo::optimizer::cascades

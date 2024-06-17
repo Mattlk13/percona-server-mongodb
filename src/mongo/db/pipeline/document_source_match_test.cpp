@@ -552,7 +552,7 @@ TEST_F(DocumentSourceMatchTest, ShouldCorrectlyJoinWithSubsequentMatch) {
     const auto match = DocumentSourceMatch::create(BSON("a" << 1), getExpCtx());
     const auto secondMatch = DocumentSourceMatch::create(BSON("b" << 1), getExpCtx());
 
-    match->joinMatchWith(secondMatch);
+    match->joinMatchWith(secondMatch, "$and"_sd);
 
     const auto mock = DocumentSourceMock::createForTest({Document{{"a", 1}, {"b", 1}},
                                                          Document{{"a", 2}, {"b", 1}},
@@ -688,7 +688,7 @@ TEST_F(DocumentSourceMatchTest, ShouldCorrectlyEvaluateJSONSchemaPredicate) {
         fromjson("{$jsonSchema: {properties: {a: {type: 'number'}}}}"), getExpCtx());
 
     const auto mock = DocumentSourceMock::createForTest(
-        {Document{{"a", 1}}, Document{{"a", "str"_sd}}, Document{{"a", {Document{{nullptr, 1}}}}}},
+        {Document{{"a", 1}}, Document{{"a", "str"_sd}}, Document{{"a", {Document{{{}, 1}}}}}},
         getExpCtx());
 
     match->setSource(mock.get());

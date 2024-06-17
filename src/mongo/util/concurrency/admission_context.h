@@ -28,22 +28,23 @@
  */
 #pragma once
 
-#include <cstdint>
-#include <type_traits>
+#include <boost/optional.hpp>
 
 #include "mongo/base/string_data.h"
-#include "mongo/platform/atomic_word.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/tick_source.h"
 
 namespace mongo {
+
+class OperationContext;
 
 /**
  * Stores state and statistics related to admission control for a given transactional context.
  */
 class AdmissionContext {
-
 public:
-    AdmissionContext() {}
+    AdmissionContext(const AdmissionContext& other);
+    AdmissionContext& operator=(const AdmissionContext& other);
 
     /**
      * Classifies the priority that an operation acquires a ticket when the system is under high
@@ -57,53 +58,96 @@ public:
      *
      * 'kNormal': It's important that the operation be throttled under load. If this operation is
      * throttled, it will not affect system availability or observability. Most operations, both
-     * user and internal, should use this priority unless they qualify as 'kLow' or 'kImmediate'
+     * user and internal, should use this priority unless they qualify as 'kLow' or 'kExempt'
      * priority.
      *
-     * 'kImmediate': It's crucial that the operation makes forward progress - bypasses the ticketing
+     * 'kExempt': It's crucial that the operation makes forward progress - bypasses the ticketing
      * mechanism.
      *
      * Reserved for operations critical to availability (e.g. replication workers) or observability
      * (e.g. FTDC), and any operation that is releasing resources (e.g. committing or aborting
      * prepared transactions). Should be used sparingly.
      */
-    enum class Priority { kLow = 0, kNormal, kImmediate };
+    enum class Priority { kExempt = 0, kLow, kNormal };
 
-    void start(TickSource* tickSource) {
-        admissions.fetchAndAdd(1);
-        if (tickSource) {
-            _startProcessingTime.store(tickSource->getTicks());
-        }
-    }
+    /**
+     * Returns the total time this admission context has ever waited in a queue.
+     */
+    Microseconds totalTimeQueuedMicros() const;
 
-    TickSource::Tick getStartProcessingTime() const {
-        return _startProcessingTime.loadRelaxed();
-    }
+    /**
+     * Returns the time this admission context started waiting to be queued, if it is currently
+     * queued.
+     */
+    boost::optional<TickSource::Tick> startQueueingTime() const;
 
     /**
      * Returns the number of times this context has taken a ticket.
      */
-    int getAdmissions() const {
-        return admissions.loadRelaxed();
-    }
+    int getAdmissions() const;
 
-    void setPriority(Priority priority) {
-        _priority.store(priority);
-    }
+    Priority getPriority() const;
 
-    Priority getPriority() const {
-        return _priority.loadRelaxed();
-    }
+protected:
+    friend class ScopedAdmissionPriorityBase;
+    friend class TicketHolder;
+    friend class WaitingForAdmissionGuard;
+
+    AdmissionContext() = default;
+
+    void recordAdmission();
+
+    constexpr static TickSource::Tick kNotQueueing = -1;
+
+    Atomic<int32_t> _admissions{0};
+    Atomic<Priority> _priority{Priority::kNormal};
+    Atomic<int64_t> _totalTimeQueuedMicros;
+    Atomic<TickSource::Tick> _startQueueingTime{kNotQueueing};
+};
+
+/**
+ * Default-constructible admission context to use for testing purposes.
+ */
+class MockAdmissionContext : public AdmissionContext {
+public:
+    MockAdmissionContext() = default;
+};
+
+/**
+ * RAII-style class to set the priority for the ticket admission mechanism when acquiring a global
+ * lock.
+ */
+class ScopedAdmissionPriorityBase {
+public:
+    explicit ScopedAdmissionPriorityBase(OperationContext* opCtx,
+                                         AdmissionContext& admCtx,
+                                         AdmissionContext::Priority priority);
+    ScopedAdmissionPriorityBase(const ScopedAdmissionPriorityBase&) = delete;
+    ScopedAdmissionPriorityBase& operator=(const ScopedAdmissionPriorityBase&) = delete;
+    ~ScopedAdmissionPriorityBase();
 
 private:
-    // We wrap these types in AtomicWord to avoid race conditions between reporting metrics and
-    // setting the values.
-    //
-    // Only a single writer thread will modify these variables and the readers allow relaxed memory
-    // semantics.
-    AtomicWord<TickSource::Tick> _startProcessingTime{0};
-    AtomicWord<int32_t> admissions{0};
-    AtomicWord<Priority> _priority{Priority::kNormal};
+    OperationContext* const _opCtx;
+    AdmissionContext* const _admCtx;
+    AdmissionContext::Priority _originalPriority;
+};
+
+template <typename AdmissionContextType>
+class ScopedAdmissionPriority : public ScopedAdmissionPriorityBase {
+public:
+    explicit ScopedAdmissionPriority(OperationContext* opCtx, AdmissionContext::Priority priority)
+        : ScopedAdmissionPriorityBase(opCtx, AdmissionContextType::get(opCtx), priority) {}
+    ~ScopedAdmissionPriority() = default;
+};
+
+class WaitingForAdmissionGuard {
+public:
+    explicit WaitingForAdmissionGuard(AdmissionContext* admCtx, TickSource* tickSource);
+    ~WaitingForAdmissionGuard();
+
+private:
+    AdmissionContext* _admCtx;
+    TickSource* _tickSource;
 };
 
 StringData toString(AdmissionContext::Priority priority);

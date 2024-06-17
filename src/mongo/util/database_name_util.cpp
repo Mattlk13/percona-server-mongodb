@@ -50,68 +50,43 @@
 
 namespace mongo {
 
+using namespace fmt::literals;
 std::string DatabaseNameUtil::serialize(const DatabaseName& dbName,
                                         const SerializationContext& context) {
     if (!gMultitenancySupport)
         return dbName.toString();
 
     switch (context.getSource()) {
-        case SerializationContext::Source::AuthPrevalidated:
-            return serializeForAuthPrevalidated(dbName, context);
         case SerializationContext::Source::Command:
             return serializeForCommands(dbName, context);
         case SerializationContext::Source::Catalog:
+            return dbName.toStringWithTenantId();
         case SerializationContext::Source::Storage:
         case SerializationContext::Source::Default:
             // Use forStorage as the default serializing rule
-            return serializeForStorage(dbName, context);
+            return serializeForStorage(dbName);
         default:
             MONGO_UNREACHABLE;
     }
 }
 
-std::string DatabaseNameUtil::serializeForAuthPrevalidated(const DatabaseName& dbName,
-                                                           const SerializationContext& context) {
-    // We want everything in the DatabaseName (tenantId, db) to be present in the serialized output
-    // to prevent loss of information in the prevalidated context.
-    return dbName.toStringWithTenantId();
-}
-
-std::string DatabaseNameUtil::serializeForStorage(const DatabaseName& dbName,
-                                                  const SerializationContext& context) {
-    if (gFeatureFlagRequireTenantID.isEnabled(serverGlobalParams.featureCompatibility)) {
+std::string DatabaseNameUtil::serializeForStorage(const DatabaseName& dbName) {
+    // TODO SERVER-84275: Change to use isEnabled again.
+    // We need to use isEnabledUseLastLTSFCVWhenUninitialized instead of isEnabled because
+    // this could run during startup while the FCV is still uninitialized.
+    if (gFeatureFlagRequireTenantID.isEnabledUseLastLTSFCVWhenUninitialized(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
         return dbName.toString();
     }
     return dbName.toStringWithTenantId();
 }
 
-std::string DatabaseNameUtil::serializeForCatalog(const DatabaseName& dbName,
-                                                  const SerializationContext& context) {
-    return dbName.toStringWithTenantId();
-}
-
 std::string DatabaseNameUtil::serializeForCommands(const DatabaseName& dbName,
                                                    const SerializationContext& context) {
-    // tenantId came from either a $tenant field or security token.
-    if (context.receivedNonPrefixedTenantId()) {
-        switch (context.getPrefix()) {
-            case SerializationContext::Prefix::ExcludePrefix:
-                // fallthrough
-            case SerializationContext::Prefix::Default:
-                return dbName.toString();
-            case SerializationContext::Prefix::IncludePrefix:
-                return dbName.toStringWithTenantId();
-            default:
-                MONGO_UNREACHABLE;
-        }
-    }
-
-    // tenantId came from the prefix.
+    // tenantId came from a security token.
     switch (context.getPrefix()) {
         case SerializationContext::Prefix::ExcludePrefix:
             return dbName.toString();
-        case SerializationContext::Prefix::Default:
-            // fallthrough
         case SerializationContext::Prefix::IncludePrefix:
             return dbName.toStringWithTenantId();
         default:
@@ -154,8 +129,6 @@ DatabaseName DatabaseNameUtil::deserialize(boost::optional<TenantId> tenantId,
     }
 
     switch (context.getSource()) {
-        case SerializationContext::Source::AuthPrevalidated:
-            return deserializeForAuthPrevalidated(std::move(tenantId), db, context);
         case SerializationContext::Source::Catalog:
             return deserializeForCatalog(std::move(tenantId), db);
         case SerializationContext::Source::Command:
@@ -166,31 +139,23 @@ DatabaseName DatabaseNameUtil::deserialize(boost::optional<TenantId> tenantId,
         case SerializationContext::Source::Storage:
         case SerializationContext::Source::Default:
             // Use forStorage as the default deserializing rule
-            return deserializeForStorage(std::move(tenantId), db, context);
+            return deserializeForStorage(std::move(tenantId), db);
         default:
             MONGO_UNREACHABLE;
     }
 }
 
-DatabaseName DatabaseNameUtil::deserializeForAuthPrevalidated(boost::optional<TenantId> tenantId,
-                                                              StringData db,
-                                                              const SerializationContext& context) {
-    if (context.shouldExpectTenantPrefixForAuth()) {
-        // If there is a tenantId, expect that it's included in the DB string, and that the tenantId
-        // field passed will be empty.
-        uassert(7489600, "TenantId must not be set, but it is", tenantId == boost::none);
-        return DatabaseNameUtil::parseFromStringExpectTenantIdInMultitenancyMode(db);
-    }
-    // Assumes that we are passing in validated and correct values for fields, and skip all checks.
-    return DatabaseName(std::move(tenantId), db);
-}
-
 DatabaseName DatabaseNameUtil::deserializeForStorage(boost::optional<TenantId> tenantId,
-                                                     StringData db,
-                                                     const SerializationContext& context) {
-    if (gFeatureFlagRequireTenantID.isEnabled(serverGlobalParams.featureCompatibility)) {
-        if (db != DatabaseName::kAdmin.db() && db != DatabaseName::kLocal.db() &&
-            db != DatabaseName::kConfig.db() && db != DatabaseName::kExternal.db())
+                                                     StringData db) {
+    // TODO SERVER-84275: Change to use isEnabled again.
+    // We need to use isEnabledUseLastLTSFCVWhenUninitialized instead of isEnabled because
+    // this could run during startup while the FCV is still uninitialized.
+    if (gFeatureFlagRequireTenantID.isEnabledUseLastLTSFCVWhenUninitialized(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+        if (db != DatabaseName::kAdmin.db(omitTenant) &&
+            db != DatabaseName::kLocal.db(omitTenant) &&
+            db != DatabaseName::kConfig.db(omitTenant) &&
+            db != DatabaseName::kExternal.db(omitTenant))
             uassert(7005300, "TenantId must be set", tenantId != boost::none);
 
         return DatabaseName(std::move(tenantId), db);
@@ -214,32 +179,28 @@ DatabaseName DatabaseNameUtil::deserializeForCommands(boost::optional<TenantId> 
     // we only get here if we are processing a Command Request.  We disregard the feature flag in
     // this case, essentially letting the request dictate the state of the feature.
 
-    // We received a tenantId from $tenant or the security token.
-    if (tenantId != boost::none && context.receivedNonPrefixedTenantId()) {
+    // We received a tenantId from the security token.
+    if (tenantId != boost::none) {
         switch (context.getPrefix()) {
-            case SerializationContext::Prefix::ExcludePrefix:
-                // fallthrough
-            case SerializationContext::Prefix::Default:
+            case SerializationContext::Prefix::ExcludePrefix: {
                 return DatabaseName(std::move(tenantId), db);
+            }
             case SerializationContext::Prefix::IncludePrefix: {
                 auto dbName = parseFromStringExpectTenantIdInMultitenancyMode(db);
                 if (!dbName.tenantId() && dbName.isInternalDb()) {
-                    return dbName;
+                    return DatabaseName(std::move(tenantId), dbName.db(omitTenant));
                 }
 
                 uassert(
                     8423386,
-                    str::stream()
-                        << "TenantId supplied by $tenant or security token as '"
-                        << tenantId->toString()
-                        << "' but prefixed tenantId also required given expectPrefix is set true",
+                    "TenantId supplied by security token as '{}' but prefixed tenantId also required given expectPrefix is set true"_format(
+                        tenantId->toString()),
                     dbName.tenantId());
                 uassert(
                     8423384,
-                    str::stream()
-                        << "TenantId from $tenant or security token must match prefixed tenantId: "
-                        << tenantId->toString() << " prefix " << dbName.tenantId()->toString(),
-                    tenantId.value() == dbName.tenantId());
+                    "TenantId from security token must match prefixed tenantId: {} prefix {}"_format(
+                        tenantId->toString(), dbName.tenantId()->toString()),
+                    tenantId == dbName.tenantId());
                 return dbName;
             }
             default:
@@ -247,32 +208,32 @@ DatabaseName DatabaseNameUtil::deserializeForCommands(boost::optional<TenantId> 
         }
     }
 
-    // We received the tenantId from the prefix.
+    // We shouldn't have a tenant ID prefix without an external tenant ID (from the security token).
     auto dbName = parseFromStringExpectTenantIdInMultitenancyMode(db);
-    if (!dbName.isInternalDb() && !dbName.isExternalDB())
-        uassert(8423388, "TenantId must be set", dbName.tenantId() != boost::none);
+    uassert(8233503,
+            str::stream() << "Atlas Proxy protocol must be true when there is a tenantId prefix "
+                          << db,
+            !dbName.hasTenantId());
+    uassert(8423388,
+            str::stream() << "TenantId must be set on " << db,
+            dbName.isInternalDb() || dbName.isExternalDB());
 
     return dbName;
 }
 
-DatabaseName DatabaseNameUtil::deserializeForCatalog(StringData db,
-                                                     const SerializationContext& context) {
-    // TenantId always prefix in the passed `db` for durable catalog. This method below checks for
-    // multitenancy and will either return a DatabaseName with (tenantId, nonPrefixedDb) or
-    // (none, prefixedDb).
-    return DatabaseNameUtil::parseFromStringExpectTenantIdInMultitenancyMode(db);
-}
-
 DatabaseName DatabaseNameUtil::deserializeForCatalog(boost::optional<TenantId> tenantId,
                                                      StringData db) {
-    // Internally, CollectionCatalog still keys against DatabaseName but needs to address all
-    // tenantIds when pattern matching by passing in boost::none.
-    return DatabaseName(tenantId, db);
+    // Internally, CollectionCatalog still keys against DatabaseName but needs to address
+    // all tenantIds when pattern matching by passing in boost::none.
+    if (tenantId == boost::none) {
+        return DatabaseNameUtil::parseFromStringExpectTenantIdInMultitenancyMode(db);
+    }
+    return DatabaseName(std::move(tenantId), db);
 }
 
 DatabaseName DatabaseNameUtil::parseFailPointData(const BSONObj& data, StringData dbFieldName) {
     const auto db = data.getStringField(dbFieldName);
-    const auto tenantField = data.getField("$tenant");
+    const auto tenantField = data.getField("tenantId");
     const auto tenantId = tenantField.ok()
         ? boost::optional<TenantId>(TenantId::parseFromBSON(tenantField))
         : boost::none;

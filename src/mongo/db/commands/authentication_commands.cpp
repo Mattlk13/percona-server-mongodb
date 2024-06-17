@@ -157,7 +157,7 @@ public:
                 as->logoutDatabase(
                     opCtx->getClient(),
                     DatabaseNameUtil::deserialize(dbname.tenantId(),
-                                                  DatabaseName::kLocal.db(),
+                                                  DatabaseName::kLocal.db(omitTenant),
                                                   request().getSerializationContext()),
                     "Logging out from local database for test purposes");
             }
@@ -247,7 +247,7 @@ void _authenticateX509(OperationContext* opCtx, AuthenticationSession* session) 
     auto authorizeExternalUser = [&] {
         uassert(ErrorCodes::BadValue,
                 kX509AuthenticationDisabledMessage,
-                !isX509AuthDisabled(opCtx->getServiceContext()));
+                !isX509AuthDisabled(opCtx->getService()));
         uassertStatusOK(authorizationSession->addAndAuthorizeUser(opCtx, request, boost::none));
     };
 
@@ -270,7 +270,7 @@ void _authenticateX509(OperationContext* opCtx, AuthenticationSession* session) 
             }
 
             if (gEnforceUserClusterSeparation && sslConfiguration.isClusterExtensionSet()) {
-                auto* am = AuthorizationManager::get(opCtx->getServiceContext());
+                auto* am = AuthorizationManager::get(opCtx->getService());
                 BSONObj ignored;
                 const bool userExists =
                     am->getUserDescription(opCtx, request.name, &ignored).isOK();
@@ -417,7 +417,7 @@ void doSpeculativeAuthenticate(OperationContext* opCtx,
 
     if (!hasDBField) {
         // No "db" field was provided, so default to "$external"
-        cmd.append(AuthenticateCommand::kDbNameFieldName, DatabaseName::kExternal.db());
+        cmd.append(AuthenticateCommand::kDbNameFieldName, DatabaseName::kExternal.db(omitTenant));
     }
 
     auto authCmdObj =

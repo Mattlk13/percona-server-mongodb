@@ -46,7 +46,6 @@
 #include "mongo/logv2/log_format.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/process_id.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/assert_util_core.h"
 #include "mongo/util/net/cidr.h"
 #include "mongo/util/version/releases.h"
@@ -78,6 +77,7 @@ struct ServerGlobalParams {
 #ifdef MONGO_CONFIG_GRPC
         DefaultGRPCServerPort = 27021,
 #endif
+        DefaultMagicRestorePort = 27022,
     };
 
     enum MaintenanceMode { None, ReplicaSetMode, StandaloneMode };
@@ -95,7 +95,11 @@ struct ServerGlobalParams {
     ClusterRole clusterRole = ClusterRole::None;  // --configsvr/--shardsvr
     MaintenanceMode maintenanceMode;              // --maintenanceMode
 
-    boost::optional<int> routerPort;  // --routerPort
+    bool upgradeBackCompat{false};    // --upgradeBackCompat
+    bool downgradeBackCompat{false};  // --downgradeBackCompat
+
+    boost::optional<int> routerPort;      // --routerPort
+    bool doAutoBootstrapSharding{false};  // This is derived from other settings during startup.
 
     bool objcheck = true;  // --objcheck
 
@@ -110,12 +114,14 @@ struct ServerGlobalParams {
     AtomicWord<double> sampleRate{1.0};    // --samplerate rate at which to sample slow queries
     int defaultLocalThresholdMillis = 15;  // --localThreshold in ms to consider a node local
 
-    bool noUnixSocket = false;    // --nounixsocket
-    bool doFork = false;          // --fork
+    bool noUnixSocket = false;  // --nounixsocket
+    bool doFork = false;        // --fork
+    bool isMongoBridge = false;
+
     std::string socket = "/tmp";  // UNIX domain socket directory
 
     size_t maxConns = DEFAULT_MAX_CONN;  // Maximum number of simultaneous open connections.
-    std::vector<stdx::variant<CIDR, std::string>> maxConnsOverride;
+    std::vector<std::variant<CIDR, std::string>> maxConnsOverride;
     int reservedAdminThreads = 0;
 
     int unixSocketPermissions = DEFAULT_UNIX_PERMS;  // permissions for the UNIX domain socket
@@ -175,15 +181,41 @@ struct ServerGlobalParams {
     int grpcServerMaxThreads = 1000;
 #endif
 
-    struct FeatureCompatibility {
+    /**
+     * Represents a "snapshot" of the in-memory FCV at a particular point in time.
+     * This is useful for callers who need to perform multiple FCV checks and expect the checks to
+     * be performed on a consistent (but possibly stale) FCV value.
+     *
+     * For example: checking isVersionInitialized() && isLessThan() with the same FCVSnapshot value
+     * would have the guarantee that if the FCV value is initialized during isVersionInitialized(),
+     * it will still be during isLessThan().
+     *
+     * Note that this can get stale, so if you call acquireFCVSnapshot() once, and then update
+     * serverGlobalParams.mutableFCV, and expect to use the new FCV value, you must acquire another
+     * snapshot. In general, if you want to check multiple properties of the FCV at a specific point
+     * in time, you should use one snapshot. For example, if you want to check both
+     * that the FCV is initialized and if it's less than some version, and that featureFlagXX is
+     * enabled on this FCV, this should all be using the same FCVSnapshot of the FCV value.
+     *
+     * But if you're doing multiple completely separate FCV checks at different points in time, such
+     * as over multiple functions, or multiple distinct feature flag enablement checks (i.e.
+     * featureFlagXX.isEnabled && featureFlagYY.isEnabled), you should get a new FCV snapshot for
+     * each check since the old one may be stale.
+     */
+    struct FCVSnapshot {
         using FCV = multiversion::FeatureCompatibilityVersion;
+
+        /**
+         * Creates an immutable "snapshot" of the passed in FCV.
+         */
+        explicit FCVSnapshot(FCV version) : _version(version) {}
 
         /**
          * On startup, the featureCompatibilityVersion may not have been explicitly set yet. This
          * exposes the actual state of the featureCompatibilityVersion if it is uninitialized.
          */
         bool isVersionInitialized() const {
-            return _version.load() != FCV::kUnsetDefaultLastLTSBehavior;
+            return _version != FCV::kUnsetDefaultLastLTSBehavior;
         }
 
         /**
@@ -192,7 +224,7 @@ struct ServerGlobalParams {
          */
         FCV getVersion() const {
             invariant(isVersionInitialized());
-            return _version.load();
+            return _version;
         }
 
         bool isLessThanOrEqualTo(FCV version, FCV* versionReturn = nullptr) const {
@@ -239,14 +271,6 @@ struct ServerGlobalParams {
                 version != multiversion::GenericFCV::kLastLTS;
         }
 
-        void reset() {
-            _version.store(FCV::kUnsetDefaultLastLTSBehavior);
-        }
-
-        void setVersion(FCV version) {
-            return _version.store(version);
-        }
-
         /**
          * Logs the current FCV global state.
          * context: the context in which this function was called, to differentiate logs (e.g.
@@ -255,12 +279,48 @@ struct ServerGlobalParams {
         void logFCVWithContext(StringData context) const;
 
     private:
+        const FCV _version;
+    };
+
+    /**
+     * Represents the in-memory FCV that can be changed.
+     * This should only be used to set/reset the in-memory FCV, or get a snapshot of the current
+     * in-memory FCV. It *cannot* be used to check the actual value of the in-memory FCV, and in
+     * particular, check the value over multiple function calls. This is because the in-memory FCV
+     * might change in between those calls (such as during initial sync). Instead, use
+     * acquireFCVSnapshot() to get a snapshot of the FCV, and use the functions available on
+     * FCVSnapshot.
+     */
+    struct MutableFCV {
+        using FCV = multiversion::FeatureCompatibilityVersion;
+
+        /**
+         * Gets an immutable copy/snapshot of the current FCV so that callers can check
+         * the FCV value at a particular point in time over multiple function calls
+         * without the snapshot value changing.
+         * Note that this snapshot might be when the FCV is uninitialized, which could happen
+         * during initial sync. The caller of this function and the subsequent functions
+         * within FCVSnapshot must handle that case.
+         */
+        FCVSnapshot acquireFCVSnapshot() const {
+            return FCVSnapshot(_version.load());
+        }
+
+        void reset() {
+            _version.store(FCV::kUnsetDefaultLastLTSBehavior);
+        }
+
+        void setVersion(FCV version) {
+            return _version.store(version);
+        }
+
+    private:
         AtomicWord<FCV> _version{FCV::kUnsetDefaultLastLTSBehavior};
 
-    } mutableFeatureCompatibility;
+    } mutableFCV;
 
     // Const reference for featureCompatibilityVersion checks.
-    const FeatureCompatibility& featureCompatibility = mutableFeatureCompatibility;
+    const MutableFCV& featureCompatibility = mutableFCV;
 
     // Feature validation differs depending on the role of a mongod in a replica set. Replica set
     // primaries can accept user-initiated writes and validate based on the feature compatibility

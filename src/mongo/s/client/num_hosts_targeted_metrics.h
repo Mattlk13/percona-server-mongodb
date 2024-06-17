@@ -41,24 +41,7 @@ class BSONObjBuilder;
 class OperationContext;
 class ServiceContext;
 
-struct TargetStats {
-    // the op targeted all shards that own chunks for the collection as long as the total number of
-    // shards in the cluster is > 1
-    AtomicWord<int> allShards;
-
-    // the op targeted > 1 shard that own chunks for the collection as long as the total number of
-    // shards in the cluster is > 1
-    AtomicWord<int> manyShards;
-
-    // the op targeted 1 shard (if there exists only one shard, the metric will count as 'oneShard')
-    AtomicWord<int> oneShard;
-
-    // the collection is unsharded
-    AtomicWord<int> unsharded;
-};
-
 class NumHostsTargetedMetrics {
-
 public:
     enum QueryType {
         kFindCmd,
@@ -77,7 +60,8 @@ public:
 
     TargetType parseTargetType(OperationContext* opCtx,
                                int nShardsTargeted,
-                               int nShardsOwningChunks);
+                               int nShardsOwningChunks,
+                               bool isSharded);
 
     static NumHostsTargetedMetrics& get(ServiceContext* serviceContext);
     static NumHostsTargetedMetrics& get(OperationContext* opCtx);
@@ -85,6 +69,23 @@ public:
     void startup();
 
 private:
+    struct TargetStats {
+        // the op targeted all shards that own chunks for the collection as long as the total number
+        // of shards in the cluster is > 1
+        AtomicWord<int> allShards;
+
+        // the op targeted > 1 shard that own chunks for the collection as long as the total number
+        // of shards in the cluster is > 1
+        AtomicWord<int> manyShards;
+
+        // the op targeted 1 shard (if there exists only one shard, the metric will count as
+        // 'oneShard')
+        AtomicWord<int> oneShard;
+
+        // the collection is unsharded
+        AtomicWord<int> unsharded;
+    };
+
     std::vector<std::unique_ptr<TargetStats>> _numHostsTargeted;
 };
 

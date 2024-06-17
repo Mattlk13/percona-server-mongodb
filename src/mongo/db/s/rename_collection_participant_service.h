@@ -66,7 +66,7 @@ public:
     explicit RenameCollectionParticipantService(ServiceContext* serviceContext)
         : PrimaryOnlyService(serviceContext) {}
 
-    ~RenameCollectionParticipantService() = default;
+    ~RenameCollectionParticipantService() override = default;
 
     static RenameCollectionParticipantService* getService(OperationContext* opCtx);
 
@@ -113,7 +113,7 @@ public:
               IDLParserContext("RenameCollectionParticipantDocument"), participantDoc.getOwned())),
           _request(_doc.getRenameCollectionRequest()) {}
 
-    ~RenameParticipantInstance();
+    ~RenameParticipantInstance() override;
 
     /*
      * Check if the given participant document has the same options as the current instance.
@@ -123,18 +123,6 @@ public:
 
     BSONObj doc() {
         return _doc.toBSON();
-    }
-
-    const NamespaceString& fromNss() {
-        return _doc.getFromNss();
-    }
-
-    const UUID& sourceUUID() {
-        return _doc.getSourceUUID();
-    }
-
-    const NamespaceString& toNss() {
-        return _doc.getTo();
     }
 
     /*
@@ -148,8 +136,11 @@ public:
      * Flags CRUD operations as ready to be served and returns a future that will be ready right
      * after releasing the critical section on source and target collection.
      */
-    SharedSemiFuture<void> getUnblockCrudFuture() {
-        stdx::lock_guard<Latch> lg(_mutex);
+    boost::optional<SharedSemiFuture<void>> getUnblockCrudFutureFor(const UUID& sourceUUID) {
+        stdx::lock_guard<Latch> lg(_stateMutex);
+        if (sourceUUID != _doc.getSourceUUID()) {
+            return boost::none;
+        }
         if (!_canUnblockCRUDPromise.getFuture().isReady()) {
             _canUnblockCRUDPromise.setFrom(Status::OK());
         }
@@ -168,12 +159,12 @@ private:
     const RenameCollectionRequest _request;
 
     SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
-                         const CancellationToken& token) noexcept override final;
+                         const CancellationToken& token) noexcept final;
 
     SemiFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                               const CancellationToken& token) noexcept;
 
-    void interrupt(Status status) noexcept override final;
+    void interrupt(Status status) noexcept final;
 
     template <typename Func>
     auto _buildPhaseHandler(const Phase& newPhase, Func&& handlerFn) {
@@ -194,9 +185,10 @@ private:
 
     void _removeStateDocument(OperationContext* opCtx);
     void _enterPhase(Phase newPhase);
-    void _invalidateFutures(const Status& errStatus);
+    void _invalidateFutures(const Status& errStatus, WithLock);
 
-    Mutex _mutex = MONGO_MAKE_LATCH("RenameParticipantInstance::_mutex");
+    // Protects the state of the service object (the recovery doc and the promise fields).
+    Mutex _stateMutex = MONGO_MAKE_LATCH("RenameParticipantInstance::_stateMutex");
 
     // Ready when step 1 (drop target && rename source) has been completed: once set, a successful
     // response to `ShardsvrRenameCollectionParticipantCommand` can be returned to the coordinator.

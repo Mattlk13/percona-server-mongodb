@@ -90,12 +90,6 @@ public:
             return copyValue(tag, val);
         }
 
-        std::pair<value::TypeTags, value::Value> copyOrMoveValue() const {
-            // Always make a copy.
-            auto [owned, tag, val] = _env->_state->values[_index];
-            return copyValue(tag, val);
-        }
-
         void reset(bool owned, value::TypeTags tag, value::Value val) {
             release();
 
@@ -159,6 +153,8 @@ public:
      */
     void resetSlot(value::SlotId slot, value::TypeTags tag, value::Value val, bool owned);
 
+    bool isSlotRegistered(value::SlotId slot) const;
+
     /**
      * Returns a SlotAccessor for the given SlotId which must be previously registered within this
      * Environment by invoking 'registerSlot' method.
@@ -191,6 +187,7 @@ public:
      * Dumps all the slots currently defined in this environment into the given string builder.
      */
     void debugString(StringBuilder* builder) const;
+    std::string toDebugString() const;
 
 private:
     RuntimeEnvironment(const RuntimeEnvironment&);

@@ -59,7 +59,6 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -80,6 +79,7 @@
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/unittest/death_test.h"
@@ -130,6 +130,7 @@ public:
                    const CollectionPtr& coll,
                    std::vector<InsertStatement>::const_iterator begin,
                    std::vector<InsertStatement>::const_iterator end,
+                   const std::vector<RecordId>& recordIds,
                    std::vector<bool> fromMigrate,
                    bool defaultFromMigrate,
                    OpStateAccumulator* opAccumulator = nullptr) override;
@@ -241,6 +242,7 @@ void OpObserverMock::onInserts(OperationContext* opCtx,
                                const CollectionPtr& coll,
                                std::vector<InsertStatement>::const_iterator begin,
                                std::vector<InsertStatement>::const_iterator end,
+                               const std::vector<RecordId>& recordIds,
                                std::vector<bool> fromMigrate,
                                bool defaultFromMigrate,
                                OpStateAccumulator* opAccumulator) {
@@ -249,10 +251,11 @@ void OpObserverMock::onInserts(OperationContext* opCtx,
     }
 
     onInsertsIsTargetDatabaseExclusivelyLocked =
-        opCtx->lockState()->isDbLockedForMode(coll->ns().dbName(), MODE_X);
+        shard_role_details::getLocker(opCtx)->isDbLockedForMode(coll->ns().dbName(), MODE_X);
 
     _logOp(opCtx, coll->ns(), "inserts");
-    OpObserverNoop::onInserts(opCtx, coll, begin, end, std::move(fromMigrate), defaultFromMigrate);
+    OpObserverNoop::onInserts(
+        opCtx, coll, begin, end, recordIds, std::move(fromMigrate), defaultFromMigrate);
 }
 
 void OpObserverMock::onCreateCollection(OperationContext* opCtx,
@@ -1248,10 +1251,7 @@ TEST_F(RenameCollectionTestMultitenancy, RenameCollectionForApplyOpsCommonRandom
     auto cmd = BSON("renameCollection" << _sourceNssTid.toString_forTest() << "to"
                                        << targetNssTid.toString_forTest());
 
-    // Because the tenantId doesn't belong to the source, we should see a collection not found
-    // error.
-    ASSERT_EQUALS(
-        ErrorCodes::NamespaceNotFound,
+    ASSERT_OK(
         renameCollectionForApplyOps(_opCtx.get(), boost::none, TenantId(OID::gen()), cmd, {}));
     ASSERT_TRUE(_collectionExists(_opCtx.get(), _sourceNssTid));
 }

@@ -39,7 +39,6 @@
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/read_concern_args.h"
@@ -52,6 +51,7 @@
 #include "mongo/util/uuid.h"
 
 namespace mongo {
+
 
 struct PlacementConcern {
     boost::optional<DatabaseVersion> dbVersion;
@@ -78,7 +78,7 @@ struct AcquisitionPrerequisites {
         kLocalCatalogOnlyWithPotentialDataLoss,
     };
 
-    using PlacementConcernVariant = stdx::variant<PlacementConcern, PlacementConcernPlaceholder>;
+    using PlacementConcernVariant = std::variant<PlacementConcern, PlacementConcernPlaceholder>;
 
     enum ViewMode { kMustBeCollection, kCanBeView };
 
@@ -89,13 +89,15 @@ struct AcquisitionPrerequisites {
                              repl::ReadConcernArgs readConcern,
                              PlacementConcernVariant placementConcern,
                              OperationType operationType,
-                             ViewMode viewMode)
+                             ViewMode viewMode,
+                             Date_t lockAcquisitionDeadline = Date_t::max())
         : nss(std::move(nss)),
           uuid(std::move(uuid)),
           readConcern(std::move(readConcern)),
           placementConcern(std::move(placementConcern)),
           operationType(operationType),
-          viewMode(viewMode) {}
+          viewMode(viewMode),
+          lockAcquisitionDeadline(lockAcquisitionDeadline) {}
 
     NamespaceString nss;
     boost::optional<UUID> uuid;
@@ -104,6 +106,7 @@ struct AcquisitionPrerequisites {
     PlacementConcernVariant placementConcern;
     OperationType operationType;
     ViewMode viewMode;
+    Date_t lockAcquisitionDeadline;
 };
 
 namespace shard_role_details {
@@ -203,6 +206,82 @@ struct AcquiredView {
     // ViewAcquisition class.
     mutable int64_t refCount = 0;
 };
+
+/**
+ * Interface for locking. Caller DOES NOT own pointer.
+ */
+// TODO (SERVER-77213): Move implementation to .cpp file
+inline Locker* getLocker(OperationContext* opCtx) {
+    return opCtx->lockState_DO_NOT_USE();
+}
+
+inline const Locker* getLocker(const OperationContext* opCtx) {
+    return opCtx->lockState_DO_NOT_USE();
+}
+
+/**
+ * Sets the locker for use by this OperationContext. Call during OperationContext initialization,
+ * only.
+ */
+void makeLockerOnOperationContext(OperationContext* opCtx);
+
+/**
+ * Swaps the locker, releasing the old locker to the caller.
+ * The Client lock is going to be acquired by this function.
+ */
+std::unique_ptr<Locker> swapLocker(OperationContext* opCtx, std::unique_ptr<Locker> newLocker);
+std::unique_ptr<Locker> swapLocker(OperationContext* opCtx,
+                                   std::unique_ptr<Locker> newLocker,
+                                   WithLock lk);
+
+/**
+ * Get the RecoveryUnit for the given opCtx. Caller DOES NOT own pointer.
+ */
+// TODO (SERVER-77213): Move implementation to .cpp file
+inline RecoveryUnit* getRecoveryUnit(OperationContext* opCtx) {
+    return opCtx->recoveryUnit_DO_NOT_USE();
+}
+
+inline const RecoveryUnit* getRecoveryUnit(const OperationContext* opCtx) {
+    return opCtx->recoveryUnit_DO_NOT_USE();
+}
+
+/**
+ * Returns the RecoveryUnit (same return value as recoveryUnit()) but the caller takes
+ * ownership of the returned RecoveryUnit, and the OperationContext instance relinquishes
+ * ownership. Sets the RecoveryUnit to NULL.
+ */
+// TODO (SERVER-77213): Move implementation to .cpp file
+std::unique_ptr<RecoveryUnit> releaseRecoveryUnit(OperationContext* opCtx);
+
+/*
+ * Sets up a new, inactive RecoveryUnit in the OperationContext. Destroys any previous recovery
+ * unit and executes its rollback handlers.
+ */
+// TODO (SERVER-77213): Move implementation to .cpp file
+inline void replaceRecoveryUnit(OperationContext* opCtx) {
+    opCtx->replaceRecoveryUnit_DO_NOT_USE();
+}
+
+/*
+ * Similar to replaceRecoveryUnit(), but returns the previous recovery unit like
+ * releaseRecoveryUnit().
+ */
+std::unique_ptr<RecoveryUnit> releaseAndReplaceRecoveryUnit(OperationContext* opCtx);
+
+/**
+ * Associates the OperatingContext with a different RecoveryUnit for getMore or
+ * subtransactions, see RecoveryUnitSwap. The new state is passed and the old state is
+ * returned separately even though the state logically belongs to the RecoveryUnit,
+ * as it is managed by the OperationContext.
+ */
+WriteUnitOfWork::RecoveryUnitState setRecoveryUnit(OperationContext* opCtx,
+                                                   std::unique_ptr<RecoveryUnit> unit,
+                                                   WriteUnitOfWork::RecoveryUnitState state);
+
+WriteUnitOfWork* getWriteUnitOfWork(OperationContext* opCtx);
+
+void setWriteUnitOfWork(OperationContext* opCtx, std::unique_ptr<WriteUnitOfWork> writeUnitOfWork);
 
 /**
  * This class is a container for all the collection resources which are currently acquired by a
@@ -305,9 +384,12 @@ struct TransactionResources {
     ////////////////////////////////////////////////////////////////////////////////////////
     // Per-collection resources
 
+    using AcquiredCollections = std::list<AcquiredCollection>;
+    using AcquiredViews = std::list<AcquiredView>;
+
     // Set of all collections which are currently acquired
-    std::list<AcquiredCollection> acquiredCollections;
-    std::list<AcquiredView> acquiredViews;
+    AcquiredCollections acquiredCollections;
+    AcquiredViews acquiredViews;
 
     // Reference counters used for controlling how many references there are to the
     // TransactionResources object.

@@ -40,6 +40,7 @@
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/util/assert_util_core.h"
 
 namespace mongo::timeseries::bucket_catalog {
@@ -55,14 +56,27 @@ uint8_t numDigits(uint32_t num) {
 }
 }  // namespace
 
-Bucket::Bucket(
-    const BucketId& bId, const BucketKey& k, StringData tf, Date_t mt, BucketStateRegistry& bsr)
-    : bucketId(bId),
-      key(k),
-      timeField(tf.toString()),
+Bucket::Bucket(TrackingContext& trackingContext,
+               const BucketId& bId,
+               BucketKey k,
+               StringData tf,
+               Date_t mt,
+               BucketStateRegistry& bsr)
+    : usingAlwaysCompressedBuckets(feature_flags::gTimeseriesAlwaysUseCompressedBuckets.isEnabled(
+          serverGlobalParams.featureCompatibility.acquireFCVSnapshot())),
       minTime(mt),
+      lastChecked(getCurrentEraAndIncrementBucketCount(bsr)),
       bucketStateRegistry(bsr),
-      lastChecked(getCurrentEraAndIncrementBucketCount(bucketStateRegistry)) {}
+      bucketId(bId),
+      timeField(make_tracked_string(trackingContext, tf.data(), tf.size())),
+      key(std::move(k)),
+      fieldNames(makeTrackedStringSet(trackingContext)),
+      uncommittedFieldNames(makeTrackedStringSet(trackingContext)),
+      batches(
+          make_tracked_unordered_map<OperationId, std::shared_ptr<WriteBatch>>(trackingContext)),
+      minmax(trackingContext),
+      schema(trackingContext),
+      measurementMap(trackingContext) {}
 
 Bucket::~Bucket() {
     decrementBucketCountForEra(bucketStateRegistry, lastChecked);
@@ -80,11 +94,12 @@ bool schemaIncompatible(Bucket& bucket,
     return (result == Schema::UpdateStatus::Failed);
 }
 
-void calculateBucketFieldsAndSizeChange(const Bucket& bucket,
+void calculateBucketFieldsAndSizeChange(TrackingContext& trackingContext,
+                                        const Bucket& bucket,
                                         const BSONObj& doc,
                                         boost::optional<StringData> metaField,
                                         Bucket::NewFieldNames& newFieldNamesToBeInserted,
-                                        int32_t& sizeToBeAdded) {
+                                        Sizes& sizesToBeAdded) {
     // BSON size for an object with an empty object field where field name is empty string.
     // We can use this as an offset to know the size when we have real field names.
     static constexpr int emptyObjSize = 12;
@@ -92,8 +107,15 @@ void calculateBucketFieldsAndSizeChange(const Bucket& bucket,
     dassert(emptyObjSize == BSON("" << BSONObj()).objsize());
 
     newFieldNamesToBeInserted.clear();
-    sizeToBeAdded = 0;
+    sizesToBeAdded.uncommittedVerifiedSize = 0;
+    sizesToBeAdded.uncommittedMeasurementEstimate = 0;
+
     auto numMeasurementsFieldLength = numDigits(bucket.numMeasurements);
+
+    // When a measurement larger than the threshold (in bytes) is being inserted into a bucket, we
+    // use the measurements uncompressed size towards the bucket size limit.
+    const int32_t largeMeasurementThreshold = gTimeseriesLargeMeasurementThreshold.load();
+
     for (const auto& elem : doc) {
         auto fieldName = elem.fieldNameStringData();
         if (fieldName == metaField) {
@@ -101,34 +123,41 @@ void calculateBucketFieldsAndSizeChange(const Bucket& bucket,
             continue;
         }
 
-        auto hashedKey = StringSet::hasher().hashed_key(fieldName);
+        auto hashedKey = TrackedStringSet::hasher().hashed_key(trackingContext, fieldName);
         if (!bucket.fieldNames.contains(hashedKey)) {
             // Record the new field name only if it hasn't been committed yet. There could
             // be concurrent batches writing to this bucket with the same new field name,
             // but they're not guaranteed to commit successfully.
-            newFieldNamesToBeInserted.push_back(hashedKey);
+            newFieldNamesToBeInserted.push_back(
+                StringMapHashedKey{hashedKey.key(), hashedKey.hash()});
 
             // Only update the bucket size once to account for the new field name if it
             // isn't already pending a commit from another batch.
             if (!bucket.uncommittedFieldNames.contains(hashedKey)) {
                 // Add the size of an empty object with that field name.
-                sizeToBeAdded += emptyObjSize + fieldName.size();
+                sizesToBeAdded.uncommittedVerifiedSize += emptyObjSize + fieldName.size();
 
                 // The control.min and control.max summaries don't have any information for
                 // this new field name yet. Add two measurements worth of data to account
                 // for this. As this is the first measurement for this field, min == max.
-                sizeToBeAdded += elem.size() * 2;
+                sizesToBeAdded.uncommittedVerifiedSize += elem.size() * 2;
             }
         }
 
-        // Add the element size, taking into account that the name will be changed to its
-        // positional number. Add 1 to the calculation since the element's field name size
-        // accounts for a null terminator whereas the stringified position does not.
-        sizeToBeAdded += elem.size() - elem.fieldNameSize() + numMeasurementsFieldLength + 1;
+        // The element size, taking into account that the name will be changed to its positional
+        // number. Add 1 to the calculation since the element's field name size accounts for a null
+        // terminator whereas the stringified position does not.
+        const int32_t elementSize =
+            elem.size() - elem.fieldNameSize() + numMeasurementsFieldLength + 1;
+
+        if (!bucket.usingAlwaysCompressedBuckets || elementSize > largeMeasurementThreshold) {
+            sizesToBeAdded.uncommittedMeasurementEstimate += elementSize;
+        }
     }
 }
 
-std::shared_ptr<WriteBatch> activeBatch(Bucket& bucket,
+std::shared_ptr<WriteBatch> activeBatch(TrackingContext& trackingContext,
+                                        Bucket& bucket,
                                         OperationId opId,
                                         std::uint8_t stripe,
                                         ExecutionStatsController& stats) {
@@ -136,11 +165,13 @@ std::shared_ptr<WriteBatch> activeBatch(Bucket& bucket,
     if (it == bucket.batches.end()) {
         it = bucket.batches
                  .try_emplace(opId,
-                              std::make_shared<WriteBatch>(BucketHandle{bucket.bucketId, stripe},
-                                                           bucket.key,
-                                                           opId,
-                                                           stats,
-                                                           bucket.timeField))
+                              std::make_shared<WriteBatch>(
+                                  trackingContext,
+                                  BucketHandle{bucket.bucketId, stripe},
+                                  bucket.key.cloneAsUntracked(),
+                                  opId,
+                                  stats,
+                                  StringData{bucket.timeField.data(), bucket.timeField.size()}))
                  .first;
     }
     return it->second;

@@ -22,6 +22,13 @@ extra_args="$extra_args UNITTESTS_COMPILE_CONCURRENCY=${num_scons_unit_cc_jobs_a
 
 if [ "${scons_cache_scope}" = "shared" ]; then
   extra_args="$extra_args --cache-debug=scons_cache.log"
+  if [ "Windows_NT" = "$OS" ]; then
+    cyg_cachedir=$(cygpath ${scons_cache_path})
+    prune_dir=$(ls -d $cyg_cachedir/*/ | sort -R | tail -1)
+  else
+    prune_dir=$(ls -d ${scons_cache_path}/*/ | sort -R | tail -1)
+  fi
+  find $prune_dir -amin +2160 -exec bash -c "evergreen/prune_cache_file.sh {}" \; &
 fi
 
 # Conditionally enable scons time debugging
@@ -52,7 +59,14 @@ else
   extra_args="$extra_args --release"
 fi
 
-extra_args="$extra_args SPLIT_DWARF=0 GDB_INDEX=0 ENABLE_OOM_RETRY=1"
+if [ "${project}" = "mongo-release" ]; then
+  extra_args="$extra_args BAZEL_BUILD_ENABLED=0"
+fi
+
+extra_args="$extra_args SPLIT_DWARF=0 GDB_INDEX=0 ENABLE_OOM_RETRY=1 BAZEL_INTEGRATION_DEBUG=1"
+
+echo "Setting evergreen tmp dir to $TMPDIR"
+extra_args="$extra_args --evergreen-tmp-dir='${TMPDIR}'"
 
 if [ "${generating_for_ninja}" = "true" ] && [ "Windows_NT" = "$OS" ]; then
   vcvars="$(vswhere -latest -property installationPath | tr '\\' '/' | dos2unix.exe)/VC/Auxiliary/Build/"
@@ -63,6 +77,7 @@ activate_venv
 # if build_patch_id is passed, try to download binaries from specified
 # evergreen patch.
 # This is purposfully before the venv setup so we do not touch the venv deps
+build_patch_id="${build_patch_id:-${reuse_compile_from}}"
 if [ -n "${build_patch_id}" ]; then
   echo "build_patch_id detected, trying to skip task"
   if [ "${task_name}" = "compile_dist_test" ] || [ "${task_name}" = "compile_dist_test_half" ]; then

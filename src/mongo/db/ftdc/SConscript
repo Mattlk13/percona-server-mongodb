@@ -20,16 +20,22 @@ ftdcEnv.Library(
         'file_manager.cpp',
         'file_reader.cpp',
         'file_writer.cpp',
+        'metadata_compressor.cpp',
         'util.cpp',
         'varint.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/bson/bson_validate',
         '$BUILD_DIR/mongo/bson/util/bson_extract',
-        '$BUILD_DIR/mongo/db/server_base',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/third_party/s2/s2',  # For VarInt
         '$BUILD_DIR/third_party/shim_zlib',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/admission/execution_admission_context',
+        '$BUILD_DIR/mongo/db/server_base',
+        '$BUILD_DIR/mongo/db/shard_role_api',
+        '$BUILD_DIR/mongo/util/concurrency/spin_lock',
     ],
 )
 
@@ -53,9 +59,12 @@ env.Library(
         'ftdc',
     ] + platform_libs,
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+        '$BUILD_DIR/mongo/db/repl/repl_settings',
         '$BUILD_DIR/mongo/db/server_base',
         '$BUILD_DIR/mongo/rpc/command_status',
         '$BUILD_DIR/mongo/rpc/message',
+        '$BUILD_DIR/mongo/s/common_s',
     ],
     LIBDEPS_TAGS=[
         'lint-allow-non-alphabetic',
@@ -69,17 +78,17 @@ env.Library(
         'ftdc_mongod.cpp',
         'ftdc_mongod.idl',
     ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
-    ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/auth/auth',
         '$BUILD_DIR/mongo/db/auth/authprivilege',
+        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/repl/repl_settings',
         '$BUILD_DIR/mongo/db/server_base',
         '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/mongo/rpc/message',
+        '$BUILD_DIR/mongo/s/common_s',
         '$BUILD_DIR/mongo/util/namespace_string_database_name_util',
+        'ftdc_mongos',
         'ftdc_server',
     ],
 )
@@ -93,6 +102,7 @@ env.Library(
         '$BUILD_DIR/mongo/client/clientdriver_minimal',
         '$BUILD_DIR/mongo/db/server_base',
         '$BUILD_DIR/mongo/executor/task_executor_pool',
+        '$BUILD_DIR/mongo/s/common_s',
         '$BUILD_DIR/mongo/s/grid',
         'ftdc_server',
     ],
@@ -105,8 +115,10 @@ env.CppUnitTest(
         'controller_test.cpp',
         'file_manager_test.cpp',
         'file_writer_test.cpp',
+        'ftdc_prctl_test.cpp',
         'ftdc_test.cpp',
         'ftdc_util_test.cpp',
+        'metadata_compressor_test.cpp',
         'varint_test.cpp',
     ],
     LIBDEPS=[

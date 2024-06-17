@@ -44,6 +44,7 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/oid.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/bson/unordered_fields_bsonobj_comparator.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/oplog_entry.h"
@@ -137,6 +138,182 @@ TEST(OplogEntryTest, Create) {
     ASSERT(entry.getCommandType() == OplogEntry::CommandType::kCreate);
     ASSERT_EQ(entry.getOpTime(), entryOpTime);
     ASSERT(!entry.getTid());
+}
+
+TEST(OplogEntryTest, ApplyOpsNotInSession) {
+    UUID uuid(UUID::gen());
+    const auto applyOpsBson =
+        BSON("ts" << Timestamp(1, 1) << "t" << 1LL << "op"
+                  << "c"
+                  << "ns"
+                  << "admin.$cmd"
+                  << "wall" << Date_t() << "o"
+                  << BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                                        << "i"
+                                                        << "ns" << nss.ns_forTest() << "ui" << uuid
+                                                        << "o" << BSON("_id" << 1)))));
+    auto applyOpsEntry = unittest::assertGet(OplogEntry::parse(applyOpsBson));
+    ASSERT_TRUE(applyOpsEntry.isCommand());
+    ASSERT_FALSE(applyOpsEntry.isInTransaction());
+    ASSERT_TRUE(applyOpsEntry.isTerminalApplyOps());
+    ASSERT_FALSE(applyOpsEntry.isSingleOplogEntryTransaction());
+    ASSERT_FALSE(applyOpsEntry.isPartialTransaction());
+    ASSERT_FALSE(applyOpsEntry.isEndOfLargeTransaction());
+    ASSERT_FALSE(applyOpsEntry.applyOpsIsLinkedTransactionally());
+}
+
+TEST(OplogEntryTest, ApplyOpsSingleEntryTransaction) {
+    UUID uuid(UUID::gen());
+    auto sessionId = makeLogicalSessionIdForTest();
+    const auto applyOpsBson =
+        BSON("ts" << Timestamp(1, 1) << "t" << 1LL << "op"
+                  << "c"
+                  << "ns"
+                  << "admin.$cmd"
+                  << "wall" << Date_t() << "o"
+                  << BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                                        << "i"
+                                                        << "ns" << nss.ns_forTest() << "ui" << uuid
+                                                        << "o" << BSON("_id" << 1))))
+                  << "lsid" << sessionId.toBSON() << "txnNumber" << TxnNumber(5) << "stmtId"
+                  << StmtId(0) << "prevOpTime" << OpTime());
+    auto applyOpsEntry = unittest::assertGet(OplogEntry::parse(applyOpsBson));
+    ASSERT_TRUE(applyOpsEntry.isCommand());
+    ASSERT_TRUE(applyOpsEntry.isInTransaction());
+    ASSERT_TRUE(applyOpsEntry.isTerminalApplyOps());
+    ASSERT_TRUE(applyOpsEntry.isSingleOplogEntryTransaction());
+    ASSERT_FALSE(applyOpsEntry.isPartialTransaction());
+    ASSERT_FALSE(applyOpsEntry.isEndOfLargeTransaction());
+    ASSERT_TRUE(applyOpsEntry.applyOpsIsLinkedTransactionally());
+}
+
+TEST(OplogEntryTest, ApplyOpsStartMultiEntryTransaction) {
+    UUID uuid(UUID::gen());
+    auto sessionId = makeLogicalSessionIdForTest();
+    const auto applyOpsBson =
+        BSON("ts" << Timestamp(1, 1) << "t" << 1LL << "op"
+                  << "c"
+                  << "ns"
+                  << "admin.$cmd"
+                  << "wall" << Date_t() << "o"
+                  << BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                                        << "i"
+                                                        << "ns" << nss.ns_forTest() << "ui" << uuid
+                                                        << "o" << BSON("_id" << 1)))
+                                     << "partialTxn" << true)
+                  << "lsid" << sessionId.toBSON() << "txnNumber" << TxnNumber(5) << "stmtId"
+                  << StmtId(0) << "prevOpTime" << OpTime());
+    auto applyOpsEntry = unittest::assertGet(OplogEntry::parse(applyOpsBson));
+    ASSERT_TRUE(applyOpsEntry.isCommand());
+    ASSERT_TRUE(applyOpsEntry.isInTransaction());
+    ASSERT_FALSE(applyOpsEntry.isTerminalApplyOps());
+    ASSERT_FALSE(applyOpsEntry.isSingleOplogEntryTransaction());
+    ASSERT_TRUE(applyOpsEntry.isPartialTransaction());
+    ASSERT_FALSE(applyOpsEntry.isEndOfLargeTransaction());
+    ASSERT_TRUE(applyOpsEntry.applyOpsIsLinkedTransactionally());
+}
+
+TEST(OplogEntryTest, ApplyOpsMiddleMultiEntryTransaction) {
+    UUID uuid(UUID::gen());
+    auto sessionId = makeLogicalSessionIdForTest();
+    const auto applyOpsBson =
+        BSON("ts" << Timestamp(1, 2) << "t" << 1LL << "op"
+                  << "c"
+                  << "ns"
+                  << "admin.$cmd"
+                  << "wall" << Date_t() << "o"
+                  << BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                                        << "i"
+                                                        << "ns" << nss.ns_forTest() << "ui" << uuid
+                                                        << "o" << BSON("_id" << 1)))
+                                     << "partialTxn" << true)
+                  << "lsid" << sessionId.toBSON() << "txnNumber" << TxnNumber(5) << "stmtId"
+                  << StmtId(0) << "prevOpTime" << OpTime(Timestamp(1, 1), 1));
+    auto applyOpsEntry = unittest::assertGet(OplogEntry::parse(applyOpsBson));
+    ASSERT_TRUE(applyOpsEntry.isCommand());
+    ASSERT_TRUE(applyOpsEntry.isInTransaction());
+    ASSERT_FALSE(applyOpsEntry.isTerminalApplyOps());
+    ASSERT_FALSE(applyOpsEntry.isSingleOplogEntryTransaction());
+    ASSERT_TRUE(applyOpsEntry.isPartialTransaction());
+    ASSERT_FALSE(applyOpsEntry.isEndOfLargeTransaction());
+    ASSERT_TRUE(applyOpsEntry.applyOpsIsLinkedTransactionally());
+}
+
+TEST(OplogEntryTest, ApplyOpsEndMultiEntryTransaction) {
+    UUID uuid(UUID::gen());
+    auto sessionId = makeLogicalSessionIdForTest();
+    const auto applyOpsBson =
+        BSON("ts" << Timestamp(1, 2) << "t" << 1LL << "op"
+                  << "c"
+                  << "ns"
+                  << "admin.$cmd"
+                  << "wall" << Date_t() << "o"
+                  << BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                                        << "i"
+                                                        << "ns" << nss.ns_forTest() << "ui" << uuid
+                                                        << "o" << BSON("_id" << 1))))
+                  << "lsid" << sessionId.toBSON() << "txnNumber" << TxnNumber(5) << "stmtId"
+                  << StmtId(0) << "prevOpTime" << OpTime(Timestamp(1, 1), 1));
+    auto applyOpsEntry = unittest::assertGet(OplogEntry::parse(applyOpsBson));
+    ASSERT_TRUE(applyOpsEntry.isInTransaction());
+    ASSERT_TRUE(applyOpsEntry.isCommand());
+    ASSERT_TRUE(applyOpsEntry.isTerminalApplyOps());
+    ASSERT_FALSE(applyOpsEntry.isSingleOplogEntryTransaction());
+    ASSERT_FALSE(applyOpsEntry.isPartialTransaction());
+    ASSERT_TRUE(applyOpsEntry.isEndOfLargeTransaction());
+    ASSERT_TRUE(applyOpsEntry.applyOpsIsLinkedTransactionally());
+}
+
+TEST(OplogEntryTest, ApplyOpsFirstOrOnlyRetryableWrite) {
+    UUID uuid(UUID::gen());
+    auto sessionId = makeLogicalSessionIdForTest();
+    const auto applyOpsBson =
+        BSON("ts" << Timestamp(1, 1) << "t" << 1LL << "op"
+                  << "c"
+                  << "ns"
+                  << "admin.$cmd"
+                  << "wall" << Date_t() << "o"
+                  << BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                                        << "i"
+                                                        << "ns" << nss.ns_forTest() << "ui" << uuid
+                                                        << "o" << BSON("_id" << 1))))
+                  << "lsid" << sessionId.toBSON() << "txnNumber" << TxnNumber(5) << "stmtId"
+                  << StmtId(0) << "prevOpTime" << OpTime() << "multiOpType" << 1);
+    auto applyOpsEntry = unittest::assertGet(OplogEntry::parse(applyOpsBson));
+    ASSERT_FALSE(applyOpsEntry.isInTransaction());
+    ASSERT_TRUE(applyOpsEntry.isCommand());
+    ASSERT_TRUE(applyOpsEntry.isTerminalApplyOps());
+    ASSERT_FALSE(applyOpsEntry.isSingleOplogEntryTransaction());
+    ASSERT_FALSE(applyOpsEntry.isPartialTransaction());
+    ASSERT_FALSE(applyOpsEntry.isEndOfLargeTransaction());
+    ASSERT_FALSE(applyOpsEntry.applyOpsIsLinkedTransactionally());
+}
+
+TEST(OplogEntryTest, ApplyOpsSubsequentRetryableWrite) {
+    UUID uuid(UUID::gen());
+    auto sessionId = makeLogicalSessionIdForTest();
+    const auto applyOpsBson =
+        BSON("ts" << Timestamp(1, 2) << "t" << 1LL << "op"
+                  << "c"
+                  << "ns"
+                  << "admin.$cmd"
+                  << "wall" << Date_t() << "o"
+                  << BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                                        << "i"
+                                                        << "ns" << nss.ns_forTest() << "ui" << uuid
+                                                        << "o" << BSON("_id" << 1))))
+                  << "lsid" << sessionId.toBSON() << "txnNumber" << TxnNumber(5) << "stmtId"
+                  << StmtId(0) << "prevOpTime" << OpTime(Timestamp(1, 1), 1) << "multiOpType" << 1);
+    auto applyOpsEntry = unittest::assertGet(OplogEntry::parse(applyOpsBson));
+    ASSERT_TRUE(applyOpsEntry.isCommand());
+    ASSERT_FALSE(applyOpsEntry.isInTransaction());
+    // All retryable-write applyOps are "terminal", because that just means they can be applied
+    // when we get them; we don't have to wait for a later oplog entry.
+    ASSERT_TRUE(applyOpsEntry.isTerminalApplyOps());
+    ASSERT_FALSE(applyOpsEntry.isSingleOplogEntryTransaction());
+    ASSERT_FALSE(applyOpsEntry.isPartialTransaction());
+    ASSERT_FALSE(applyOpsEntry.isEndOfLargeTransaction());
+    ASSERT_FALSE(applyOpsEntry.applyOpsIsLinkedTransactionally());
 }
 
 TEST(OplogEntryTest, OpTimeBaseNonStrictParsing) {
@@ -256,7 +433,13 @@ TEST(OplogEntryTest, ParseReplOperationIncludesTidField) {
         BSONObjBuilder{}.append("_id", 1).obj());
     BSONObj oplogBson = op.toBSON();
 
-    auto replOp = ReplOperation::parse(IDLParserContext("ReplOperation", false, tid), oplogBson);
+    const auto vts = auth::ValidatedTenancyScopeFactory::create(
+        tid,
+        auth::ValidatedTenancyScope::TenantProtocol::kDefault,
+        auth::ValidatedTenancyScopeFactory::TenantForTestingTag{});
+    auto replOp = ReplOperation::parse(
+        IDLParserContext("ReplOperation", false, vts, tid, SerializationContext::stateDefault()),
+        oplogBson);
     ASSERT(replOp.getTid());
     ASSERT_EQ(replOp.getTid(), tid);
     ASSERT_EQ(replOp.getNss(), nssWithTid);
@@ -313,6 +496,91 @@ TEST(OplogEntryTest, ConvertMutableOplogEntryToReplOperation) {
     entry.setCheckExistenceForDiffInsert();
     auto replOp3 = entry.toReplOperation();
     ASSERT_EQ(replOp3.getCheckExistenceForDiffInsert(), entry.getCheckExistenceForDiffInsert());
+}
+
+TEST(OplogEntryTest, StatementIDParseAndSerialization) {
+    UnorderedFieldsBSONObjComparator bsonCompare;
+    const BSONObj oplogEntryWithNoStmtId = BSON("op"
+                                                << "c"
+                                                << "ns" << nss.ns_forTest() << "o"
+                                                << BSON("_id" << 1) << "v" << 2 << "ts"
+                                                << Timestamp(0, 0) << "t" << 0LL << "wall"
+                                                << Date_t());
+
+    auto oplogEntryBaseNoStmtId =
+        OplogEntryBase::parse(IDLParserContext("OplogEntry"), oplogEntryWithNoStmtId);
+    ASSERT_TRUE(oplogEntryBaseNoStmtId.getStatementIds().empty());
+    auto rtOplogEntryWithNoStmtId = oplogEntryBaseNoStmtId.toBSON();
+    ASSERT_EQ(bsonCompare.compare(oplogEntryWithNoStmtId, rtOplogEntryWithNoStmtId), 0)
+        << "Did not round trip: " << oplogEntryWithNoStmtId << " should be equal to "
+        << rtOplogEntryWithNoStmtId;
+
+    const BSONObj oplogEntryWithOneStmtId = BSON("op"
+                                                 << "c"
+                                                 << "ns" << nss.ns_forTest() << "o"
+                                                 << BSON("_id" << 1) << "v" << 2 << "ts"
+                                                 << Timestamp(0, 0) << "t" << 0LL << "wall"
+                                                 << Date_t() << "stmtId" << 99);
+    auto oplogEntryBaseOneStmtId =
+        OplogEntryBase::parse(IDLParserContext("OplogEntry"), oplogEntryWithOneStmtId);
+    ASSERT_EQ(oplogEntryBaseOneStmtId.getStatementIds(), std::vector<StmtId>{99});
+    auto rtOplogEntryWithOneStmtId = oplogEntryBaseOneStmtId.toBSON();
+    ASSERT_EQ(bsonCompare.compare(oplogEntryWithOneStmtId, rtOplogEntryWithOneStmtId), 0)
+        << "Did not round trip: " << oplogEntryWithOneStmtId << " should be equal to "
+        << rtOplogEntryWithOneStmtId;
+    // Statement id should be NumberInt, not NumberLong or some other numeric.
+    ASSERT_EQ(rtOplogEntryWithOneStmtId["stmtId"].type(), NumberInt);
+
+    const BSONObj oplogEntryWithMultiStmtId = BSON("op"
+                                                   << "c"
+                                                   << "ns" << nss.ns_forTest() << "o"
+                                                   << BSON("_id" << 1) << "v" << 2 << "ts"
+                                                   << Timestamp(0, 0) << "t" << 0LL << "wall"
+                                                   << Date_t() << "stmtId"
+                                                   << BSON_ARRAY(101 << 102 << 103));
+    auto oplogEntryBaseMultiStmtId =
+        OplogEntryBase::parse(IDLParserContext("OplogEntry"), oplogEntryWithMultiStmtId);
+    ASSERT_EQ(oplogEntryBaseMultiStmtId.getStatementIds(), (std::vector<StmtId>{101, 102, 103}));
+    auto rtOplogEntryWithMultiStmtId = oplogEntryBaseMultiStmtId.toBSON();
+    ASSERT_EQ(bsonCompare.compare(oplogEntryWithMultiStmtId, rtOplogEntryWithMultiStmtId), 0)
+        << "Did not round trip: " << oplogEntryWithMultiStmtId << " should be equal to "
+        << rtOplogEntryWithMultiStmtId;
+    // Array entries should be NumberInt, not NumberLong or some other numeric.
+    ASSERT_EQ(rtOplogEntryWithMultiStmtId["stmtId"]["0"].type(), NumberInt);
+
+    // A non-canonical entry with an empty stmtId array.
+    const BSONObj oplogEntryWithEmptyStmtId = BSON("op"
+                                                   << "c"
+                                                   << "ns" << nss.ns_forTest() << "o"
+                                                   << BSON("_id" << 1) << "v" << 2 << "ts"
+                                                   << Timestamp(0, 0) << "t" << 0LL << "wall"
+                                                   << Date_t() << "stmtId" << BSONArray());
+
+    auto oplogEntryBaseEmptyStmtId =
+        OplogEntryBase::parse(IDLParserContext("OplogEntry"), oplogEntryWithEmptyStmtId);
+    ASSERT_TRUE(oplogEntryBaseEmptyStmtId.getStatementIds().empty());
+    auto rtOplogEntryWithEmptyStmtId = oplogEntryBaseEmptyStmtId.toBSON();
+    // This round-trips to the canonical version with no statement ID.
+    ASSERT_EQ(bsonCompare.compare(oplogEntryWithNoStmtId, rtOplogEntryWithEmptyStmtId), 0)
+        << "Did not round trip: " << oplogEntryWithNoStmtId << " should be equal to "
+        << rtOplogEntryWithEmptyStmtId;
+
+    // A non-canonical entry with a singleton stmtId array.
+    const BSONObj oplogEntryWithSingletonStmtId = BSON("op"
+                                                       << "c"
+                                                       << "ns" << nss.ns_forTest() << "o"
+                                                       << BSON("_id" << 1) << "v" << 2 << "ts"
+                                                       << Timestamp(0, 0) << "t" << 0LL << "wall"
+                                                       << Date_t() << "stmtId" << BSON_ARRAY(99));
+
+    auto oplogEntryBaseSingletonStmtId =
+        OplogEntryBase::parse(IDLParserContext("OplogEntry"), oplogEntryWithSingletonStmtId);
+    ASSERT_EQ(oplogEntryBaseSingletonStmtId.getStatementIds(), std::vector<StmtId>{99});
+    auto rtOplogEntryWithSingletonStmtId = oplogEntryBaseSingletonStmtId.toBSON();
+    // This round-trips to the canonical version with a non-array statement ID.
+    ASSERT_EQ(bsonCompare.compare(oplogEntryWithOneStmtId, rtOplogEntryWithSingletonStmtId), 0)
+        << "Did not round trip: " << oplogEntryWithNoStmtId << " should be equal to "
+        << rtOplogEntryWithSingletonStmtId;
 }
 
 }  // namespace

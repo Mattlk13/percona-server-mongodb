@@ -53,8 +53,7 @@ public:
             setGlobalServiceContext(ServiceContext::make());
         auto client = svcCtx->getService()->makeClient("opCtx");
         auto opCtx = client->makeOperationContext();
-        _engine.reset(new WiredTigerKVEngine(opCtx.get(),
-                                             kInMemoryEngineName,
+        _engine.reset(new WiredTigerKVEngine(kInMemoryEngineName,
                                              _dbpath.path(),
                                              _cs.get(),
                                              "in_memory=true,"
@@ -69,7 +68,7 @@ public:
             svcCtx,
             std::unique_ptr<repl::ReplicationCoordinator>(
                 new repl::ReplicationCoordinatorMock(svcCtx, repl::ReplSettings())));
-        _engine->notifyStartupComplete();
+        _engine->notifyStorageStartupRecoveryComplete();
     }
 
     virtual ~InMemoryKVHarnessHelper() {

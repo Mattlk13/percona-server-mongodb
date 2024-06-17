@@ -57,9 +57,9 @@ struct FindCmdShapeComponents : public CmdSpecificShapeComponents {
      */
     void appendTo(BSONObjBuilder&) const;
 
-    int64_t size() const final {
-        return sizeof(this) + filter.objsize() + projection.objsize() + sort.objsize() +
-            min.objsize() + max.objsize();
+    size_t size() const final {
+        return sizeof(FindCmdShapeComponents) + filter.objsize() + projection.objsize() +
+            sort.objsize() + min.objsize() + max.objsize();
     }
 
     BSONObj filter;
@@ -93,9 +93,15 @@ struct FindCmdShapeComponents : public CmdSpecificShapeComponents {
     SerializationOptions serializationOpts;
 
     void HashValue(absl::HashState state) const final;
+
+    /**
+     * Encodes all optional bools (as well as limit and skip) into a single uint32_t. Every flag
+     * takes two bits. 0b00 stands for none, 0b10 for false and 0b11 for true.
+     */
+    uint32_t optionalArgumentsEncoding() const;
 };
 
-class FindCmdShape : public CmdWithLetShape {
+class FindCmdShape final : public CmdWithLetShape {
 public:
     FindCmdShape(const ParsedFindCommand& findRequest,
                  const boost::intrusive_ptr<ExpressionContext>& expCtx);
@@ -108,6 +114,9 @@ public:
 
     FindCmdShapeComponents components;
 
+    QueryShapeHash sha256Hash(OperationContext*,
+                              const SerializationContext& serializationContext) const override;
+
 protected:
     void appendLetCmdSpecificShapeComponents(BSONObjBuilder& bob,
                                              const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -119,5 +128,8 @@ H AbslHashValue(H h, const FindCmdShapeComponents::HasField& hasField) {
     return H::combine(
         std::move(h), hasField.projection, hasField.sort, hasField.limit, hasField.skip);
 }
+static_assert(sizeof(FindCmdShape) == sizeof(CmdWithLetShape) + sizeof(FindCmdShapeComponents),
+              "If the class' members have changed, this assert and the extraSize() calculation may "
+              "need to be updated with a new value.");
 
 }  // namespace mongo::query_shape

@@ -53,13 +53,10 @@
 #include "mongo/db/session/logical_session_id_gen.h"
 #include "mongo/db/session/logical_session_id_helpers.h"
 #include "mongo/db/storage/recovery_unit.h"
-#include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/transport/session.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/cancellation.h"
 #include "mongo/util/concurrency/with_lock.h"
@@ -73,7 +70,6 @@
 
 namespace mongo {
 
-class CurOp;
 class ServiceContext;
 
 namespace repl {
@@ -116,63 +112,66 @@ public:
      * CTOR if possible to avoid OperationId collisions.
      */
     OperationContext(Client* client, OperationId opId);
-    OperationContext(Client* client, OperationIdSlot&& opIdSlot);
-    virtual ~OperationContext();
+    ~OperationContext() override;
 
-    /**
-     * Interface for durability.  Caller DOES NOT own pointer.
-     */
-    RecoveryUnit* recoveryUnit() const {
+    // TODO (SERVER-77213): The RecoveryUnit ownership is being moved to the TransactionResources.
+    // Do not add any new usages to these methods as they will go away and will be folded as an
+    // implementation detail of the Shard Role API.
+    //
+    // Interface for durability.  Caller DOES NOT own pointer.
+    RecoveryUnit* recoveryUnit_DO_NOT_USE() const {
         return _recoveryUnit.get();
     }
 
-    /**
-     * Returns the RecoveryUnit (same return value as recoveryUnit()) but the caller takes
-     * ownership of the returned RecoveryUnit, and the OperationContext instance relinquishes
-     * ownership. Sets the RecoveryUnit to NULL.
-     */
-    std::unique_ptr<RecoveryUnit> releaseRecoveryUnit();
+    // TODO (SERVER-77213): The RecoveryUnit ownership is being moved to the TransactionResources.
+    // Do not add any new usages to these methods as they will go away and will be folded as an
+    // implementation detail of the Shard Role API.
+    //
+    // Returns the RecoveryUnit (same return value as recoveryUnit()) but the caller takes
+    // ownership of the returned RecoveryUnit, and the OperationContext instance relinquishes
+    // ownership. Sets the RecoveryUnit to NULL.
+    std::unique_ptr<RecoveryUnit> releaseRecoveryUnit_DO_NOT_USE();
 
-    /*
-     * Sets up a new, inactive RecoveryUnit in the OperationContext. Destroys any previous recovery
-     * unit and executes its rollback handlers.
-     */
-    void replaceRecoveryUnit();
+    // TODO (SERVER-77213): The RecoveryUnit ownership is being moved to the TransactionResources.
+    // Do not add any new usages to these methods as they will go away and will be folded as an
+    // implementation detail of the Shard Role API.
+    //
+    // Sets up a new, inactive RecoveryUnit in the OperationContext. Destroys any previous recovery
+    // unit and executes its rollback handlers.
+    void replaceRecoveryUnit_DO_NOT_USE();
 
-    /*
-     * Similar to replaceRecoveryUnit(), but returns the previous recovery unit like
-     * releaseRecoveryUnit().
-     */
-    std::unique_ptr<RecoveryUnit> releaseAndReplaceRecoveryUnit();
+    // TODO (SERVER-77213): The RecoveryUnit ownership is being moved to the TransactionResources.
+    // Do not add any new usages to these methods as they will go away and will be folded as an
+    // implementation detail of the Shard Role API.
+    //
+    // Similar to replaceRecoveryUnit(), but returns the previous recovery unit like
+    // releaseRecoveryUnit().
+    std::unique_ptr<RecoveryUnit> releaseAndReplaceRecoveryUnit_DO_NOT_USE();
 
 
-    /**
-     * Associates the OperatingContext with a different RecoveryUnit for getMore or
-     * subtransactions, see RecoveryUnitSwap. The new state is passed and the old state is
-     * returned separately even though the state logically belongs to the RecoveryUnit,
-     * as it is managed by the OperationContext.
-     */
-    WriteUnitOfWork::RecoveryUnitState setRecoveryUnit(std::unique_ptr<RecoveryUnit> unit,
-                                                       WriteUnitOfWork::RecoveryUnitState state);
+    // TODO (SERVER-77213): The RecoveryUnit ownership is being moved to the TransactionResources.
+    // Do not add any new usages to these methods as they will go away and will be folded as an
+    // implementation detail of the Shard Role API.
+    //
+    // Associates the OperatingContext with a different RecoveryUnit for getMore or
+    // subtransactions, see RecoveryUnitSwap. The new state is passed and the old state is
+    // returned separately even though the state logically belongs to the RecoveryUnit,
+    // as it is managed by the OperationContext.
+    WriteUnitOfWork::RecoveryUnitState setRecoveryUnit_DO_NOT_USE(
+        std::unique_ptr<RecoveryUnit> unit, WriteUnitOfWork::RecoveryUnitState state);
 
-    /**
-     * Interface for locking.  Caller DOES NOT own pointer.
-     */
-    Locker* lockState() const {
+    // TODO (SERVER-77213): The locker ownership is being moved to the TransactionResources. Do not
+    // add any new usages to these methods as they will go away and will be folded as an
+    // implementation detail of the Shard Role API.
+    //
+    // The way to access the locker associated with a given OperationContext is through the
+    // shard_role_details::getLocker methods.
+    Locker* lockState_DO_NOT_USE() const {
         return _locker.get();
     }
-
-    /**
-     * Sets the locker for use by this OperationContext. Call during OperationContext
-     * initialization, only.
-     */
-    void setLockState(std::unique_ptr<Locker> locker);
-
-    /**
-     * Swaps the locker, releasing the old locker to the caller.  The Client lock is required to
-     * call this function.
-     */
-    std::unique_ptr<Locker> swapLockState(std::unique_ptr<Locker> locker, WithLock);
+    void setLockState_DO_NOT_USE(std::unique_ptr<Locker> locker);
+    std::unique_ptr<Locker> swapLockState_DO_NOT_USE(std::unique_ptr<Locker> locker,
+                                                     WithLock clientLock);
 
     /**
      * Returns Status::OK() unless this operation is in a killed state.
@@ -207,7 +206,7 @@ public:
      * Returns the operation ID associated with this operation.
      */
     OperationId getOpID() const {
-        return _opId.getId();
+        return _opId;
     }
 
     /**
@@ -299,6 +298,14 @@ public:
              isInternalSessionForRetryableWrite(*getLogicalSessionId()));
     }
 
+    bool isCommandForwardedFromRouter() const {
+        return _isCommandForwardedFromRouter;
+    }
+
+    void setCommandForwardedFromRouter() {
+        _isCommandForwardedFromRouter = true;
+    }
+
     // TODO (SERVER-80523): END Expose OperationSessionInfoFromClient as a decoration instead of
     // projecting all its fields as properties
 
@@ -328,7 +335,7 @@ public:
     /**
      * Returns the top-level WriteUnitOfWork associated with this operation context, if any.
      */
-    WriteUnitOfWork* getWriteUnitOfWork() {
+    WriteUnitOfWork* getWriteUnitOfWork_DO_NOT_USE() {
         return _writeUnitOfWork.get();
     }
 
@@ -336,7 +343,7 @@ public:
      * Sets a top-level WriteUnitOfWork for this operation context, to be held for the duration
      * of the given network operation.
      */
-    void setWriteUnitOfWork(std::unique_ptr<WriteUnitOfWork> writeUnitOfWork) {
+    void setWriteUnitOfWork_DO_NOT_USE(std::unique_ptr<WriteUnitOfWork> writeUnitOfWork) {
         invariant(writeUnitOfWork || _writeUnitOfWork);
         invariant(!(writeUnitOfWork && _writeUnitOfWork));
 
@@ -546,6 +553,7 @@ public:
         invariant(_ruState == WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
         _inMultiDocumentTransaction = false;
         _isStartingMultiDocumentTransaction = false;
+        _isActiveTransactionParticipant = false;
         _lsid = boost::none;
         _txnNumber = boost::none;
         _txnRetryCounter = boost::none;
@@ -571,6 +579,22 @@ public:
      */
     void setIsStartingMultiDocumentTransaction(bool isStartingMultiDocumentTransaction) {
         _isStartingMultiDocumentTransaction = isStartingMultiDocumentTransaction;
+    }
+
+    /**
+     * Set if this op is being executed by an active transaction participant. Used to differentiate
+     * from an op being coordinated by a transaction router.
+     */
+    void setActiveTransactionParticipant() {
+        invariant(_inMultiDocumentTransaction || isRetryableWrite());
+        _isActiveTransactionParticipant = true;
+    }
+
+    /**
+     * Returns whether this op is being executed by an active transaction participant.
+     */
+    bool isActiveTransactionParticipant() const {
+        return _isActiveTransactionParticipant;
     }
 
     /**
@@ -671,6 +695,14 @@ public:
 
     void setQuerySamplingOptions(QuerySamplingOptions option) {
         _querySamplingOpts = option;
+    }
+
+    void setRoutedByReplicaSetEndpoint(bool value) {
+        _routedByReplicaSetEndpoint = value;
+    }
+
+    bool routedByReplicaSetEndpoint() const {
+        return _routedByReplicaSetEndpoint;
     }
 
     /**
@@ -805,7 +837,7 @@ private:
 
     Client* const _client;
 
-    const OperationIdSlot _opId;
+    const OperationId _opId;
     boost::optional<OperationKey> _opKey;
 
     boost::optional<LogicalSessionId> _lsid;
@@ -862,6 +894,8 @@ private:
     bool _shouldIncrementLatencyStats = true;
     bool _inMultiDocumentTransaction = false;
     bool _isStartingMultiDocumentTransaction = false;
+    bool _isActiveTransactionParticipant = false;
+    bool _isCommandForwardedFromRouter = false;
     // Commands from user applications must run validations and enforce constraints. Operations from
     // a trusted source, such as initial sync or consuming an oplog entry generated by a primary
     // typically desire to ignore constraints.
@@ -875,8 +909,6 @@ private:
     // If true, this OpCtx will get interrupted during replica set stepUp and stepDown, regardless
     // of what locks it's taken.
     AtomicWord<bool> _alwaysInterruptAtStepDownOrUp{false};
-
-    AtomicWord<bool> _killRequestedForReplStateChange{false};
 
     // If populated, this is an owned singleton BSONObj whose only field, 'comment', is a copy of
     // the 'comment' field from the input command object.
@@ -898,6 +930,10 @@ private:
 
     // The query sampling options for operations on this opCtx.
     boost::optional<QuerySamplingOptions> _querySamplingOpts;
+
+    // Set to true if this operation is going through the router code paths because of the replica
+    // set endpoint.
+    bool _routedByReplicaSetEndpoint = false;
 };
 
 // Gets a TimeZoneDatabase pointer from the ServiceContext.

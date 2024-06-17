@@ -40,6 +40,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -98,8 +99,7 @@ CollectionTruncateMarkers::Marker& CollectionTruncateMarkers::createNewMarker(
         _currentRecords.swap(0), _currentBytes.swap(0), lastRecord, wallTime);
 }
 
-void CollectionTruncateMarkers::createNewMarkerIfNeeded(OperationContext* opCtx,
-                                                        const RecordId& lastRecord,
+void CollectionTruncateMarkers::createNewMarkerIfNeeded(const RecordId& lastRecord,
                                                         Date_t wallTime) {
     auto logFailedLockAcquisition = [&](const std::string& lock) {
         LOGV2_DEBUG(7393214,
@@ -147,23 +147,24 @@ void CollectionTruncateMarkers::updateCurrentMarkerAfterInsertOnCommit(
     const RecordId& highestInsertedRecordId,
     Date_t wallTime,
     int64_t countInserted) {
-    opCtx->recoveryUnit()->onCommit([collectionMarkers = shared_from_this(),
-                                     bytesInserted,
-                                     recordId = highestInsertedRecordId,
-                                     wallTime,
-                                     countInserted](OperationContext* opCtx, auto) {
-        invariant(bytesInserted >= 0);
-        invariant(recordId.isValid());
+    shard_role_details::getRecoveryUnit(opCtx)->onCommit(
+        [collectionMarkers = shared_from_this(),
+         bytesInserted,
+         recordId = highestInsertedRecordId,
+         wallTime,
+         countInserted](OperationContext* opCtx, auto) {
+            invariant(bytesInserted >= 0);
+            invariant(recordId.isValid());
 
-        collectionMarkers->_currentRecords.addAndFetch(countInserted);
-        int64_t newCurrentBytes = collectionMarkers->_currentBytes.addAndFetch(bytesInserted);
-        if (wallTime != Date_t() && newCurrentBytes >= collectionMarkers->_minBytesPerMarker) {
-            // When other transactions commit concurrently, an uninitialized wallTime may delay
-            // the creation of a new marker. This delay is limited to the number of concurrently
-            // running transactions, so the size difference should be inconsequential.
-            collectionMarkers->createNewMarkerIfNeeded(opCtx, recordId, wallTime);
-        }
-    });
+            collectionMarkers->_currentRecords.addAndFetch(countInserted);
+            int64_t newCurrentBytes = collectionMarkers->_currentBytes.addAndFetch(bytesInserted);
+            if (wallTime != Date_t() && newCurrentBytes >= collectionMarkers->_minBytesPerMarker) {
+                // When other transactions commit concurrently, an uninitialized wallTime may delay
+                // the creation of a new marker. This delay is limited to the number of concurrently
+                // running transactions, so the size difference should be inconsequential.
+                collectionMarkers->createNewMarkerIfNeeded(recordId, wallTime);
+            }
+        });
 }
 
 void CollectionTruncateMarkers::setMinBytesPerMarker(int64_t size) {
@@ -479,7 +480,7 @@ void CollectionTruncateMarkersWithPartialExpiration::updateCurrentMarkerAfterIns
     const RecordId& highestInsertedRecordId,
     Date_t wallTime,
     int64_t countInserted) {
-    opCtx->recoveryUnit()->onCommit(
+    shard_role_details::getRecoveryUnit(opCtx)->onCommit(
         [collectionMarkers =
              std::static_pointer_cast<CollectionTruncateMarkersWithPartialExpiration>(
                  shared_from_this()),
@@ -490,7 +491,7 @@ void CollectionTruncateMarkersWithPartialExpiration::updateCurrentMarkerAfterIns
             invariant(bytesInserted >= 0);
             invariant(recordId.isValid());
             collectionMarkers->updateCurrentMarker(
-                opCtx, bytesInserted, recordId, wallTime, countInserted);
+                bytesInserted, recordId, wallTime, countInserted);
         });
 }
 
@@ -549,7 +550,6 @@ void CollectionTruncateMarkersWithPartialExpiration::_updateHighestSeenRecordIdA
 }
 
 void CollectionTruncateMarkersWithPartialExpiration::updateCurrentMarker(
-    OperationContext* opCtx,
     int64_t bytesAdded,
     const RecordId& highestRecordId,
     Date_t highestWallTime,
@@ -564,7 +564,7 @@ void CollectionTruncateMarkersWithPartialExpiration::updateCurrentMarker(
     int64_t newCurrentBytes = _currentBytes.addAndFetch(bytesAdded);
     if (highestWallTime != Date_t() && highestRecordId.isValid() &&
         newCurrentBytes >= _minBytesPerMarker) {
-        createNewMarkerIfNeeded(opCtx, highestRecordId, highestWallTime);
+        createNewMarkerIfNeeded(highestRecordId, highestWallTime);
     }
 }
 

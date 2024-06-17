@@ -7,6 +7,7 @@
  */
 
 import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
 import {
     checkWriteConcernTimedOut,
     restartServerReplication,
@@ -47,19 +48,44 @@ function _testSecondaryMetricsHelper(secondary, opCount, baseOpsApplied, baseOps
     assert.gt(ss.metrics.repl.syncSource.numSelections, 0, "num selections not incremented");
     assert.gt(ss.metrics.repl.syncSource.numTimesChoseDifferent, 0, "no new sync source chosen");
 
-    assert(ss.metrics.repl.buffer.count >= 0, "buffer count missing");
-    assert(ss.metrics.repl.buffer.sizeBytes >= 0, "size (bytes)] missing");
-    assert(ss.metrics.repl.buffer.maxSizeBytes >= 0, "maxSize (bytes) missing");
+    if (FeatureFlagUtil.isPresentAndEnabled(secondary, "ReduceMajorityWriteLatency")) {
+        assert(ss.metrics.repl.buffer.write.count >= 0, "write buffer count missing");
+        assert(ss.metrics.repl.buffer.write.sizeBytes >= 0, "write buffer size (bytes)] missing");
+        assert(ss.metrics.repl.buffer.write.maxSizeBytes >= 0,
+               "write buffer maxSize (bytes) missing");
+        assert(ss.metrics.repl.buffer.apply.count >= 0, "apply buffer count missing");
+        assert(ss.metrics.repl.buffer.apply.sizeBytes >= 0, "apply buffer size (bytes)] missing");
+        assert(ss.metrics.repl.buffer.apply.maxSizeBytes >= 0,
+               "apply buffer maxSize (bytes) missing");
+        assert(!ss.metrics.repl.buffer.count, "repl.buffer.count shoud not exist");
+    } else {
+        assert(ss.metrics.repl.buffer.count >= 0, "buffer count missing");
+        assert(ss.metrics.repl.buffer.sizeBytes >= 0, "size (bytes)] missing");
+        assert(ss.metrics.repl.buffer.maxSizeBytes >= 0, "maxSize (bytes) missing");
+        assert(!ss.metrics.repl.buffer.write, "repl.buffer.write should not exist");
+        assert(!ss.metrics.repl.buffer.apply, "repl.buffer.apply should not exist");
+    }
 
     assert.eq(ss.metrics.repl.apply.batchSize,
               opCount + baseOpsReceived,
               "apply ops batch size mismatch");
-    assert(ss.metrics.repl.apply.batches.num > 0, "no batches");
-    assert(ss.metrics.repl.apply.batches.totalMillis >= 0, "missing batch time");
+    assert(ss.metrics.repl.apply.batches.num > 0, "no applied batches");
+    assert(ss.metrics.repl.apply.batches.totalMillis >= 0, "missing applied batch time");
     assert.eq(ss.metrics.repl.apply.ops, opCount + baseOpsApplied, "wrong number of applied ops");
+
+    if (FeatureFlagUtil.isPresentAndEnabled(secondary, "ReduceMajorityWriteLatency")) {
+        assert.eq(ss.metrics.repl.write.batchSize,
+                  opCount + baseOpsReceived,
+                  "write ops batch size mismatch");
+        assert(ss.metrics.repl.write.batches.num > 0, "no write batches");
+        assert(ss.metrics.repl.write.batches.totalMillis >= 0, "missing write batch time");
+    } else {
+        assert(!ss.metrics.repl.write, "repl.write should not exist");
+    }
 }
 
-// Metrics are racy, e.g. repl.buffer.count could over- or under-reported briefly. Retry on error.
+// Metrics are racy, e.g. repl.buffer.apply.count could over- or under-reported briefly. Retry on
+// error.
 function testSecondaryMetrics(secondary, opCount, baseOpsApplied, baseOpsReceived) {
     assert.soon(() => {
         try {
@@ -109,6 +135,9 @@ var ss = secondary.getDB("test").serverStatus();
 // optime is greater than OplogApplier::Options::beginApplyingOpTime.
 var secondaryBaseOplogOpsApplied = ss.metrics.repl.apply.ops;
 var secondaryBaseOplogOpsReceived = ss.metrics.repl.apply.batchSize;
+
+// Disable batching of inserts so each one creates an oplog entry.
+assert.commandWorked(testDB.adminCommand({setParameter: 1, internalInsertMaxBatchSize: 1}));
 
 // add test docs
 var bulk = testDB.a.initializeUnorderedBulkOp();

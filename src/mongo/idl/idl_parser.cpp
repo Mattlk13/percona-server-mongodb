@@ -33,6 +33,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <span>
 #include <stack>
 #include <string>
 
@@ -50,7 +51,7 @@ namespace {
  *
  * Example: "string, bool, numberDouble"
  */
-std::string toCommaDelimitedList(const std::vector<BSONType>& types) {
+std::string toCommaDelimitedList(std::span<const BSONType> types) {
     str::stream builder;
 
     for (std::size_t i = 0; i < types.size(); ++i) {
@@ -104,7 +105,7 @@ bool IDLParserContext::checkAndAssertBinDataTypeSlowPath(const BSONElement& elem
 }
 
 bool IDLParserContext::checkAndAssertTypes(const BSONElement& element,
-                                           const std::vector<BSONType>& types) const {
+                                           std::span<const BSONType> types) const {
     auto elementType = element.type();
 
     auto pos = std::find(types.begin(), types.end(), elementType);
@@ -220,7 +221,7 @@ void IDLParserContext::throwBadEnumValue(StringData enumValue) const {
 }
 
 void IDLParserContext::throwBadType(const BSONElement& element,
-                                    const std::vector<BSONType>& types) const {
+                                    std::span<const BSONType> types) const {
     std::string path = getElementPath(element);
     std::string type_str = toCommaDelimitedList(types);
     uasserted(ErrorCodes::TypeMismatch,
@@ -259,7 +260,7 @@ StringData IDLParserContext::checkAndAssertCollectionName(const BSONElement& ele
     return element.valueStringData();
 }
 
-stdx::variant<UUID, StringData> IDLParserContext::checkAndAssertCollectionNameOrUUID(
+std::variant<UUID, StringData> IDLParserContext::checkAndAssertCollectionNameOrUUID(
     const BSONElement& element) {
     if (element.type() == BinData && element.binDataType() == BinDataType::newUUID) {
         return uassertStatusOK(UUID::parse(element));
@@ -293,6 +294,11 @@ const boost::optional<TenantId>& IDLParserContext::getTenantId() const {
 
 const SerializationContext& IDLParserContext::getSerializationContext() const {
     return _serializationContext;
+}
+
+const boost::optional<auth::ValidatedTenancyScope>& IDLParserContext::getValidatedTenancyScope()
+    const {
+    return _validatedTenancyScope;
 }
 
 std::vector<StringData> transformVector(const std::vector<std::string>& input) {

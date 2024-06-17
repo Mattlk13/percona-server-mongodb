@@ -36,7 +36,9 @@
 #include <string>
 #include <utility>
 
+#include "mongo/db/query/opt_counter_info.h"
 #include "mongo/db/query/optimizer/cascades/interfaces.h"
+#include "mongo/db/query/optimizer/cascades/logical_rewrites.h"
 #include "mongo/db/query/optimizer/cascades/memo.h"
 #include "mongo/db/query/optimizer/cascades/rewriter_rules.h"
 #include "mongo/db/query/optimizer/containers.h"
@@ -58,21 +60,18 @@ public:
      */
     static constexpr size_t kMaxSargableNodeSplitCount = 2;
 
-    /**
-     * Map of rewrite type to rewrite priority
-     */
-    using RewriteSet = opt::unordered_map<LogicalRewriteType, double>;
-
     LogicalRewriter(const Metadata& metadata,
                     Memo& memo,
                     PrefixId& prefixId,
-                    RewriteSet rewriteSet,
+                    LogicalRewriteSet rewriteSet,
                     const DebugInfo& debugInfo,
                     const QueryHints& hints,
                     const PathToIntervalFn& pathToInterval,
                     const ConstFoldFn& constFold,
                     const LogicalPropsInterface& logicalPropsDerivation,
-                    const CardinalityEstimator& cardinalityEstimator);
+                    const CardinalityEstimator& cardinalityEstimator,
+                    const QueryParameterMap& queryParameters,
+                    OptimizerCounterInfo& optCounterInfo);
 
     // This is a transient structure. We do not allow copying or moving.
     LogicalRewriter() = delete;
@@ -100,9 +99,6 @@ public:
      */
     void rewriteGroup(GroupIdType groupId);
 
-    static const RewriteSet& getExplorationSet();
-    static const RewriteSet& getSubstitutionSet();
-
 private:
     using RewriteFn = std::function<void(
         LogicalRewriter* rewriter, const MemoLogicalNodeId nodeId, const LogicalRewriteType rule)>;
@@ -123,10 +119,7 @@ private:
     void registerRewrite(LogicalRewriteType rewriteType, RewriteFn fn);
     void initializeRewrites();
 
-    static RewriteSet _explorationSet;
-    static RewriteSet _substitutionSet;
-
-    const RewriteSet _activeRewriteSet;
+    const LogicalRewriteSet _activeRewriteSet;
 
     // For standalone logical rewrite phase, keeps track of which groups still have rewrites
     // pending.
@@ -142,6 +135,9 @@ private:
     const ConstFoldFn& _constFold;
     const LogicalPropsInterface& _logicalPropsDerivation;
     const CardinalityEstimator& _cardinalityEstimator;
+    const QueryParameterMap& _queryParameters;
+    // This tracks notable events during optimization. It is used for explain purposes.
+    OptimizerCounterInfo& _optCounterInfo;
 
     RewriteFnMap _rewriteMap;
 

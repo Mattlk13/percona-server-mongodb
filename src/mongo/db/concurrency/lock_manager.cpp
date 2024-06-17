@@ -47,7 +47,6 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/config.h"  // IWYU pragma: keep
-#include "mongo/db/client.h"
 #include "mongo/db/concurrency/lock_request_list.h"
 #include "mongo/db/concurrency/locker.h"
 #include "mongo/db/operation_context.h"
@@ -441,38 +440,6 @@ LockManager* LockManager::get(ServiceContext& service) {
     return &getLockManager(service);
 }
 
-// static
-LockManager* LockManager::get(OperationContext* opCtx) {
-    return get(opCtx->getServiceContext());
-}
-
-
-// static
-std::map<LockerId, BSONObj> LockManager::getLockToClientMap(ServiceContext* serviceContext) {
-    std::map<LockerId, BSONObj> lockToClientMap;
-
-    for (ServiceContext::LockedClientsCursor cursor(serviceContext);
-         Client* client = cursor.next();) {
-        invariant(client);
-
-        stdx::lock_guard<Client> lk(*client);
-        const OperationContext* clientOpCtx = client->getOperationContext();
-
-        // Operation context specific information
-        if (clientOpCtx) {
-            BSONObjBuilder infoBuilder;
-            // The client information
-            client->reportState(infoBuilder);
-
-            infoBuilder.append("opid", static_cast<int>(clientOpCtx->getOpID()));
-            LockerId lockerId = clientOpCtx->lockState()->getId();
-            lockToClientMap.insert({lockerId, infoBuilder.obj()});
-        }
-    }
-
-    return lockToClientMap;
-}
-
 LockManager::LockManager() {
     _lockBuckets = new LockBucket[_numLockBuckets];
     _partitions = new Partition[_numPartitions];
@@ -540,80 +507,6 @@ LockResult LockManager::lock(ResourceId resId, LockRequest* request, LockMode mo
 
     request->partitioned = false;
     return lock->newRequest(request);
-}
-
-LockResult LockManager::convert(ResourceId resId, LockRequest* request, LockMode newMode) {
-    // If we are here, we already hold the lock in some mode. In order to keep it simple, we do
-    // not allow requesting a conversion while a lock is already waiting or pending conversion.
-    invariant(request->recursiveCount > 0);
-
-    request->recursiveCount++;
-
-    // Fast path for acquiring the same lock multiple times in modes, which are already covered
-    // by the current mode. It is safe to do this without locking, because 1) all calls for the
-    // same lock request must be done on the same thread and 2) if there are lock requests
-    // hanging off a given LockHead, then this lock will never disappear.
-    if ((LockConflictsTable[request->mode] | LockConflictsTable[newMode]) ==
-        LockConflictsTable[request->mode]) {
-        return LOCK_OK;
-    }
-
-    // TODO: For the time being we do not need conversions between unrelated lock modes (i.e.,
-    // modes which both add and remove to the conflicts set), so these are not implemented yet
-    // (e.g., S -> IX).
-    invariant((LockConflictsTable[request->mode] | LockConflictsTable[newMode]) ==
-              LockConflictsTable[newMode]);
-
-    LockBucket* bucket = _getBucket(resId);
-    stdx::lock_guard<SimpleMutex> scopedLock(bucket->mutex);
-    invariant(request->status == LockRequest::STATUS_GRANTED);
-
-    LockBucket::Map::iterator it = bucket->data.find(resId);
-    invariant(it != bucket->data.end());
-
-    LockHead* const lock = it->second;
-
-    if (lock->partitioned()) {
-        lock->migratePartitionedLockHeads();
-    }
-
-    // Construct granted mask without our current mode, so that it is not counted as
-    // conflicting
-    uint32_t grantedModesWithoutCurrentRequest = 0;
-
-    // We start the counting at 1 below, because LockModesCount also includes MODE_NONE
-    // at position 0, which can never be acquired/granted.
-    for (uint32_t i = 1; i < LockModesCount; i++) {
-        const uint32_t currentRequestHolds = (request->mode == static_cast<LockMode>(i) ? 1 : 0);
-
-        if (lock->grantedCounts[i] > currentRequestHolds) {
-            grantedModesWithoutCurrentRequest |= modeMask(static_cast<LockMode>(i));
-        }
-    }
-
-    // This check favours conversion requests over pending requests. For example:
-    //
-    // T1 requests lock L in IS
-    // T2 requests lock L in X
-    // T1 then upgrades L from IS -> S
-    //
-    // Because the check does not look into the conflict modes bitmap, it will grant L to
-    // T1 in S mode, instead of block, which would otherwise cause deadlock.
-    if (conflicts(newMode, grantedModesWithoutCurrentRequest)) {
-        request->status = LockRequest::STATUS_CONVERTING;
-        request->convertMode = newMode;
-
-        lock->conversionsCount++;
-        lock->incGrantedModeCount(request->convertMode);
-
-        return LOCK_WAITING;
-    } else {  // No conflict, existing request
-        lock->incGrantedModeCount(newMode);
-        lock->decGrantedModeCount(request->mode);
-        request->mode = newMode;
-
-        return LOCK_OK;
-    }
 }
 
 bool LockManager::unlock(LockRequest* request) {
@@ -728,7 +621,6 @@ void LockManager::cleanupUnusedLocks() {
 
 void LockManager::_cleanupUnusedLocksInBucket(LockBucket* bucket) {
     LockBucket::Map::iterator it = bucket->data.begin();
-    size_t deletedLockHeads = 0;
     while (it != bucket->data.end()) {
         LockHead* lock = it->second;
 
@@ -747,7 +639,6 @@ void LockManager::_cleanupUnusedLocksInBucket(LockBucket* bucket) {
             invariant(lock->compatibleFirstCount == 0);
 
             bucket->data.erase(it++);
-            deletedLockHeads++;
             delete lock;
         } else {
             it++;
@@ -878,22 +769,6 @@ bool LockManager::hasConflictingRequests(ResourceId resId, const LockRequest* re
     return request->lock ? !request->lock->conflictList.empty() : false;
 }
 
-void LockManager::dump() const {
-    BSONArrayBuilder locks;
-    _buildLocksArray(getLockToClientMap(getGlobalServiceContext()), true, nullptr, &locks);
-    LOGV2_OPTIONS(20521,
-                  logv2::LogTruncation::Disabled,
-                  "lock manager dump",
-                  "addr"_attr = formatPtr(this),
-                  "locks"_attr = locks.arr());
-}
-
-void LockManager::getLockInfoBSON(const std::map<LockerId, BSONObj>& lockToClientMap,
-                                  BSONObjBuilder* result) {
-    auto lockInfoArr = BSONArrayBuilder(result->subarrayStart("lockInfo"));
-    _buildLocksArray(lockToClientMap, false, this, &lockInfoArr);
-}
-
 std::vector<LogDegugInfo> LockManager::getLockInfoFromResourceHolders(ResourceId resId) {
     std::vector<LogDegugInfo> locksInfo;
     for (size_t i = 0; i < _numLockBuckets; ++i) {
@@ -911,7 +786,7 @@ std::vector<LogDegugInfo> LockManager::getLockInfoFromResourceHolders(ResourceId
     return locksInfo;
 }
 
-void LockManager::_buildLocksArray(const std::map<LockerId, BSONObj>& lockToClientMap,
+void LockManager::getLockInfoArray(const std::map<LockerId, BSONObj>& lockToClientMap,
                                    bool forLogging,
                                    LockManager* mutableThis,
                                    BSONArrayBuilder* locks) const {

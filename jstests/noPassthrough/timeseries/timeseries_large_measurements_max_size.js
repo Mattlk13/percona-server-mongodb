@@ -24,8 +24,6 @@ const resetCollection = (() => {
 });
 
 const numMeasurements = 4;
-let expectedNumBucketsClosedDueToSize = 0;
-let expectedNumBucketsKeptOpenDueToLargeMeasurements = 0;
 const checkBucketSize = (() => {
     const timeseriesStats = assert.commandWorked(coll.stats()).timeseries;
 
@@ -43,9 +41,8 @@ const checkBucketSize = (() => {
     assert.eq(numMeasurements - 1, bucketDocs[1].control.min._id);
     assert.eq(numMeasurements - 1, bucketDocs[1].control.max._id);
 
-    assert.eq(++expectedNumBucketsClosedDueToSize, timeseriesStats.numBucketsClosedDueToSize);
-    assert.eq(++expectedNumBucketsKeptOpenDueToLargeMeasurements,
-              timeseriesStats.numBucketsKeptOpenDueToLargeMeasurements);
+    assert.eq(1, timeseriesStats.numBucketsClosedDueToSize);
+    assert.eq(1, timeseriesStats.numBucketsKeptOpenDueToLargeMeasurements);
 });
 
 const measurementValueLength = 2 * 1024 * 1024;
@@ -54,7 +51,9 @@ jsTestLog("Testing single inserts");
 resetCollection();
 
 for (let i = 0; i < numMeasurements; i++) {
-    const doc = {_id: i, [timeFieldName]: ISODate(), value: "a".repeat(measurementValueLength)};
+    // Strings greater than 16 bytes are not compressed unless they are equal to the previous.
+    const value = (i % 2 == 0 ? "a" : "b");
+    const doc = {_id: i, [timeFieldName]: ISODate(), value: value.repeat(measurementValueLength)};
     assert.commandWorked(coll.insert(doc));
 }
 checkBucketSize();
@@ -64,7 +63,9 @@ resetCollection();
 
 let batch = [];
 for (let i = 0; i < numMeasurements; i++) {
-    const doc = {_id: i, [timeFieldName]: ISODate(), value: "a".repeat(measurementValueLength)};
+    // Strings greater than 16 bytes are not compressed unless they are equal to the previous.
+    const value = (i % 2 == 0 ? "a" : "b");
+    const doc = {_id: i, [timeFieldName]: ISODate(), value: value.repeat(measurementValueLength)};
     batch.push(doc);
 }
 assert.commandWorked(coll.insertMany(batch, {ordered: false}));

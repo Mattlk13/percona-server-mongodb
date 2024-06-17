@@ -71,7 +71,7 @@ constexpr auto kBlockedOpInterruptibleName = "BlockedOpForTestInterruptible"_sd;
 
 class BlockedOp {
 public:
-    void start(ServiceContext* serviceContext);
+    void start(Service* service);
     void join();
     void setIsContended(bool value);
     void setIsWaiting(bool value);
@@ -103,15 +103,15 @@ private:
 // This function causes us to make an additional thread with a self-contended lock so that
 // $currentOp can observe its DiagnosticInfo. Note that we track each thread that called us so that
 // we can join the thread when they are gone.
-void BlockedOp::start(ServiceContext* serviceContext) {
+void BlockedOp::start(Service* service) {
     stdx::unique_lock<stdx::mutex> lk(_m);
 
     invariant(!_latchState.thread);
     invariant(!_interruptibleState.thread);
 
     _latchState.mutex.lock();
-    _latchState.thread = stdx::thread([this, serviceContext]() mutable {
-        ThreadClient tc("DiagnosticCaptureTestLatch", serviceContext->getService());
+    _latchState.thread = stdx::thread([this, service]() mutable {
+        ThreadClient tc("DiagnosticCaptureTestLatch", service);
 
         // TODO(SERVER-74659): Please revisit if this thread could be made killable.
         {
@@ -126,8 +126,8 @@ void BlockedOp::start(ServiceContext* serviceContext) {
         LOGV2(23124, "Joining currentOpSpawnsThreadWaitingForLatch thread");
     });
 
-    _interruptibleState.thread = stdx::thread([this, serviceContext]() mutable {
-        ThreadClient tc("DiagnosticCaptureTestInterruptible", serviceContext->getService());
+    _interruptibleState.thread = stdx::thread([this, service]() mutable {
+        ThreadClient tc("DiagnosticCaptureTestInterruptible", service);
 
         // TODO(SERVER-74659): Please revisit if this thread could be made killable.
         {
@@ -241,7 +241,7 @@ MONGO_INITIALIZER(InterruptibleWaitListener)(InitializerContext* context) {
         using WakeReason = Interruptible::WakeReason;
         using WakeSpeed = Interruptible::WakeSpeed;
 
-        void addInfo(const StringData& name) {
+        void addInfo(StringData name) {
             if (auto client = Client::getCurrent()) {
                 DiagnosticInfo::capture(client, name);
 
@@ -252,7 +252,7 @@ MONGO_INITIALIZER(InterruptibleWaitListener)(InitializerContext* context) {
             }
         }
 
-        void removeInfo(const StringData& name) {
+        void removeInfo(StringData name) {
             if (auto client = Client::getCurrent()) {
                 auto& handle = getDiagnosticInfoHandle(client);
                 stdx::lock_guard<stdx::mutex> lk(handle.mutex);
@@ -262,11 +262,11 @@ MONGO_INITIALIZER(InterruptibleWaitListener)(InitializerContext* context) {
             }
         }
 
-        void onLongSleep(const StringData& name) override {
+        void onLongSleep(StringData name) override {
             addInfo(name);
         }
 
-        void onWake(const StringData& name, WakeReason, WakeSpeed speed) override {
+        void onWake(StringData name, WakeReason, WakeSpeed speed) override {
             if (speed == WakeSpeed::kSlow) {
                 removeInfo(name);
             }
@@ -289,7 +289,7 @@ std::string DiagnosticInfo::toString() const {
 }
 
 const DiagnosticInfo& DiagnosticInfo::capture(Client* client,
-                                              const StringData& captureName,
+                                              StringData captureName,
                                               Options options) noexcept {
     auto currentTime = client->getServiceContext()->getFastClockSource()->now();
 
@@ -315,7 +315,7 @@ auto DiagnosticInfo::maybeMakeBlockedOpForTest(Client* client) -> std::unique_pt
     std::unique_ptr<BlockedOpGuard> guard;
     currentOpSpawnsThreadWaitingForLatch.executeIf(
         [&](const BSONObj&) {
-            gBlockedOp.start(client->getServiceContext());
+            gBlockedOp.start(client->getService());
             guard = std::make_unique<BlockedOpGuard>();
         },
         [&](const BSONObj& data) {

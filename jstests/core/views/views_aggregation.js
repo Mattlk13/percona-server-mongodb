@@ -6,7 +6,7 @@
  *   does_not_support_stepdowns,
  *   does_not_support_transactions,
  *   # The killCursors command is not allowed with a security token.
- *   not_allowed_with_security_token,
+ *   not_allowed_with_signed_security_token,
  *   requires_getmore,
  *   requires_non_retryable_commands,
  *   # Explain of a resolved view must be executed by mongos.
@@ -23,9 +23,9 @@ import {getSingleNodeExplain} from "jstests/libs/analyze_plan.js";
 import {
     FixtureHelpers
 } from "jstests/libs/fixture_helpers.js";  // For arrayEq, assertErrorCode, and
-import {checkSBEEnabled} from "jstests/libs/sbe_util.js";
+import {checkSbeFullyEnabled} from "jstests/libs/sbe_util.js";
 
-const sbeEnabled = checkSBEEnabled(db);
+const sbeEnabled = checkSbeFullyEnabled(db);
 
 let viewsDB = db.getSiblingDB("views_aggregation");
 assert.commandWorked(viewsDB.dropDatabase());

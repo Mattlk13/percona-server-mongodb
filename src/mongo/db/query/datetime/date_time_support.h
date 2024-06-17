@@ -644,6 +644,20 @@ long long dateDiff(Date_t startDate,
                    DayOfWeek startOfWeek = kStartOfWeekDefault);
 
 /**
+ * Specialized version of dateDiff that compute the difference between two UTC dates in millisecond.
+ */
+long long dateDiffMillisecond(Date_t startDate, Date_t endDate);
+
+/**
+ * Specialized version of dateDiff that compute the difference between two timezone-aware dates
+ * using a provided time unit (that MUST NOT be millisecond).
+ */
+long long dateDiff(_timelib_time* startDateInTimeZone,
+                   _timelib_time* endDateInTimeZone,
+                   TimeUnit unit,
+                   DayOfWeek startOfWeek = kStartOfWeekDefault);
+
+/**
  * Add time interval to a date. The interval duration is given in 'amount' number of 'units'.
  * The amount can be a negative number in which case the interval is subtracted from the date.
  * The result date is always in UTC.
@@ -694,4 +708,42 @@ Date_t truncateDate(Date_t date,
                     unsigned long long binSize,
                     const TimeZone& timezone,
                     DayOfWeek startOfWeek = kStartOfWeekDefault);
+
+/*
+ * A date reference point representation required in dateTrunc computation
+ */
+struct DateReferencePoint {
+    Date_t dateMillis;
+    long long year;
+    int month;
+    int dayOfMonth;
+};
+
+/**
+ * Returns the default reference point used in $dateTrunc computation that is tied to 'timezone'. It
+ * must be aligned to time unit 'unit'.
+ */
+DateReferencePoint defaultReferencePointForDateTrunc(const TimeZone& timezone,
+                                                     TimeUnit unit,
+                                                     DayOfWeek startOfWeek);
+
+/**
+ * The same as 'truncateDate(Date_t, TimeUnit, unsigned long long binSize, const TimeZone&,
+ * DayOfWeek)', but additionally accepts a reference point 'referencePoint', that is expected to be
+ * aligned to the given time unit.
+ */
+Date_t truncateDate(Date_t date,
+                    TimeUnit unit,
+                    unsigned long long binSize,
+                    DateReferencePoint referencePoint,
+                    const TimeZone& timezone,
+                    DayOfWeek startOfWeek);
+
+/**
+ * An optimized version of date truncation algorithm that works with bins in milliseconds, seconds,
+ * minutes and hours.
+ */
+Date_t truncateDateMillis(Date_t date, Date_t referencePoint, unsigned long long binSizeMillis);
+
+long long getBinSizeInMillis(unsigned long long binSize, TimeUnit unit);
 }  // namespace mongo

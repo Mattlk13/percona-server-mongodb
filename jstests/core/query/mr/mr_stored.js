@@ -1,20 +1,26 @@
-// This test expects a function stored in the system.js collection to be available for a map/reduce,
-// which may not be the case if it is implicitly sharded in a passthrough.
-//
-// @tags: [
-//   # The test runs commands that are not allowed with security token: mapReduce.
-//   not_allowed_with_security_token,
-//   assumes_unsharded_collection,
-//   # mapReduce does not support afterClusterTime.
-//   does_not_support_causal_consistency,
-//   does_not_support_stepdowns,
-//   requires_non_retryable_writes,
-//   uses_map_reduce_with_temp_collections,
-//   requires_scripting,
-// ]
 /**
  * Tests that map reduce works with stored javascript.
+ *
+ * @tags: [
+ *  # The test runs commands that are not allowed with security token: mapReduce.
+ *  not_allowed_with_signed_security_token,
+ *  # This test expects a function stored in the system.js collection to be available for a
+ *  # map/reduce, which may not be the case if it is implicitly sharded in a passthrough.
+ *  assumes_unsharded_collection,
+ *  # mapReduce does not support afterClusterTime.
+ *  does_not_support_causal_consistency,
+ *  does_not_support_stepdowns,
+ *  requires_non_retryable_writes,
+ *  uses_map_reduce_with_temp_collections,
+ *  requires_scripting,
+ *  requires_system_dot_js_stored_functions,
+ *  # system.js stored functions only work for collections located on the db-primary shard (see
+ *  # SERVER-83269). Therefore, this test would fail if ran on suites that migrate data to other
+ *  # shards (e.g. moveChunk, moveCollection).
+ *  assumes_balancer_off,
+ * ]
  */
+
 import {assertArrayEq} from "jstests/aggregation/extras/utils.js";
 
 // Use a unique database name to avoid conflicts with other tests that directly modify
@@ -53,9 +59,10 @@ const finalize = function(key, reducedValue) {
     return reducedValue;
 };
 
-assert.commandWorked(testDB.system.js.insert({_id: "mr_stored_map", value: map}));
-assert.commandWorked(testDB.system.js.insert({_id: "mr_stored_reduce", value: reduce}));
-assert.commandWorked(testDB.system.js.insert({_id: "mr_stored_finalize", value: finalize}));
+const systemJsColl = testDB.getCollection("system.js");
+assert.commandWorked(systemJsColl.insert({_id: "mr_stored_map", value: map}));
+assert.commandWorked(systemJsColl.insert({_id: "mr_stored_reduce", value: reduce}));
+assert.commandWorked(systemJsColl.insert({_id: "mr_stored_finalize", value: finalize}));
 
 const out = testDB.mr_stored_out;
 
@@ -131,6 +138,6 @@ assert.commandWorked(testDB.runCommand({
 assertCorrect(out.convertToSingleObject("value"));
 out.drop();
 
-assert.commandWorked(testDB.system.js.remove({_id: "mr_stored_map"}));
-assert.commandWorked(testDB.system.js.remove({_id: "mr_stored_reduce"}));
-assert.commandWorked(testDB.system.js.remove({_id: "mr_stored_finalize"}));
+assert.commandWorked(systemJsColl.remove({_id: "mr_stored_map"}));
+assert.commandWorked(systemJsColl.remove({_id: "mr_stored_reduce"}));
+assert.commandWorked(systemJsColl.remove({_id: "mr_stored_finalize"}));

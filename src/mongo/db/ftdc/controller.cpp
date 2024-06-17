@@ -73,6 +73,12 @@ Status FTDCController::setEnabled(bool enabled) {
     return Status::OK();
 }
 
+void FTDCController::setMetadataCaptureFrequency(std::uint64_t freq) {
+    stdx::lock_guard<Latch> lock(_mutex);
+    _configTemp.metadataCaptureFrequency = freq;
+    _condvar.notify_one();
+}
+
 void FTDCController::setPeriod(Milliseconds millis) {
     stdx::lock_guard<Latch> lock(_mutex);
     _configTemp.period = millis;
@@ -120,22 +126,28 @@ Status FTDCController::setDirectory(const boost::filesystem::path& path) {
 }
 
 
-void FTDCController::addPeriodicCollector(std::unique_ptr<FTDCCollectorInterface> collector) {
-    {
-        stdx::lock_guard<Latch> lock(_mutex);
-        invariant(_state == State::kNotStarted);
+void FTDCController::addPeriodicMetadataCollector(std::unique_ptr<FTDCCollectorInterface> collector,
+                                                  ClusterRole role) {
+    stdx::lock_guard<Latch> lock(_mutex);
+    invariant(_state == State::kNotStarted);
 
-        _periodicCollectors.add(std::move(collector));
-    }
+    _periodicMetadataCollectors.add(std::move(collector), role);
 }
 
-void FTDCController::addOnRotateCollector(std::unique_ptr<FTDCCollectorInterface> collector) {
-    {
-        stdx::lock_guard<Latch> lock(_mutex);
-        invariant(_state == State::kNotStarted);
+void FTDCController::addPeriodicCollector(std::unique_ptr<FTDCCollectorInterface> collector,
+                                          ClusterRole role) {
+    stdx::lock_guard<Latch> lock(_mutex);
+    invariant(_state == State::kNotStarted);
 
-        _rotateCollectors.add(std::move(collector));
-    }
+    _periodicCollectors.add(std::move(collector), role);
+}
+
+void FTDCController::addOnRotateCollector(std::unique_ptr<FTDCCollectorInterface> collector,
+                                          ClusterRole role) {
+    stdx::lock_guard<Latch> lock(_mutex);
+    invariant(_state == State::kNotStarted);
+
+    _rotateCollectors.add(std::move(collector), role);
 }
 
 BSONObj FTDCController::getMostRecentPeriodicDocument() {
@@ -145,13 +157,13 @@ BSONObj FTDCController::getMostRecentPeriodicDocument() {
     }
 }
 
-void FTDCController::start() {
+void FTDCController::start(Service* service) {
     LOGV2(20625,
           "Initializing full-time diagnostic data capture",
           "dataDirectory"_attr = _path.generic_string());
 
     // Start the thread
-    _thread = stdx::thread([this] { doLoop(); });
+    _thread = stdx::thread([this, service] { doLoop(service); });
 
     {
         stdx::lock_guard<Latch> lock(_mutex);
@@ -197,10 +209,10 @@ void FTDCController::stop() {
     }
 }
 
-void FTDCController::doLoop() noexcept {
+void FTDCController::doLoop(Service* service) noexcept {
     // Note: All exceptions thrown in this loop are considered process fatal. The default terminate
     // is used to provide a good stack trace of the issue.
-    Client::initThread(kFTDCThreadName, getGlobalServiceContext()->getService());
+    Client::initThread(kFTDCThreadName, service);
     Client* client = &cc();
 
     // TODO(SERVER-74659): Please revisit if this thread could be made killable.
@@ -214,6 +226,11 @@ void FTDCController::doLoop() noexcept {
         stdx::lock_guard<Latch> lock(_mutex);
         _config = _configTemp;
     }
+
+    // Periodic metadata is collected when metadataCaptureFrequencyCountdown hits 0 (which will
+    // always include the first iteration). Then, the value of metadataCaptureFrequencyCountdown is
+    // reset to _config.metadataCaptureFrequency and countdown starts again.
+    std::uint64_t metadataCaptureFrequencyCountdown = 1;
 
     while (true) {
         // Compute the next interval to run regardless of how we were woken up
@@ -256,12 +273,13 @@ void FTDCController::doLoop() noexcept {
             // Delay initialization of FTDCFileManager until we are sure the user has enabled
             // FTDC
             if (!_mgr) {
-                auto swMgr = FTDCFileManager::create(&_config, _path, &_rotateCollectors, client);
+                auto swMgr = FTDCFileManager::create(
+                    &_config, _path, &_rotateCollectors, client, _multiServiceSchema);
 
                 _mgr = uassertStatusOK(std::move(swMgr));
             }
 
-            auto collectSample = _periodicCollectors.collect(client);
+            auto collectSample = _periodicCollectors.collect(client, _multiServiceSchema);
 
             Status s = _mgr->writeSampleAndRotateIfNeeded(
                 client, std::get<0>(collectSample), std::get<1>(collectSample));
@@ -272,6 +290,15 @@ void FTDCController::doLoop() noexcept {
             {
                 stdx::lock_guard<Latch> lock(_mutex);
                 _mostRecentPeriodicDocument = std::get<0>(collectSample);
+            }
+
+            if (--metadataCaptureFrequencyCountdown == 0) {
+                metadataCaptureFrequencyCountdown = _config.metadataCaptureFrequency;
+                auto collectSample =
+                    _periodicMetadataCollectors.collect(client, _multiServiceSchema);
+                Status s = _mgr->writePeriodicMetadataSampleAndRotateIfNeeded(
+                    client, std::get<0>(collectSample), std::get<1>(collectSample));
+                iassert(s);
             }
         }
     }

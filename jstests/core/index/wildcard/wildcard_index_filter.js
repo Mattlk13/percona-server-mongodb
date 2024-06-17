@@ -4,11 +4,13 @@
  * @tags: [
  *   # The test runs commands that are not allowed with security token: planCacheClearFilters,
  *   # planCacheListFilters, planCacheSetFilter.
- *   not_allowed_with_security_token,
+ *   not_allowed_with_signed_security_token,
  *   # Does not support stepdowns, because the stepdown/kill_primary passthroughs will reject
  *   # commands that may return different values after a failover; in this case,
  *   # 'planCacheClearFilters'.
  *   does_not_support_stepdowns,
+ *   # Plan cache state is node-local and will not get migrated alongside user data
+ *   assumes_balancer_off,
  * ]
  */
 

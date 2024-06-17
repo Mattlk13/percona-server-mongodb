@@ -45,14 +45,13 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/s/add_shard_cmd_gen.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/sharding_mongod_test_fixture.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/unittest/framework.h"
 
@@ -66,12 +65,10 @@ const std::string kShardName("TestShard");
  * include the ShardingMongodOpObserver), writes to the 'admin.system.version' collection (and the
  * shardIdentity document specifically) will invoke the sharding initialization code.
  */
-class ShardingInitializationOpObserverTest : public ShardingMongodTestFixture {
-public:
+class ShardingInitializationOpObserverTest : public ShardingMongoDTestFixture {
+protected:
     void setUp() override {
-        ShardingMongodTestFixture::setUp();
-
-        serverGlobalParams.clusterRole = ClusterRole::ShardServer;
+        ShardingMongoDTestFixture::setUp();
 
         // NOTE: this assumes that globalInit will always be called on the same thread as the main
         // test thread
@@ -83,17 +80,13 @@ public:
                 });
     }
 
-    void tearDown() override {
-        ShardingState::get(getServiceContext())->clearForTests();
-
-        ShardingMongodTestFixture::tearDown();
-    }
-
     int getInitCallCount() const {
         return _initCallCount;
     }
 
 private:
+    service_context_test::ShardRoleOverride _shardRole;
+
     int _initCallCount = 0;
 };
 

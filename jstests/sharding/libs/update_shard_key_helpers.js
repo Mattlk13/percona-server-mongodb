@@ -4,7 +4,8 @@ export function shardCollectionMoveChunks(
     st, kDbName, ns, shardKey, docsToInsert, splitDoc, moveChunkDoc) {
     assert.commandWorked(st.s.getDB(kDbName).foo.createIndex(shardKey));
 
-    assert.eq(st.s.getDB('config').collections.countDocuments({_id: ns}), 0);
+    assert.eq(st.s.getDB('config').collections.countDocuments({_id: ns, unsplittable: {$ne: true}}),
+              0);
 
     for (let i = 0; i < docsToInsert.length; i++) {
         assert.commandWorked(st.s.getDB(kDbName).foo.insert(docsToInsert[i]));
@@ -109,7 +110,7 @@ export function runFindAndModifyCmdSuccess(st,
             updatedVal = pipelineUpdateResult[i];
         let newDoc = sessionDB.foo.find(updatedVal).toArray();
         assert.eq(0, sessionDB.foo.find(queries[i]).itcount());
-        assert.eq(1, newDoc.length);
+        assert.eq(1, newDoc.length, updatedVal);
         if (bsonWoCompare(updatedVal, collectionSplitPoint) > 0) {
             assert.eq(0, st.rs0.getPrimary().getDB(kDbName).foo.find(updatedVal).itcount());
             assert.eq(1, st.rs1.getPrimary().getDB(kDbName).foo.find(updatedVal).itcount());

@@ -71,6 +71,7 @@
 #include "mongo/db/storage/snapshot.h"
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/update/document_diff_applier.h"
 #include "mongo/db/update/document_diff_calculator.h"
 #include "mongo/stdx/thread.h"
@@ -230,7 +231,7 @@ TEST_F(CollectionTest, CappedNotifierWaitUntilInterrupt) {
         auto after = Date_t::now();
         ASSERT_GTE(after - before, Milliseconds(25));
 
-        stdx::lock_guard<Client> lk(clientToInterrupt);
+        ClientLock lk(&clientToInterrupt);
         getServiceContext()->killOperation(
             lk, clientToInterrupt.getOperationContext(), ErrorCodes::Interrupted);
     });
@@ -353,7 +354,8 @@ TEST_F(CollectionTest, VerifyIndexIsUpdated) {
     auto newDoc = BSON("_id" << 1 << "a" << 5);
     {
         WriteUnitOfWork wuow(opCtx);
-        Snapshotted<BSONObj> oldSnap(opCtx->recoveryUnit()->getSnapshotId(), oldDoc);
+        Snapshotted<BSONObj> oldSnap(shard_role_details::getRecoveryUnit(opCtx)->getSnapshotId(),
+                                     oldDoc);
         CollectionUpdateArgs args{oldDoc};
         collection_internal::updateDocument(opCtx,
                                             coll,
@@ -404,7 +406,8 @@ TEST_F(CollectionTest, VerifyIndexIsUpdatedWithDamages) {
     auto damagesOutput = doc_diff::computeDamages(oldDoc, *diff, false);
     {
         WriteUnitOfWork wuow(opCtx);
-        Snapshotted<BSONObj> oldSnap(opCtx->recoveryUnit()->getSnapshotId(), oldDoc);
+        Snapshotted<BSONObj> oldSnap(shard_role_details::getRecoveryUnit(opCtx)->getSnapshotId(),
+                                     oldDoc);
         CollectionUpdateArgs args{oldDoc};
         auto newDocStatus =
             collection_internal::updateDocumentWithDamages(opCtx,
@@ -585,7 +588,9 @@ TEST_F(CollectionTest, CheckTimeseriesBucketDocsForMixedSchemaData) {
                                              "max" : { "x" : [ 2, 3 ] } } })")};
 
     for (const auto& controlDoc : mixedSchemaControlDocs) {
-        ASSERT_TRUE(coll->doesTimeseriesBucketsDocContainMixedSchemaData(controlDoc));
+        auto mixedSchema = coll->doesTimeseriesBucketsDocContainMixedSchemaData(controlDoc);
+        ASSERT_OK(mixedSchema) << controlDoc;
+        ASSERT_TRUE(mixedSchema.getValue()) << controlDoc;
     }
 
     std::vector<BSONObj> nonMixedSchemaControlDocs = {
@@ -642,7 +647,27 @@ TEST_F(CollectionTest, CheckTimeseriesBucketDocsForMixedSchemaData) {
 
 
     for (const auto& controlDoc : nonMixedSchemaControlDocs) {
-        ASSERT_FALSE(coll->doesTimeseriesBucketsDocContainMixedSchemaData(controlDoc));
+        auto mixedSchema = coll->doesTimeseriesBucketsDocContainMixedSchemaData(controlDoc);
+        ASSERT_OK(mixedSchema) << controlDoc;
+        ASSERT_FALSE(mixedSchema.getValue()) << controlDoc;
+    }
+
+    std::vector<BSONObj> malformedControlDocs = {
+        // Inconsistent field name ordering
+        ::mongo::fromjson(R"({ "control" : { "min" : { "x" : 1, "y" : 1 },
+                                             "max" : { "y" : 2, "x" : 2 } } })"),
+
+        // Extra field in min
+        ::mongo::fromjson(R"({ "control" : { "min" : { "x" : 1, "y" : 1 },
+                                             "max" : { "x" : 2 } } })"),
+
+        // Extra field in max
+        ::mongo::fromjson(R"({ "control" : { "min" : { "y" : 1 },
+                                             "max" : { "y" : 2, "x" : 2 } } })")};
+
+    for (const auto& controlDoc : malformedControlDocs) {
+        ASSERT_NOT_OK(coll->doesTimeseriesBucketsDocContainMixedSchemaData(controlDoc))
+            << controlDoc;
     }
 }
 
@@ -968,10 +993,11 @@ TEST_F(CollectionTest, CappedCursorRollover) {
     // Setup the cursor that should rollover.
     auto otherClient = getServiceContext()->getService()->makeClient("otherClient");
     auto otherOpCtx = otherClient->makeOperationContext();
+    Lock::GlobalLock globalLock{otherOpCtx.get(), MODE_IS};
     auto cursor = rs->getCursor(otherOpCtx.get());
     ASSERT(cursor->next());
     cursor->save();
-    otherOpCtx->recoveryUnit()->abandonSnapshot();
+    shard_role_details::getRecoveryUnit(otherOpCtx.get())->abandonSnapshot();
 
     // Insert 10 documents which causes a rollover.
     {
@@ -987,6 +1013,73 @@ TEST_F(CollectionTest, CappedCursorRollover) {
     // Cursor should now be dead.
     ASSERT_FALSE(cursor->restore(false));
     ASSERT(!cursor->next());
+}
+
+TEST_F(CollectionTest, BoundedSeek) {
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.t");
+    ASSERT_OK(storageInterface()->createCollection(operationContext(), nss, {}));
+
+    AutoGetCollection autoColl(operationContext(), nss, MODE_IX);
+    const CollectionPtr& coll = autoColl.getCollection();
+    RecordStore* rs = coll->getRecordStore();
+
+    auto doInsert = [&](OperationContext* opCtx) -> RecordId {
+        Lock::GlobalLock globalLock{opCtx, MODE_IX};
+        std::string data = "data";
+        return uassertStatusOK(rs->insertRecord(opCtx, data.c_str(), data.size(), Timestamp()));
+    };
+
+    // Insert 5 records and delete the first one.
+    const int numToInsert = 5;
+    RecordId recordIds[numToInsert];
+    {
+        WriteUnitOfWork wuow(operationContext());
+        for (int i = 0; i < numToInsert; ++i) {
+            recordIds[i] = doInsert(operationContext());
+        }
+        Lock::GlobalLock globalLock{operationContext(), MODE_IX};
+        rs->deleteRecord(operationContext(), recordIds[0]);
+        wuow.commit();
+    }
+
+    // Forward inclusive seek
+    ASSERT_ID_EQ(rs->getCursor(operationContext())
+                     ->seek(recordIds[1], SeekableRecordCursor::BoundInclusion::kInclude),
+                 recordIds[1]);
+    ASSERT_ID_EQ(rs->getCursor(operationContext())
+                     ->seek(recordIds[0], SeekableRecordCursor::BoundInclusion::kInclude),
+                 recordIds[1]);
+    ASSERT(!rs->getCursor(operationContext())
+                ->seek(RecordId(recordIds[numToInsert - 1].getLong() + 1),
+                       SeekableRecordCursor::BoundInclusion::kInclude));
+
+    // Forward exclusive seek
+    ASSERT_ID_EQ(rs->getCursor(operationContext())
+                     ->seek(recordIds[1], SeekableRecordCursor::BoundInclusion::kExclude),
+                 recordIds[2]);
+    ASSERT(!rs->getCursor(operationContext())
+                ->seek(RecordId(recordIds[numToInsert - 1]),
+                       SeekableRecordCursor::BoundInclusion::kExclude));
+
+    // Reverse inclusive seek
+    ASSERT_ID_EQ(
+        rs->getCursor(operationContext(), false)
+            ->seek(recordIds[numToInsert - 1], SeekableRecordCursor::BoundInclusion::kInclude),
+        recordIds[numToInsert - 1]);
+    ASSERT_ID_EQ(rs->getCursor(operationContext(), false)
+                     ->seek(RecordId(recordIds[numToInsert - 1].getLong() + 1),
+                            SeekableRecordCursor::BoundInclusion::kInclude),
+                 recordIds[numToInsert - 1]);
+    ASSERT(!rs->getCursor(operationContext(), false)
+                ->seek(recordIds[0], SeekableRecordCursor::BoundInclusion::kInclude));
+
+    // Reverse exclusive seek
+    ASSERT_ID_EQ(
+        rs->getCursor(operationContext(), false)
+            ->seek(recordIds[numToInsert - 1], SeekableRecordCursor::BoundInclusion::kExclude),
+        recordIds[numToInsert - 2]);
+    ASSERT(!rs->getCursor(operationContext(), false)
+                ->seek(RecordId(recordIds[1]), SeekableRecordCursor::BoundInclusion::kExclude));
 }
 
 TEST_F(CatalogTestFixture, CappedCursorYieldFirst) {
@@ -1014,7 +1107,7 @@ TEST_F(CatalogTestFixture, CappedCursorYieldFirst) {
 
     // See that things work if you yield before you first call next().
     cursor->save();
-    operationContext()->recoveryUnit()->abandonSnapshot();
+    shard_role_details::getRecoveryUnit(operationContext())->abandonSnapshot();
 
     ASSERT_TRUE(cursor->restore());
 

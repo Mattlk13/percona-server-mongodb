@@ -40,25 +40,57 @@
 
 namespace mongo::timeseries::bucket_catalog {
 
+namespace {
+boost::optional<OID> initializeRequest(BucketCatalog& catalog,
+                                       Stripe& stripe,
+                                       const BucketKey& key,
+                                       const ReopeningContext::CandidateType& candidate) {
+    boost::optional<OID> oid;
+    if (holds_alternative<std::monostate>(candidate)) {
+        // No need to initialize a request.
+        return oid;
+    } else if (auto* c = get_if<OID>(&candidate)) {
+        oid = *c;
+    }
+    invariant(oid.has_value() || !stripe.outstandingReopeningRequests.contains(key));
+
+    auto it = stripe.outstandingReopeningRequests.find(key);
+    if (it == stripe.outstandingReopeningRequests.end()) {
+        bool inserted = false;
+        // Track the memory usage for the bucket keys in this data structure because these buckets
+        // are not open yet which means they are not already being tracked.
+        std::tie(it, inserted) = stripe.outstandingReopeningRequests.try_emplace(
+            key.cloneAsTracked(catalog.trackingContext),
+            make_tracked_inlined_vector<shared_tracked_ptr<ReopeningRequest>,
+                                        Stripe::kInlinedVectorSize>(catalog.trackingContext));
+        invariant(inserted);
+    }
+    auto& list = it->second;
+
+    list.push_back(make_shared_tracked<ReopeningRequest>(
+        catalog.trackingContext,
+        ExecutionStatsController{
+            internal::getOrInitializeExecutionStats(catalog, key.collectionUUID)},
+        oid));
+
+    return oid;
+}
+}  // namespace
+
 ReopeningContext::~ReopeningContext() {
     if (!_cleared) {
         clear();
     }
 }
 
-ReopeningContext::ReopeningContext(BucketCatalog& catalog,
-                                   Stripe& s,
-                                   WithLock,
-                                   const BucketKey& k,
-                                   uint64_t era,
-                                   CandidateType&& c)
-    : catalogEra{era}, candidate{std::move(c)}, _stripe(&s), _key(k), _cleared(false) {
-    invariant(!_stripe->outstandingReopeningRequests.contains(_key));
-    _stripe->outstandingReopeningRequests.emplace(
-        _key,
-        std::make_shared<ReopeningRequest>(
-            ExecutionStatsController{internal::getOrInitializeExecutionStats(catalog, _key.ns)}));
-}
+ReopeningContext::ReopeningContext(
+    BucketCatalog& catalog, Stripe& s, WithLock, BucketKey k, uint64_t era, CandidateType&& c)
+    : catalogEra{era},
+      candidate{std::move(c)},
+      _stripe(&s),
+      _key(std::move(k)),
+      _oid{initializeRequest(catalog, s, _key, candidate)},
+      _cleared(holds_alternative<std::monostate>(candidate)) {}
 
 ReopeningContext::ReopeningContext(ReopeningContext&& other)
     : catalogEra{other.catalogEra},
@@ -68,14 +100,21 @@ ReopeningContext::ReopeningContext(ReopeningContext&& other)
       bucketToReopen{std::move(other.bucketToReopen)},
       _stripe(other._stripe),
       _key(std::move(other._key)),
+      _oid(std::move(other._oid)),
       _cleared(other._cleared) {
     other._cleared = true;
 }
 
 ReopeningContext& ReopeningContext::operator=(ReopeningContext&& other) {
     if (this != &other) {
+        catalogEra = other.catalogEra;
+        candidate = std::move(other.candidate);
+        fetchedBucket = other.fetchedBucket;
+        queriedBucket = other.queriedBucket;
+        bucketToReopen = std::move(other.bucketToReopen);
         _stripe = other._stripe;
-        _key = other._key;
+        _key = std::move(other._key);
+        _oid = std::move(other._oid);
         _cleared = other._cleared;
         other._cleared = true;
     }
@@ -88,30 +127,36 @@ void ReopeningContext::clear() {
 }
 
 void ReopeningContext::clear(WithLock) {
-    auto it = _stripe->outstandingReopeningRequests.find(_key);
-    invariant(it != _stripe->outstandingReopeningRequests.end());
+    if (_cleared) {
+        return;
+    }
+
+    auto keyIt = _stripe->outstandingReopeningRequests.find(_key);
+    invariant(keyIt != _stripe->outstandingReopeningRequests.end());
+    auto& list = keyIt->second;
+
+    invariant(_oid.has_value() || list.size() == 1);
+    auto requestIt = std::find_if(
+        list.begin(), list.end(), [&](const std::shared_ptr<ReopeningRequest>& request) {
+            return request->oid == _oid;
+        });
+    invariant(requestIt != list.end());
 
     // Notify any waiters and clean up state.
-    it->second->promise.emplaceValue();
-    _stripe->outstandingReopeningRequests.erase(it);
+    (*requestIt)->promise.emplaceValue();
+    list.erase(requestIt);
+    if (list.empty()) {
+        _stripe->outstandingReopeningRequests.erase(keyIt);
+    }
     _cleared = true;
 }
 
-ArchivedBucket::ArchivedBucket(const BucketId& b, const std::string& t)
+ArchivedBucket::ArchivedBucket(const BucketId& b, const tracked_string& t)
     : bucketId{b}, timeField{t} {}
 
-long long marginalMemoryUsageForArchivedBucket(
-    const ArchivedBucket& bucket, IncludeMemoryOverheadFromMap includeMemoryOverheadFromMap) {
-    return sizeof(Date_t) +        // key in set of archived buckets for meta hash
-        sizeof(ArchivedBucket) +   // main data for archived bucket
-        bucket.timeField.size() +  // allocated space for timeField string, ignoring SSO
-        (includeMemoryOverheadFromMap == IncludeMemoryOverheadFromMap::kInclude
-             ? sizeof(std::size_t) +                                    // key in set (meta hash)
-                 sizeof(decltype(Stripe::archivedBuckets)::value_type)  // set container
-             : 0);
-}
 
-ReopeningRequest::ReopeningRequest(ExecutionStatsController&& s) : stats{std::move(s)} {}
+ReopeningRequest::ReopeningRequest(ExecutionStatsController&& s, boost::optional<OID> o)
+    : stats{std::move(s)}, oid{o} {}
 
 void waitForReopeningRequest(ReopeningRequest& request) {
     if (!request.promise.getFuture().isReady()) {

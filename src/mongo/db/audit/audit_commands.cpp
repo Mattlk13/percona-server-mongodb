@@ -119,7 +119,7 @@ namespace mongo {
             return ok;
         }
     };
-    MONGO_REGISTER_COMMAND(LogApplicationMessageCommand);
+    MONGO_REGISTER_COMMAND(LogApplicationMessageCommand).forRouter().forShard();
 
     class AuditGetOptionsCommand : public AuditCommand {
     public:
@@ -145,5 +145,5 @@ namespace mongo {
             return true;
         }
     };
-    MONGO_REGISTER_COMMAND(AuditGetOptionsCommand);
+    MONGO_REGISTER_COMMAND(AuditGetOptionsCommand).forRouter().forShard();
 }  // namespace mongo

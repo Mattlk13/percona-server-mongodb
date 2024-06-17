@@ -51,7 +51,6 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/collection_scan.h"
@@ -83,6 +82,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
@@ -120,7 +120,7 @@ public:
         _ctx->tempDir = storageGlobalParams.dbpath + "/_tmp";
     }
 
-    virtual ~DocumentSourceCursorTest() {
+    ~DocumentSourceCursorTest() override {
         client.dropCollection(nss);
     }
 
@@ -140,12 +140,11 @@ protected:
             CanonicalQueryParams{.expCtx = makeExpressionContext(opCtx(), *findCommand),
                                  .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
 
-        auto exec = uassertStatusOK(getExecutor(opCtx(),
-                                                &_coll,
-                                                std::move(cq),
-                                                nullptr /* extractAndAttachPipelineStages */,
-                                                PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
-                                                QueryPlannerParams::RETURN_OWNED_DATA));
+        auto exec = uassertStatusOK(getExecutorFind(opCtx(),
+                                                    MultipleCollectionAccessor{_coll},
+                                                    std::move(cq),
+                                                    PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
+                                                    QueryPlannerParams::RETURN_OWNED_DATA));
 
         _source = DocumentSourceCursor::create(MultipleCollectionAccessor(_coll),
                                                std::move(exec),
@@ -186,11 +185,11 @@ private:
 TEST_F(DocumentSourceCursorTest, Empty) {
     createSource();
     // The DocumentSourceCursor doesn't hold a read lock.
-    ASSERT(!opCtx()->lockState()->isReadLocked());
+    ASSERT(!shard_role_details::getLocker(opCtx())->isReadLocked());
     // The collection is empty, so the source produces no results.
     ASSERT(source()->getNext().isEOF());
     // Exhausting the source releases the read lock.
-    ASSERT(!opCtx()->lockState()->isReadLocked());
+    ASSERT(!shard_role_details::getLocker(opCtx())->isReadLocked());
 }
 
 /** Iterate a DocumentSourceCursor. */
@@ -198,7 +197,7 @@ TEST_F(DocumentSourceCursorTest, Iterate) {
     client.insert(nss, BSON("a" << 1));
     createSource();
     // The DocumentSourceCursor doesn't hold a read lock.
-    ASSERT(!opCtx()->lockState()->isReadLocked());
+    ASSERT(!shard_role_details::getLocker(opCtx())->isReadLocked());
     // The cursor will produce the expected result.
     auto next = source()->getNext();
     ASSERT(next.isAdvanced());
@@ -206,17 +205,17 @@ TEST_F(DocumentSourceCursorTest, Iterate) {
     // There are no more results.
     ASSERT(source()->getNext().isEOF());
     // Exhausting the source releases the read lock.
-    ASSERT(!opCtx()->lockState()->isReadLocked());
+    ASSERT(!shard_role_details::getLocker(opCtx())->isReadLocked());
 }
 
 /** Dispose of a DocumentSourceCursor. */
 TEST_F(DocumentSourceCursorTest, Dispose) {
     createSource();
     // The DocumentSourceCursor doesn't hold a read lock.
-    ASSERT(!opCtx()->lockState()->isReadLocked());
+    ASSERT(!shard_role_details::getLocker(opCtx())->isReadLocked());
     source()->dispose();
     // Releasing the cursor releases the read lock.
-    ASSERT(!opCtx()->lockState()->isReadLocked());
+    ASSERT(!shard_role_details::getLocker(opCtx())->isReadLocked());
     // The source is marked as exhausted.
     ASSERT(source()->getNext().isEOF());
 }
@@ -236,10 +235,10 @@ TEST_F(DocumentSourceCursorTest, IterateDispose) {
     ASSERT(next.isAdvanced());
     ASSERT_VALUE_EQ(Value(2), next.getDocument().getField("a"));
     // The DocumentSourceCursor doesn't hold a read lock.
-    ASSERT(!opCtx()->lockState()->isReadLocked());
+    ASSERT(!shard_role_details::getLocker(opCtx())->isReadLocked());
     source()->dispose();
     // Disposing of the source releases the lock.
-    ASSERT(!opCtx()->lockState()->isReadLocked());
+    ASSERT(!shard_role_details::getLocker(opCtx())->isReadLocked());
     // The source cannot be advanced further.
     ASSERT(source()->getNext().isEOF());
 }

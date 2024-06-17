@@ -31,6 +31,7 @@
 
 #include <absl/container/node_hash_map.h>
 #include <absl/container/node_hash_set.h>
+#include <boost/core/demangle.hpp>
 #include <boost/move/utility_core.hpp>
 #include <boost/none.hpp>
 #include <boost/optional.hpp>
@@ -53,6 +54,7 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/sbe/makeobj_spec.h"
 #include "mongo/db/exec/sbe/values/bson.h"
 #include "mongo/db/query/optimizer/algebra/operator.h"
 #include "mongo/db/query/optimizer/algebra/polyvalue.h"
@@ -75,10 +77,23 @@ namespace mongo::optimizer {
 
 ABTPrinter::ABTPrinter(Metadata metadata,
                        PlanAndProps planAndProps,
-                       const ExplainVersion explainVersion)
+                       const ExplainVersion explainVersion,
+                       QueryParameterMap qpMap)
     : _metadata(std::move(metadata)),
       _planAndProps(std::move(planAndProps)),
-      _explainVersion(explainVersion) {}
+      _explainVersion(explainVersion),
+      _queryParameters(std::move(qpMap)) {}
+
+ABTPrinter::ABTPrinter(Metadata metadata,
+                       PlanAndProps planAndProps,
+                       const ExplainVersion explainVersion,
+                       QueryParameterMap qpMap,
+                       QueryPlannerOptimizationStagesForDebugExplain queryPlannerOptimizationStages)
+    : _metadata(std::move(metadata)),
+      _planAndProps(std::move(planAndProps)),
+      _explainVersion(explainVersion),
+      _queryParameters(std::move(qpMap)),
+      _queryPlannerOptimizationStages(std::move(queryPlannerOptimizationStages)) {}
 
 BSONObj ABTPrinter::explainBSON() const {
     const auto explainPlanStr = [&](const std::string& planStr) {
@@ -103,12 +118,148 @@ BSONObj ABTPrinter::explainBSON() const {
                                                     nullptr /*memoInterface*/,
                                                     _planAndProps._map);
 
+        case ExplainVersion::UserFacingExplain: {
+            UserFacingExplain ex(_planAndProps._map);
+            return ex.explain(_planAndProps._node);
+        }
         case ExplainVersion::Vmax:
             // Should not be seeing this value here.
             break;
     }
 
     MONGO_UNREACHABLE;
+}
+
+BSONObj ABTPrinter::getQueryParameters() const {
+    // To obtain consistent explain results, we display the parameters in the order of their sorted
+    // ids.
+    std::vector<int32_t> paramIds;
+    for (const auto& elem : _queryParameters) {
+        paramIds.push_back(elem.first);
+    }
+    std::sort(paramIds.begin(), paramIds.end());
+
+    BSONObjBuilder result;
+    for (const auto& paramId : paramIds) {
+        std::stringstream idStream;
+        idStream << paramId;
+        BSONObjBuilder paramBuilder(result.subobjStart(idStream.str()));
+        const auto& constant = _queryParameters.at(paramId).get();
+        paramBuilder.append("value", sbe::value::print(constant));
+
+        std::stringstream typeStream;
+        typeStream << constant.first;
+        paramBuilder.append("type", typeStream.str());
+
+        paramBuilder.doneFast();
+    }
+
+    return result.obj();
+}
+
+BSONObj ABTPrinter::explainQueryPlannerDebug() const {
+
+    const auto explainPlan = [&]<typename T>(const std::string& fieldName, const T& planStr) {
+        BSONObjBuilder local_builder;
+        local_builder.append("name", fieldName);
+        local_builder.append("plan", planStr);
+        return local_builder.done().getOwned();
+    };
+
+    /**
+     * Simplify the creation of a single BSONObj from the collected plans from Bonsai optimization
+     * stages. The lambda returns an array BSONObj. It expects as a parameter a function that will
+     * transform each plan into a BSONObj.
+     * The function taken as parameter returns auto to match the different output types (BSONObj or
+     * string).
+     */
+    const auto explainPlanForAllStagesFunction =
+        [&](const bool displayProperties,
+            const QueryPlannerOptimizationStagesForDebugExplain& queryPlannerOptimizationStages,
+            auto (*func)(const ABT::reference_type node,
+                         const bool displayProperties,
+                         const cascades::MemoExplainInterface* memoInterface,
+                         const NodeToGroupPropsMap& nodeMap)) {
+            BSONArrayBuilder builder;
+
+            if (queryPlannerOptimizationStages._logicalTranslated) {
+                builder.append(
+                    explainPlan("logicalTranslated",
+                                func(queryPlannerOptimizationStages._logicalTranslated.get(),
+                                     false /*displayProperties*/,
+                                     nullptr /*memoInterface*/,
+                                     {} /*nodeMap*/)));
+            }
+
+            if (queryPlannerOptimizationStages._logicalStructuralRewrites) {
+                builder.append(explainPlan(
+                    "logicalStructuralRewrites",
+                    func(queryPlannerOptimizationStages._logicalStructuralRewrites.get(),
+                         false /*displayProperties*/,
+                         nullptr /*memoInterface*/,
+                         {} /*nodeMap*/)));
+            }
+
+            if (queryPlannerOptimizationStages._logicalMemoSub) {
+                builder.append(
+                    explainPlan("logicalMemoSubstitution",
+                                func(queryPlannerOptimizationStages._logicalMemoSub.get()._node,
+                                     displayProperties /*displayProperties*/,
+                                     nullptr /*memoInterface*/,
+                                     queryPlannerOptimizationStages._logicalMemoSub.get()._map)));
+            }
+
+            if (queryPlannerOptimizationStages._physical) {
+                builder.append(
+                    explainPlan("physical",
+                                func(queryPlannerOptimizationStages._physical.get()._node,
+                                     displayProperties /*displayProperties*/,
+                                     nullptr /*memoInterface*/,
+                                     queryPlannerOptimizationStages._physical.get()._map)));
+            }
+
+            if (queryPlannerOptimizationStages._physicalLowered) {
+                builder.append(
+                    explainPlan("physicalLowered",
+                                func(queryPlannerOptimizationStages._physicalLowered.get()._node,
+                                     displayProperties /*displayProperties*/,
+                                     nullptr /*memoInterface*/,
+                                     queryPlannerOptimizationStages._physicalLowered.get()._map)));
+            }
+
+            return builder.done().getOwned();
+        };
+
+    // Invoke the corresponding plan serializer for each version of explain format.
+    // Plan serializing with properties is supported only for BSONObj and V3. Displaying properties
+    // is disabled for all other versions.
+    switch (_explainVersion) {
+        case ExplainVersion::V1:
+            return explainPlanForAllStagesFunction(false /*displayProperties*/,
+                                                   _queryPlannerOptimizationStages,
+                                                   ExplainGenerator::explain);
+        case ExplainVersion::V2:
+            return explainPlanForAllStagesFunction(false /*displayProperties*/,
+                                                   _queryPlannerOptimizationStages,
+                                                   ExplainGenerator::explainV2);
+        case ExplainVersion::V2Compact:
+            return explainPlanForAllStagesFunction(false /*displayProperties*/,
+                                                   _queryPlannerOptimizationStages,
+                                                   ExplainGenerator::explainV2Compact);
+        case ExplainVersion::V3:
+            return explainPlanForAllStagesFunction(true /*displayProperties*/,
+                                                   _queryPlannerOptimizationStages,
+                                                   ExplainGenerator::explainBSONObj);
+        case ExplainVersion::UserFacingExplain:
+            return explainPlanForAllStagesFunction(true /*displayProperties*/,
+                                                   _queryPlannerOptimizationStages,
+                                                   ExplainGenerator::explainBSONObj);
+        case ExplainVersion::Vmax:
+            // Should not be seeing this value here.
+            break;
+    }
+
+    return {};
 }
 
 bool constexpr operator<(const ExplainVersion v1, const ExplainVersion v2) {
@@ -190,7 +341,7 @@ public:
         return *this;
     }
 
-    ExplainPrinterImpl& print(const StringData& s) {
+    ExplainPrinterImpl& print(StringData s) {
         print(s.empty() ? "<empty>" : s.rawData());
         return *this;
     }
@@ -493,8 +644,24 @@ public:
     }
 
     ExplainPrinterImpl& print(const std::pair<sbe::value::TypeTags, sbe::value::Value> v) {
-        auto [tag, val] = sbe::value::copyValue(v.first, v.second);
-        addValue(tag, val);
+        if (sbe::value::tagToType(v.first) == BSONType::EOO &&
+            v.first != sbe::value::TypeTags::Nothing) {
+            if (v.first == sbe::value::TypeTags::makeObjSpec) {
+                // We want to append a stringified version of MakeObjSpec to explain here.
+                auto [mosTag, mosVal] =
+                    sbe::value::makeNewString(sbe::value::getMakeObjSpecView(v.second)->toString());
+                addValue(mosTag, mosVal);
+            } else {
+                // Extended types need to implement their own explain, since we can't directly
+                // convert them to bson.
+                MONGO_UNREACHABLE_TASSERT(7936708);
+            }
+
+        } else {
+            auto [tag, val] = sbe::value::copyValue(v.first, v.second);
+            addValue(tag, val);
+        }
+
         return *this;
     }
 
@@ -503,7 +670,7 @@ public:
         return *this;
     }
 
-    ExplainPrinterImpl& print(const StringData& s) {
+    ExplainPrinterImpl& print(StringData s) {
         printStringInternal(s);
         return *this;
     }
@@ -587,7 +754,7 @@ public:
     }
 
 private:
-    ExplainPrinterImpl& printStringInternal(const StringData& s) {
+    ExplainPrinterImpl& printStringInternal(StringData s) {
         auto [tag, val] = sbe::value::makeNewString(s);
         addValue(tag, val);
         return *this;
@@ -943,6 +1110,14 @@ public:
             .fieldName("scanDefName", ExplainVersion::V3)
             .print(node.getScanDefName());
         printBooleanFlag(printer, "parallel", node.useParallelScan());
+
+        // If the scan order is forward, only print it for V3. Otherwise, print for all versions.
+        if (version >= ExplainVersion::V3 || node.getScanOrder() != ScanOrder::Forward) {
+            printer.separator(", ");
+            printer.fieldName("direction", ExplainVersion::V3)
+                .print(toStringData(node.getScanOrder()));
+        }
+
         printer.separator("]");
         nodeCEPropsPrint(printer, n, node);
         printer.fieldName("bindings", ExplainVersion::V3).print(bindResult);
@@ -2251,7 +2426,10 @@ public:
                         .printSingleLevel(pathPrinter)
                         .separator("', ")
                         .fieldName("ce")
-                        .print(ce);
+                        .print(ce._ce)
+                        .separator(", ")
+                        .fieldName("mode")
+                        .print(ce._mode);
                     reqPrinters.push_back(std::move(local));
                 }
                 ExplainPrinter requirementsPrinter;
@@ -3157,6 +3335,10 @@ public:
     }
 
     std::string getPlanSummary(const ABT& n) {
+        if (isEOFPlan(n)) {
+            return "EOF";
+        }
+
         algebra::transport<false>(n, *this);
         return ss.str();
     }
@@ -3212,5 +3394,333 @@ std::string ExplainGenerator::explainCompoundIntervalExpr(
 std::string ExplainGenerator::explainCandidateIndex(const CandidateIndexEntry& indexEntry) {
     ExplainGeneratorV2 gen;
     return gen.printCandidateIndexEntry(indexEntry);
+}
+
+bool isEOFPlan(const ABT::reference_type node) {
+    // This function expects the full ABT to be the argument. So we must have a RootNode.
+    auto root = node.cast<RootNode>();
+    if (!root->getChild().is<EvaluationNode>()) {
+        // An EOF plan will have an EvaluationNode as the child of the RootNode.
+        return false;
+    }
+
+    auto eval = root->getChild().cast<EvaluationNode>();
+    if (eval->getProjection() != Constant::nothing()) {
+        // The EvaluationNode of an EOF plan will have Nothing as the projection.
+        return false;
+    }
+
+    // This is the rest of an EOF plan.
+    ABT eofChild = make<LimitSkipNode>(properties::LimitSkipRequirement{0, 0}, make<CoScanNode>());
+    return eval->getChild() == eofChild;
+}
+
+class StringifyPathsAndExprsTransporter {
+public:
+    template <typename T, typename... Ts>
+    void walk(const T&, StringBuilder* sb, Ts&&...) {
+        tasserted(8075801,
+                  str::stream() << "Trying to stringify an unsupported operator for explain: "
+                                << boost::core::demangle(typeid(T).name()));
+    }
+
+    // Helpers
+    std::string prettyPrintPathProjs(const FieldNameOrderedSet& names) {
+        StringBuilder result;
+        bool first = true;
+        for (const FieldNameType& s : names) {
+            if (first) {
+                first = false;
+            } else {
+                result.append(", ");
+            }
+            result.append(s.value());
+        }
+        return result.str();
+    }
+
+    void generateStringForLeafNode(StringBuilder* sb,
+                                   StringData name,
+                                   boost::optional<StringData> property) {
+        sb->append(std::move(name));
+
+        if (property) {
+            sb->append(" [");
+            sb->append(std::move(property.get()));
+            sb->append("]");
+        }
+    }
+
+    void generateStringForOneChildNode(StringBuilder* sb,
+                                       StringData name,
+                                       boost::optional<StringData> property,
+                                       const ABT& child,
+                                       bool addParensAroundChild = false) {
+        sb->append(std::move(name));
+
+        if (property) {
+            sb->append(" [");
+            sb->append(std::move(property.get()));
+            sb->append("] ");
+        } else {
+            sb->append(" ");
+        }
+
+        if (addParensAroundChild) {
+            sb->append("(");
+        }
+
+        generateString(child, sb);
+
+
+        if (addParensAroundChild) {
+            sb->append(")");
+        }
+    }
+
+    void generateStringForTwoChildNode(StringBuilder* sb,
+                                       StringData name,
+                                       const ABT& childOne,
+                                       const ABT& childTwo) {
+        sb->append(std::move(name));
+
+        sb->append(" (");
+        generateString(childOne, sb);
+        sb->append(")");
+
+        sb->append(" (");
+        generateString(childTwo, sb);
+        sb->append(")");
+    }
+
+    /**
+     * Paths
+     */
+    void walk(const PathConstant& path, StringBuilder* sb, const ABT& child) {
+        generateStringForOneChildNode(sb, "Constant" /* name */, boost::none /* property */, child);
+    }
+
+    void walk(const PathLambda& path, StringBuilder* sb, const ABT& child) {
+        generateStringForOneChildNode(sb, "Lambda" /* name */, boost::none /* property */, child);
+    }
+
+    void walk(const PathIdentity& path, StringBuilder* sb) {
+        generateStringForLeafNode(sb, "Identity" /* name */, boost::none /* property */);
+    }
+
+    void walk(const PathDefault& path, StringBuilder* sb, const ABT& child) {
+        generateStringForOneChildNode(sb, "Default" /* name */, boost::none /* property */, child);
+    }
+
+    void walk(const PathCompare& path, StringBuilder* sb, const ABT& child) {
+        std::string name;
+        switch (path.op()) {
+            case Operations::Eq:
+                name = "=";
+                break;
+            case Operations::EqMember:
+                name = "eqMember";
+                break;
+            case Operations::Neq:
+                name = "!=";
+                break;
+            case Operations::Gt:
+                name = ">";
+                break;
+            case Operations::Gte:
+                name = ">=";
+                break;
+            case Operations::Lt:
+                name = "<";
+                break;
+            case Operations::Lte:
+                name = "<=";
+                break;
+            case Operations::Cmp3w:
+                name = "<=>";
+                break;
+            default:
+                // Instead of reaching this case, we'd first hit error code 6684500 when the
+                // PathCompare was created with a non-comparison operator.
+                MONGO_UNREACHABLE;
+        }
+
+        generateStringForOneChildNode(sb, name, boost::none /* property */, child);
+    }
+
+    void walk(const PathDrop& path, StringBuilder* sb) {
+        generateStringForLeafNode(
+            sb, "Drop" /* name */, StringData(prettyPrintPathProjs(path.getNames())));
+    }
+
+    void walk(const PathKeep& path, StringBuilder* sb) {
+        generateStringForLeafNode(
+            sb, "Keep" /* name */, StringData(prettyPrintPathProjs(path.getNames())));
+    }
+
+    void walk(const PathObj& path, StringBuilder* sb) {
+        generateStringForLeafNode(sb, "Obj" /* name */, boost::none /* property */);
+    }
+
+    void walk(const PathArr& path, StringBuilder* sb) {
+        generateStringForLeafNode(sb, "Arr" /* name */, boost::none /* property */);
+    }
+
+    void walk(const PathTraverse& path, StringBuilder* sb, const ABT& child) {
+        std::string property;
+        if (path.getMaxDepth() == PathTraverse::kUnlimited) {
+            property = "inf";
+        } else {
+            // The string 'property' will own the result of ss.str() below, so it will hold the
+            // value of the PathTraverse's max depth after the stringstream goes out of scope.
+            std::stringstream ss;
+            ss << path.getMaxDepth();
+            property = ss.str();
+        }
+        generateStringForOneChildNode(sb, "Traverse" /* name */, StringData(property), child);
+    }
+
+    void walk(const PathField& path, StringBuilder* sb, const ABT& child) {
+        generateStringForOneChildNode(sb, "Field" /* name */, path.name().value(), child);
+    }
+
+    void walk(const PathGet& path, StringBuilder* sb, const ABT& child) {
+        generateStringForOneChildNode(sb, "Get" /* name */, path.name().value(), child);
+    }
+
+    void walk(const PathComposeM& path,
+              StringBuilder* sb,
+              const ABT& leftChild,
+              const ABT& rightChild) {
+        generateStringForTwoChildNode(sb, "ComposeM" /* name */, leftChild, rightChild);
+    }
+
+    void walk(const PathComposeA& path,
+              StringBuilder* sb,
+              const ABT& leftChild,
+              const ABT& rightChild) {
+        generateStringForTwoChildNode(sb, "ComposeA" /* name */, leftChild, rightChild);
+    }
+
+    /**
+     * Expressions
+     */
+    void walk(const Constant& expr, StringBuilder* sb) {
+        generateStringForLeafNode(
+            sb, "Const" /* name */, StringData(sbe::value::print(expr.get())));
+    }
+
+    void walk(const Variable& expr, StringBuilder* sb) {
+        generateStringForLeafNode(sb, "Var" /* name */, expr.name().value());
+    }
+
+    void walk(const UnaryOp& expr, StringBuilder* sb, const ABT& child) {
+        generateStringForOneChildNode(sb,
+                                      toStringData(expr.op()),
+                                      boost::none /* property */,
+                                      child,
+                                      true /* addParensAroundChild */);
+    }
+
+    void walk(const BinaryOp& expr,
+              StringBuilder* sb,
+              const ABT& leftChild,
+              const ABT& rightChild) {
+        generateStringForTwoChildNode(sb, toStringData(expr.op()), leftChild, rightChild);
+    }
+
+    void walk(const If& expr,
+              StringBuilder* sb,
+              const ABT& condChild,
+              const ABT& thenChild,
+              const ABT& elseChild) {
+        sb->append("if");
+        sb->append(" (");
+        generateString(condChild, sb);
+        sb->append(") ");
+
+        sb->append("then");
+        sb->append(" (");
+        generateString(thenChild, sb);
+        sb->append(") ");
+
+        sb->append("else");
+        sb->append(" (");
+        generateString(elseChild, sb);
+        sb->append(")");
+    }
+
+    void walk(const Let& expr, StringBuilder* sb, const ABT& bind, const ABT& in) {
+        sb->append("let ");
+        sb->append(expr.varName().value());
+
+        sb->append(" = (");
+        generateString(bind, sb);
+        sb->append(") ");
+
+        sb->append("in (");
+        generateString(in, sb);
+        sb->append(")");
+    }
+
+    void walk(const LambdaAbstraction& expr, StringBuilder* sb, const ABT& body) {
+        generateStringForOneChildNode(sb,
+                                      "LambdaAbstraction" /* name */,
+                                      expr.varName().value(),
+                                      body,
+                                      true /* addParensAroundChild */);
+    }
+
+    void walk(const LambdaApplication& expr,
+              StringBuilder* sb,
+              const ABT& lambda,
+              const ABT& argument) {
+        generateStringForTwoChildNode(sb, "LambdaApplication" /* name */, lambda, argument);
+    }
+
+    void walk(const FunctionCall& expr, StringBuilder* sb, const std::vector<ABT>& args) {
+        sb->append(expr.name());
+        sb->append("(");
+
+        // TODO SERVER-83824: Remvoe the special case for getParam - just include the body of the
+        // else here.
+        if (expr.name() == "getParam") {
+            //  The getParam FunctionCall node has two children, one is the parameter id and the
+            //  other is an enum/int representation of the constant's sbe type tag. For explain
+            //  purposes, we want this function call to look like "getParam(<id>)" so we extract and
+            //  display only the first child.
+            generateString(args.at(0), sb);
+        } else {
+            bool first = true;
+            for (const auto& arg : args) {
+                if (first) {
+                    first = false;
+                } else {
+                    sb->append(", ");
+                }
+                generateString(arg, sb);
+            }
+        }
+
+        sb->append(")");
+    }
+
+    void walk(const EvalPath& expr, StringBuilder* sb, const ABT& path, const ABT& input) {
+        generateStringForTwoChildNode(sb, "EvalPath" /* name */, path, input);
+    }
+
+    void walk(const EvalFilter& expr, StringBuilder* sb, const ABT& path, const ABT& input) {
+        generateStringForTwoChildNode(sb, "EvalFilter" /* name */, path, input);
+    }
+
+    void generateString(const ABT::reference_type n, StringBuilder* sb) {
+        algebra::walk<false>(n, *this, sb);
+    }
+};
+
+std::string StringifyPathsAndExprs::stringify(const ABT::reference_type node) {
+    StringBuilder result;
+    StringifyPathsAndExprsTransporter().generateString(node, &result);
+    return result.str();
 }
 }  // namespace mongo::optimizer

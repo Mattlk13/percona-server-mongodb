@@ -55,7 +55,7 @@ class TimeSeriesOpObserver final : public OpObserverNoop {
 
 public:
     TimeSeriesOpObserver() = default;
-    ~TimeSeriesOpObserver() = default;
+    ~TimeSeriesOpObserver() override = default;
 
     NamespaceFilters getNamespaceFilters() const final {
         return {NamespaceFilter::kSystem, NamespaceFilter::kSystem};
@@ -65,6 +65,7 @@ public:
                    const CollectionPtr& coll,
                    std::vector<InsertStatement>::const_iterator first,
                    std::vector<InsertStatement>::const_iterator last,
+                   const std::vector<RecordId>& recordIds,
                    std::vector<bool> fromMigrate,
                    bool defaultFromMigrate,
                    OpStateAccumulator* opAccumulator = nullptr) final;
@@ -78,8 +79,6 @@ public:
                        const BSONObj& doc,
                        OplogDeleteEntryArgs* args,
                        OpStateAccumulator* opAccumulator = nullptr) final;
-
-    void onDropDatabase(OperationContext* opCtx, const DatabaseName& dbName) final;
 
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,

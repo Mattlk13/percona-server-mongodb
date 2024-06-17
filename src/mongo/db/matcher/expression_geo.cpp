@@ -269,6 +269,7 @@ Status GeoNearExpression::parseNewQuery(const BSONObj& obj) {
         if (fieldName == kGeometryField) {
             if (e.isABSONObj()) {
                 BSONObj embeddedObj = e.embeddedObject();
+                // TODO SERVER-86141: Refactor geoParsing.
                 Status status = GeoParser::parseQueryPoint(e, centroid.get());
                 if (!status.isOK()) {
                     return Status(ErrorCodes::BadValue,
@@ -460,7 +461,7 @@ void GeoMatchExpression::appendSerializedRightHandSide(BSONObjBuilder* bob,
                                                        const SerializationOptions& opts,
                                                        bool includePath) const {
     if (opts.literalPolicy != LiteralSerializationPolicy::kUnchanged) {
-        geoCustomSerialization(bob, _rawObj, opts, includePath);
+        geoExpressionCustomSerialization(*bob, _rawObj, opts, includePath);
         return;
     }
     bob->appendElements(_rawObj);
@@ -517,7 +518,7 @@ void GeoNearMatchExpression::appendSerializedRightHandSide(BSONObjBuilder* bob,
                                                            const SerializationOptions& opts,
                                                            bool includePath) const {
     if (opts.literalPolicy != LiteralSerializationPolicy::kUnchanged) {
-        geoCustomSerialization(bob, _rawObj, opts, includePath);
+        geoNearExpressionCustomSerialization(*bob, _rawObj, opts, includePath);
         return;
     }
     bob->appendElements(_rawObj);

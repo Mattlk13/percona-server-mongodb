@@ -31,12 +31,9 @@
 
 #include <memory>
 
-#include "mongo/base/string_data.h"
-#include "mongo/stdx/type_traits.h"
 #include "mongo/unittest/framework.h"
 #include "mongo/util/concurrency/ticketholder_test_fixture.h"
 #include "mongo/util/duration.h"
-#include "mongo/util/tick_source.h"
 #include "mongo/util/tick_source_mock.h"
 
 namespace {
@@ -47,7 +44,9 @@ class SemaphoreTicketHolderTest : public TicketHolderTestFixture {};
 TEST_F(SemaphoreTicketHolderTest, BasicTimeoutSemaphore) {
     ServiceContext serviceContext;
     serviceContext.setTickSource(std::make_unique<TickSourceMock<Microseconds>>());
-    basicTimeout(_opCtx.get(), std::make_unique<SemaphoreTicketHolder>(1, &serviceContext));
+    basicTimeout(
+        _opCtx.get(),
+        std::make_unique<SemaphoreTicketHolder>(&serviceContext, 1, false /* trackPeakUsed */));
 }
 
 TEST_F(SemaphoreTicketHolderTest, ResizeStatsSemaphore) {
@@ -56,14 +55,39 @@ TEST_F(SemaphoreTicketHolderTest, ResizeStatsSemaphore) {
     auto tickSource = dynamic_cast<TickSourceMock<Microseconds>*>(serviceContext.getTickSource());
 
     resizeTest(
-        _opCtx.get(), std::make_unique<SemaphoreTicketHolder>(1, &serviceContext), tickSource);
+        _opCtx.get(),
+        std::make_unique<SemaphoreTicketHolder>(&serviceContext, 1, false /* trackPeakUsed */),
+        tickSource);
 }
 
 TEST_F(SemaphoreTicketHolderTest, Interruption) {
     ServiceContext serviceContext;
     serviceContext.setTickSource(std::make_unique<TickSourceMock<Microseconds>>());
-    interruptTest(_opCtx.get(),
-                  std::make_unique<SemaphoreTicketHolder>(1 /* tickets */, getServiceContext()));
+    interruptTest(
+        _opCtx.get(),
+        std::make_unique<SemaphoreTicketHolder>(&serviceContext, 1, false /* trackPeakUsed */));
+}
+
+TEST_F(SemaphoreTicketHolderTest, PriorityBookkeeping) {
+    ServiceContext serviceContext;
+    serviceContext.setTickSource(std::make_unique<TickSourceMock<Microseconds>>());
+    priorityBookkeepingTest(
+        _opCtx.get(),
+        std::make_unique<SemaphoreTicketHolder>(&serviceContext, 1, false /* trackPeakUsed */),
+        AdmissionContext::Priority::kNormal,
+        AdmissionContext::Priority::kExempt,
+        [](auto statsWhileProcessing, auto statsWhenFinished) {
+            ASSERT_EQ(statsWhileProcessing.getObjectField("normalPriority")
+                          .getIntField("startedProcessing"),
+                      0);
+            ASSERT_EQ(
+                statsWhileProcessing.getObjectField("exempt").getIntField("startedProcessing"), 1);
+            ASSERT_EQ(statsWhenFinished.getObjectField("normalPriority")
+                          .getIntField("finishedProcessing"),
+                      0);
+            ASSERT_EQ(statsWhenFinished.getObjectField("exempt").getIntField("finishedProcessing"),
+                      1);
+        });
 }
 
 }  // namespace

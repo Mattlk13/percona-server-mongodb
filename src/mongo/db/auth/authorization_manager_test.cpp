@@ -94,11 +94,11 @@ public:
     AuthorizationManagerTest() {
         auto localExternalState = std::make_unique<AuthzManagerExternalStateMock>();
         externalState = localExternalState.get();
-        auto localAuthzManager = std::make_unique<AuthorizationManagerImpl>(
-            getServiceContext(), std::move(localExternalState));
+        auto localAuthzManager =
+            std::make_unique<AuthorizationManagerImpl>(getService(), std::move(localExternalState));
         authzManager = localAuthzManager.get();
         authzManager->setAuthEnabled(true);
-        AuthorizationManager::set(getServiceContext(), std::move(localAuthzManager));
+        AuthorizationManager::set(getService(), std::move(localAuthzManager));
 
         // Re-initialize the client after setting the AuthorizationManager to get an
         // AuthorizationSession.
@@ -114,9 +114,9 @@ public:
                                   "password", saslGlobalParams.scramSHA256IterationCount.load()));
     }
 
-    ~AuthorizationManagerTest() {
+    ~AuthorizationManagerTest() override {
         if (authzManager)
-            authzManager->invalidateUserCache(opCtx.get());
+            AuthorizationManager::get(opCtx->getService())->invalidateUserCache();
     }
 
     transport::TransportLayerMock transportLayer;
@@ -383,7 +383,7 @@ TEST_F(AuthorizationManagerTest, testRefreshExternalV2User) {
         ASSERT(user.isValid());
 
         RoleNameIterator cachedUserRolesIt = user->getRoles();
-        if (userDoc.getStringField(kDbFieldName) == DatabaseName::kExternal.db()) {
+        if (userDoc.getStringField(kDbFieldName) == DatabaseName::kExternal.db(omitTenant)) {
             for (const auto& userDocRole : updatedRoles) {
                 ASSERT_EQUALS(cachedUserRolesIt.next(),
                               RoleName(userDocRole.getStringField(kRoleFieldName),

@@ -95,6 +95,7 @@
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/platform/process_id.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/shell/linenoise.h"
 #include "mongo/shell/mongo_main.h"
@@ -106,6 +107,7 @@
 #include "mongo/transport/asio/asio_transport_layer.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/transport/transport_layer_manager_impl.h"
+#include "mongo/util/allocator_thread.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/ctype.h"
 #include "mongo/util/duration.h"
@@ -167,8 +169,7 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersionLatest,
                                      ("EndStartupOptionStorage"))
 // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
 (InitializerContext* context) {
-    mongo::serverGlobalParams.mutableFeatureCompatibility.setVersion(
-        multiversion::GenericFCV::kLatest);
+    mongo::serverGlobalParams.mutableFCV.setVersion(multiversion::GenericFCV::kLatest);
 }
 
 namespace {
@@ -346,7 +347,7 @@ void shellHistoryAdd(const char* line) {
 }
 
 void killOps() {
-    if (shellGlobalParams.nokillop)
+    if (shellGlobalParams.nokillop.load())
         return;
 
     if (atPrompt.load())
@@ -772,10 +773,14 @@ int mongo_main(int argc, char* argv[]) {
         // TODO This should use a TransportLayerManager or TransportLayerFactory
         auto serviceContext = getGlobalServiceContext();
 
+        startAllocatorThread();
+
         // Set up the periodic runner for background job execution. This is required to be running
         // before the transport layer is initialized.
         auto runner = makePeriodicRunner(serviceContext);
         serviceContext->setPeriodicRunner(std::move(runner));
+
+        ShardingState::create(serviceContext);
 
 #ifdef MONGO_CONFIG_SSL
         OCSPManager::start(serviceContext);
@@ -925,7 +930,7 @@ int mongo_main(int argc, char* argv[]) {
         }
 
         mongo::ScriptEngine::setConnectCallback(mongo::shell_utils::onConnect);
-        mongo::ScriptEngine::setup();
+        mongo::ScriptEngine::setup(ExecutionEnvironment::TestRunner);
         mongo::getGlobalScriptEngine()->setJSHeapLimitMB(shellGlobalParams.jsHeapLimitMB);
         mongo::getGlobalScriptEngine()->setScopeInitCallback(mongo::shell_utils::initScope);
         mongo::getGlobalScriptEngine()->enableJIT(!shellGlobalParams.nojit);

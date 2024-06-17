@@ -3,6 +3,7 @@
 // @tags: [
 //   requires_persistence,
 // ]
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
 import {getLatestOp, reconfig} from "jstests/replsets/rslib.js";
 
 // Skip db hash check since secondary has slave delay.
@@ -42,12 +43,14 @@ var secondary = rst.getSecondary();
 const lastOp = getLatestOp(secondary);
 
 assert.commandWorked(primary.getCollection(ns).insert([{}, {}, {}]));
-assert.soon(() => secondary.adminCommand('serverStatus').metrics.repl.buffer.count > 0,
-            () => secondary.adminCommand('serverStatus').metrics.repl);
+if (!FeatureFlagUtil.isPresentAndEnabled(secondary, "ReduceMajorityWriteLatency")) {
+    assert.soon(() => secondary.adminCommand('serverStatus').metrics.repl.buffer.count > 0,
+                () => secondary.adminCommand('serverStatus').metrics.repl);
+}
 assert.neq(getLatestOp(primary), lastOp);
 assert.eq(getLatestOp(secondary), lastOp);
 
-sleep(2000);  // Prevent the test from passing by chance.
+sleep(5000);  // Prevent the test from passing by chance.
 assert.eq(getLatestOp(secondary), lastOp);
 
 // Make sure shutdown won't take a long time due to I/O.

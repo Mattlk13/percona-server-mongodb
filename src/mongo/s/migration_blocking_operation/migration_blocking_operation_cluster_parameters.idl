@@ -54,3 +54,7 @@ server_parameters:
         set_at: cluster
         cpp_vartype: PauseMigrationsDuringMultiUpdatesParam
         cpp_varname: pauseMigrationsDuringMultiUpdates
+        condition:
+          min_fcv: 7.2
+        redact: false
+        omit_in_ftdc: false

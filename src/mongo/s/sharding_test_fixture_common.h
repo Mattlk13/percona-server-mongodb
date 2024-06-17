@@ -47,7 +47,6 @@
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/grid.h"
 #include "mongo/transport/session.h"
-#include "mongo/unittest/temp_dir.h"
 #include "mongo/util/assert_util_core.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
@@ -68,23 +67,12 @@ public:
 
 protected:
     ShardingTestFixtureCommon();
-    ~ShardingTestFixtureCommon();
+    ~ShardingTestFixtureCommon() override;
 
     void setUp() override;
-
     void tearDown() override;
 
-    OperationContext* operationContext() const {
-        invariant(_opCtxHolder,
-                  "ShardingTestFixtureCommon::setUp() must have been called before this method");
-        return _opCtxHolder.get();
-    }
-
-    template <typename Lambda>
-    executor::NetworkTestEnv::FutureHandle<typename std::invoke_result<Lambda>::type> launchAsync(
-        Lambda&& func) const {
-        return _networkTestEnv->launchAsync(std::forward<Lambda>(func));
-    }
+    OperationContext* operationContext() const;
 
     executor::NetworkInterfaceMock* network() const {
         invariant(_mockNetwork);
@@ -94,6 +82,12 @@ protected:
     RemoteCommandTargeterFactoryMock* targeterFactory() const {
         invariant(_targeterFactory);
         return _targeterFactory;
+    }
+
+    template <typename Lambda>
+    executor::NetworkTestEnv::FutureHandle<typename std::invoke_result<Lambda>::type> launchAsync(
+        Lambda&& func) const {
+        return _networkTestEnv->launchAsync(std::forward<Lambda>(func));
     }
 
     /**
@@ -107,26 +101,6 @@ protected:
     void onFindCommand(executor::NetworkTestEnv::OnFindCommandFunction func);
     void onFindWithMetadataCommand(
         executor::NetworkTestEnv::OnFindCommandWithMetadataFunction func);
-
-    /**
-     * Waits for an operation which creates a capped config collection with the specified name and
-     * capped size.
-     */
-    void expectConfigCollectionCreate(const HostAndPort& configHost,
-                                      StringData collName,
-                                      int cappedSize,
-                                      const BSONObj& response);
-
-    /**
-     * Wait for a single insert in one of the change or action log collections with the specified
-     * contents and return a successful response.
-     */
-    void expectConfigCollectionInsert(const HostAndPort& configHost,
-                                      StringData collName,
-                                      Date_t timestamp,
-                                      const std::string& what,
-                                      const NamespaceString& ns,
-                                      const BSONObj& detail);
 
     virtual std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient() {
         return nullptr;
@@ -150,9 +124,6 @@ protected:
 private:
     // Keeps the lifetime of the operation context
     ServiceContext::UniqueOperationContext _opCtxHolder;
-
-    // The temporary dbpath for the tests in this fixture.
-    unittest::TempDir _tempDir;
 };
 
 }  // namespace mongo

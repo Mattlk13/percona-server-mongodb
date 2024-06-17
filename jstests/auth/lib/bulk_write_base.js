@@ -1,18 +1,9 @@
-import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
-
 // Auth test the BulkWrite command.
 // These test cover privilege combination scenarios that commands_lib.js format cannot.
 export function runTest(mongod) {
     const admin = mongod.getDB('admin');
     admin.createUser({user: 'admin', pwd: 'pass', roles: jsTest.adminUserRoles});
     assert(admin.auth('admin', 'pass'));
-
-    // Skip this test if the BulkWriteCommand feature flag is not enabled.
-    if (!FeatureFlagUtil.isEnabled(admin, "BulkWriteCommand")) {
-        jsTestLog('Skipping test because the BulkWriteCommand feature flag is disabled.');
-        admin.logout();
-        return;
-    }
 
     // Establish test and test1
     mongod.getDB("test").coll.insert({x: "y"});

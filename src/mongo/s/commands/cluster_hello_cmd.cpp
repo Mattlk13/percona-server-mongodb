@@ -46,6 +46,7 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/oid.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/db/admission/execution_admission_context.h"
 #include "mongo/db/api_parameters.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/basic_types_gen.h"
@@ -64,6 +65,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/session/logical_session_id_gen.h"
 #include "mongo/db/tenant_id.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
@@ -95,9 +97,9 @@
 namespace mongo {
 
 // Hangs in the beginning of each hello command when set.
-MONGO_FAIL_POINT_DEFINE(waitInHello);
+MONGO_FAIL_POINT_DEFINE(routerWaitInHello);
 
-MONGO_FAIL_POINT_DEFINE(appendHelloOkToHelloResponse);
+MONGO_FAIL_POINT_DEFINE(routerAppendHelloOkToHelloResponse);
 
 namespace {
 
@@ -160,14 +162,14 @@ public:
                              const BSONObj& cmdObj,
                              rpc::ReplyBuilderInterface* replyBuilder) final {
         // Critical to observability and diagnosability, categorize as immediate priority.
-        ScopedAdmissionPriorityForLock skipAdmissionControl(opCtx->lockState(),
-                                                            AdmissionContext::Priority::kImmediate);
+        ScopedAdmissionPriority<ExecutionAdmissionContext> skipAdmissionControl(
+            opCtx, AdmissionContext::Priority::kExempt);
 
         CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
         const bool apiStrict = APIParameters::get(opCtx).getAPIStrict().value_or(false);
         auto cmd = HelloCommand::parse({"hello", apiStrict}, cmdObj);
 
-        waitInHello.execute([&](const BSONObj& args) {
+        routerWaitInHello.execute([&](const BSONObj& args) {
             if (args.hasElement("delayMillis")) {
                 Milliseconds delay{args["delayMillis"].safeNumberLong()};
                 LOGV2(6724103,
@@ -186,7 +188,7 @@ public:
                   "client"_attr = opCtx->getClient()->clientAddress(true),
                   "desc"_attr = opCtx->getClient()->desc());
 
-            waitInHello.pauseWhileSet(opCtx);
+            routerWaitInHello.pauseWhileSet(opCtx);
         });
 
         // "hello" is exempt from error code rewrites.
@@ -255,7 +257,7 @@ public:
             result.append("helloOk", true);
         }
 
-        if (MONGO_unlikely(appendHelloOkToHelloResponse.shouldFail())) {
+        if (MONGO_unlikely(routerAppendHelloOkToHelloResponse.shouldFail())) {
             result.append("clientSupportsHello", client->supportsHello());
         }
 

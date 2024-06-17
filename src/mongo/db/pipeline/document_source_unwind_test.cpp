@@ -844,11 +844,11 @@ TEST_F(UnwindStageTest, Redaction) {
         redact(*docSource));
 }
 
-class All : public OldStyleSuiteSpecification {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("DocumentSourceUnwindTests") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<Empty>();
         add<EmptyArray>();
         add<MissingValue>();
@@ -871,7 +871,7 @@ public:
     }
 };
 
-OldStyleSuiteInitializer<All> myall;
+unittest::OldStyleSuiteInitializer<All> myall;
 
 }  // namespace
 }  // namespace mongo

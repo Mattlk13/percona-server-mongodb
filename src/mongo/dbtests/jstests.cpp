@@ -1440,7 +1440,7 @@ public:
     }
 };
 
-class All : public OldStyleSuiteSpecification {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("js") {}
 
@@ -1494,13 +1494,13 @@ public:
         add<BasicAsyncJS<scopeFactory>>();
     }
 
-    void setupTests() {
+    void setupTests() override {
         setupTestsWithScopeFactory<&ScriptEngine::newScope>();
         setupTestsWithScopeFactory<&ScriptEngine::newScopeForCurrentThread>();
     }
 };
 
-OldStyleSuiteInitializer<All> myall;
+unittest::OldStyleSuiteInitializer<All> myall;
 
 }  // namespace JSTests
 }  // namespace mongo

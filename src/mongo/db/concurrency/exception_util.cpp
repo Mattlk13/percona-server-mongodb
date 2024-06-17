@@ -34,6 +34,7 @@
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/exception_util_gen.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -65,15 +66,17 @@ void logWriteConflictAndBackoff(size_t attempt,
 
 namespace {
 
-CounterMetric temporarilyUnavailableErrors{"operation.temporarilyUnavailableErrors"};
-CounterMetric temporarilyUnavailableErrorsEscaped{"operation.temporarilyUnavailableErrorsEscaped"};
-CounterMetric temporarilyUnavailableErrorsConvertedToWriteConflict{
-    "operation.temporarilyUnavailableErrorsConvertedToWriteConflict"};
+auto& temporarilyUnavailableErrors =
+    *MetricBuilder<Counter64>{"operation.temporarilyUnavailableErrors"};
+auto& temporarilyUnavailableErrorsEscaped =
+    *MetricBuilder<Counter64>{"operation.temporarilyUnavailableErrorsEscaped"};
+auto& temporarilyUnavailableErrorsConvertedToWriteConflict =
+    *MetricBuilder<Counter64>{"operation.temporarilyUnavailableErrorsConvertedToWriteConflict"};
 
-CounterMetric transactionTooLargeForCacheErrors{"operation.transactionTooLargeForCacheErrors"};
-CounterMetric transactionTooLargeForCacheErrorsConvertedToWriteConflict{
+auto& transactionTooLargeForCacheErrors =
+    *MetricBuilder<Counter64>{"operation.transactionTooLargeForCacheErrors"};
+auto& transactionTooLargeForCacheErrorsConvertedToWriteConflict = *MetricBuilder<Counter64>{
     "operation.transactionTooLargeForCacheErrorsConvertedToWriteConflict"};
-
 
 }  // namespace
 
@@ -86,7 +89,7 @@ void handleTemporarilyUnavailableException(
     size_t& writeConflictAttempts) {
     CurOp::get(opCtx)->debug().additiveMetrics.incrementTemporarilyUnavailableErrors(1);
 
-    opCtx->recoveryUnit()->abandonSnapshot();
+    shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
     temporarilyUnavailableErrors.increment(1);
 
     // Internal operations cannot escape a TUE to the client. Convert it to a write conflict
@@ -137,6 +140,7 @@ void convertToWCEAndRethrow(OperationContext* opCtx,
     // WriteConflict to allow users of multi-document transactions to retry without changing
     // any behavior.
     temporarilyUnavailableErrorsConvertedToWriteConflict.increment(1);
+    CurOp::get(opCtx)->debug().additiveMetrics.incrementWriteConflicts(1);
     throwWriteConflictException(e.reason());
 }
 
@@ -162,7 +166,7 @@ void handleTransactionTooLargeForCacheException(
     logWriteConflictAndBackoff(
         writeConflictAttempts, opStr, e.reason(), NamespaceStringOrUUID(nssOrUUID));
     ++writeConflictAttempts;
-    opCtx->recoveryUnit()->abandonSnapshot();
+    shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
 }
 
 }  // namespace mongo

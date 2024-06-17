@@ -63,6 +63,7 @@
 #include "mongo/bson/oid.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/client/connection_string.h"
 #include "mongo/db/auth/access_checks_gen.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_contract.h"
@@ -71,7 +72,9 @@
 #include "mongo/db/auth/validated_tenancy_scope.h"
 #include "mongo/db/basic_types.h"
 #include "mongo/db/basic_types_gen.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/database_name.h"
+#include "mongo/db/logical_time.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/tenant_id.h"
 #include "mongo/db/write_concern_options_gen.h"
@@ -83,7 +86,6 @@
 #include "mongo/idl/unittest_import_gen.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/rpc/op_msg.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/unittest/bson_test_util.h"
 #include "mongo/unittest/death_test.h"
@@ -716,10 +718,10 @@ void TestLoopbackVariant(TestT test_value) {
 
     auto parsed = ParserT::parse(ctxt, obj);
     if constexpr (std::is_same_v<TestT, BSONObj>) {
-        ASSERT_BSONOBJ_EQ(stdx::get<TestT>(parsed.getValue()), test_value);
+        ASSERT_BSONOBJ_EQ(get<TestT>(parsed.getValue()), test_value);
     } else {
         // Use ASSERT instead of ASSERT_EQ to avoid operator<<
-        ASSERT(stdx::get<TestT>(parsed.getValue()) == test_value);
+        ASSERT(get<TestT>(parsed.getValue()) == test_value);
     }
     ASSERT_BSONOBJ_EQ(obj, parsed.toBSON());
 
@@ -731,9 +733,9 @@ void TestLoopbackVariant(TestT test_value) {
     // Test the constructor.
     ParserT constructed(test_value);
     if constexpr (std::is_same_v<TestT, BSONObj>) {
-        ASSERT_BSONOBJ_EQ(stdx::get<TestT>(parsed.getValue()), test_value);
+        ASSERT_BSONOBJ_EQ(get<TestT>(parsed.getValue()), test_value);
     } else {
-        ASSERT(stdx::get<TestT>(parsed.getValue()) == test_value);
+        ASSERT(get<TestT>(parsed.getValue()) == test_value);
     }
     ASSERT_BSONOBJ_EQ(obj, constructed.toBSON());
 }
@@ -769,15 +771,13 @@ TEST(IDLVariantTests, TestVariantSafeInt) {
 
     // safeInt accepts all numbers, but always deserializes and serializes as int32.
     IDLParserContext ctxt("root");
-    ASSERT_EQ(stdx::get<std::int32_t>(
+    ASSERT_EQ(get<std::int32_t>(
                   One_variant_safeInt::parse(ctxt, BSON("value" << Decimal128(1))).getValue()),
               1);
-    ASSERT_EQ(
-        stdx::get<std::int32_t>(One_variant_safeInt::parse(ctxt, BSON("value" << 1LL)).getValue()),
-        1);
-    ASSERT_EQ(
-        stdx::get<std::int32_t>(One_variant_safeInt::parse(ctxt, BSON("value" << 1.0)).getValue()),
-        1);
+    ASSERT_EQ(get<std::int32_t>(One_variant_safeInt::parse(ctxt, BSON("value" << 1LL)).getValue()),
+              1);
+    ASSERT_EQ(get<std::int32_t>(One_variant_safeInt::parse(ctxt, BSON("value" << 1.0)).getValue()),
+              1);
 }
 
 TEST(IDLVariantTests, TestVariantSafeIntArray) {
@@ -790,34 +790,29 @@ TEST(IDLVariantTests, TestVariantSafeIntArray) {
 
     // Use ASSERT instead of ASSERT_EQ to avoid operator<<
     IDLParserContext ctxt("root");
-    ASSERT(stdx::get<int32vec>(
+    ASSERT(get<int32vec>(
                One_variant_safeInt_array::parse(ctxt, BSON("value" << BSON_ARRAY(Decimal128(1))))
                    .getValue()) == int32vec{1});
-    ASSERT(
-        stdx::get<int32vec>(
-            One_variant_safeInt_array::parse(ctxt, BSON("value" << BSON_ARRAY(1LL))).getValue()) ==
-        int32vec{1});
-    ASSERT(
-        stdx::get<int32vec>(
-            One_variant_safeInt_array::parse(ctxt, BSON("value" << BSON_ARRAY(1.0))).getValue()) ==
-        int32vec{1});
-    ASSERT(
-        stdx::get<int32vec>(One_variant_safeInt_array::parse(
-                                ctxt, BSON("value" << BSON_ARRAY(1.0 << 2LL << 3 << Decimal128(4))))
-                                .getValue()) == (int32vec{1, 2, 3, 4}));
+    ASSERT(get<int32vec>(One_variant_safeInt_array::parse(ctxt, BSON("value" << BSON_ARRAY(1LL)))
+                             .getValue()) == int32vec{1});
+    ASSERT(get<int32vec>(One_variant_safeInt_array::parse(ctxt, BSON("value" << BSON_ARRAY(1.0)))
+                             .getValue()) == int32vec{1});
+    ASSERT(get<int32vec>(One_variant_safeInt_array::parse(
+                             ctxt, BSON("value" << BSON_ARRAY(1.0 << 2LL << 3 << Decimal128(4))))
+                             .getValue()) == (int32vec{1, 2, 3, 4}));
 }
 
 TEST(IDLVariantTests, TestVariantTwoStructs) {
     auto obj = BSON("value" << BSON("insert" << 1));
     auto parsed = One_variant_two_structs::parse(IDLParserContext{"root"}, obj);
     ASSERT_BSONOBJ_EQ(obj, parsed.toBSON());
-    ASSERT_EQ(stdx::get<Insert_variant_struct>(parsed.getValue()).getInsert(), 1);
+    ASSERT_EQ(get<Insert_variant_struct>(parsed.getValue()).getInsert(), 1);
 
     obj = BSON("value" << BSON("update"
                                << "foo"));
     parsed = One_variant_two_structs::parse(IDLParserContext{"root"}, obj);
     ASSERT_BSONOBJ_EQ(obj, parsed.toBSON());
-    ASSERT_EQ(stdx::get<Update_variant_struct>(parsed.getValue()).getUpdate(), "foo");
+    ASSERT_EQ(get<Update_variant_struct>(parsed.getValue()).getUpdate(), "foo");
 }
 
 TEST(IDLVariantTests, TestVariantTwoArrays) {
@@ -831,8 +826,8 @@ TEST(IDLVariantTests, TestVariantTwoArrays) {
     // because that type is declared first in the IDL.
     auto obj = BSON("value" << BSONArray());
     auto parsed = One_variant_two_arrays::parse(IDLParserContext{"root"}, obj);
-    ASSERT(stdx::get<std::vector<int>>(parsed.getValue()) == std::vector<int>());
-    ASSERT_THROWS(stdx::get<std::vector<std::string>>(parsed.getValue()), stdx::bad_variant_access);
+    ASSERT(get<std::vector<int>>(parsed.getValue()) == std::vector<int>());
+    ASSERT_THROWS(get<std::vector<std::string>>(parsed.getValue()), std::bad_variant_access);
 
     // Corrupt array: its first key isn't "0".
     BSONObjBuilder bob;
@@ -851,7 +846,7 @@ TEST(IDLVariantTests, TestVariantOptional) {
         auto obj = BSON("value" << 1);
         auto parsed = One_variant_optional::parse(IDLParserContext{"root"}, obj);
         ASSERT_BSONOBJ_EQ(obj, parsed.toBSON());
-        ASSERT_EQ(stdx::get<int>(*parsed.getValue()), 1);
+        ASSERT_EQ(get<int>(*parsed.getValue()), 1);
     }
 
     {
@@ -859,7 +854,7 @@ TEST(IDLVariantTests, TestVariantOptional) {
                         << "test_value");
         auto parsed = One_variant_optional::parse(IDLParserContext{"root"}, obj);
         ASSERT_BSONOBJ_EQ(obj, parsed.toBSON());
-        ASSERT_EQ(stdx::get<std::string>(*parsed.getValue()), "test_value");
+        ASSERT_EQ(get<std::string>(*parsed.getValue()), "test_value");
     }
 
     // The optional key is absent.
@@ -875,8 +870,8 @@ TEST(IDLVariantTests, TestTwoVariants) {
         auto obj = BSON("value0" << 1 << "value1" << BSONObj());
         auto parsed = Two_variants::parse(IDLParserContext{"root"}, obj);
         ASSERT_BSONOBJ_EQ(obj, parsed.toBSON());
-        ASSERT_EQ(stdx::get<int>(parsed.getValue0()), 1);
-        ASSERT_BSONOBJ_EQ(stdx::get<BSONObj>(parsed.getValue1()), BSONObj());
+        ASSERT_EQ(get<int>(parsed.getValue0()), 1);
+        ASSERT_BSONOBJ_EQ(get<BSONObj>(parsed.getValue1()), BSONObj());
         ASSERT_BSONOBJ_EQ(Two_variants(1, BSONObj()).toBSON(), obj);
     }
 
@@ -886,8 +881,8 @@ TEST(IDLVariantTests, TestTwoVariants) {
                         << "value1" << BSONObj());
         auto parsed = Two_variants::parse(IDLParserContext{"root"}, obj);
         ASSERT_BSONOBJ_EQ(obj, parsed.toBSON());
-        ASSERT_EQ(stdx::get<std::string>(parsed.getValue0()), "test_value");
-        ASSERT_BSONOBJ_EQ(stdx::get<BSONObj>(parsed.getValue1()), BSONObj());
+        ASSERT_EQ(get<std::string>(parsed.getValue0()), "test_value");
+        ASSERT_BSONOBJ_EQ(get<BSONObj>(parsed.getValue1()), BSONObj());
         ASSERT_BSONOBJ_EQ(Two_variants("test_value", BSONObj()).toBSON(), obj);
     }
 
@@ -897,8 +892,8 @@ TEST(IDLVariantTests, TestTwoVariants) {
                                                << "y"));
         auto parsed = Two_variants::parse(IDLParserContext{"root"}, obj);
         ASSERT_BSONOBJ_EQ(obj, parsed.toBSON());
-        ASSERT_EQ(stdx::get<int>(parsed.getValue0()), 1);
-        ASSERT(stdx::get<std::vector<std::string>>(parsed.getValue1()) ==
+        ASSERT_EQ(get<int>(parsed.getValue0()), 1);
+        ASSERT(get<std::vector<std::string>>(parsed.getValue1()) ==
                (std::vector<std::string>{"x", "y"}));
         ASSERT_BSONOBJ_EQ(Two_variants(1, std::vector<std::string>{"x", "y"}).toBSON(), obj);
     }
@@ -911,8 +906,8 @@ TEST(IDLVariantTests, TestTwoVariants) {
                                       << "y"));
         auto parsed = Two_variants::parse(IDLParserContext{"root"}, obj);
         ASSERT_BSONOBJ_EQ(obj, parsed.toBSON());
-        ASSERT_EQ(stdx::get<std::string>(parsed.getValue0()), "test_value");
-        ASSERT(stdx::get<std::vector<std::string>>(parsed.getValue1()) ==
+        ASSERT_EQ(get<std::string>(parsed.getValue0()), "test_value");
+        ASSERT(get<std::vector<std::string>>(parsed.getValue1()) ==
                (std::vector<std::string>{"x", "y"}));
         ASSERT_BSONOBJ_EQ(Two_variants("test_value", std::vector<std::string>{"x", "y"}).toBSON(),
                           obj);
@@ -927,7 +922,7 @@ TEST(IDLVariantTests, TestChainedStructVariant) {
                         << "field1"
                         << "y");
         auto parsed = Chained_struct_variant::parse(ctxt, obj);
-        ASSERT_EQ(stdx::get<std::string>(parsed.getOne_variant_compound().getValue()), "x");
+        ASSERT_EQ(get<std::string>(parsed.getOne_variant_compound().getValue()), "x");
         ASSERT_EQ(parsed.getField1(), "y");
         ASSERT_BSONOBJ_EQ(obj, parsed.toBSON());
 
@@ -939,7 +934,7 @@ TEST(IDLVariantTests, TestChainedStructVariant) {
         // Test the constructor.
         Chained_struct_variant constructed("y");
         constructed.setOne_variant_compound(One_variant_compound("x"));
-        ASSERT_EQ(stdx::get<std::string>(constructed.getOne_variant_compound().getValue()), "x");
+        ASSERT_EQ(get<std::string>(constructed.getOne_variant_compound().getValue()), "x");
         ASSERT_EQ(constructed.getField1(), "y");
         ASSERT_BSONOBJ_EQ(obj, constructed.toBSON());
     }
@@ -949,7 +944,7 @@ TEST(IDLVariantTests, TestChainedStructVariant) {
                                 << "field1"
                                 << "y");
         auto parsed = Chained_struct_variant::parse(ctxt, obj);
-        ASSERT(stdx::get<std::vector<std::string>>(parsed.getOne_variant_compound().getValue()) ==
+        ASSERT(get<std::vector<std::string>>(parsed.getOne_variant_compound().getValue()) ==
                (std::vector<std::string>{"x", "y"}));
         ASSERT_EQ(parsed.getField1(), "y");
         ASSERT_BSONOBJ_EQ(obj, parsed.toBSON());
@@ -963,9 +958,8 @@ TEST(IDLVariantTests, TestChainedStructVariant) {
         Chained_struct_variant constructed("y");
         constructed.setOne_variant_compound(
             One_variant_compound(std::vector<std::string>{"x", "y"}));
-        ASSERT(
-            stdx::get<std::vector<std::string>>(constructed.getOne_variant_compound().getValue()) ==
-            (std::vector<std::string>{"x", "y"}));
+        ASSERT(get<std::vector<std::string>>(constructed.getOne_variant_compound().getValue()) ==
+               (std::vector<std::string>{"x", "y"}));
         ASSERT_EQ(constructed.getField1(), "y");
         ASSERT_BSONOBJ_EQ(obj, constructed.toBSON());
     }
@@ -973,8 +967,7 @@ TEST(IDLVariantTests, TestChainedStructVariant) {
         auto obj = BSON("value" << BSONObj() << "field1"
                                 << "y");
         auto parsed = Chained_struct_variant::parse(ctxt, obj);
-        ASSERT_BSONOBJ_EQ(stdx::get<BSONObj>(parsed.getOne_variant_compound().getValue()),
-                          BSONObj());
+        ASSERT_BSONOBJ_EQ(get<BSONObj>(parsed.getOne_variant_compound().getValue()), BSONObj());
         ASSERT_EQ(parsed.getField1(), "y");
         ASSERT_BSONOBJ_EQ(obj, parsed.toBSON());
 
@@ -986,7 +979,7 @@ TEST(IDLVariantTests, TestChainedStructVariant) {
         // Test the constructor.
         Chained_struct_variant constructed("y");
         constructed.setOne_variant_compound({BSONObj()});
-        ASSERT_BSONOBJ_EQ(stdx::get<BSONObj>(constructed.getOne_variant_compound().getValue()),
+        ASSERT_BSONOBJ_EQ(get<BSONObj>(constructed.getOne_variant_compound().getValue()),
                           BSONObj());
         ASSERT_EQ(constructed.getField1(), "y");
         ASSERT_BSONOBJ_EQ(obj, constructed.toBSON());
@@ -1001,7 +994,7 @@ TEST(IDLVariantTests, TestChainedStructVariantInline) {
                         << "field1"
                         << "y");
         auto parsed = Chained_struct_variant_inline::parse(ctxt, obj);
-        ASSERT_EQ(stdx::get<std::string>(parsed.getValue()), "x");
+        ASSERT_EQ(get<std::string>(parsed.getValue()), "x");
         ASSERT_EQ(parsed.getField1(), "y");
         ASSERT_BSONOBJ_EQ(obj, parsed.toBSON());
 
@@ -1013,7 +1006,7 @@ TEST(IDLVariantTests, TestChainedStructVariantInline) {
         // Test the constructor.
         Chained_struct_variant_inline constructed("y");
         constructed.setOne_variant_compound(One_variant_compound("x"));
-        ASSERT_EQ(stdx::get<std::string>(constructed.getValue()), "x");
+        ASSERT_EQ(get<std::string>(constructed.getValue()), "x");
         ASSERT_EQ(constructed.getField1(), "y");
         ASSERT_BSONOBJ_EQ(obj, constructed.toBSON());
     }
@@ -1023,7 +1016,7 @@ TEST(IDLVariantTests, TestChainedStructVariantInline) {
                                 << "field1"
                                 << "y");
         auto parsed = Chained_struct_variant_inline::parse(ctxt, obj);
-        ASSERT(stdx::get<std::vector<std::string>>(parsed.getValue()) ==
+        ASSERT(get<std::vector<std::string>>(parsed.getValue()) ==
                (std::vector<std::string>{"x", "y"}));
         ASSERT_EQ(parsed.getField1(), "y");
         ASSERT_BSONOBJ_EQ(obj, parsed.toBSON());
@@ -1037,7 +1030,7 @@ TEST(IDLVariantTests, TestChainedStructVariantInline) {
         Chained_struct_variant_inline constructed("y");
         constructed.setOne_variant_compound(
             One_variant_compound(std::vector<std::string>{"x", "y"}));
-        ASSERT(stdx::get<std::vector<std::string>>(constructed.getValue()) ==
+        ASSERT(get<std::vector<std::string>>(constructed.getValue()) ==
                (std::vector<std::string>{"x", "y"}));
         ASSERT_EQ(constructed.getField1(), "y");
         ASSERT_BSONOBJ_EQ(obj, constructed.toBSON());
@@ -1046,7 +1039,7 @@ TEST(IDLVariantTests, TestChainedStructVariantInline) {
         auto obj = BSON("value" << BSONObj() << "field1"
                                 << "y");
         auto parsed = Chained_struct_variant_inline::parse(ctxt, obj);
-        ASSERT_BSONOBJ_EQ(stdx::get<BSONObj>(parsed.getValue()), BSONObj());
+        ASSERT_BSONOBJ_EQ(get<BSONObj>(parsed.getValue()), BSONObj());
         ASSERT_EQ(parsed.getField1(), "y");
         ASSERT_BSONOBJ_EQ(obj, parsed.toBSON());
 
@@ -1058,7 +1051,7 @@ TEST(IDLVariantTests, TestChainedStructVariantInline) {
         // Test the constructor.
         Chained_struct_variant_inline constructed("y");
         constructed.setOne_variant_compound({BSONObj()});
-        ASSERT_BSONOBJ_EQ(stdx::get<BSONObj>(constructed.getValue()), BSONObj());
+        ASSERT_BSONOBJ_EQ(get<BSONObj>(constructed.getValue()), BSONObj());
         ASSERT_EQ(constructed.getField1(), "y");
         ASSERT_BSONOBJ_EQ(obj, constructed.toBSON());
     }
@@ -1070,7 +1063,7 @@ TEST(IDLVariantTests, TestChainedStructVariantStruct) {
         auto obj = BSON("value" << 1 << "field1"
                                 << "y");
         auto parsed = Chained_struct_variant_struct::parse(ctxt, obj);
-        ASSERT_EQ(stdx::get<int>(parsed.getOne_variant_struct().getValue()), 1);
+        ASSERT_EQ(get<int>(parsed.getOne_variant_struct().getValue()), 1);
         ASSERT_EQ(parsed.getField1(), "y");
         ASSERT_BSONOBJ_EQ(obj, parsed.toBSON());
 
@@ -1082,7 +1075,7 @@ TEST(IDLVariantTests, TestChainedStructVariantStruct) {
         // Test the constructor.
         Chained_struct_variant_struct constructed("y");
         constructed.setOne_variant_struct(One_variant_struct(1));
-        ASSERT_EQ(stdx::get<int>(constructed.getOne_variant_struct().getValue()), 1);
+        ASSERT_EQ(get<int>(constructed.getOne_variant_struct().getValue()), 1);
         ASSERT_EQ(constructed.getField1(), "y");
         ASSERT_BSONOBJ_EQ(obj, constructed.toBSON());
     }
@@ -1092,7 +1085,7 @@ TEST(IDLVariantTests, TestChainedStructVariantStruct) {
                                 << "field1"
                                 << "y");
         auto parsed = Chained_struct_variant_struct::parse(ctxt, obj);
-        ASSERT_EQ(stdx::get<One_string>(parsed.getOne_variant_struct().getValue()).getValue(), "x");
+        ASSERT_EQ(get<One_string>(parsed.getOne_variant_struct().getValue()).getValue(), "x");
         ASSERT_EQ(parsed.getField1(), "y");
         ASSERT_BSONOBJ_EQ(obj, parsed.toBSON());
 
@@ -1104,8 +1097,7 @@ TEST(IDLVariantTests, TestChainedStructVariantStruct) {
         // Test the constructor.
         Chained_struct_variant_struct constructed("y");
         constructed.setOne_variant_struct(One_variant_struct(One_string("x")));
-        ASSERT_EQ(stdx::get<One_string>(constructed.getOne_variant_struct().getValue()).getValue(),
-                  "x");
+        ASSERT_EQ(get<One_string>(constructed.getOne_variant_struct().getValue()).getValue(), "x");
         ASSERT_EQ(constructed.getField1(), "y");
         ASSERT_BSONOBJ_EQ(obj, constructed.toBSON());
     }
@@ -1117,7 +1109,7 @@ TEST(IDLVariantTests, TestChainedStructVariantStructInline) {
         auto obj = BSON("value" << 1 << "field1"
                                 << "y");
         auto parsed = Chained_struct_variant_struct_inline::parse(ctxt, obj);
-        ASSERT_EQ(stdx::get<int>(parsed.getValue()), 1);
+        ASSERT_EQ(get<int>(parsed.getValue()), 1);
         ASSERT_EQ(parsed.getField1(), "y");
         ASSERT_BSONOBJ_EQ(obj, parsed.toBSON());
 
@@ -1129,7 +1121,7 @@ TEST(IDLVariantTests, TestChainedStructVariantStructInline) {
         // Test the constructor.
         Chained_struct_variant_struct_inline constructed("y");
         constructed.setOne_variant_struct(One_variant_struct(1));
-        ASSERT_EQ(stdx::get<int>(constructed.getValue()), 1);
+        ASSERT_EQ(get<int>(constructed.getValue()), 1);
         ASSERT_EQ(constructed.getField1(), "y");
         ASSERT_BSONOBJ_EQ(obj, constructed.toBSON());
     }
@@ -1139,7 +1131,7 @@ TEST(IDLVariantTests, TestChainedStructVariantStructInline) {
                                 << "field1"
                                 << "y");
         auto parsed = Chained_struct_variant_struct_inline::parse(ctxt, obj);
-        ASSERT_EQ(stdx::get<One_string>(parsed.getValue()).getValue(), "x");
+        ASSERT_EQ(get<One_string>(parsed.getValue()).getValue(), "x");
         ASSERT_EQ(parsed.getField1(), "y");
         ASSERT_BSONOBJ_EQ(obj, parsed.toBSON());
 
@@ -1151,7 +1143,7 @@ TEST(IDLVariantTests, TestChainedStructVariantStructInline) {
         // Test the constructor.
         Chained_struct_variant_struct_inline constructed("y");
         constructed.setOne_variant_struct(One_variant_struct(One_string("x")));
-        ASSERT_EQ(stdx::get<One_string>(constructed.getValue()).getValue(), "x");
+        ASSERT_EQ(get<One_string>(constructed.getValue()).getValue(), "x");
         ASSERT_EQ(constructed.getField1(), "y");
         ASSERT_BSONOBJ_EQ(obj, constructed.toBSON());
     }
@@ -1447,14 +1439,14 @@ TEST(IDLFieldTests, TestStrictDuplicateIgnoredFields) {
     {                                                                                             \
         auto testDoc = BSONObj();                                                                 \
         auto testStruct = Default_values::parse(ctxt, testDoc);                                   \
-        ASSERT_TRUE(stdx::holds_alternative<default_type>(testStruct.get##field_name()));         \
-        ASSERT_EQUALS(stdx::get<default_type>(testStruct.get##field_name()), default_value);      \
+        ASSERT_TRUE(holds_alternative<default_type>(testStruct.get##field_name()));               \
+        ASSERT_EQUALS(get<default_type>(testStruct.get##field_name()), default_value);            \
     }                                                                                             \
     {                                                                                             \
         auto testDoc = BSON(#field_name << new_value);                                            \
         auto testStruct = Default_values::parse(ctxt, testDoc);                                   \
-        ASSERT_TRUE(stdx::holds_alternative<new_type>(testStruct.get##field_name()));             \
-        ASSERT_EQUALS(stdx::get<new_type>(testStruct.get##field_name()), new_value);              \
+        ASSERT_TRUE(holds_alternative<new_type>(testStruct.get##field_name()));                   \
+        ASSERT_EQUALS(get<new_type>(testStruct.get##field_name()), new_value);                    \
     }
 
 // Mixed: struct strict, and ignored field works
@@ -1734,8 +1726,8 @@ TEST(IDLArrayTests, TestArrayOfVariant) {
     auto parsed = One_array_variant::parse(ctxt, testDoc);
     ASSERT_BSONOBJ_EQ(testDoc, parsed.toBSON());
 
-    ASSERT_EQ(stdx::get<Insert_variant_struct>(parsed.getValue()[0]).getInsert(), 13);
-    ASSERT_EQ(stdx::get<Update_variant_struct>(parsed.getValue()[1]).getUpdate(), "some word");
+    ASSERT_EQ(get<Insert_variant_struct>(parsed.getValue()[0]).getInsert(), 13);
+    ASSERT_EQ(get<Update_variant_struct>(parsed.getValue()[1]).getUpdate(), "some word");
 
     // Positive: Test we can roundtrip from the just parsed document
     {
@@ -2553,13 +2545,15 @@ OpMsgRequest makeOMR(BSONObj obj) {
     return request;
 }
 
-OpMsgRequest makeOMRWithTenant(BSONObj obj, TenantId tenant) {
+using VTS = auth::ValidatedTenancyScope;
+OpMsgRequest makeOMRWithTenant(BSONObj obj, TenantId tenant, VTS::TenantProtocol tenantProtocol) {
     OpMsgRequest request;
     request.body = obj;
 
-    using VTS = auth::ValidatedTenancyScope;
-    request.validatedTenancyScope =
-        VTS(std::move(tenant), VTS::TenantProtocol::kDefault, VTS::TenantForTestingTag{});
+    request.validatedTenancyScope = auth::ValidatedTenancyScopeFactory::create(
+        std::move(tenant),
+        tenantProtocol,
+        auth::ValidatedTenancyScopeFactory::TenantForTestingTag{});
     return request;
 }
 
@@ -2614,8 +2608,6 @@ TEST(IDLCommand, TestConcatentateWithDb) {
 
 TEST(IDLCommand, TestConcatentateWithDb_WithTenant) {
     RAIIServerParameterControllerForTest multitenanyController("multitenancySupport", true);
-    IDLParserContext ctxt("root");
-
     const auto tenantId = TenantId(OID::gen());
     const auto prefixedDb = std::string(str::stream() << tenantId.toString() << "_db");
 
@@ -2623,7 +2615,6 @@ TEST(IDLCommand, TestConcatentateWithDb_WithTenant) {
                        .append(BasicConcatenateWithDbCommand::kCommandName, "coll1")
                        .append("field1", 3)
                        .append("field2", "five")
-                       .append("expectPrefix", true)
                        .append("$db", prefixedDb)
                        .obj();
 
@@ -2634,8 +2625,11 @@ TEST(IDLCommand, TestConcatentateWithDb_WithTenant) {
                          .append("$db", prefixedDb)
                          .obj();
 
-    auto testStruct =
-        BasicConcatenateWithDbCommand::parse(ctxt, makeOMRWithTenant(testDoc, tenantId));
+    auto opMsg = makeOMRWithTenant(testDoc, tenantId, VTS::TenantProtocol::kAtlasProxy);
+    IDLParserContext ctxt(
+        "root", false, opMsg.validatedTenancyScope, tenantId, SerializationContext::stateDefault());
+
+    auto testStruct = BasicConcatenateWithDbCommand::parse(ctxt, opMsg);
     ASSERT_EQUALS(testStruct.getDbName(), DatabaseName::createDatabaseName_forTest(tenantId, "db"));
     ASSERT_EQUALS(testStruct.getNamespace(),
                   NamespaceString::createNamespaceString_forTest(tenantId, "db.coll1"));
@@ -2772,8 +2766,6 @@ TEST(IDLCommand, TestConcatentateWithDbOrUUID_TestNSS) {
 
 TEST(IDLCommand, TestConcatentateWithDbOrUUID_TestNSS_WithTenant) {
     RAIIServerParameterControllerForTest multitenanyController("multitenancySupport", true);
-    IDLParserContext ctxt("root");
-
     const auto tenantId = TenantId(OID::gen());
     const auto prefixedDb = std::string(str::stream() << tenantId.toString() << "_db");
 
@@ -2781,7 +2773,6 @@ TEST(IDLCommand, TestConcatentateWithDbOrUUID_TestNSS_WithTenant) {
                        .append(BasicConcatenateWithDbOrUUIDCommand::kCommandName, "coll1")
                        .append("field1", 3)
                        .append("field2", "five")
-                       .append("expectPrefix", true)
                        .append("$db", prefixedDb)
                        .obj();
 
@@ -2792,8 +2783,11 @@ TEST(IDLCommand, TestConcatentateWithDbOrUUID_TestNSS_WithTenant) {
                          .append("$db", prefixedDb)
                          .obj();
 
-    auto testStruct =
-        BasicConcatenateWithDbOrUUIDCommand::parse(ctxt, makeOMRWithTenant(testDoc, tenantId));
+    const auto opMsg = makeOMRWithTenant(testDoc, tenantId, VTS::TenantProtocol::kAtlasProxy);
+    IDLParserContext ctxt(
+        "root", false, opMsg.validatedTenancyScope, tenantId, SerializationContext::stateDefault());
+
+    auto testStruct = BasicConcatenateWithDbOrUUIDCommand::parse(ctxt, opMsg);
     ASSERT_EQUALS(testStruct.getDbName(), DatabaseName::createDatabaseName_forTest(tenantId, "db"));
     ASSERT_EQUALS(testStruct.getNamespaceOrUUID().nss(),
                   NamespaceString::createNamespaceString_forTest(tenantId, "db.coll1"));
@@ -2855,7 +2849,6 @@ TEST(IDLCommand, TestConcatentateWithDbOrUUID_TestUUID) {
 
 TEST(IDLCommand, TestConcatentateWithDbOrUUID_TestUUID_WithTenant) {
     RAIIServerParameterControllerForTest multitenanyController("multitenancySupport", true);
-    IDLParserContext ctxt("root");
 
     UUID uuid = UUID::gen();
     const auto tenantId = TenantId(OID::gen());
@@ -2866,7 +2859,6 @@ TEST(IDLCommand, TestConcatentateWithDbOrUUID_TestUUID_WithTenant) {
             .appendElements(BSON(BasicConcatenateWithDbOrUUIDCommand::kCommandName << uuid))
             .append("field1", 3)
             .append("field2", "five")
-            .append("expectPrefix", true)
             .append("$db", prefixedDb)
             .obj();
 
@@ -2878,8 +2870,11 @@ TEST(IDLCommand, TestConcatentateWithDbOrUUID_TestUUID_WithTenant) {
             .append("$db", prefixedDb)
             .obj();
 
-    auto testStruct =
-        BasicConcatenateWithDbOrUUIDCommand::parse(ctxt, makeOMRWithTenant(testDoc, tenantId));
+    const auto opMsg = makeOMRWithTenant(testDoc, tenantId, VTS::TenantProtocol::kAtlasProxy);
+    IDLParserContext ctxt(
+        "root", false, opMsg.validatedTenancyScope, tenantId, SerializationContext::stateDefault());
+
+    auto testStruct = BasicConcatenateWithDbOrUUIDCommand::parse(ctxt, opMsg);
     ASSERT_EQUALS(testStruct.getDbName(), DatabaseName::createDatabaseName_forTest(tenantId, "db"));
     ASSERT_EQUALS(testStruct.getNamespaceOrUUID().dbName(),
                   DatabaseName::createDatabaseName_forTest(tenantId, "db"));
@@ -3038,10 +3033,10 @@ void TestLoopbackCommandTypeVariant(TestT test_value) {
 
     auto parsed = CommandT::parse(ctxt, obj);
     if constexpr (std::is_same_v<TestT, BSONObj>) {
-        ASSERT_BSONOBJ_EQ(stdx::get<TestT>(parsed.getValue()), test_value);
+        ASSERT_BSONOBJ_EQ(get<TestT>(parsed.getValue()), test_value);
     } else {
         // Use ASSERT instead of ASSERT_EQ to avoid operator<<
-        ASSERT(stdx::get<TestT>(parsed.getCommandParameter()) == test_value);
+        ASSERT(get<TestT>(parsed.getCommandParameter()) == test_value);
     }
     ASSERT_BSONOBJ_EQ(obj, serializeCmd(parsed));
 
@@ -3049,9 +3044,9 @@ void TestLoopbackCommandTypeVariant(TestT test_value) {
     CommandT constructed(test_value);
     constructed.setDbName(DatabaseName::createDatabaseName_forTest(boost::none, "db"));
     if constexpr (std::is_same_v<TestT, BSONObj>) {
-        ASSERT_BSONOBJ_EQ(stdx::get<TestT>(parsed.getValue()), test_value);
+        ASSERT_BSONOBJ_EQ(get<TestT>(parsed.getValue()), test_value);
     } else {
-        ASSERT(stdx::get<TestT>(parsed.getCommandParameter()) == test_value);
+        ASSERT(get<TestT>(parsed.getCommandParameter()) == test_value);
     }
     ASSERT_BSONOBJ_EQ(obj, serializeCmd(constructed));
 }
@@ -3173,8 +3168,10 @@ void TestDocSequence(StringData name) {
                                  << "field1" << 3 << "field2"
                                  << "five");
 
-    OpMsgRequest request = OpMsgRequest::fromDBAndBody(
-        DatabaseName::createDatabaseName_forTest(boost::none, "db"), testTempDoc);
+    OpMsgRequest request =
+        OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::kNotRequired,
+                                    DatabaseName::createDatabaseName_forTest(boost::none, "db"),
+                                    testTempDoc);
     request.sequences.push_back({"structs",
                                  {BSON("value"
                                        << "hello"),
@@ -3216,8 +3213,10 @@ void TestBadDocSequences(StringData name, bool extraFieldAllowed) {
 
     // Negative: Duplicate fields in doc sequence
     {
-        OpMsgRequest request = OpMsgRequest::fromDBAndBody(
-            DatabaseName::createDatabaseName_forTest(boost::none, "db"), testTempDoc);
+        OpMsgRequest request =
+            OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::kNotRequired,
+                                        DatabaseName::createDatabaseName_forTest(boost::none, "db"),
+                                        testTempDoc);
         request.sequences.push_back({"structs",
                                      {BSON("value"
                                            << "hello"),
@@ -3230,8 +3229,10 @@ void TestBadDocSequences(StringData name, bool extraFieldAllowed) {
 
     // Negative: Extra field in document sequence
     {
-        OpMsgRequest request = OpMsgRequest::fromDBAndBody(
-            DatabaseName::createDatabaseName_forTest(boost::none, "db"), testTempDoc);
+        OpMsgRequest request =
+            OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::kNotRequired,
+                                        DatabaseName::createDatabaseName_forTest(boost::none, "db"),
+                                        testTempDoc);
         request.sequences.push_back({"structs",
                                      {BSON("value"
                                            << "hello"),
@@ -3249,8 +3250,10 @@ void TestBadDocSequences(StringData name, bool extraFieldAllowed) {
 
     // Negative: Missing field in both document sequence and body
     {
-        OpMsgRequest request = OpMsgRequest::fromDBAndBody(
-            DatabaseName::createDatabaseName_forTest(boost::none, "db"), testTempDoc);
+        OpMsgRequest request =
+            OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::kNotRequired,
+                                        DatabaseName::createDatabaseName_forTest(boost::none, "db"),
+                                        testTempDoc);
         request.sequences.push_back({"objects", {BSON("foo" << 1)}});
 
         ASSERT_THROWS(TestT::parse(ctxt, request), AssertionException);
@@ -3258,8 +3261,10 @@ void TestBadDocSequences(StringData name, bool extraFieldAllowed) {
 
     // Negative: Missing field in both document sequence and body
     {
-        OpMsgRequest request = OpMsgRequest::fromDBAndBody(
-            DatabaseName::createDatabaseName_forTest(boost::none, "db"), testTempDoc);
+        OpMsgRequest request =
+            OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::kNotRequired,
+                                        DatabaseName::createDatabaseName_forTest(boost::none, "db"),
+                                        testTempDoc);
         request.sequences.push_back({"structs",
                                      {BSON("value"
                                            << "hello"),
@@ -3293,8 +3298,10 @@ void TestDuplicateDocSequences(StringData name) {
                                                            << "world"))
                                      << "objects" << BSON_ARRAY(BSON("foo" << 1)));
 
-        OpMsgRequest request = OpMsgRequest::fromDBAndBody(
-            DatabaseName::createDatabaseName_forTest(boost::none, "db"), testTempDoc);
+        OpMsgRequest request =
+            OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::kNotRequired,
+                                        DatabaseName::createDatabaseName_forTest(boost::none, "db"),
+                                        testTempDoc);
         request.sequences.push_back({"structs",
                                      {BSON("value"
                                            << "hello"),
@@ -3316,8 +3323,10 @@ void TestDuplicateDocSequences(StringData name) {
                                                            << "world"))
                                      << "objects" << BSON_ARRAY(BSON("foo" << 1)));
 
-        OpMsgRequest request = OpMsgRequest::fromDBAndBody(
-            DatabaseName::createDatabaseName_forTest(boost::none, "db"), testTempDoc);
+        OpMsgRequest request =
+            OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::kNotRequired,
+                                        DatabaseName::createDatabaseName_forTest(boost::none, "db"),
+                                        testTempDoc);
         request.sequences.push_back({"objects", {BSON("foo" << 1)}});
 
         ASSERT_THROWS(DocSequenceCommand::parse(ctxt, request), AssertionException);
@@ -3347,8 +3356,10 @@ TEST(IDLDocSequence, TestEmptySequence) {
                                                       << "world"))
                                 << "objects" << BSON_ARRAY(BSON("foo" << 1)));
 
-        OpMsgRequest request = OpMsgRequest::fromDBAndBody(
-            DatabaseName::createDatabaseName_forTest(boost::none, "db"), testTempDoc);
+        OpMsgRequest request =
+            OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::kNotRequired,
+                                        DatabaseName::createDatabaseName_forTest(boost::none, "db"),
+                                        testTempDoc);
         request.sequences.push_back({"structs", {}});
 
         ASSERT_THROWS(DocSequenceCommand::parse(ctxt, request), AssertionException);
@@ -3362,8 +3373,10 @@ TEST(IDLDocSequence, TestEmptySequence) {
                                 << "five"
                                 << "objects" << BSON_ARRAY(BSON("foo" << 1)));
 
-        OpMsgRequest request = OpMsgRequest::fromDBAndBody(
-            DatabaseName::createDatabaseName_forTest(boost::none, "db"), testTempDoc);
+        OpMsgRequest request =
+            OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::kNotRequired,
+                                        DatabaseName::createDatabaseName_forTest(boost::none, "db"),
+                                        testTempDoc);
         request.sequences.push_back({"structs", {}});
 
         auto testStruct = DocSequenceCommand::parse(ctxt, request);
@@ -3403,8 +3416,10 @@ TEST(IDLDocSequence, TestWellKnownFieldsAreIgnored) {
                                 << "objects" << BSON_ARRAY(BSON("foo" << 1)));
 
 
-        OpMsgRequest request = OpMsgRequest::fromDBAndBody(
-            DatabaseName::createDatabaseName_forTest(boost::none, "db"), testTempDoc);
+        OpMsgRequest request =
+            OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::kNotRequired,
+                                        DatabaseName::createDatabaseName_forTest(boost::none, "db"),
+                                        testTempDoc);
 
         // Validate it can be parsed as a OpMsgRequest.
         {
@@ -3473,8 +3488,10 @@ TEST(IDLDocSequence, TestNonStrict) {
                                 << "field1" << 3 << "field2"
                                 << "five");
 
-        OpMsgRequest request = OpMsgRequest::fromDBAndBody(
-            DatabaseName::createDatabaseName_forTest(boost::none, "db"), testTempDoc);
+        OpMsgRequest request =
+            OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::kNotRequired,
+                                        DatabaseName::createDatabaseName_forTest(boost::none, "db"),
+                                        testTempDoc);
         request.sequences.push_back({"structs",
                                      {BSON("value"
                                            << "hello"),
@@ -3495,8 +3512,10 @@ TEST(IDLDocSequence, TestNonStrict) {
                                 << "five"
                                 << "extra" << 1);
 
-        OpMsgRequest request = OpMsgRequest::fromDBAndBody(
-            DatabaseName::createDatabaseName_forTest(boost::none, "db"), testTempDoc);
+        OpMsgRequest request =
+            OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::kNotRequired,
+                                        DatabaseName::createDatabaseName_forTest(boost::none, "db"),
+                                        testTempDoc);
         request.sequences.push_back({"structs",
                                      {BSON("value"
                                            << "hello"),
@@ -3526,8 +3545,8 @@ TEST(IDLDocSequence, TestArrayVariant) {
 
     auto testStruct = DocSequenceCommandArrayVariant::parse(ctxt, request);
     ASSERT_EQUALS(2UL, testStruct.getStructs().size());
-    ASSERT_EQ(stdx::get<Update_variant_struct>(testStruct.getStructs()[0]).getUpdate(), "foo");
-    ASSERT_EQ(stdx::get<Insert_variant_struct>(testStruct.getStructs()[1]).getInsert(), 12);
+    ASSERT_EQ(get<Update_variant_struct>(testStruct.getStructs()[0]).getUpdate(), "foo");
+    ASSERT_EQ(get<Insert_variant_struct>(testStruct.getStructs()[1]).getInsert(), 12);
 
     assert_same_types<decltype(testStruct.getNamespace()), const NamespaceString&>();
 
@@ -3543,8 +3562,8 @@ TEST(IDLDocSequence, TestArrayVariant) {
         // Verify doc sequence part of DocSequenceCommandArrayVariant::parseProtected too.
         testStruct = DocSequenceCommandArrayVariant::parse(ctxt, loopbackRequest);
         ASSERT_EQUALS(2UL, testStruct.getStructs().size());
-        ASSERT_EQ(stdx::get<Update_variant_struct>(testStruct.getStructs()[0]).getUpdate(), "foo");
-        ASSERT_EQ(stdx::get<Insert_variant_struct>(testStruct.getStructs()[1]).getInsert(), 12);
+        ASSERT_EQ(get<Update_variant_struct>(testStruct.getStructs()[0]).getUpdate(), "foo");
+        ASSERT_EQ(get<Insert_variant_struct>(testStruct.getStructs()[1]).getInsert(), 12);
     }
 }
 
@@ -3632,6 +3651,27 @@ TEST(IDLChainedStruct, TestInline) {
 
         ASSERT_BSONOBJ_EQ(testDoc, loopbackDoc);
     }
+}
+
+TEST(IDLChainedStruct, TestInlinedGettersAndSetters) {
+    IDLParserContext ctxt("root");
+
+    auto testDoc = BSON("stringField"
+                        << "bar"
+                        << "field3"
+                        << "foo");
+
+    auto testStruct = Chained_struct_inline::parse(ctxt, testDoc);
+    ASSERT_EQUALS(testStruct.getStringField(), "bar");
+    ASSERT_EQUALS(testStruct.getChained_string_inline_basic_type().getStringField(), "bar");
+
+    testStruct.getChained_string_inline_basic_type().setStringField("foo");
+    ASSERT_EQUALS(testStruct.getStringField(), "foo");
+    ASSERT_EQUALS(testStruct.getChained_string_inline_basic_type().getStringField(), "foo");
+
+    testStruct.setStringField("baz");
+    ASSERT_EQUALS(testStruct.getStringField(), "baz");
+    ASSERT_EQUALS(testStruct.getChained_string_inline_basic_type().getStringField(), "baz");
 }
 
 TEST(IDLValidatedField, Int_basic_ranges) {
@@ -4276,8 +4316,8 @@ TEST(IDLCommand,
                                                                   << "admin");
 
     const auto tenantId = TenantId(OID::gen());
-    auto testStruct =
-        CommandTypeNamespaceCommand::parse(ctxt, makeOMRWithTenant(testDoc, tenantId));
+    auto testStruct = CommandTypeNamespaceCommand::parse(
+        ctxt, makeOMRWithTenant(testDoc, tenantId, VTS::TenantProtocol::kDefault));
     ASSERT_EQUALS(testStruct.getDbName(),
                   DatabaseName::createDatabaseName_forTest(tenantId, "admin"));
     ASSERT_EQUALS(testStruct.getCommandParameter(),
@@ -4301,7 +4341,8 @@ TEST(IDLCommand, TestCommandTypeNamespaceCommand_WithMultitenancySupportOn) {
     auto testDoc = BSON(CommandTypeNamespaceCommand::kCommandName
                         << nssWithPrefixedTenantId << "field1" << 3 << "$db" << prefixedAdminDb);
 
-    auto testStruct = CommandTypeNamespaceCommand::parse(ctxt, makeOMR(testDoc));
+    auto testStruct = CommandTypeNamespaceCommand::parse(
+        ctxt, makeOMRWithTenant(testDoc, tenantId, VTS::TenantProtocol::kAtlasProxy));
 
     ASSERT_EQUALS(testStruct.getDbName(),
                   DatabaseName::createDatabaseName_forTest(tenantId, "admin"));
@@ -4329,7 +4370,8 @@ TEST(IDLTypeCommand, TestCommandWithNamespaceMember_WithTenant) {
                        .obj();
 
     const auto tenantId = TenantId(OID::gen());
-    auto testStruct = CommandWithNamespaceMember::parse(ctxt, makeOMRWithTenant(testDoc, tenantId));
+    auto testStruct = CommandWithNamespaceMember::parse(
+        ctxt, makeOMRWithTenant(testDoc, tenantId, VTS::TenantProtocol::kDefault));
 
     assert_same_types<decltype(testStruct.getField1()), const NamespaceString&>();
     assert_same_types<decltype(testStruct.getField2()),
@@ -4367,7 +4409,8 @@ TEST(IDLTypeCommand, TestCommandWithNamespaceStruct_WithTenant) {
                        .obj();
 
     const auto tenantId = TenantId(OID::gen());
-    auto testStruct = CommandWithNamespaceStruct::parse(ctxt, makeOMRWithTenant(testDoc, tenantId));
+    auto testStruct = CommandWithNamespaceStruct::parse(
+        ctxt, makeOMRWithTenant(testDoc, tenantId, VTS::TenantProtocol::kDefault));
 
     assert_same_types<decltype(testStruct.getField1()), NamespaceInfoStruct&>();
     assert_same_types<decltype(testStruct.getField2()), std::vector<NamespaceInfoStruct>&>();
@@ -4398,8 +4441,6 @@ TEST(IDLParserContext, TestConstructorWithPredecessorAndDifferentTenant) {
     RAIIServerParameterControllerForTest multitenanyController("multitenancySupport", true);
 
     const auto tenantId = TenantId(OID::gen());
-    const auto otherTenantId = TenantId(OID::gen());
-    IDLParserContext ctxt("root", false, tenantId);
 
     auto nsInfoStructBSON = [&](const char* ns) {
         BSONObjBuilder builder;
@@ -4413,10 +4454,16 @@ TEST(IDLParserContext, TestConstructorWithPredecessorAndDifferentTenant) {
             .append("$db", "admin")
             .append("field2", BSON_ARRAY(nsInfoStructBSON("a.b") << nsInfoStructBSON("c.d")))
             .obj();
-    ASSERT_THROWS_CODE(
-        CommandWithNamespaceStruct::parse(ctxt, makeOMRWithTenant(testDoc, otherTenantId)),
-        DBException,
-        8423379);
+
+    const auto otherTenantId = TenantId(OID::gen());
+    const auto otherOpMsg =
+        makeOMRWithTenant(testDoc, otherTenantId, VTS::TenantProtocol::kDefault);
+    auto ctxt = IDLParserContext("root",
+                                 false,
+                                 otherOpMsg.validatedTenancyScope,
+                                 tenantId,
+                                 SerializationContext::stateDefault());
+    ASSERT_THROWS_CODE(CommandWithNamespaceStruct::parse(ctxt, otherOpMsg), DBException, 8423379);
 }
 
 TEST(IDLTypeCommand, TestCommandWithBypassAndNamespaceMember_Parse) {
@@ -4453,7 +4500,7 @@ TEST(IDLTypeCommand, TestCommandWithBypassAndNamespaceMember_Parse) {
             OpMsgRequest request;
             if (multitenancySupport) {
                 const auto tenantId = TenantId(OID::gen());
-                request = makeOMRWithTenant(testDoc, tenantId);
+                request = makeOMRWithTenant(testDoc, tenantId, VTS::TenantProtocol::kDefault);
             } else
                 request.body = testDoc;
 
@@ -4500,9 +4547,17 @@ TEST(IDLTypeCommand, TestStructWithBypassAndNamespaceMember_Parse) {
         for (bool featureFlag : {false, true}) {
             RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID",
                                                                        featureFlag);
-            boost::optional<TenantId> tenantId =
-                multitenancySupport ? boost::make_optional(TenantId(OID::gen())) : boost::none;
-            IDLParserContext ctxt("root", false, tenantId);
+            boost::optional<auth::ValidatedTenancyScope> vts = boost::none;
+            boost::optional<TenantId> tenantId = boost::none;
+            if (multitenancySupport) {
+                tenantId = boost::make_optional(TenantId(OID::gen()));
+                vts = auth::ValidatedTenancyScopeFactory::create(
+                    *tenantId,
+                    VTS::TenantProtocol::kDefault,
+                    auth::ValidatedTenancyScopeFactory::TenantForTestingTag{});
+            }
+            IDLParserContext ctxt(
+                "root", false, vts, tenantId, SerializationContext::stateDefault());
 
             const std::string ns1 = "db.coll1";
             const std::string ns2 = "a.b";
@@ -4556,9 +4611,17 @@ TEST(IDLTypeCommand, TestStructWithBypassReplyAndNamespaceMember_Parse) {
         for (bool featureFlag : {false, true}) {
             RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID",
                                                                        featureFlag);
-            boost::optional<TenantId> tenantId =
-                multitenancySupport ? boost::make_optional(TenantId(OID::gen())) : boost::none;
-            IDLParserContext ctxt("root", false, tenantId);
+            boost::optional<auth::ValidatedTenancyScope> vts = boost::none;
+            boost::optional<TenantId> tenantId = boost::none;
+            if (multitenancySupport) {
+                tenantId = TenantId(OID::gen());
+                vts = auth::ValidatedTenancyScopeFactory::create(
+                    *tenantId,
+                    VTS::TenantProtocol::kDefault,
+                    auth::ValidatedTenancyScopeFactory::TenantForTestingTag{});
+            }
+            IDLParserContext ctxt(
+                "root", false, vts, tenantId, SerializationContext::stateDefault());
 
             const std::string ns1 = "db.coll1";
             const std::string ns2 = "a.b";
@@ -4819,166 +4882,6 @@ TEST(IDLTypeCommand, TestCommandWithBypassAndNamespaceMember_ConstructWithArgs) 
     }
 }
 
-TEST(IDLTypeCommand, TestCommandParseExpectPrefix_MissingExpectPrefix) {
-    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID", true);
-
-    IDLParserContext ctxt("root");
-
-    const std::string ns1 = "db.coll1";
-    const std::string ns2 = "a.b";
-    const std::string ns3 = "c.d";
-    auto nsInfoStructBSON = [&](StringData ns) {
-        BSONObjBuilder builder;
-        builder.append("ns", ns);
-        return builder.obj();
-    };
-    auto bypassStructBSON = [&]() {
-        BSONObjBuilder builder;
-        builder.append("field1", nsInfoStructBSON(ns1));
-        builder.append("field2", BSON_ARRAY(nsInfoStructBSON(ns2) << nsInfoStructBSON(ns3)));
-        return builder.obj();
-    };
-
-    auto testDoc = BSONObjBuilder{}
-                       .append("CommandWithBypassAndNamespaceMember", 1)
-                       .append("field1", bypassStructBSON())
-                       .append("$db", "admin")
-                       .obj();
-
-    OpMsgRequest request;
-    const auto tenantId = TenantId(OID::gen());
-    request = makeOMRWithTenant(testDoc, tenantId);
-
-    auto testStruct = CommandWithBypassAndNamespaceStruct::parse(ctxt, request);
-
-    auto serializationContextCommand = testStruct.getSerializationContext();
-    ASSERT_EQUALS(serializationContextCommand.getPrefix(), SerializationContext::Prefix::Default);
-
-    auto bypassStruct = testStruct.getField1();
-    auto serializationContextBypass = bypassStruct.getSerializationContext();
-    ASSERT_EQUALS(serializationContextBypass.getPrefix(), SerializationContext::Prefix::Default);
-
-    auto nsInfoStruct = bypassStruct.getField1();
-    auto serializationContextNsInfo = nsInfoStruct.getSerializationContext();
-    ASSERT_EQUALS(serializationContextNsInfo.getPrefix(), SerializationContext::Prefix::Default);
-
-    auto nsInfoArray = bypassStruct.getField2();
-    for (const auto& nsInfo : nsInfoArray) {
-        auto serializationContextNsInfoArr = nsInfo.getSerializationContext();
-        ASSERT_EQUALS(serializationContextNsInfoArr.getPrefix(),
-                      SerializationContext::Prefix::Default);
-    }
-}
-
-TEST(IDLTypeCommand, TestCommandParseExpectPrefix) {
-    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID", true);
-
-    for (bool expectPrefix : {false, true}) {
-        IDLParserContext ctxt("root");
-
-        const auto tenantId = TenantId(OID::gen());
-        std::string prefix = "";
-        if (expectPrefix)
-            prefix = str::stream() << tenantId.toString() << "_";
-
-        const std::string ns1 = prefix + "db.coll1";
-        const std::string ns2 = prefix + "a.b";
-        const std::string ns3 = prefix + "c.d";
-        auto nsInfoStructBSON = [&](StringData ns) {
-            BSONObjBuilder builder;
-            builder.append("ns", ns);
-            return builder.obj();
-        };
-        auto bypassStructBSON = [&]() {
-            BSONObjBuilder builder;
-            builder.append("field1", nsInfoStructBSON(ns1));
-            builder.append("field2", BSON_ARRAY(nsInfoStructBSON(ns2) << nsInfoStructBSON(ns3)));
-            return builder.obj();
-        };
-
-        auto testDoc = BSONObjBuilder{}
-                           .append("CommandWithBypassAndNamespaceMember", 1)
-                           .append("field1", bypassStructBSON())
-                           .append("expectPrefix", expectPrefix)
-                           .append("$db", prefix + "admin")
-                           .obj();
-
-        std::cout << "expectPrefix: " << (expectPrefix ? "true" : "false") << std::endl;
-        OpMsgRequest request;
-        request = makeOMRWithTenant(testDoc, tenantId);
-
-        std::cout << "request.body: " << request.body << std::endl;
-        auto testStruct = CommandWithBypassAndNamespaceStruct::parse(ctxt, request);
-
-        auto serializationContextCommand = testStruct.getSerializationContext();
-        ASSERT_EQUALS(serializationContextCommand.getPrefix(),
-                      expectPrefix ? SerializationContext::Prefix::IncludePrefix
-                                   : SerializationContext::Prefix::ExcludePrefix);
-
-        auto bypassStruct = testStruct.getField1();
-        auto serializationContextBypass = bypassStruct.getSerializationContext();
-        ASSERT_EQUALS(serializationContextBypass.getPrefix(),
-                      expectPrefix ? SerializationContext::Prefix::IncludePrefix
-                                   : SerializationContext::Prefix::ExcludePrefix);
-
-        auto nsInfoStruct = bypassStruct.getField1();
-        auto serializationContextNsInfo = nsInfoStruct.getSerializationContext();
-        ASSERT_EQUALS(serializationContextNsInfo.getPrefix(),
-                      expectPrefix ? SerializationContext::Prefix::IncludePrefix
-                                   : SerializationContext::Prefix::ExcludePrefix);
-
-        auto nsInfoArray = bypassStruct.getField2();
-        for (const auto& nsInfo : nsInfoArray) {
-            auto serializationContextNsInfoArr = nsInfo.getSerializationContext();
-            ASSERT_EQUALS(serializationContextNsInfoArr.getPrefix(),
-                          expectPrefix ? SerializationContext::Prefix::IncludePrefix
-                                       : SerializationContext::Prefix::ExcludePrefix);
-        }
-    }
-}
-
-TEST(IDLTypeCommand, TestCommandParseDuplicateExpectPrefix) {
-    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
-
-    for (bool featureFlag : {false, true}) {
-        RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID",
-                                                                   featureFlag);
-        IDLParserContext ctxt("root");
-
-        const std::string ns1 = "db.coll1";
-        const std::string ns2 = "a.b";
-        const std::string ns3 = "c.d";
-        auto nsInfoStructBSON = [&](StringData ns) {
-            BSONObjBuilder builder;
-            builder.append("ns", ns);
-            return builder.obj();
-        };
-        auto bypassStructBSON = [&]() {
-            BSONObjBuilder builder;
-            builder.append("field1", nsInfoStructBSON(ns1));
-            builder.append("field2", BSON_ARRAY(nsInfoStructBSON(ns2) << nsInfoStructBSON(ns3)));
-            return builder.obj();
-        };
-
-        auto testDoc = BSONObjBuilder{}
-                           .append("CommandWithBypassAndNamespaceMember", 1)
-                           .append("field1", bypassStructBSON())
-                           .append("expectPrefix", true)
-                           .append("expectPrefix", false)
-                           .append("$db", "admin")
-                           .obj();
-
-        OpMsgRequest request;
-        const auto tenantId = TenantId(OID::gen());
-        request = makeOMRWithTenant(testDoc, tenantId);
-
-        ASSERT_THROWS(CommandWithBypassAndNamespaceStruct::parse(ctxt, request),
-                      AssertionException);
-    }
-}
-
 void verifyContract(const AuthorizationContract& left, const AuthorizationContract& right) {
     ASSERT_TRUE(left.contains(right));
     ASSERT_TRUE(right.contains(left));
@@ -5077,60 +4980,6 @@ TEST(IDLFieldTests, TestOptionalBoolField) {
     }
 }
 
-TEST(IDLFieldTests, TenantOverrideField) {
-    const auto mkdoc = [](boost::optional<TenantId> tenantId) {
-        BSONObjBuilder doc;
-        doc.append("BasicIgnoredCommand", 1);
-        doc.append("$db", "admin");
-        if (tenantId) {
-            tenantId->serializeToBSON("$tenant", &doc);
-        }
-        doc.append("field1", 42);
-        doc.append("field2", "foo");
-        return doc.obj();
-    };
-
-    // Test optionality of $tenant arg.
-    {
-        auto obj = BasicIgnoredCommand::parse(IDLParserContext{"nil"}, mkdoc(boost::none));
-        auto tenant = obj.getDollarTenant();
-        ASSERT(tenant == boost::none);
-        ASSERT_FALSE(obj.getSerializationContext().receivedNonPrefixedTenantId());
-    }
-
-    // Test passing an tenant id (acting on behalf of a specific tenant)
-    {
-        auto id = TenantId(OID::gen());
-        auto obj = BasicIgnoredCommand::parse(IDLParserContext{"oid"}, mkdoc(id));
-        auto tenant = obj.getDollarTenant();
-        ASSERT(tenant == id);
-        ASSERT_TRUE(obj.getSerializationContext().receivedNonPrefixedTenantId());
-    }
-}
-
-TEST(IDLFieldTests, TenantOverrideFieldWithInvalidValue) {
-    const auto mkdoc = [](auto tenantId) {
-        BSONObjBuilder doc;
-        doc.append("BasicIgnoredCommand", 1);
-        doc.append("$db", "admin");
-        doc.append("$tenant", tenantId);
-        doc.append("field1", 42);
-        doc.append("field2", "foo");
-        return doc.obj();
-    };
-
-    // Negative: Parse invalid types.
-    {
-        ASSERT_THROWS(BasicIgnoredCommand::parse(IDLParserContext{"int"}, mkdoc(123)), DBException);
-        ASSERT_THROWS(BasicIgnoredCommand::parse(IDLParserContext{"float"}, mkdoc(3.14)),
-                      DBException);
-        ASSERT_THROWS(BasicIgnoredCommand::parse(IDLParserContext{"string"}, mkdoc("bar")),
-                      DBException);
-        ASSERT_THROWS(BasicIgnoredCommand::parse(IDLParserContext{"object"}, mkdoc(BSONObj())),
-                      DBException);
-    }
-}
-
 TEST(IDLOwnershipTests, ParseOwnAssumesOwnership) {
     IDLParserContext ctxt("root");
     One_plain_object idlStruct;
@@ -5164,6 +5013,169 @@ TEST(IDLOwnershipTests, ParseSharingOwnershipTmpIDLStruct) {
     // Now that idlStruct is out of scope, if bson didn't particpate in ownership, it would be
     // accessing free'd memory which should error on ASAN and debug builds.
     ASSERT_BSONOBJ_EQ(bson["value"].Obj(), BSON("x" << 42));
+}
+
+TEST(IDLOwnershipTests, ChainedParseSharingOwnershipTmpBSON) {
+    IDLParserContext ctxt("root");
+
+    ViewStructChainedStruct view_struct_chained_struct;
+    {
+        auto tmp = BSON("view_type" << BSON("a"
+                                            << "b"));
+        view_struct_chained_struct = ViewStructChainedStruct::parseSharingOwnership(ctxt, tmp);
+    }
+    // Now that tmp is out of scope, if idlStruct didn't particpate in ownership, it would be
+    // accessing free'd memory which should error on ASAN and debug builds.
+    ASSERT_BSONOBJ_EQ(view_struct_chained_struct.getView_type(),
+                      BSON("a"
+                           << "b"));
+
+    ViewStructChainedType view_struct_chained_type;
+    {
+        auto tmp = BSON("view_type" << BSON("a"
+                                            << "b"));
+        view_struct_chained_type = ViewStructChainedType::parseSharingOwnership(ctxt, tmp);
+    }
+    ASSERT_BSONOBJ_EQ(view_struct_chained_type.getViewChainedType().getView_type(),
+                      BSON("view_type" << BSON("a"
+                                               << "b")));
+
+    ViewStructWithViewStructMember view_struct_member;
+    {
+        auto tmp = BSON("view_struct" << BSON("view_type" << BSON("a"
+                                                                  << "b")));
+        view_struct_member = ViewStructWithViewStructMember::parseSharingOwnership(ctxt, tmp);
+    }
+    ASSERT_BSONOBJ_EQ(view_struct_member.getView_struct().getView_type(),
+                      BSON("a"
+                           << "b"));
+}
+
+/**
+ * Tests that a non view struct (which has only non view type members) will own the data of all
+ * of its members. The IDL types tested are the types defined in `basic_types.idl`.
+ */
+TEST(IDLOwnershipTests, NonViewStructParseAssumesOwnership) {
+    IDLParserContext ctxt("root");
+    NonViewStruct idlStruct;
+    BSONObj ownedBSON = BSON("a"
+                             << "b");
+    ASSERT_TRUE(ownedBSON.isOwned());
+    BSONObj ownedElementBSON = BSON("field34"
+                                    << "a");
+    BSONElement ownedElement = ownedElementBSON.getField("field34");
+    ASSERT_TRUE(ownedElementBSON.isOwned());
+    {
+        uint8_t testArray[] = {1, 2, 3};
+        UUID testUUID = UUID::gen();
+        BSONBinData testUUIDBin =
+            BSONBinData(testUUID.toCDR().data(), testUUID.toCDR().length(), newUUID);
+        BSONBinData testArrayBinGen = BSONBinData(testArray, 3, BinDataGeneral);
+        BSONBinData testArrayBinFun = BSONBinData(testArray, 3, Function);
+        BSONBinData testArrayBinUUID =
+            BSONBinData(testUUID.toCDR().data(), testUUID.toCDR().length(), newUUID);
+        BSONBinData testArrayBinEnc = BSONBinData(testArray, 3, Encrypt);
+        BSONBinData testArrayBinSen = BSONBinData(testArray, 3, Sensitive);
+        uint8_t testData[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+        BSONBinData testDataBin = BSONBinData(testData, 16, MD5Type);
+        OID testOID = OID::gen();
+        Timestamp testTimestamp = Timestamp::max();
+        Date_t testDate = Date_t::now();
+        BSONObj testLogicalTimeBSON = LogicalTime(testTimestamp).toBSON();
+        DatabaseName testDatabaseName = DatabaseName::createDatabaseName_forTest({}, "test");
+        std::string testNamespaceString = NamespaceString(testDatabaseName).toString_forTest();
+        std::string testConnectionString = ConnectionString::forLocal().toString();
+        // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
+        StringData testFCVstring = multiversion::toString(multiversion::GenericFCV::kLastLTS);
+        TenantId testTenantId = TenantId(testOID);
+        std::string testTenantIdStr = testTenantId.toString();
+        std::string testDatabaseNameStr = testDatabaseName.toString_forTest();
+        BSONObjBuilder bob;
+        bob.append("field1", "1");
+        bob.append("field2", 2);
+        bob.append("field3", 3);
+        bob.append("field4", 4);
+        bob.append("field5", 5);
+        bob.append("field6", 6.0);
+        bob.append("field7", 7LL);
+        bob.append("field8", 8.0);
+        bob.append("field9", true);
+        bob.append("field10", true);
+        bob.append("field11", true);
+        bob.append("field12", testArrayBinGen);
+        bob.append("field13", testArrayBinFun);
+        bob.append("field14", testArrayBinUUID);
+        bob.append("field15", testArrayBinEnc);
+        bob.append("field16", testArrayBinSen);
+        bob.append("field17", testUUIDBin);
+        bob.append("field18", testDataBin);
+        bob.append("field19", testOID);
+        bob.append("field20", ownedBSON);
+        bob.append("field21", testDate);
+        bob.append("field22", 22);
+        bob.append("field23", 23);
+        bob.append("field24", 25);
+        bob.append("field25", 26);
+        bob.append("field26", testLogicalTimeBSON);
+        bob.append("field27", testLogicalTimeBSON);
+        bob.append("field28", testTimestamp);
+        bob.append("field29", testNamespaceString);
+        bob.append("field30", "abcd");
+        bob.append("field31", "abcd");
+        bob.append("field32", testConnectionString);
+        bob.append("field33", testFCVstring);
+        bob.append(ownedElement);
+        bob.append("field35", testOID);
+        bob.append("field36", testTenantIdStr);
+        bob.append("field37", testDatabaseNameStr);
+        auto tmp = bob.obj();
+        // We want to test that idlStruct is internally a non view type, and that the struct
+        // inherently owns all its members.
+        idlStruct = NonViewStruct::parse(ctxt, std::move(tmp));
+    }
+
+    // Now that tmp is out of scope, if idlStruct is a view type, it would be accessing
+    // free'd memory which should error on ASAN and debug builds.
+    idlStruct.getField1();
+    idlStruct.getField2();
+    idlStruct.getField3();
+    idlStruct.getField4();
+    idlStruct.getField5();
+    idlStruct.getField6();
+    idlStruct.getField7();
+    idlStruct.getField8();
+    idlStruct.getField9();
+    idlStruct.getField10();
+    idlStruct.getField11();
+    idlStruct.getField12();
+    idlStruct.getField13();
+    idlStruct.getField14();
+    idlStruct.getField15();
+    idlStruct.getField16();
+    idlStruct.getField17();
+    idlStruct.getField18();
+    idlStruct.getField19();
+    idlStruct.getField20();
+    idlStruct.getField21();
+    idlStruct.getField22();
+    idlStruct.getField23();
+    idlStruct.getField24();
+    idlStruct.getField25();
+    idlStruct.getField26();
+    idlStruct.getField27();
+    idlStruct.getField28();
+    idlStruct.getField29();
+    idlStruct.getField30();
+    idlStruct.getField31();
+    idlStruct.getField32();
+    idlStruct.getField33();
+    idlStruct.getField34();
+    idlStruct.getField35();
+    idlStruct.getField36();
+    idlStruct.getField37();
+    ASSERT_BSONOBJ_EQ(idlStruct.getField20(),
+                      BSON("a"
+                           << "b"));
 }
 
 

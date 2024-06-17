@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/exec/sbe/expressions/compile_ctx.h"
+#include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/expressions/runtime_environment.h"
 #include "mongo/db/exec/sbe/values/slot.h"
 #include "mongo/db/matcher/expression.h"
@@ -70,7 +71,7 @@ struct ParameterizedIndexScanSlots {
     // In the case that the parameterized plan will always consist of a single interval index scan,
     // this holds the SingleInterval struct. Otherwise, holds the necessary slots for a fully
     // generic parameterized index scan plan.
-    stdx::variant<SingleIntervalPlan, GenericPlan> slots;
+    std::variant<SingleIntervalPlan, GenericPlan> slots;
 };
 
 // Holds the slots for the clustered collection scan bounds.
@@ -78,6 +79,14 @@ struct ParameterizedClusteredScanSlots {
     // Holds the min and max record for the bounds of a clustered collection scan.
     boost::optional<sbe::value::SlotId> minRecord;
     boost::optional<sbe::value::SlotId> maxRecord;
+};
+
+/**
+ * Holds the slots for the find command limit skip values.
+ */
+struct ParameterizedLimitSkipSlots {
+    boost::optional<sbe::value::SlotId> limit;
+    boost::optional<sbe::value::SlotId> skip;
 };
 
 using VariableIdToSlotMap = stdx::unordered_map<Variables::Id, sbe::value::SlotId>;
@@ -136,6 +145,43 @@ struct PlanStageMetadataSlots {
     boost::optional<sbe::value::SlotId> searchSortValuesSlot;
     boost::optional<sbe::value::SlotId> sortKeySlot;
     boost::optional<sbe::value::SlotId> searchSequenceToken;
+
+    void reset() {
+        searchScoreSlot.reset();
+        searchHighlightsSlot.reset();
+        searchDetailsSlot.reset();
+        searchSortValuesSlot.reset();
+        sortKeySlot.reset();
+        searchSequenceToken.reset();
+    }
+
+    sbe::value::SlotVector getSlotVector() {
+        auto slots = sbe::makeSV();
+        if (auto slot = searchScoreSlot) {
+            slots.push_back(*slot);
+        }
+
+        if (auto slot = searchHighlightsSlot) {
+            slots.push_back(*slot);
+        }
+
+        if (auto slot = searchDetailsSlot) {
+            slots.push_back(*slot);
+        }
+
+        if (auto slot = searchSortValuesSlot) {
+            slots.push_back(*slot);
+        }
+
+        if (auto slot = searchSequenceToken) {
+            slots.push_back(*slot);
+        }
+
+        if (auto slot = sortKeySlot) {
+            slots.push_back(*slot);
+        }
+        return slots;
+    }
 };
 
 /**
@@ -158,7 +204,7 @@ struct PlanStageStaticData {
     int direction{1};
 
     // True iff this plan does an SBE clustered collection scan.
-    bool doSbeClusteredCollectionScan{false};
+    bool doClusteredCollectionScanSbe{false};
 
     // Iff 'doSbeClusteredCollectionScan', this holds the cluster key field name.
     std::string clusterKeyFieldName;
@@ -185,6 +231,12 @@ struct PlanStageStaticData {
     // SBE Slots. The slots are registered in the 'RuntimeEnvironment'.
     VariableIdToSlotMap variableIdToSlotMap;
 
+    // Stores variables that are not global/part of the runtime environment, but are temporarily
+    // injected when translating a specific expression. This is useful if we're translating an MQL
+    // expression as part of translating some larger entity (e.g. a match expression).
+    stdx::unordered_map<Variables::Id, std::pair<sbe::FrameId, sbe::value::SlotId>>
+        injectedVariables;
+
     // Stores auxiliary data to restore index bounds for a cached auto-parameterized SBE plan
     // for every index used by the plan.
     std::vector<IndexBoundsEvaluationInfo> indexBoundsEvaluationInfos;
@@ -192,6 +244,12 @@ struct PlanStageStaticData {
     // Stores data to restore collection scan bounds for a cached auto-parameterized SBE plan for
     // every clustered collection scan used by the plan.
     std::vector<ParameterizedClusteredScanSlots> clusteredCollBoundsInfos;
+
+    /**
+     * Stores slot ids for slots holding limit and skip amounts for a cached
+     * auto-parameterized SBE plan.
+     */
+    ParameterizedLimitSkipSlots limitSkipSlots;
 
     // Stores all namespaces involved in the build side of a hash join plan. Needed to check if
     // the plan should be evicted as the size of the foreign namespace changes.
@@ -212,6 +270,13 @@ struct PlanStageStaticData {
      * Default to a regular result cursor.
      */
     CursorTypeEnum cursorType = CursorTypeEnum::DocumentResult;
+
+    /**
+     * For queries with aggregation pipelines, stores the node id of the QSN that was root before
+     * the solution was extended with aggregation pipeline, or kEmptyPlanNodeId if there was no
+     * pushed down agg pipeline.
+     */
+    PlanNodeId runtimePlanningRootNodeId = kEmptyPlanNodeId;
 };
 
 /**

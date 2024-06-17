@@ -5,7 +5,9 @@
  * - manual key rotation is possible by deleting existing keys and restarting the cluster.
  *
  * Manual key rotation requires restarting a shard, so a persistent storage engine is necessary.
- * @tags: [requires_persistence]
+ * @tags: [
+ *   requires_persistence,
+ * ]
  */
 
 // This test restarts a shard replica set, potentially changing the primary node, while
@@ -72,11 +74,10 @@ assert.eq(res.$clusterTime.signature.keyId, NumberLong(0));
 
 // Resume key generation.
 for (let i = 0; i < st.configRS.nodes.length; i++) {
-    st.configRS.getPrimary().adminCommand(
-        {configureFailPoint: "disableKeyGeneration", mode: "off"});
+    st.configRS.nodes[i].adminCommand({configureFailPoint: "disableKeyGeneration", mode: "off"});
 }
 
-st.restartMongos(0);
+st.restartRouterNode(0);
 
 // Wait for config server primary to create new keys.
 assert.soonNoExcept(function() {

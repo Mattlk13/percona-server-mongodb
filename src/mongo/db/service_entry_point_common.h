@@ -36,6 +36,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/common_request_args_gen.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/optime.h"
@@ -87,9 +88,10 @@ struct ServiceEntryPointCommon {
                                          BSONObjBuilder& commandResponseBuilder) const = 0;
 
         virtual void waitForLinearizableReadConcern(OperationContext* opCtx) const = 0;
-        virtual void uassertCommandDoesNotSpecifyWriteConcern(const BSONObj& cmdObj) const = 0;
+        virtual void uassertCommandDoesNotSpecifyWriteConcern(
+            const CommonRequestArgs& requestArgs) const = 0;
 
-        virtual void attachCurOpErrInfo(OperationContext* opCtx, const BSONObj& replyObj) const = 0;
+        virtual void attachCurOpErrInfo(OperationContext* opCtx, Status status) const = 0;
 
         virtual bool refreshDatabase(OperationContext* opCtx,
                                      const StaleDbRoutingVersion& se) const noexcept = 0;
@@ -110,13 +112,13 @@ struct ServiceEntryPointCommon {
         scopedOperationCompletionShardingActions(OperationContext* opCtx) const = 0;
 
         virtual void appendReplyMetadata(OperationContext* opCtx,
-                                         const OpMsgRequest& request,
+                                         const CommonRequestArgs& requestArgs,
                                          BSONObjBuilder* metadataBob) const = 0;
     };
 
     static Future<DbResponse> handleRequest(OperationContext* opCtx,
                                             const Message& m,
-                                            std::unique_ptr<const Hooks> hooks) noexcept;
+                                            const Hooks& hooks) noexcept;
 
     /**
      * Produce a new object based on cmdObj, but with redactions applied as specified by

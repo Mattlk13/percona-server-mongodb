@@ -46,9 +46,9 @@
 #include <limits>
 #include <memory>
 #include <ostream>
+#include <set>
 #include <string>
 #include <type_traits>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -182,6 +182,7 @@ enum class TypeTags : uint8_t {
     ArraySet,
     ArrayMultiSet,
     Object,
+    MultiMap,
 
     ObjectId,
     RecordId,
@@ -270,6 +271,10 @@ inline constexpr bool isObject(TypeTags tag) noexcept {
 inline constexpr bool isArray(TypeTags tag) noexcept {
     return tag == TypeTags::Array || tag == TypeTags::ArraySet || tag == TypeTags::ArrayMultiSet ||
         tag == TypeTags::bsonArray;
+}
+
+inline constexpr bool isInListData(TypeTags tag) noexcept {
+    return tag == TypeTags::inListData;
 }
 
 inline constexpr bool isNullish(TypeTags tag) noexcept {
@@ -376,6 +381,20 @@ std::string printTagAndVal(TypeTags tag, Value value);                // debuggi
 std::string printTagAndVal(const std::pair<TypeTags, Value>& value);  // debugging function
 
 /**
+ * Performs a three-way comparison for any type that has < and == operators. Additionally,
+ * guarantees that the result will be exactlty -1, 0, or 1, which is important, because not all
+ * comparison functions make that guarantee.
+ *
+ * The StringData::compare(basic_string_view s) function, for example, only promises that it
+ * will return a value less than 0 in the case that 'this' is less than 's,' whereas we want to
+ * return exactly -1.
+ */
+template <typename T>
+int32_t compareHelper(const T lhs, const T rhs) noexcept {
+    return lhs < rhs ? -1 : (lhs == rhs ? 0 : 1);
+}
+
+/**
  * Three ways value comparison (aka spaceship operator).
  */
 std::pair<TypeTags, Value> compareValue(TypeTags lhsTag,
@@ -383,6 +402,17 @@ std::pair<TypeTags, Value> compareValue(TypeTags lhsTag,
                                         TypeTags rhsTag,
                                         Value rhsValue,
                                         const StringDataComparator* comparator = nullptr);
+
+inline std::pair<TypeTags, Value> compare3way(TypeTags lhsTag,
+                                              Value lhsValue,
+                                              TypeTags rhsTag,
+                                              Value rhsValue,
+                                              const StringDataComparator* comparator = nullptr) {
+    if (lhsTag == TypeTags::Nothing || rhsTag == TypeTags::Nothing) {
+        return {TypeTags::Nothing, 0};
+    }
+    return compareValue(lhsTag, lhsValue, rhsTag, rhsValue, comparator);
+}
 
 bool isNaN(TypeTags tag, Value val) noexcept;
 
@@ -409,6 +439,9 @@ public:
     MONGO_COMPILER_ALWAYS_INLINE ValueGuard(TypeTags tag, Value val) : _tag(tag), _value(val) {}
     MONGO_COMPILER_ALWAYS_INLINE ValueGuard(bool owned, TypeTags tag, Value val)
         : ValueGuard(owned ? tag : TypeTags::Nothing, owned ? val : 0) {}
+    MONGO_COMPILER_ALWAYS_INLINE ValueGuard(
+        const FastTuple<bool, value::TypeTags, value::Value>& tuple)
+        : ValueGuard(tuple.a, tuple.b, tuple.c) {}
     ValueGuard() = delete;
     ValueGuard(const ValueGuard&) = delete;
     ValueGuard(ValueGuard&& other) = delete;
@@ -427,6 +460,36 @@ public:
 private:
     TypeTags _tag;
     Value _value;
+};
+
+class ValueVectorGuard {
+public:
+    MONGO_COMPILER_ALWAYS_INLINE ValueVectorGuard(std::vector<TypeTags>& tags,
+                                                  std::vector<Value>& values)
+        : _owned(true), _tags(tags), _values(values) {}
+    ValueVectorGuard() = delete;
+    ValueVectorGuard(const ValueVectorGuard&) = delete;
+    ValueVectorGuard(ValueVectorGuard&& other) = delete;
+    MONGO_COMPILER_ALWAYS_INLINE ~ValueVectorGuard() {
+        if (_owned) {
+            invariant(_tags.size() == _values.size());
+            for (size_t i = 0; i < _tags.size(); i++) {
+                releaseValue(_tags[i], _values[i]);
+            }
+        }
+    }
+
+    ValueVectorGuard& operator=(const ValueVectorGuard&) = delete;
+    ValueVectorGuard& operator=(ValueVectorGuard&& other) = delete;
+
+    void reset() {
+        _owned = false;
+    }
+
+private:
+    bool _owned;
+    std::vector<TypeTags>& _tags;
+    std::vector<Value>& _values;
 };
 
 inline char* getRawPointerView(Value val) noexcept {
@@ -539,6 +602,33 @@ struct ValueEq {
             return false;
         } else {
             return true;
+        }
+    }
+
+    const CollatorInterface* getCollator() const {
+        return _collator;
+    }
+
+private:
+    const CollatorInterface* _collator;
+};
+
+/**
+ * Defines less or greater, depending on the template instantiation, of two <TypeTags, Value> pairs.
+ * To be used in associative containers.
+ */
+template <bool less>
+struct ValueCompare {
+    explicit ValueCompare(const CollatorInterface* collator = nullptr) : _collator(collator) {}
+
+    bool operator()(const std::pair<TypeTags, Value>& lhs,
+                    const std::pair<TypeTags, Value>& rhs) const {
+        auto [tag, val] = compareValue(lhs.first, lhs.second, rhs.first, rhs.second, _collator);
+        uassert(7548805, "Invalid comparison result", tag == TypeTags::NumberInt32);
+        if constexpr (less) {
+            return bitcastTo<int>(val) < 0;
+        } else {
+            return bitcastTo<int>(val) > 0;
         }
     }
 
@@ -1013,6 +1103,10 @@ public:
      */
     bool push_back(TypeTags tag, Value val);
 
+    bool push_back(std::pair<TypeTags, Value> val) {
+        return push_back(val.first, val.second);
+    }
+
     auto& values() const noexcept {
         return _values;
     }
@@ -1039,28 +1133,21 @@ private:
 };
 
 /**
- * This is the SBE representation of unordered_multiset. It is similar to ArraySet but each value
- * can be stored multiple times.
+ * This is the SBE representation of multiset. It is similar to ArraySet but each value can be
+ * stored multiple times.
  */
 class ArrayMultiSet {
 public:
-    using iterator =
-        typename std::unordered_multiset<std::pair<TypeTags, Value>,
-                                         ValueHash,
-                                         ValueEq,
-                                         std::allocator<std::pair<TypeTags, Value>>>::iterator;
-    using const_iterator = typename std::unordered_multiset<
-        std::pair<TypeTags, Value>,
-        ValueHash,
-        ValueEq,
-        std::allocator<std::pair<TypeTags, Value>>>::const_iterator;
+    using ValueMultiSetType =
+        std::multiset<std::pair<TypeTags, Value>, ValueCompare<true>>;  // NOLINT
+    using iterator = typename ValueMultiSetType::iterator;
+    using const_iterator = typename ValueMultiSetType::const_iterator;
 
     ArrayMultiSet() = default;
     explicit ArrayMultiSet(const CollatorInterface* collator = nullptr)
-        : _values(0, ValueHash(collator), ValueEq(collator)) {}
+        : _values(ValueCompare<true>(collator)) {}
 
-    ArrayMultiSet(const ArrayMultiSet& other) {
-        reserve(other._values.size());
+    ArrayMultiSet(const ArrayMultiSet& other) : _values(ValueCompare<true>(other.getCollator())) {
         for (const auto& p : other._values) {
             const auto copy = copyValue(p.first, p.second);
             ValueGuard guard{copy.first, copy.second};
@@ -1092,18 +1179,24 @@ public:
     }
 
     /**
-     * Removes an element val from the multiset. Returns true if an element has been removed.
+     * Removes an element val from the multiset. Returns false if it was not possible to remove the
+     * element.
      */
     bool remove(std::pair<TypeTags, Value> val) {
-        if (val.first != TypeTags::Nothing) {
-            if (auto it = _values.find(val); it != _values.end()) {
-                releaseValue(it->first, it->second);
-                _values.erase(it);
-                return true;
-            }
+        // Remove Nothing is always succesful since ArrayMultiset ignores those elements.
+        if (val.first == TypeTags::Nothing) {
+            return true;
         }
 
-        return false;
+        // We cannot remove an element that is not present.
+        if (_values.find(val) == _values.end()) {
+            return false;
+        }
+
+        auto it = _values.equal_range(val).first;
+        releaseValue(it->first, it->second);
+        _values.erase(it);
+        return true;
     }
 
     bool remove(TypeTags tag, Value val) {
@@ -1114,18 +1207,16 @@ public:
         return _values.size();
     }
 
-    void reserve(size_t s) {
-        // Normalize to at least 1.
-        s = s ? s : 1;
-        _values.reserve(s);
-    }
-
     auto& values() const noexcept {
         return _values;
     }
 
     auto& values() noexcept {
         return _values;
+    }
+
+    void clearValues() {
+        _values.clear();
     }
 
     void clear() {
@@ -1135,8 +1226,8 @@ public:
         _values.clear();
     }
 
-    const CollatorInterface* getCollator() {
-        return _values.key_eq().getCollator();
+    const CollatorInterface* getCollator() const {
+        return _values.key_comp().getCollator();
     }
 
     friend bool operator==(const ArrayMultiSet& lhs, const ArrayMultiSet& rhs) {
@@ -1150,10 +1241,81 @@ public:
     friend class ArraySet;
 
 private:
-    std::unordered_multiset<std::pair<TypeTags, Value>,  // NOLINT
-                            ValueHash,
-                            ValueEq,
-                            std::allocator<std::pair<TypeTags, Value>>>
+    ValueMultiSetType _values;
+};
+
+/**
+ * This is SBE representation of std::multimap
+ */
+class MultiMap {
+public:
+    MultiMap(const CollatorInterface* collator = nullptr) : _values(ValueCompare<true>(collator)) {}
+
+    MultiMap(const MultiMap& other) : _values(ValueCompare<true>(other.getCollator())) {
+        for (const auto& [key, value] : other._values) {
+            const auto copyKey = copyValue(key.first, key.second);
+            const auto copyVal = copyValue(value.first, value.second);
+            ValueGuard keyGuard{copyKey.first, copyKey.second};
+            ValueGuard valueGuard{copyVal.first, copyVal.second};
+            _values.insert({copyKey, copyVal});
+            keyGuard.reset();
+            valueGuard.reset();
+        }
+    }
+
+    MultiMap(MultiMap&&) = default;
+
+    ~MultiMap() {
+        for (auto& [key, value] : _values) {
+            releaseValue(key.first, key.second);
+            releaseValue(value.first, value.second);
+        }
+        _values.clear();
+    }
+
+    void insert(std::pair<TypeTags, Value> key, std::pair<TypeTags, Value> value) {
+        ValueGuard keyGuard{key};
+        ValueGuard valueGuard{value};
+        if (key.first != TypeTags::Nothing && value.first != TypeTags::Nothing) {
+            _values.insert({key, value});
+            keyGuard.reset();
+            valueGuard.reset();
+        }
+    }
+
+    // Remove the entry corresponding to the provided key. In case of multiple equivalent keys, the
+    // first entry in the order of insertion will be removed
+    bool remove(std::pair<TypeTags, Value> key) {
+        if (key.first != TypeTags::Nothing) {
+            if (auto it = _values.find(key); it != _values.end()) {
+                it = _values.lower_bound(key);
+                value::releaseValue(it->first.first, it->first.second);
+                value::releaseValue(it->second.first, it->second.second);
+                _values.erase(it);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    auto size() const noexcept {
+        return _values.size();
+    }
+
+    auto& values() const noexcept {
+        return _values;
+    }
+
+    auto& values() noexcept {
+        return _values;
+    }
+
+    const CollatorInterface* getCollator() const {
+        return _values.key_comp().getCollator();
+    }
+
+private:
+    std::multimap<std::pair<TypeTags, Value>, std::pair<TypeTags, Value>, ValueCompare<true>>
         _values;
 };
 
@@ -1166,6 +1328,9 @@ struct SortKeyComponentVector {
 
 bool operator==(const ArraySet& lhs, const ArraySet& rhs);
 bool operator!=(const ArraySet& lhs, const ArraySet& rhs);
+
+bool operator==(const MultiMap& lhs, const MultiMap& rhs);
+bool operator!=(const MultiMap& lhs, const MultiMap& rhs);
 
 constexpr size_t kSmallStringMaxLength = 7;
 using ObjectIdType = std::array<uint8_t, 12>;
@@ -1467,6 +1632,20 @@ inline Object* getObjectView(Value val) noexcept {
     return reinterpret_cast<Object*>(val);
 }
 
+inline std::pair<TypeTags, Value> makeNewMultiMap(const CollatorInterface* collator = nullptr) {
+    auto m = new MultiMap(collator);
+    return {TypeTags::MultiMap, reinterpret_cast<Value>(m)};
+}
+
+inline MultiMap* getMultiMapView(Value val) noexcept {
+    return reinterpret_cast<MultiMap*>(val);
+}
+
+inline std::pair<TypeTags, Value> makeCopyMultiMap(const MultiMap& map) {
+    auto m = new MultiMap(map);
+    return {TypeTags::MultiMap, reinterpret_cast<Value>(m)};
+}
+
 inline std::pair<TypeTags, Value> makeNewObjectId() {
     auto o = new ObjectIdType;
     return {TypeTags::ObjectId, reinterpret_cast<Value>(o)};
@@ -1709,10 +1888,12 @@ inline std::pair<TypeTags, Value> copyValue(TypeTags tag, Value val) {
             return makeCopyArrayMultiSet(*getArrayMultiSetView(val));
         case TypeTags::Object:
             return makeCopyObject(*getObjectView(val));
+        case TypeTags::MultiMap:
+            return makeCopyMultiMap(*getMultiMapView(val));
         case TypeTags::StringBig:
             return makeBigString(getStringView(tag, val));
         case TypeTags::bsonString:
-            return makeBigString(getStringView(tag, val));
+            return makeNewString(getStringView(tag, val));
         case TypeTags::bsonSymbol:
             return makeNewBsonSymbol(getStringOrSymbolView(tag, val));
         case TypeTags::ObjectId: {
@@ -2067,6 +2248,42 @@ private:
 std::pair<TypeTags, Value> arrayToSet(TypeTags tag,
                                       Value val,
                                       CollatorInterface* collator = nullptr);
+
+std::pair<TypeTags, Value> genericEq(TypeTags lhsTag,
+                                     Value lhsValue,
+                                     TypeTags rhsTag,
+                                     Value rhsValue,
+                                     const StringDataComparator* comparator = nullptr);
+
+std::pair<TypeTags, Value> genericNeq(TypeTags lhsTag,
+                                      Value lhsValue,
+                                      TypeTags rhsTag,
+                                      Value rhsValue,
+                                      const StringDataComparator* comparator = nullptr);
+
+std::pair<TypeTags, Value> genericLt(TypeTags lhsTag,
+                                     Value lhsValue,
+                                     TypeTags rhsTag,
+                                     Value rhsValue,
+                                     const StringDataComparator* comparator = nullptr);
+
+std::pair<TypeTags, Value> genericLte(TypeTags lhsTag,
+                                      Value lhsValue,
+                                      TypeTags rhsTag,
+                                      Value rhsValue,
+                                      const StringDataComparator* comparator = nullptr);
+
+std::pair<TypeTags, Value> genericGt(TypeTags lhsTag,
+                                     Value lhsValue,
+                                     TypeTags rhsTag,
+                                     Value rhsValue,
+                                     const StringDataComparator* comparator = nullptr);
+
+std::pair<TypeTags, Value> genericGte(TypeTags lhsTag,
+                                      Value lhsValue,
+                                      TypeTags rhsTag,
+                                      Value rhsValue,
+                                      const StringDataComparator* comparator = nullptr);
 }  // namespace value
 }  // namespace sbe
 }  // namespace mongo

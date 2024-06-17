@@ -12,7 +12,7 @@
  * __cursor_fix_append_next --
  *     Return the next entry on the append list.
  */
-static inline int
+static WT_INLINE int
 __cursor_fix_append_next(WT_CURSOR_BTREE *cbt, bool newpage, bool restart)
 {
     WT_SESSION_IMPL *session;
@@ -74,7 +74,7 @@ restart_read:
  * __cursor_fix_next --
  *     Move to the next, fixed-length column-store item.
  */
-static inline int
+static WT_INLINE int
 __cursor_fix_next(WT_CURSOR_BTREE *cbt, bool newpage, bool restart)
 {
     WT_PAGE *page;
@@ -148,7 +148,7 @@ restart_read:
  * __cursor_var_append_next --
  *     Return the next variable-length entry on the append list.
  */
-static inline int
+static WT_INLINE int
 __cursor_var_append_next(
   WT_CURSOR_BTREE *cbt, bool newpage, bool restart, size_t *skippedp, bool *key_out_of_boundsp)
 {
@@ -207,7 +207,7 @@ restart_read:
  * __cursor_var_next --
  *     Move to the next, variable-length column-store item.
  */
-static inline int
+static WT_INLINE int
 __cursor_var_next(
   WT_CURSOR_BTREE *cbt, bool newpage, bool restart, size_t *skippedp, bool *key_out_of_boundsp)
 {
@@ -385,7 +385,7 @@ restart_read:
  * __cursor_row_next --
  *     Move to the next row-store item.
  */
-static inline int
+static WT_INLINE int
 __cursor_row_next(
   WT_CURSOR_BTREE *cbt, bool newpage, bool restart, size_t *skippedp, bool *key_out_of_boundsp)
 {
@@ -768,21 +768,22 @@ __wt_btcur_next(WT_CURSOR_BTREE *cbt, bool truncating)
     WT_CURSOR *cursor;
     WT_DECL_RET;
     WT_PAGE *page;
+    WT_PAGE_WALK_SKIP_STATS walk_skip_stats;
     WT_SESSION_IMPL *session;
     size_t total_skipped, skipped;
     uint32_t flags;
-    bool key_out_of_bounds, newpage, restart, need_walk;
+    bool key_out_of_bounds, newpage, need_walk, repositioned, restart;
 #ifdef HAVE_DIAGNOSTIC
     bool inclusive_set;
 
     inclusive_set = false;
 #endif
     cursor = &cbt->iface;
-    key_out_of_bounds = false;
-    need_walk = false;
-    newpage = false;
+    key_out_of_bounds = need_walk = newpage = repositioned = false;
     session = CUR2S(cbt);
     total_skipped = 0;
+    walk_skip_stats.total_del_pages_skipped = 0;
+    walk_skip_stats.total_inmem_del_pages_skipped = 0;
 
     WT_STAT_CONN_DATA_INCR(session, cursor_next);
 
@@ -802,6 +803,7 @@ __wt_btcur_next(WT_CURSOR_BTREE *cbt, bool truncating)
      * bounds, continue the next traversal logic.
      */
     if (F_ISSET(cursor, WT_CURSTD_BOUND_LOWER) && !WT_CURSOR_IS_POSITIONED(cbt)) {
+        repositioned = true;
         WT_ERR(__wt_btcur_bounds_position(session, cbt, true, &need_walk));
         if (!need_walk) {
             __wt_value_return(cbt, cbt->upd_value);
@@ -922,8 +924,8 @@ __wt_btcur_next(WT_CURSOR_BTREE *cbt, bool truncating)
          */
         if (session->txn->isolation == WT_ISO_SNAPSHOT &&
           !F_ISSET(&cbt->iface, WT_CURSTD_IGNORE_TOMBSTONE))
-            WT_ERR(
-              __wt_tree_walk_custom_skip(session, &cbt->ref, __wt_btcur_skip_page, NULL, flags));
+            WT_ERR(__wt_tree_walk_custom_skip(
+              session, &cbt->ref, __wt_btcur_skip_page, &walk_skip_stats, flags));
         else
             WT_ERR(__wt_tree_walk(session, &cbt->ref, flags));
         WT_ERR_TEST(cbt->ref == NULL, WT_NOTFOUND, false);
@@ -939,6 +941,12 @@ err:
     }
 
     WT_STAT_CONN_DATA_INCRV(session, cursor_next_skip_total, total_skipped);
+    if (walk_skip_stats.total_del_pages_skipped != 0)
+        WT_STAT_CONN_DATA_INCRV(
+          session, cursor_tree_walk_del_page_skip, walk_skip_stats.total_del_pages_skipped);
+    if (walk_skip_stats.total_inmem_del_pages_skipped != 0)
+        WT_STAT_CONN_DATA_INCRV(session, cursor_tree_walk_inmem_del_page_skip,
+          walk_skip_stats.total_inmem_del_pages_skipped);
 
     switch (ret) {
     case 0:
@@ -983,10 +991,19 @@ err:
         break;
     case WT_PREPARE_CONFLICT:
         /*
-         * If prepare conflict occurs, cursor should not be reset, as current cursor position will
-         * be reused in case of a retry from user.
+         * If prepare conflict occurs, cursor should not be reset unless they have bounds and were
+         * being initially positioned, as the current cursor position will be reused in case of a
+         * retry from user.
+         *
+         * Bounded cursors don't lose their bounds if the reset call is internal, per the API.
+         * Additionally by resetting the cursor here we have a slightly different semantic to a
+         * traditional prepare conflict. We are giving up the page which may allow to be evicted but
+         * for the purposes of the bounded cursor this should be fine.
          */
-        F_SET(cbt, WT_CBT_ITERATE_RETRY_NEXT);
+        if (repositioned)
+            WT_TRET(__cursor_reset(cbt));
+        else
+            F_SET(cbt, WT_CBT_ITERATE_RETRY_NEXT);
         break;
     default:
         WT_TRET(__cursor_reset(cbt));

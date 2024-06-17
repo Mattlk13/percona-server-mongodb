@@ -44,6 +44,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/auth/validated_tenancy_scope.h"
+#include "mongo/db/basic_types.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/vector_clock.h"
@@ -51,7 +52,6 @@
 #include "mongo/rpc/metadata.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/metadata/impersonated_user_metadata.h"
-#include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/decorable.h"
 #include "mongo/util/fail_point.h"
@@ -67,41 +67,23 @@ BSONObj makeEmptyMetadata() {
     return BSONObj();
 }
 
-void readRequestMetadata(OperationContext* opCtx, const OpMsg& opMsg, bool cmdRequiresAuth) {
-    BSONElement readPreferenceElem;
-    BSONElement trackingElem;
-    BSONElement clientElem;
-    BSONElement helloClientElem;
-    BSONElement impersonationElem;
-    BSONElement clientOperationKeyElem;
-    BSONElement mayBypassWriteBlockingElem;
-
-    for (const auto& metadataElem : opMsg.body) {
-        auto fieldName = metadataElem.fieldNameStringData();
-        if (fieldName == "$readPreference") {
-            readPreferenceElem = metadataElem;
-        } else if (fieldName == ClientMetadata::fieldName()) {
-            clientElem = metadataElem;
-        } else if (fieldName == TrackingMetadata::fieldName()) {
-            trackingElem = metadataElem;
-        } else if (fieldName == kImpersonationMetadataSectionName) {
-            impersonationElem = metadataElem;
-        } else if (fieldName == "clientOperationKey"_sd) {
-            clientOperationKeyElem = metadataElem;
-        } else if (fieldName == WriteBlockBypass::fieldName()) {
-            mayBypassWriteBlockingElem = metadataElem;
-        }
-    }
-
+void readRequestMetadata(OperationContext* opCtx,
+                         const CommonRequestArgs& requestArgs,
+                         const OpMsgRequest& request,
+                         bool cmdRequiresAuth) {
     AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
 
-    if (clientOperationKeyElem &&
+    if (requestArgs.getClientOperationKey() &&
         (TestingProctor::instance().isEnabled() ||
          authSession->isAuthorizedForActionsOnResource(
-             ResourcePattern::forClusterResource(opMsg.getValidatedTenantId()),
+             ResourcePattern::forClusterResource(request.getValidatedTenantId()),
              ActionType::internal))) {
-        auto opKey = uassertStatusOK(UUID::parse(clientOperationKeyElem));
-        opCtx->setOperationKey(std::move(opKey));
+        {
+            // We must obtain the client lock to set the OperationKey on the operation context as
+            // it may be concurrently read by CurrentOp.
+            stdx::lock_guard lg(*opCtx->getClient());
+            opCtx->setOperationKey(std::move(*requestArgs.getClientOperationKey()));
+        }
         failIfOperationKeyMismatch.execute([&](const BSONObj& data) {
             tassert(7446600,
                     "OperationKey in request does not match test provided OperationKey",
@@ -110,28 +92,44 @@ void readRequestMetadata(OperationContext* opCtx, const OpMsg& opMsg, bool cmdRe
         });
     }
 
-    if (readPreferenceElem) {
-        ReadPreferenceSetting::get(opCtx) =
-            uassertStatusOK(ReadPreferenceSetting::fromInnerBSON(readPreferenceElem));
+    if (requestArgs.getReadPreference()) {
+        ReadPreferenceSetting::get(opCtx) = uassertStatusOK(
+            ReadPreferenceSetting::fromInnerBSON(requestArgs.getReadPreference()->getElement()));
     }
 
-    readImpersonatedUserMetadata(impersonationElem, opCtx);
-    auth::ValidatedTenancyScope::set(opCtx, opMsg.validatedTenancyScope);
+    if (opCtx->routedByReplicaSetEndpoint()) {
+        ReadPreferenceSetting::get(opCtx).isPretargeted = true;
+    } else if (ReadPreferenceSetting::get(opCtx).isPretargeted) {
+        // '$_isPretargeted' is used exclusively by the replica set endpoint to mark commands
+        // that it forces to go through the router as needing to target the local mongod.
+        // Given that this request has been marked as pre-targeted, it must have originated from
+        // a request routed by the replica set endpoint. Mark the opCtx with this info.
+        opCtx->setRoutedByReplicaSetEndpoint(true);
+    }
+
+    readImpersonatedUserMetadata(requestArgs.getImpersonation().value_or(IDLAnyType()).getElement(),
+                                 opCtx);
+
+    invariant(!auth::ValidatedTenancyScope::get(opCtx).has_value() ||
+              (request.validatedTenancyScope &&
+               *auth::ValidatedTenancyScope::get(opCtx) == *request.validatedTenancyScope));
+
+    auth::ValidatedTenancyScope::set(opCtx, request.validatedTenancyScope);
 
     // We check for "$client" but not "client" here, because currentOp can filter on "client" as
     // a top-level field.
-    if (clientElem) {
+    if (requestArgs.getClientMetadata()) {
         // The '$client' field is populated by mongos when it sends requests to shards on behalf of
         // its own requests. This may or may not be relevant for SERVER-50804.
-        ClientMetadata::setFromMetadataForOperation(opCtx, clientElem);
+        ClientMetadata::setFromMetadataForOperation(opCtx,
+                                                    requestArgs.getClientMetadata()->getElement());
     }
 
-    TrackingMetadata::get(opCtx) =
-        uassertStatusOK(TrackingMetadata::readFromMetadata(trackingElem));
+    VectorClock::get(opCtx)->gossipIn(
+        opCtx, requestArgs.getGossipedVectorClockComponents(), !cmdRequiresAuth);
 
-    VectorClock::get(opCtx)->gossipIn(opCtx, opMsg.body, !cmdRequiresAuth);
-
-    WriteBlockBypass::get(opCtx).setFromMetadata(opCtx, mayBypassWriteBlockingElem);
+    WriteBlockBypass::get(opCtx).setFromMetadata(
+        opCtx, requestArgs.getMayBypassWriteBlocking().value_or(IDLAnyType()).getElement());
 }
 
 namespace {
@@ -155,7 +153,10 @@ bool isArrayOfObjects(BSONElement array) {
 }  // namespace
 
 
-OpMsgRequest upconvertRequest(const DatabaseName& dbName, BSONObj cmdObj, int queryFlags) {
+OpMsgRequest upconvertRequest(const DatabaseName& dbName,
+                              BSONObj cmdObj,
+                              int queryFlags,
+                              boost::optional<auth::ValidatedTenancyScope> vts) {
     cmdObj = cmdObj.getOwned();  // Usually this is a no-op since it is already owned.
 
     auto readPrefContainer = BSONObj();
@@ -190,13 +191,13 @@ OpMsgRequest upconvertRequest(const DatabaseName& dbName, BSONObj cmdObj, int qu
         ? BSONElement()
         : cmdObj[docSequenceIt->second];
     if (!isArrayOfObjects(docSequenceElem))
-        return OpMsgRequestBuilder::create(dbName, std::move(cmdObj));
+        return OpMsgRequestBuilder::create(vts, dbName, std::move(cmdObj));
 
     auto docSequenceName = docSequenceElem.fieldNameStringData();
 
     // Note: removing field before adding "$db" to avoid the need to copy the potentially large
     // array.
-    auto out = OpMsgRequestBuilder::create(dbName, cmdObj.removeField(docSequenceName));
+    auto out = OpMsgRequestBuilder::create(vts, dbName, cmdObj.removeField(docSequenceName));
     out.sequences.push_back({docSequenceName.toString()});
     for (auto elem : docSequenceElem.Obj()) {
         out.sequences[0].objs.push_back(elem.Obj().shareOwnershipWith(cmdObj));

@@ -594,7 +594,9 @@ TEST_F(StorageInterfaceImplTest, CreateCollectionWithIDIndexCommits) {
         ASSERT_OK(loaderStatus.getStatus());
         auto loader = std::move(loaderStatus.getValue());
         std::vector<BSONObj> docs = {BSON("_id" << 1), BSON("_id" << 1), BSON("_id" << 2)};
-        ASSERT_OK(loader->insertDocuments(docs.begin(), docs.end()));
+        ASSERT_OK(loader->insertDocuments(docs.begin(), docs.end(), [](const BSONObj& doc) {
+            return std::make_pair(RecordId(0), doc);
+        }));
         ASSERT_OK(loader->commit());
     }
 
@@ -619,7 +621,9 @@ void _testDestroyUncommitedCollectionBulkLoader(
     ASSERT_OK(loaderStatus.getStatus());
     auto loader = std::move(loaderStatus.getValue());
     std::vector<BSONObj> docs = {BSON("_id" << 1)};
-    ASSERT_OK(loader->insertDocuments(docs.begin(), docs.end()));
+    ASSERT_OK(loader->insertDocuments(docs.begin(), docs.end(), [](const BSONObj& doc) {
+        return std::make_pair(RecordId(0), doc);
+    }));
 
     // Destroy bulk loader.
     // Collection and ID index should not exist after 'loader' is destroyed.
@@ -933,7 +937,9 @@ TEST_F(StorageInterfaceImplTest, FindDocumentsReturnsIndexOptionsConflictIfIndex
         auto loader = unittest::assertGet(storage.createCollectionForBulkLoading(
             nss, generateOptionsWithUuid(), makeIdIndexSpec(nss), indexes));
         std::vector<BSONObj> docs = {BSON("_id" << 1), BSON("_id" << 1), BSON("_id" << 2)};
-        ASSERT_OK(loader->insertDocuments(docs.begin(), docs.end()));
+        ASSERT_OK(loader->insertDocuments(docs.begin(), docs.end(), [](const BSONObj& doc) {
+            return std::make_pair(RecordId(0), doc);
+        }));
         ASSERT_OK(loader->commit());
     }
     auto indexName = "x_1"_sd;
@@ -2522,6 +2528,61 @@ TEST_F(StorageInterfaceImplTest, UpdateSingletonUpdatesDocumentWhenCollectionIsN
     _assertDocumentsInCollectionEquals(opCtx, nss, {BSON("_id" << 0 << "x" << 1)});
 }
 
+TEST_F(StorageInterfaceImplTest, UpdateDocumentsNeverUpserts) {
+    auto opCtx = getOperationContext();
+    StorageInterfaceImpl storage;
+    auto nss = makeNamespace(_agent);
+    ASSERT_OK(storage.createCollection(opCtx, nss, generateOptionsWithUuid()));
+
+    TimestampedBSONObj update;
+    update.obj = BSON("$set" << BSON("_id" << 0 << "x" << 1));
+    update.timestamp = Timestamp();
+
+    ASSERT_OK(storage.updateDocuments(opCtx, nss, {}, update));
+    ASSERT_EQ(ErrorCodes::CollectionIsEmpty, storage.findSingleton(opCtx, nss));
+    _assertDocumentsInCollectionEquals(opCtx, nss, std::vector<mongo::BSONObj>());
+}
+
+TEST_F(StorageInterfaceImplTest, UpdateDocumentsUpdatesDocumentWhenCollectionIsNotEmpty) {
+    auto opCtx = getOperationContext();
+    StorageInterfaceImpl storage;
+    auto nss = makeNamespace(_agent);
+    ASSERT_OK(storage.createCollection(opCtx, nss, generateOptionsWithUuid()));
+    auto doc1 = BSON("_id" << 0 << "x" << 0);
+    auto doc2 = BSON("_id" << 1 << "x" << 0);
+    ASSERT_OK(storage.insertDocuments(opCtx, nss, {InsertStatement{doc1}, InsertStatement{doc2}}));
+
+    TimestampedBSONObj update;
+    update.obj = BSON("$set" << BSON("x" << 1));
+    update.timestamp = Timestamp();
+
+    ASSERT_OK(storage.updateDocuments(opCtx, nss, BSON("x" << 0), update));
+    auto docs =
+        unittest::assertGet(storage.findDocuments(opCtx,
+                                                  nss,
+                                                  {},
+                                                  repl::StorageInterface::ScanDirection::kForward,
+                                                  {},
+                                                  BoundInclusion::kIncludeStartKeyOnly,
+                                                  -1 /* limit */));
+    ASSERT_EQ(2, docs.size());
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 0 << "x" << 1), docs[0]);
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 1 << "x" << 1), docs[1]);
+    _assertDocumentsInCollectionEquals(
+        opCtx, nss, {BSON("_id" << 0 << "x" << 1), BSON("_id" << 1 << "x" << 1)});
+}
+
+TEST_F(StorageInterfaceImplTest, UpdateDocumentsNamespaceNotFound) {
+    auto opCtx = getOperationContext();
+    StorageInterfaceImpl storage;
+    auto nss = makeNamespace(_agent);
+    TimestampedBSONObj update;
+    update.obj = BSON("$set" << BSON("x" << 1));
+    update.timestamp = Timestamp();
+    ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
+                  storage.updateDocuments(opCtx, nss, BSON("x" << 0), update));
+}
+
 TEST_F(StorageInterfaceImplTest, FindByIdThrowsIfUUIDNotInCatalog) {
     auto op = makeOplogEntry({Timestamp(Seconds(1), 0), 1LL});
     auto opCtx = getOperationContext();
@@ -2799,7 +2860,7 @@ TEST_F(StorageInterfaceImplTest,
     // namespaces.
     NamespaceString nss =
         NamespaceString::createNamespaceString_forTest("local.system.rollback.docs");
-    ASSERT_FALSE(nss.isLegalClientSystemNS(serverGlobalParams.featureCompatibility));
+    ASSERT_FALSE(nss.isLegalClientSystemNS());
 
     auto opCtx = getOperationContext();
     auto options = generateOptionsWithUuid();
@@ -3092,7 +3153,7 @@ TEST_F(StorageInterfaceImplTest, DeleteByFilterRemovesDocumentsInIllegalClientSy
     // client system" namespaces.
     NamespaceString nss =
         NamespaceString::createNamespaceString_forTest("local.system.rollback.docs");
-    ASSERT_FALSE(nss.isLegalClientSystemNS(serverGlobalParams.featureCompatibility));
+    ASSERT_FALSE(nss.isLegalClientSystemNS());
 
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;

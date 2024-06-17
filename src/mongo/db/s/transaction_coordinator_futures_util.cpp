@@ -43,7 +43,6 @@
 #include "mongo/db/cluster_role.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/dbmessage.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/transaction_coordinator_futures_util.h"
 #include "mongo/db/server_options.h"
 #include "mongo/executor/remote_command_request.h"
@@ -56,6 +55,7 @@
 #include "mongo/rpc/op_msg.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/util/cancellation.h"
 #include "mongo/util/fail_point.h"
@@ -147,7 +147,9 @@ Future<executor::TaskExecutor::ResponseStatus> AsyncWorkScheduler::scheduleRemot
             auto start = _executor->now();
 
             auto requestOpMsg =
-                OpMsgRequest::fromDBAndBody(DatabaseName::kAdmin, commandObj).serialize();
+                OpMsgRequestBuilder::create(
+                    auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, commandObj)
+                    .serialize();
             const auto replyOpMsg = OpMsg::parseOwned(service->getService(ClusterRole::ShardServer)
                                                           ->getServiceEntryPoint()
                                                           ->handleRequest(opCtx, requestOpMsg)
@@ -248,7 +250,7 @@ void AsyncWorkScheduler::shutdown(Status status) {
     _shutdownStatus = std::move(status);
 
     for (const auto& it : _activeOpContexts) {
-        stdx::lock_guard<Client> clientLock(*it->getClient());
+        ClientLock clientLock(it->getClient());
         _serviceContext->killOperation(clientLock, it.get(), _shutdownStatus.code());
     }
 

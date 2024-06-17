@@ -146,25 +146,36 @@ export function getExecutionStatsForShard(stats, shardName) {
     return stats.shards[shardName].stages[0].$cursor.executionStats;
 }
 
+export function getUnwindStageForShard(stats, shardName) {
+    assert(stats.shards.hasOwnProperty(shardName), stats);
+    const stages = stats.shards[shardName].stages;
+    assert.eq(stages[1].$changeStream.stage, "internalUnwindTransaction");
+    return stages[1];
+}
+
 // Verifies the number of oplog events read by a particular shard.
 export function assertNumMatchingOplogEventsForShard(stats, shardName, expectedTotalReturned) {
     const executionStats = getExecutionStatsForShard(stats, shardName);
-    assert.eq(executionStats.nReturned,
+    // We verify the number of documents from the unwind stage instead of the oplog cursor, so we
+    // are testing that the filter is applied to the output of batched oplog entries as well.
+    const unwindStage = getUnwindStageForShard(stats, shardName);
+    assert.eq(unwindStage.nReturned,
               expectedTotalReturned,
               () => `Expected ${expectedTotalReturned} events on shard ${shardName} but got ` +
-                  `${executionStats.nReturned}. Execution stats:\n${tojson(executionStats)}`);
+                  `${executionStats.nReturned}. Execution stats:\n${tojson(executionStats)}\n` +
+                  `Unwind stage:\n${tojson(unwindStage)}`);
 }
 
 // Returns a newly created sharded collection sharded by caller provided shard key.
 export function createShardedCollection(shardingTest, shardKey, dbName, collName, splitAt) {
+    assert.commandWorked(shardingTest.s.adminCommand(
+        {enableSharding: dbName, primaryShard: shardingTest.shard0.name}));
+
     const db = shardingTest.s.getDB(dbName);
     assertDropAndRecreateCollection(db, collName);
 
     const coll = db.getCollection(collName);
     assert.commandWorked(coll.createIndex({[shardKey]: 1}));
-
-    assert.commandWorked(
-        shardingTest.s.adminCommand({movePrimary: dbName, to: shardingTest.shard0.name}));
 
     // Shard the test collection and split it into two chunks: one that contains all {shardKey: <lt
     // splitAt>} documents and one that contains all {shardKey: <gte splitAt>} documents.

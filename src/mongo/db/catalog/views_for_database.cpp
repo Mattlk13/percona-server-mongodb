@@ -51,7 +51,6 @@
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/index/index_access_method.h"
@@ -62,6 +61,7 @@
 #include "mongo/db/session/logical_session_id.h"
 #include "mongo/db/storage/record_data.h"
 #include "mongo/db/storage/snapshot.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/views/util.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
@@ -122,7 +122,8 @@ Status ViewsForDatabase::reload(OperationContext* opCtx, const CollectionPtr& sy
         return Status::OK();
     }
 
-    invariant(opCtx->lockState()->isCollectionLockedForMode(systemViews->ns(), MODE_IS));
+    invariant(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(systemViews->ns(),
+                                                                              MODE_IS));
 
     auto cursor = systemViews->getCursor(opCtx);
     while (auto record = cursor->next()) {
@@ -369,9 +370,11 @@ Status ViewsForDatabase::_upsertIntoCatalog(OperationContext* opCtx,
 void ViewsForDatabase::remove(OperationContext* opCtx,
                               const CollectionPtr& systemViews,
                               const NamespaceString& ns) {
-    dassert(opCtx->lockState()->isDbLockedForMode(systemViews->ns().dbName(), MODE_IX));
-    dassert(opCtx->lockState()->isCollectionLockedForMode(ns, MODE_IX));
-    dassert(opCtx->lockState()->isCollectionLockedForMode(systemViews->ns(), MODE_X));
+    dassert(shard_role_details::getLocker(opCtx)->isDbLockedForMode(systemViews->ns().dbName(),
+                                                                    MODE_IX));
+    dassert(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(ns, MODE_IX));
+    dassert(
+        shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(systemViews->ns(), MODE_X));
 
     _viewGraph.remove(ns);
     _viewMap.erase(ns.coll());

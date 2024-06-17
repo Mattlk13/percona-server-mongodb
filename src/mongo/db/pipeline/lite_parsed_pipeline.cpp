@@ -65,13 +65,6 @@ ReadConcernSupportResult LiteParsedPipeline::supportsReadConcern(
             ErrorCodes::ReadConcernMajorityNotEnabled,
             "Only change stream aggregation queries support 'majority' read concern when "
             "enableMajorityReadConcern=false"};
-    } else if (explain && level != repl::ReadConcernLevel::kLocalReadConcern) {
-        // Reject non-local read concern when the pipeline is being explained.
-        result.readConcernSupport = {
-            ErrorCodes::InvalidOptions,
-            str::stream() << "Explain for the aggregate command cannot run with a readConcern "
-                          << "other than 'local'. Current readConcern level: "
-                          << repl::readConcernLevels::toString(level)};
     }
 
     // 2. Determine whether the default read concern must be denied for any pipeline-global reasons.
@@ -156,9 +149,7 @@ void LiteParsedPipeline::verifyIsSupported(
 void LiteParsedPipeline::tickGlobalStageCounters() const {
     for (auto&& stage : _stageSpecs) {
         // Tick counter corresponding to current stage.
-        aggStageCounters.stageCounterMap.find(stage->getParseTimeName())
-            ->second->counter.increment(1);
-
+        aggStageCounters.increment(stage->getParseTimeName(), 1);
         // Recursively step through any sub-pipelines.
         for (auto&& subPipeline : stage->getSubPipelines()) {
             subPipeline.tickGlobalStageCounters();

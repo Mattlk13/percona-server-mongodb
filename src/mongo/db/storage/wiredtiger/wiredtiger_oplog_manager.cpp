@@ -37,7 +37,6 @@
 #include <string>
 
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/storage/record_store.h"
@@ -46,6 +45,7 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -149,7 +149,7 @@ void WiredTigerOplogManager::triggerOplogVisibilityUpdate() {
 
 void WiredTigerOplogManager::waitForAllEarlierOplogWritesToBeVisible(
     const WiredTigerRecordStore* oplogRecordStore, OperationContext* opCtx) {
-    invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
     // In order to reliably detect rollback situations, we need to fetch the latestVisibleTimestamp
     // prior to querying the end of the oplog.
@@ -163,13 +163,13 @@ void WiredTigerOplogManager::waitForAllEarlierOplogWritesToBeVisible(
     auto lastOplogRecord = cursor->next();
     if (!lastOplogRecord) {
         LOGV2_DEBUG(22369, 2, "The oplog does not exist. Not going to wait for oplog visibility.");
-        opCtx->recoveryUnit()->abandonSnapshot();
+        shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
         return;
     }
     const auto& waitingFor = lastOplogRecord->id;
 
     // Close transaction before we wait.
-    opCtx->recoveryUnit()->abandonSnapshot();
+    shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
 
     stdx::unique_lock<Latch> lk(_oplogVisibilityStateMutex);
 

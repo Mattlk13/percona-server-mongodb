@@ -121,14 +121,6 @@ void MultikeynessTrie::add(const ABT& path) {
     merge(MultikeynessTrie::fromIndexPath(path));
 }
 
-void IndexedFieldPaths::add(const ABT& path) {
-    _indexPathSet.insert(path);
-}
-
-bool IndexedFieldPaths::isIndexed(const ABT& path) const {
-    return _indexPathSet.find(path) != _indexPathSet.cend();
-}
-
 IndexCollationEntry::IndexCollationEntry(ABT path, CollationOp op)
     : _path(std::move(path)), _op(op) {}
 
@@ -198,7 +190,8 @@ ScanDefinition::ScanDefinition()
                      true /*exists*/,
                      boost::none /*ce*/,
                      {} /*shardingMetadata*/,
-                     {} /*indexedFieldPaths*/) {}
+                     {} /*indexPathOccurrences*/,
+                     ScanOrder::Forward /* scanOrder */) {}
 
 ScanDefinition::ScanDefinition(DatabaseName dbName,
                                boost::optional<UUID> uuid,
@@ -209,17 +202,19 @@ ScanDefinition::ScanDefinition(DatabaseName dbName,
                                const bool exists,
                                boost::optional<CEType> ce,
                                ShardingMetadata shardingMetadata,
-                               IndexedFieldPaths indexedFieldPaths)
+                               IndexPathOccurrences indexPathOccurrences,
+                               ScanOrder scanOrder)
     : _options(std::move(options)),
       _distributionAndPaths(std::move(distributionAndPaths)),
       _dbName(std::move(dbName)),
       _uuid(std::move(uuid)),
       _indexDefs(std::move(indexDefs)),
       _multikeynessTrie(std::move(multikeynessTrie)),
-      _indexedFieldPaths(std::move(indexedFieldPaths)),
+      _indexPathOccurrences(std::move(indexPathOccurrences)),
       _exists(exists),
       _ce(std::move(ce)),
-      _shardingMetadata(std::move(shardingMetadata)) {}
+      _shardingMetadata(std::move(shardingMetadata)),
+      _scanOrder(scanOrder) {}
 
 const ScanDefOptions& ScanDefinition::getOptionsMap() const {
     return _options;
@@ -249,8 +244,16 @@ const MultikeynessTrie& ScanDefinition::getMultikeynessTrie() const {
     return _multikeynessTrie;
 }
 
-const IndexedFieldPaths& ScanDefinition::getIndexedFieldPaths() const {
-    return _indexedFieldPaths;
+const IndexPathOccurrences& ScanDefinition::getIndexPathOccurrences() const {
+    return _indexPathOccurrences;
+}
+
+ScanOrder ScanDefinition::getScanOrder() const {
+    return _scanOrder;
+}
+
+void ScanDefinition::setScanOrder(ScanOrder newScanOrder) {
+    _scanOrder = newScanOrder;
 }
 
 bool ScanDefinition::exists() const {

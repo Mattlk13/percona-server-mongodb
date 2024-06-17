@@ -47,12 +47,14 @@ types:
     bson_serialization_type: long
     cpp_type: "std::int64_t"
     deserializer: "mongo::BSONElement::_numberLong"
+    is_view: false
 
   StmtId:
     description: "A number representing an operation within a transaction."
     bson_serialization_type: int
     cpp_type: "std::int32_t"
     deserializer: "mongo::BSONElement::_numberInt"
+    is_view: false
 
   TxnRetryCounter:
     description: "A strictly-increasing per-transaction counter that starts at 0 and is incremented
@@ -61,6 +63,7 @@ types:
     bson_serialization_type: int
     cpp_type: "std::int32_t"
     deserializer: "mongo::BSONElement::_numberInt"
+    is_view: false
 
 structs:
 
@@ -157,6 +160,11 @@ structs:
                       transaction."
         type: bool
         optional: true
+      startOrContinueTransaction:
+        description: "Used to indicate that recipient should be added as a new participant if not
+                      already part of this transaction, or continue the transaction otherwise."
+        type: bool
+        optional: true
 
   OperationSessionInfoFromClientBase:
     description: "Parser for pulling out session transaction metadata from commands, as opposed to
@@ -190,6 +198,11 @@ structs:
       startTransaction:
         description: "Used to indicate that a command is the start of a multi-statement
                       transaction."
+        type: bool
+        optional: true
+      startOrContinueTransaction:
+        description: "Used to indicate that recipient should be added as a new participant if not
+                      already part of this transaction, or continue the transaction otherwise."
         type: bool
         optional: true
       coordinator:
@@ -253,3 +266,4 @@ server_parameters:
     cpp_vartype: int
     cpp_varname: localLogicalSessionTimeoutMinutes
     default: 30
+    redact: false

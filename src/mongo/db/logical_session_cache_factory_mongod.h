@@ -31,13 +31,13 @@
 
 #include <memory>
 
-#include "mongo/db/service_liaison.h"
 #include "mongo/db/session/logical_session_cache.h"
 
 namespace mongo {
 
 enum class LogicalSessionCacheServer { kSharded, kConfigServer, kReplicaSet, kStandalone };
 
-std::unique_ptr<LogicalSessionCache> makeLogicalSessionCacheD(LogicalSessionCacheServer state);
+std::unique_ptr<LogicalSessionCache> makeLogicalSessionCacheD(LogicalSessionCacheServer state,
+                                                              bool isRouterServer);
 
 }  // namespace mongo

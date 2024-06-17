@@ -43,6 +43,7 @@
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_group.h"
 #include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/document_source_redact.h"
 #include "mongo/db/pipeline/document_source_sample.h"
 #include "mongo/db/pipeline/document_source_single_document_transformation.h"
 #include "mongo/db/pipeline/expression_context.h"
@@ -72,7 +73,11 @@ DocumentSource::DocumentSource(const StringData stageName,
                                const intrusive_ptr<ExpressionContext>& pCtx)
     : pSource(nullptr), pExpCtx(pCtx), _commonStats(stageName.rawData()) {
     if (pExpCtx->shouldCollectDocumentSourceExecStats()) {
-        _commonStats.executionTime.emplace(0);
+        if (internalMeasureQueryExecutionTimeInNanoseconds.load()) {
+            _commonStats.executionTime.precision = QueryExecTimerPrecision::kNanos;
+        } else {
+            _commonStats.executionTime.precision = QueryExecTimerPrecision::kMillis;
+        }
     }
 }
 
@@ -139,14 +144,8 @@ list<intrusive_ptr<DocumentSource>> DocumentSource::parse(
             str::stream() << "Unrecognized pipeline stage name: '" << stageName << "'",
             it != parserMap.end());
 
-    uassert(
-        ErrorCodes::QueryFeatureNotAllowed,
-        str::stream() << stageName
-                      << " is not allowed in the current feature compatibility version. See "
-                      << feature_compatibility_version_documentation::kCompatibilityLink
-                      << " for more information.",
-        !expCtx->maxFeatureCompatibilityVersion || !it->second.featureFlag ||
-            it->second.featureFlag->isEnabledOnVersion(*expCtx->maxFeatureCompatibilityVersion));
+    auto& entry = it->second;
+    expCtx->throwIfFeatureFlagIsNotEnabledOnFCV(stageName, entry.featureFlag);
 
     return it->second.parser(stageSpec, expCtx);
 }
@@ -187,19 +186,26 @@ bool DocumentSource::pushMatchBefore(Pipeline::SourceContainer::iterator itr,
     auto thisGroup = dynamic_cast<DocumentSourceGroup*>(this);
     if (constraints().canSwapWithMatch && nextMatch && !nextMatch->isTextQuery() &&
         (!thisGroup || groupMatchSwapVerified(*nextMatch, *thisGroup))) {
-        // We're allowed to swap with a $match and the stage after us is a $match. Furthermore, the
-        // $match does not contain a text search predicate, which we do not attempt to optimize
-        // because such a $match must already be the first stage in the pipeline. We can attempt to
-        // swap the $match or part of the $match before ourselves.
+        // If we reach this point we know:
+        // 1) The current stage is allowed to swap with a $match
+        // 2) The stage after us is a $match
+        // 3) The $match does not contain a text search predicate
+        // (We do not need to attempt this optimization if the $match contains a text search
+        // predicate because, in that scenario, $match is already required to be the first stage in
+        // the pipeline.)
         auto splitMatch =
             DocumentSourceMatch::splitMatchByModifiedFields(nextMatch, getModifiedPaths());
         invariant(splitMatch.first || splitMatch.second);
 
         if (splitMatch.first) {
-            // At least part of the $match can be moved before this stage. Erase the original $match
-            // and put the independent part before this stage. If splitMatch.second is not null,
-            // then there is a new $match stage to insert after ourselves which is dependent on the
-            // modified fields.
+            // If we reach this point: we know that at least part of the $match expression can be
+            // moved before this stage. So, we erase the original $match and move that independent
+            // part before this stage.
+            //
+            // If splitMatch.second is not null: the "independent part" of the $match expression was
+            // only one component of the original $match. So, we need to create a new $match stage
+            // for the remaining "dependent" component and insert it after ourselves--effectively
+            // keeping it in its original position in the pipeline.
             LOGV2_DEBUG(
                 5943503,
                 5,
@@ -251,21 +257,24 @@ BSONObj DocumentSource::serializeToBSONForDebug() const {
     return serialized[0].getDocument().toBson();
 }
 
-bool DocumentSource::pushSingleDocumentTransformBefore(Pipeline::SourceContainer::iterator itr,
-                                                       Pipeline::SourceContainer* container) {
-    auto singleDocTransform =
-        dynamic_cast<DocumentSourceSingleDocumentTransformation*>((*std::next(itr)).get());
+bool DocumentSource::pushSingleDocumentTransformOrRedactBefore(
+    Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
+    if (constraints().canSwapWithSingleDocTransformOrRedact) {
+        auto nextItr = std::next(itr);
+        if (dynamic_cast<DocumentSourceSingleDocumentTransformation*>(nextItr->get()) ||
+            dynamic_cast<DocumentSourceRedact*>(nextItr->get())) {
+            LOGV2_DEBUG(5943500,
+                        5,
+                        "Pushing a single document transform stage or a redact stage in ahead of "
+                        "the current stage: ",
+                        "singleDocTransformOrRedactStage"_attr =
+                            redact((*nextItr)->serializeToBSONForDebug()),
+                        "currentStage"_attr = redact(serializeToBSONForDebug()));
 
-    if (constraints().canSwapWithSingleDocTransform && singleDocTransform) {
-        LOGV2_DEBUG(5943500,
-                    5,
-                    "Swapping a single document transform stage in front of another stage: ",
-                    "singleDocTransform"_attr =
-                        redact(singleDocTransform->serializeToBSONForDebug()),
-                    "thisStage"_attr = redact(serializeToBSONForDebug()));
-        container->insert(itr, std::move(singleDocTransform));
-        container->erase(std::next(itr));
-        return true;
+            // Swap 'itr' and 'nextItr' list nodes.
+            container->splice(itr, *container, nextItr);
+            return true;
+        }
     }
     return false;
 }
@@ -305,23 +314,5 @@ std::unique_ptr<LiteParsedDocumentSource> throwOnParseLite(NamespaceString nss,
 MONGO_INITIALIZER_GROUP(BeginDocumentSourceRegistration,
                         ("default"),
                         ("EndDocumentSourceRegistration"))
-// Any remaining work on the parserMap should be done before finishing DocumentSource Registration.
-MONGO_INITIALIZER_WITH_PREREQUISITES(EndDocumentSourceRegistration,
-                                     ("BeginDocumentSourceRegistration"))
-(InitializerContext*) {
-    auto searchStageNames = {
-        "$vectorSearch"_sd, "$search"_sd, "$searchMeta"_sd, "$listSearchIndexes"_sd};
-    for (auto stageName : searchStageNames) {
-        auto searchIt = parserMap.find(stageName);
-        // If the stage has not been registered at this point, register a parser that errors
-        // with a useful error message on parsing a search stage.
-        if (searchIt == parserMap.end()) {
-            LiteParsedDocumentSource::registerParser(stageName.toString(),
-                                                     throwOnParseLite,
-                                                     AllowedWithApiStrict::kAlways,
-                                                     AllowedWithClientType::kAny);
-            DocumentSource::registerParser(stageName.toString(), throwOnParse, boost::none);
-        }
-    }
-}
+MONGO_INITIALIZER_GROUP(EndDocumentSourceRegistration, ("BeginDocumentSourceRegistration"), ())
 }  // namespace mongo

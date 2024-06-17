@@ -51,9 +51,9 @@ public:
      * would need to be done confirm support for both command and aggregation stages as is done for
      * the aggregate command.
      */
-    virtual ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
-                                                         repl::ReadConcernLevel level,
-                                                         bool isImplicitDefault) const {
+    ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
+                                                 repl::ReadConcernLevel level,
+                                                 bool isImplicitDefault) const override {
         static const Status kReadConcernNotSupported{ErrorCodes::InvalidOptions,
                                                      "read concern not supported"};
         static const Status kDefaultReadConcernNotPermitted{ErrorCodes::InvalidOptions,
@@ -68,7 +68,7 @@ public:
         return true;
     }
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return map_reduce_common::mrSupportsWriteConcern(cmd);
     }
 
@@ -102,7 +102,7 @@ public:
         auto builder = result->getBodyBuilder();
         auto explain = boost::make_optional(verbosity);
         try {
-            _explainImpl(opCtx, request.getDbName(), request.body, builder, explain);
+            _explainImpl(opCtx, request.parseDbName(), request.body, builder, explain);
         } catch (...) {
             return exceptionToStatus();
         }

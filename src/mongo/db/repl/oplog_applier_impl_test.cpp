@@ -75,7 +75,6 @@
 #include "mongo/db/change_stream_pre_images_collection_manager.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
@@ -94,6 +93,7 @@
 #include "mongo/db/repl/oplog_applier.h"
 #include "mongo/db/repl/oplog_applier_impl.h"
 #include "mongo/db/repl/oplog_applier_impl_test_fixture.h"
+#include "mongo/db/repl/oplog_applier_utils.h"
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/oplog_entry_gen.h"
@@ -117,6 +117,7 @@
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/db/tenant_id.h"
 #include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/update/document_diff_serialization.h"
 #include "mongo/db/update/update_oplog_entry_serialization.h"
 #include "mongo/executor/task_executor.h"
@@ -596,7 +597,7 @@ TEST_F(OplogApplierImplTest, CreateCollectionCommand) {
                                             const BSONObj&) {
         applyCmdCalled = true;
         ASSERT_TRUE(opCtx);
-        ASSERT_TRUE(opCtx->lockState()->isDbLockedForMode(nss.dbName(), MODE_IX));
+        ASSERT_TRUE(shard_role_details::getLocker(opCtx)->isDbLockedForMode(nss.dbName(), MODE_IX));
         ASSERT_EQUALS(nss, collNss);
         return Status::OK();
     };
@@ -622,7 +623,7 @@ TEST_F(OplogApplierImplTest, CreateCollectionCommandMultitenant) {
                                             const BSONObj&) {
         applyCmdCalled = true;
         ASSERT_TRUE(opCtx);
-        ASSERT_TRUE(opCtx->lockState()->isDbLockedForMode(nss.dbName(), MODE_IX));
+        ASSERT_TRUE(shard_role_details::getLocker(opCtx)->isDbLockedForMode(nss.dbName(), MODE_IX));
         ASSERT_TRUE(collNss.tenantId());
         ASSERT_EQ(tid, collNss.tenantId().get());
         ASSERT_EQUALS(nss, collNss);
@@ -657,7 +658,7 @@ TEST_F(OplogApplierImplTest, CreateCollectionCommandMultitenantRequireTenantIDFa
                                             const BSONObj&) {
         applyCmdCalled = true;
         ASSERT_TRUE(opCtx);
-        ASSERT_TRUE(opCtx->lockState()->isDbLockedForMode(nss.dbName(), MODE_IX));
+        ASSERT_TRUE(shard_role_details::getLocker(opCtx)->isDbLockedForMode(nss.dbName(), MODE_IX));
         ASSERT_TRUE(collNss.tenantId());
         ASSERT_EQ(tid, collNss.tenantId().get());
         ASSERT_EQUALS(nss, collNss);
@@ -700,7 +701,8 @@ TEST_F(OplogApplierImplTest, CreateCollectionCommandMultitenantAlreadyExists) {
                                             const BSONObj&) {
         applyCmdCalled = true;
         ASSERT_TRUE(opCtx);
-        ASSERT_TRUE(opCtx->lockState()->isDbLockedForMode(nssTenant2.dbName(), MODE_IX));
+        ASSERT_TRUE(
+            shard_role_details::getLocker(opCtx)->isDbLockedForMode(nssTenant2.dbName(), MODE_IX));
         ASSERT_TRUE(collNss.tenantId());
         ASSERT_EQ(tid2, collNss.tenantId().get());
         ASSERT_EQUALS(nssTenant2, collNss);
@@ -1828,7 +1830,8 @@ TEST_F(OplogApplierImplTest, ApplyApplyOpsSessionDeleteBeforeEarlierRetryableUpd
         NamespaceString::kAdminCommandNamespace,
         BSON("applyOps" << BSON_ARRAY(BSON("op"
                                            << "d"
-                                           << "ns" << NamespaceString::kConfigImagesNamespace.ns()
+                                           << "ns"
+                                           << redactTenant(NamespaceString::kConfigImagesNamespace)
                                            << "ui" << configImagesUUID << "o"
                                            << BSON("_id" << sessionId.toBSON())))));
 
@@ -1896,7 +1899,8 @@ TEST_F(OplogApplierImplTest, ApplyApplyOpsSessionDeleteAfterLaterRetryableUpdate
         NamespaceString::kAdminCommandNamespace,
         BSON("applyOps" << BSON_ARRAY(BSON("op"
                                            << "d"
-                                           << "ns" << NamespaceString::kConfigImagesNamespace.ns()
+                                           << "ns"
+                                           << redactTenant(NamespaceString::kConfigImagesNamespace)
                                            << "ui" << configImagesUUID << "o"
                                            << BSON("_id" << sessionId.toBSON())))));
 
@@ -2012,7 +2016,7 @@ protected:
                        const repl::OpTime& expectedOpTime,
                        Date_t expectedWallClock,
                        boost::optional<repl::OpTime> expectedStartOpTime,
-                       DurableTxnStateEnum expectedState) {
+                       boost::optional<DurableTxnStateEnum> expectedState) {
         repl::checkTxnTable(_opCtx.get(),
                             lsid,
                             txnNum,
@@ -2211,6 +2215,11 @@ TEST_F(MultiOplogEntryOplogApplierImplTest, MultiApplyUnpreparedTransactionTwoBa
     ASSERT_BSONOBJ_EQ(insertDocs[3], *(nss1It++));
 }
 
+OplogEntry addMultiOpType(OplogEntry op, MultiOplogEntryType multiOpType) {
+    return unittest::assertGet(OplogEntry::parse(op.getEntry().toBSON().addField(
+        BSON(OplogEntry::kMultiOpTypeFieldName << multiOpType).firstElement())));
+}
+
 TEST_F(MultiOplogEntryOplogApplierImplTest, MultiApplyTwoTransactionsOneBatch) {
     // Tests that two transactions on the same session ID in the same batch both
     // apply correctly.
@@ -2320,6 +2329,182 @@ TEST_F(MultiOplogEntryOplogApplierImplTest, MultiApplyTwoTransactionsOneBatch) {
     ASSERT_BSONOBJ_EQ(BSON("_id" << 2), *(nss1It++));
     ASSERT_BSONOBJ_EQ(BSON("_id" << 3), *(nss1It++));
     ASSERT_BSONOBJ_EQ(BSON("_id" << 4), *(nss1It++));
+}
+
+TEST_F(MultiOplogEntryOplogApplierImplTest, MultiApplyNontransactionalRetryableWriteLastInsert) {
+    // Tests a retryable write with two oplog entries, where the first is an applyOps and the
+    // second is an actual insert.  These should be applied nontransactionally.  The applyOps
+    // writes one document to nss1 and one to nss2, the insert writes one document to nss1.
+    std::vector<OplogEntry> insertOps;
+    std::vector<BSONObj> insertDocs;
+
+    const NamespaceString cmdNss = NamespaceString::createNamespaceString_forTest("admin", "$cmd");
+    insertDocs.push_back(BSON("_id" << 0));
+    insertDocs.push_back(BSON("_id" << 1));
+    insertDocs.push_back(BSON("_id" << 2));
+    auto applyOpsBson = BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                                           << "i"
+                                                           << "ns" << _nss1.ns_forTest() << "ui"
+                                                           << *_uuid1 << "o" << insertDocs[0])
+                                                      << BSON("op"
+                                                              << "i"
+                                                              << "ns" << _nss2.ns_forTest() << "ui"
+                                                              << *_uuid2 << "o" << insertDocs[1])));
+    auto applyOpsOp = addMultiOpType(
+        makeCommandOplogEntryWithSessionInfoAndStmtIds({Timestamp(Seconds(1), 1), 1LL},
+                                                       cmdNss,
+                                                       applyOpsBson,
+                                                       _lsid,
+                                                       _txnNum,
+                                                       {StmtId(0), StmtId(1)},
+                                                       OpTime()),
+        MultiOplogEntryType::kApplyOpsAppliedSeparately);
+    auto singleInsertOp =
+        makeInsertDocumentOplogEntryWithSessionInfoAndStmtIds({Timestamp(Seconds(1), 2), 1LL},
+                                                              _nss1,
+                                                              *_uuid1,
+                                                              insertDocs[2],
+                                                              _lsid,
+                                                              _txnNum,
+                                                              {StmtId(2)},
+                                                              applyOpsOp.getOpTime());
+    insertOps.push_back(singleInsertOp);
+
+    NoopOplogApplierObserver observer;
+    OplogApplierImpl oplogApplier(
+        nullptr,  // executor
+        nullptr,  // oplogBuffer
+        &observer,
+        ReplicationCoordinator::get(_opCtx.get()),
+        getConsistencyMarkers(),
+        getStorageInterface(),
+        repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
+        _writerPool.get());
+
+    // Insert the applyops entry in its own batch.  This should result in the oplog entry being
+    // written and the operations being applied.
+    const auto expectedStartOpTime = boost::none;  // Retryable writes don't have a startOpTime
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {applyOpsOp}));
+    ASSERT_EQ(1U, oplogDocs().size());
+    ASSERT_EQ(1U, _insertedDocs[_nss1].size());
+    ASSERT_EQ(1U, _insertedDocs[_nss2].size());
+    checkTxnTable(_lsid,
+                  _txnNum,
+                  applyOpsOp.getOpTime(),
+                  applyOpsOp.getWallClockTime(),
+                  expectedStartOpTime,
+                  boost::none);
+
+    // Insert the insert entry in its own batch.  This should result in the insert entry being
+    // written and the operations being applied.
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {singleInsertOp}));
+    ASSERT_EQ(2U, oplogDocs().size());
+    ASSERT_EQ(2U, _insertedDocs[_nss1].size());
+    ASSERT_EQ(1U, _insertedDocs[_nss2].size());
+    checkTxnTable(_lsid,
+                  _txnNum,
+                  singleInsertOp.getOpTime(),
+                  singleInsertOp.getWallClockTime(),
+                  expectedStartOpTime,
+                  boost::none);
+
+    auto nss1It = _insertedDocs[_nss1].begin();
+    auto nss2It = _insertedDocs[_nss2].begin();
+    ASSERT_BSONOBJ_EQ(insertDocs[0], *(nss1It++));
+    ASSERT_BSONOBJ_EQ(insertDocs[1], *(nss2It++));
+    ASSERT_BSONOBJ_EQ(insertDocs[2], *(nss1It++));
+}
+
+TEST_F(MultiOplogEntryOplogApplierImplTest, MultiApplyNontransactionalRetryableWriteThreeEntries) {
+    // Tests a retryable write with three oplog entries. These should be applied nontransactionally.
+    // Populate oplog entries with 6 inserts, three in nss1 and three in nss2.
+    std::vector<OplogEntry> insertOps;
+    std::vector<BSONObj> insertDocs;
+
+    const NamespaceString cmdNss = NamespaceString::createNamespaceString_forTest("admin", "$cmd");
+    for (int i = 0; i < 6; i += 2) {
+        insertDocs.push_back(BSON("_id" << i));
+        insertDocs.push_back(BSON("_id" << (i + 1)));
+        auto applyOpsBson =
+            BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                               << "i"
+                                               << "ns" << _nss1.ns_forTest() << "ui" << *_uuid1
+                                               << "o" << insertDocs[i])
+                                          << BSON("op"
+                                                  << "i"
+                                                  << "ns" << _nss2.ns_forTest() << "ui" << *_uuid2
+                                                  << "o" << insertDocs[i + 1])));
+        insertOps.push_back(addMultiOpType(makeCommandOplogEntryWithSessionInfoAndStmtIds(
+                                               {Timestamp(Seconds(1), i + 1), 1LL},
+                                               cmdNss,
+                                               applyOpsBson,
+                                               _lsid,
+                                               _txnNum,
+                                               {StmtId(i), StmtId(i + 1)},
+                                               i == 0 ? OpTime() : insertOps.back().getOpTime()),
+                                           MultiOplogEntryType::kApplyOpsAppliedSeparately));
+    }
+
+    NoopOplogApplierObserver observer;
+    OplogApplierImpl oplogApplier(
+        nullptr,  // executor
+        nullptr,  // oplogBuffer
+        &observer,
+        ReplicationCoordinator::get(_opCtx.get()),
+        getConsistencyMarkers(),
+        getStorageInterface(),
+        repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
+        _writerPool.get());
+
+    // Insert the first entry in its own batch.  This should result in the oplog entry being written
+    // and the operations being applied.
+    const auto expectedStartOpTime = boost::none;  // Retryable writes don't have a startOpTime
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {insertOps[0]}));
+    ASSERT_EQ(1U, oplogDocs().size());
+    ASSERT_EQ(1U, _insertedDocs[_nss1].size());
+    ASSERT_EQ(1U, _insertedDocs[_nss2].size());
+    checkTxnTable(_lsid,
+                  _txnNum,
+                  insertOps[0].getOpTime(),
+                  insertOps[0].getWallClockTime(),
+                  expectedStartOpTime,
+                  boost::none);
+
+    // Insert the second entry in its own batch.  This should result in the oplog entry being
+    // written and the operations being applied.
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {insertOps[1]}));
+    ASSERT_EQ(2U, oplogDocs().size());
+    ASSERT_EQ(2U, _insertedDocs[_nss1].size());
+    ASSERT_EQ(2U, _insertedDocs[_nss2].size());
+    checkTxnTable(_lsid,
+                  _txnNum,
+                  insertOps[1].getOpTime(),
+                  insertOps[1].getWallClockTime(),
+                  expectedStartOpTime,
+                  boost::none);
+
+    // Insert the last entry. This should result in the oplog entry being
+    // written and the operations being applied.
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), {insertOps[2]}));
+    ASSERT_EQ(3U, oplogDocs().size());
+    ASSERT_EQ(3U, _insertedDocs[_nss1].size());
+    ASSERT_EQ(3U, _insertedDocs[_nss2].size());
+    checkTxnTable(_lsid,
+                  _txnNum,
+                  insertOps[2].getOpTime(),
+                  insertOps[2].getWallClockTime(),
+                  expectedStartOpTime,
+                  boost::none);
+
+    // Check that we inserted the expected documents
+    auto nss1It = _insertedDocs[_nss1].begin();
+    auto nss2It = _insertedDocs[_nss2].begin();
+    ASSERT_BSONOBJ_EQ(insertDocs[0], *(nss1It++));
+    ASSERT_BSONOBJ_EQ(insertDocs[1], *(nss2It++));
+    ASSERT_BSONOBJ_EQ(insertDocs[2], *(nss1It++));
+    ASSERT_BSONOBJ_EQ(insertDocs[3], *(nss2It++));
+    ASSERT_BSONOBJ_EQ(insertDocs[4], *(nss1It++));
+    ASSERT_BSONOBJ_EQ(insertDocs[5], *(nss2It++));
 }
 
 class MultiOplogEntryOplogApplierImplTestMultitenant : public OplogApplierImplTest {
@@ -5773,6 +5958,18 @@ protected:
         return topLevelTxnOps;
     }
 
+    int getDocumentIdFromOp(const OplogEntry* op) {
+        switch (op->getOpType()) {
+            case OpTypeEnum::kInsert:
+            case OpTypeEnum::kDelete:
+                return op->getObject()["_id"].Int();
+            case OpTypeEnum::kUpdate:
+                return (*op->getObject2())["_id"].Int();
+            default:
+                MONGO_UNREACHABLE
+        }
+    }
+
 protected:
     std::unique_ptr<TrackOpsAppliedApplier> _applier;
     std::unique_ptr<ThreadPool> _writerPool;
@@ -5958,6 +6155,143 @@ TEST_F(PreparedTxnSplitTest, SingleEmptyPrepareTransaction) {
             ASSERT_EQ(boost::none, commitWriter[0].preparedTxnOps);
         }
     }
+}
+
+// For the SinglePreparedTxnMultipleOpsOnOneDoc, we need to make sure we don't fail spuriously
+// due to a hash collision.
+int findDocIdWithSeparateWriterId(
+    OperationContext* opCtx, const NamespaceString& nss, UUID uuid, int docId, int nWriters) {
+
+    invariant(nWriters > 1);
+    const int itersToCheck = std::min(nWriters, 10);
+    CachedCollectionProperties collPropertiesCache;
+    auto oplogEntry1 =
+        makeOplogEntry(OpTypeEnum::kInsert, nss, uuid, BSON("_id" << docId), boost::none);
+    uint32_t id1 =
+        OplogApplierUtils::getOplogEntryHash(opCtx, &oplogEntry1, &collPropertiesCache) % nWriters;
+    for (int newDocId = 1 + docId; newDocId <= docId + itersToCheck; newDocId++) {
+        auto oplogEntry2 =
+            makeOplogEntry(OpTypeEnum::kInsert, nss, uuid, BSON("_id" << newDocId), boost::none);
+        uint32_t id2 =
+            OplogApplierUtils::getOplogEntryHash(opCtx, &oplogEntry2, &collPropertiesCache) %
+            nWriters;
+        if (id1 != id2)
+            return newDocId;
+    }
+    invariant(false,
+              str::stream() << "Unable to find a non-colliding doc ID between " << docId + 1
+                            << " and " << docId + itersToCheck << " inclusive");
+    MONGO_UNREACHABLE;
+}
+
+TEST_F(PreparedTxnSplitTest, SinglePreparedTxnMultipleOpsOnOneDoc) {
+    std::vector<OplogEntry> prepareOps;
+    const int kNumDocuments = 2;
+    const int kNumOpsPerDoc = 3;
+    const int kNumApplierThreads = 100;
+    const int kDocID1 = 1001;
+    const int kDocID2 =
+        findDocIdWithSeparateWriterId(_opCtx.get(), _nss, *_uuid, kDocID1, kNumApplierThreads);
+
+    // Construct one insert, one update and one delete op for each document.
+    std::vector<BSONObj> cruds;
+    cruds.push_back(BSON("op"
+                         << "i"
+                         << "ns" << _nss.ns_forTest() << "ui" << *_uuid << "o"
+                         << BSON("_id" << kDocID1)));
+    cruds.push_back(BSON("op"
+                         << "i"
+                         << "ns" << _nss.ns_forTest() << "ui" << *_uuid << "o"
+                         << BSON("_id" << kDocID2)));
+    cruds.push_back(BSON("op"
+                         << "u"
+                         << "ns" << _nss.ns_forTest() << "ui" << *_uuid << "o" << BSON("a" << 11)
+                         << "o2" << BSON("_id" << kDocID1)));
+    cruds.push_back(BSON("op"
+                         << "u"
+                         << "ns" << _nss.ns_forTest() << "ui" << *_uuid << "o" << BSON("a" << 12)
+                         << "o2" << BSON("_id" << kDocID2)));
+    cruds.push_back(BSON("op"
+                         << "d"
+                         << "ns" << _nss.ns_forTest() << "ui" << *_uuid << "o"
+                         << BSON("_id" << kDocID1)));
+    cruds.push_back(BSON("op"
+                         << "d"
+                         << "ns" << _nss.ns_forTest() << "ui" << *_uuid << "o"
+                         << BSON("_id" << kDocID2)));
+
+    prepareOps.push_back(makePrepareOplogEntry(cruds, {Timestamp(1, 1), 1}, _lsid1, _txnNum1));
+
+    WriterVectors prepareWriterVectors(kNumApplierThreads);
+    std::vector<std::vector<OplogEntry>> derivedPrepareOps;
+    _applier->fillWriterVectors_forTest(
+        _opCtx.get(), &prepareOps, &prepareWriterVectors, &derivedPrepareOps);
+
+    // Verify the config.transactions collection got an entry for the prepared transaction.
+    int txnTableOps = filterConfigTransactionsEntriesFromWriterVectors(prepareWriterVectors);
+    ASSERT_EQ(1, txnTableOps);
+
+    // Verify each top-level transaction has a corresponding prepare entry in the writerVectors.
+    int topLevelTxnOps = filterTopLevelTxnEntriesFromWriterVectors(prepareWriterVectors);
+    ASSERT_EQ(1, topLevelTxnOps);
+
+    // Test that applying a commitTransaction in the next batch will correctly split the entry
+    // and add it into those writer vectors that previously got assigned the prepare entry.
+    std::vector<OplogEntry> commitOps;
+    commitOps.push_back(makeCommitOplogEntry(
+        {Timestamp(3, 1), 1}, Timestamp(2, 1), _lsid1, _txnNum1, prepareOps[0].getOpTime()));
+
+    WriterVectors commitWriterVectors(kNumApplierThreads);
+    std::vector<std::vector<OplogEntry>> derivedCommitOps;
+    _applier->fillWriterVectors_forTest(
+        _opCtx.get(), &commitOps, &commitWriterVectors, &derivedCommitOps);
+
+    // Verify the config.transactions collection got an entry for the commit op.
+    txnTableOps = filterConfigTransactionsEntriesFromWriterVectors(commitWriterVectors);
+    ASSERT_EQ(1, txnTableOps);
+
+    // Verify each top-level transaction has a corresponding commit entry in the writerVectors.
+    topLevelTxnOps = filterTopLevelTxnEntriesFromWriterVectors(commitWriterVectors);
+    ASSERT_EQ(1, topLevelTxnOps);
+
+    // Verify that ops on the same document are grouped into the same split transaction.
+    int splitTxnCount = 0;
+    std::set<int> docIDs;
+    std::set<int> expectDocIDs{kDocID1, kDocID2};
+
+    for (size_t i = 0; i < kNumApplierThreads; ++i) {
+        auto& prepareWriter = prepareWriterVectors[i];
+        auto& commitWriter = commitWriterVectors[i];
+
+        if (prepareWriter.size()) {
+            ++splitTxnCount;
+            ASSERT_EQ(1, prepareWriter.size());
+            ASSERT_EQ(1, commitWriter.size());
+
+            ASSERT_EQ(ApplicationInstruction::applySplitPreparedTxnOp,
+                      prepareWriter[0].instruction);
+            ASSERT_TRUE(prepareWriter[0]->shouldPrepare());
+            ASSERT_NE(boost::none, prepareWriter[0].subSession);
+            ASSERT_NE(boost::none, prepareWriter[0].preparedTxnOps);
+            ASSERT_EQ(kNumOpsPerDoc, prepareWriter[0].preparedTxnOps->size());
+
+            // Check all ops in one split transaction are on the same document.
+            const auto& ops = *prepareWriter[0].preparedTxnOps;
+            const int firstDocID = getDocumentIdFromOp(ops[0]);
+            ASSERT_TRUE(std::all_of(ops.begin(), ops.end(), [=, this](const auto op) {
+                return getDocumentIdFromOp(op) == firstDocID;
+            }));
+            docIDs.insert(firstDocID);
+
+            ASSERT_EQ(ApplicationInstruction::applySplitPreparedTxnOp, commitWriter[0].instruction);
+            ASSERT_TRUE(commitWriter[0]->isPreparedCommit());
+            ASSERT_EQ(prepareWriter[0].subSession->getSessionId(),
+                      commitWriter[0].subSession->getSessionId());
+            ASSERT_EQ(boost::none, commitWriter[0].preparedTxnOps);
+        }
+    }
+    ASSERT_EQ(kNumDocuments, splitTxnCount);
+    ASSERT_EQ(expectDocIDs, docIDs);
 }
 
 class GlobalIndexTest : public OplogApplierImplTest {

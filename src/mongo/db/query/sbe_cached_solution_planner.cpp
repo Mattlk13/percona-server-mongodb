@@ -39,9 +39,7 @@
 #include "mongo/db/exec/sbe/stages/plan_stats.h"
 #include "mongo/db/exec/trial_period_utils.h"
 #include "mongo/db/exec/trial_run_tracker.h"
-#include "mongo/db/namespace_string.h"
-#include "mongo/db/query/get_executor.h"
-#include "mongo/db/query/optimizer/explain_interface.h"
+#include "mongo/db/query/bind_input_params.h"
 #include "mongo/db/query/plan_cache.h"
 #include "mongo/db/query/plan_cache_key_factory.h"
 #include "mongo/db/query/plan_explainer.h"
@@ -50,6 +48,7 @@
 #include "mongo/db/query/planner_analysis.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_planner.h"
+#include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/sbe_cached_solution_planner.h"
 #include "mongo/db/query/sbe_multi_planner.h"
 #include "mongo/db/query/sbe_plan_cache.h"
@@ -60,7 +59,6 @@
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
 #include "mongo/logv2/redaction.h"
-#include "mongo/platform/atomic_proxy.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
@@ -69,16 +67,16 @@
 
 
 namespace mongo::sbe {
+
 CandidatePlans CachedSolutionPlanner::plan(
+    const QueryPlannerParams& plannerParams,
     std::vector<std::unique_ptr<QuerySolution>> solutions,
     std::vector<std::pair<std::unique_ptr<PlanStage>, stage_builder::PlanStageData>> roots) {
     if (!_cq.cqPipeline().empty()) {
         // We'd like to check if there is any foreign collection in the hash_lookup stage that is no
         // longer eligible for using a hash_lookup plan. In this case we invalidate the cache and
         // immediately replan without ever running a trial period.
-        auto secondaryCollectionsInfo =
-            fillOutSecondaryCollectionsInformation(_opCtx, _collections, &_cq);
-
+        const auto& secondaryCollectionsInfo = plannerParams.secondaryCollectionsInfo;
         for (const auto& foreignCollection :
              roots[0].second.staticData->foreignHashJoinCollections) {
             const auto collectionInfo = secondaryCollectionsInfo.find(foreignCollection);
@@ -88,17 +86,20 @@ CandidatePlans CachedSolutionPlanner::plan(
             tassert(6693501, "Foreign collection must exist", collectionInfo->second.exists);
 
             if (!QueryPlannerAnalysis::isEligibleForHashJoin(collectionInfo->second)) {
-                return replan(/* shouldCache */ true,
+                return replan(plannerParams,
+                              /* shouldCache */ true,
                               str::stream() << "Foreign collection "
                                             << foreignCollection.toStringForErrorMsg()
-                                            << " is not eligible for hash join anymore");
+                                            << " is not eligible for hash join anymore",
+                              _remoteCursors);
             }
         }
     }
     // If the '_decisionReads' is not present then we do not run a trial period, keeping the current
     // plan.
     if (!_decisionReads) {
-        prepareExecutionPlan(roots[0].first.get(), &roots[0].second, true /* preparingFromCache */);
+        _trialRuntimeExecutor.prepareExecutionPlan(
+            roots[0].first.get(), &roots[0].second, true /* preparingFromCache */, _remoteCursors);
         roots[0].first->open(false /* reOpen */);
         return {makeVector(plan_ranker::CandidatePlan{
                     std::move(solutions[0]),
@@ -129,9 +130,19 @@ CandidatePlans CachedSolutionPlanner::plan(
                                                   {},    /* rejectedCandidates */
                                                   false, /* isMultiPlan */
                                                   true,  /* isFromPlanCache */
+                                                  true,  /* matchesCachedPlan */
                                                   candidate.data.stageData.debugInfo);
 
     if (!candidate.status.isOK()) {
+        // Recover $where expression JS function predicate from the SBE runtime environemnt, if
+        // necessary, so we could successfully replan the query. The primary match expression
+        // was modified during the input parameters bind-in process while we were collecting
+        // execution stats above.
+        if (_cq.getExpCtxRaw()->hasWhereClause) {
+            input_params::recoverWhereExprPredicate(_cq.getPrimaryMatchExpression(),
+                                                    candidate.data.stageData);
+        }
+
         // On failure, fall back to replanning the whole query. We neither evict the existing cache
         // entry, nor cache the result of replanning.
         LOGV2_DEBUG(2057901,
@@ -139,7 +150,9 @@ CandidatePlans CachedSolutionPlanner::plan(
                     "Execution of cached plan failed, falling back to replan",
                     "query"_attr = redact(_cq.toStringShort()),
                     "planSummary"_attr = explainer->getPlanSummary());
-        return replan(false, str::stream() << "cached plan returned: " << candidate.status);
+        return replan(plannerParams,
+                      /* shouldCache */ false,
+                      str::stream() << "cached plan returned: " << candidate.status);
     }
 
     // If the trial run did not exit early, it means no replanning is necessary and can return this
@@ -154,6 +167,16 @@ CandidatePlans CachedSolutionPlanner::plan(
     auto visitor = PlanStatsNumReadsVisitor{};
     candidate.root->accumulate(kEmptyPlanNodeId, &visitor);
     const auto numReads = visitor.numReads;
+
+    // Recover $where expression JS function predicate from the SBE runtime environemnt, if
+    // necessary, so we could successfully replan the query. The primary match expression was
+    // modified during the input parameters bind-in process while we were collecting execution
+    // stats above.
+    if (_cq.getExpCtxRaw()->hasWhereClause) {
+        input_params::recoverWhereExprPredicate(_cq.getPrimaryMatchExpression(),
+                                                candidate.data.stageData);
+    }
+
     LOGV2_DEBUG(
         2058001,
         1,
@@ -164,7 +187,8 @@ CandidatePlans CachedSolutionPlanner::plan(
         "query"_attr = redact(_cq.toStringShort()),
         "planSummary"_attr = explainer->getPlanSummary());
     return replan(
-        true,
+        plannerParams,
+        /* shouldCache */ true,
         str::stream()
             << "cached plan was less efficient than expected: expected trial execution to take "
             << *_decisionReads << " reads but it took at least " << numReads << " reads");
@@ -205,15 +229,21 @@ plan_ranker::CandidatePlan CachedSolutionPlanner::collectExecutionStatsForCached
                 MONGO_UNREACHABLE;
         }
     };
-    candidate.data.tracker = std::make_unique<TrialRunTracker>(
-        std::move(onMetricReached), maxNumResults, maxTrialPeriodNumReads);
+    candidate.data.tracker =
+        std::make_unique<TrialRunTracker>(std::move(onMetricReached),
+                                          maxNumResults,
+                                          maxTrialPeriodNumReads,
+                                          size_t{0} /*kNumPlanningResults - used only in crp_sbe*/);
     candidate.root->attachToTrialRunTracker(candidate.data.tracker.get());
-    executeCachedCandidateTrial(&candidate, maxNumResults);
+    _trialRuntimeExecutor.executeCachedCandidateTrial(&candidate, maxNumResults);
 
     return candidate;
 }
 
-CandidatePlans CachedSolutionPlanner::replan(bool shouldCache, std::string reason) const {
+CandidatePlans CachedSolutionPlanner::replan(const QueryPlannerParams& plannerParams,
+                                             bool shouldCache,
+                                             std::string reason,
+                                             RemoteCursorMap* remoteCursors) const {
     // The plan drawn from the cache is being discarded, and should no longer be registered with the
     // yield policy.
     _yieldPolicy->clearRegisteredPlans();
@@ -221,7 +251,8 @@ CandidatePlans CachedSolutionPlanner::replan(bool shouldCache, std::string reaso
     if (shouldCache) {
         // Deactivate the current cache entry.
         auto&& sbePlanCache = sbe::getPlanCache(_opCtx);
-        sbePlanCache.deactivate(plan_cache_key_factory::make(_cq, _collections));
+        sbePlanCache.deactivate(plan_cache_key_factory::make(
+            _cq, _collections, canonical_query_encoder::Optimizer::kSbeStageBuilders));
     }
 
     auto buildExecutableTree = [&](const QuerySolution& sol) {
@@ -231,24 +262,24 @@ CandidatePlans CachedSolutionPlanner::replan(bool shouldCache, std::string reaso
         return std::make_pair(std::move(root), std::move(data));
     };
 
-    QueryPlannerParams plannerParams;
-    plannerParams.options = _queryParams.options;
-    fillOutPlannerParams(_opCtx, _collections, &_cq, &plannerParams);
+    // The trial run might have allowed DDL commands to be executed during yields. Check if the
+    // provided planner parameters still match the current view of the index catalog.
+    _indexExistenceChecker.check(_opCtx, _collections);
+
     // Use the query planning module to plan the whole query.
     auto statusWithMultiPlanSolns = QueryPlanner::plan(_cq, plannerParams);
     auto solutions = uassertStatusOK(std::move(statusWithMultiPlanSolns));
 
     if (solutions.size() == 1) {
         if (!_cq.cqPipeline().empty()) {
-            auto secondaryCollectionsInfo =
-                fillOutSecondaryCollectionsInformation(_opCtx, _collections, &_cq);
             solutions[0] = QueryPlanner::extendWithAggPipeline(
-                _cq, std::move(solutions[0]), secondaryCollectionsInfo);
+                _cq, std::move(solutions[0]), plannerParams.secondaryCollectionsInfo);
         }
 
         // Only one possible plan. Build the stages from the solution.
         auto [root, data] = buildExecutableTree(*solutions[0]);
-        prepareExecutionPlan(root.get(), &data, false /*preparingFromCache*/);
+        _trialRuntimeExecutor.prepareExecutionPlan(
+            root.get(), &data, false /*preparingFromCache*/, remoteCursors);
         root->open(false /* reOpen */);
 
         auto explainer = plan_explainer_factory::make(root.get(), &data, solutions[0].get());
@@ -274,8 +305,9 @@ CandidatePlans CachedSolutionPlanner::replan(bool shouldCache, std::string reaso
 
     const auto cachingMode =
         shouldCache ? PlanCachingMode::AlwaysCache : PlanCachingMode::NeverCache;
-    MultiPlanner multiPlanner{_opCtx, _collections, _cq, plannerParams, cachingMode, _yieldPolicy};
-    auto&& [candidates, winnerIdx] = multiPlanner.plan(std::move(solutions), std::move(roots));
+    MultiPlanner multiPlanner{_opCtx, _collections, _cq, cachingMode, _yieldPolicy};
+    auto&& [candidates, winnerIdx] =
+        multiPlanner.plan(plannerParams, std::move(solutions), std::move(roots));
     auto explainer = plan_explainer_factory::make(candidates[winnerIdx].root.get(),
                                                   &candidates[winnerIdx].data.stageData,
                                                   candidates[winnerIdx].solution.get());

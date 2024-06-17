@@ -55,7 +55,6 @@
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/exception_util.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_build_interceptor.h"
@@ -70,6 +69,7 @@
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -108,7 +108,7 @@ IndexBuildInterceptor::IndexBuildInterceptor(OperationContext* opCtx,
                                              boost::optional<StringData> skippedRecordTrackerIdent)
     : _sideWritesTable(
           opCtx->getServiceContext()->getStorageEngine()->makeTemporaryRecordStoreFromExistingIdent(
-              opCtx, sideWritesIdent)),
+              opCtx, sideWritesIdent, KeyFormat::Long)),
       _skippedRecordTracker(opCtx, skippedRecordTrackerIdent),
       _skipNumAppliedCheck(true) {
 
@@ -153,7 +153,7 @@ Status IndexBuildInterceptor::drainWritesIntoIndex(OperationContext* opCtx,
                                                    const InsertDeleteOptions& options,
                                                    TrackDuplicates trackDuplicates,
                                                    DrainYieldPolicy drainYieldPolicy) {
-    invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
     // These are used for logging only.
     int64_t totalDeleted = 0;
@@ -206,7 +206,7 @@ Status IndexBuildInterceptor::drainWritesIntoIndex(OperationContext* opCtx,
         // Note that index builds will only "resume" once. A second resume results in the index
         // build starting from scratch. A "resumed" index build does not use a majority read
         // concern. And thus will observe data that can be rolled back via replication.
-        opCtx->recoveryUnit()->allowOneUntimestampedWrite();
+        shard_role_details::getRecoveryUnit(opCtx)->allowOneUntimestampedWrite();
         WriteUnitOfWork wuow(opCtx);
 
         int32_t batchSize = 0;
@@ -372,10 +372,10 @@ void IndexBuildInterceptor::_yield(OperationContext* opCtx,
                                    const IndexCatalogEntry* indexCatalogEntry,
                                    const Yieldable* yieldable) {
     // Releasing locks means a new snapshot should be acquired when restored.
-    opCtx->recoveryUnit()->abandonSnapshot();
+    shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
     yieldable->yield();
 
-    auto locker = opCtx->lockState();
+    auto locker = shard_role_details::getLocker(opCtx);
     Locker::LockSnapshot snapshot;
     locker->saveLockStateAndUnlock(&snapshot);
 
@@ -456,7 +456,7 @@ Status IndexBuildInterceptor::_finishSideWrite(OperationContext* opCtx,
     // This insert may roll back, but not necessarily from inserting into this table. If other write
     // operations outside this table and in the same transaction are rolled back, this counter also
     // needs to be rolled back.
-    opCtx->recoveryUnit()->onRollback(
+    shard_role_details::getRecoveryUnit(opCtx)->onRollback(
         [sharedCounter = _sideWritesCounter, size = toInsert.size()](OperationContext*) {
             sharedCounter->fetchAndSubtract(size);
         });
@@ -488,7 +488,7 @@ Status IndexBuildInterceptor::sideWrite(OperationContext* opCtx,
                                         const MultikeyPaths& multikeyPaths,
                                         Op op,
                                         int64_t* const numKeysOut) {
-    invariant(opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
     invariant(op != IndexBuildInterceptor::Op::kUpdate);
 
     // Maintain parity with IndexAccessMethods handling of key counting. Only include
@@ -560,7 +560,7 @@ Status IndexBuildInterceptor::sideWrite(OperationContext* opCtx,
                                         const std::vector<column_keygen::CellPatch>& keys,
                                         int64_t* const numKeysWrittenOut,
                                         int64_t* const numKeysDeletedOut) {
-    invariant(opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
     int64_t numKeysWritten = 0;
     int64_t numKeysDeleted = 0;

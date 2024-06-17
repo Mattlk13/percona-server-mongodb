@@ -107,7 +107,7 @@
 #include "mongo/db/query/expression_walker.h"
 #include "mongo/db/query/find_command.h"
 #include "mongo/db/query/projection_policies.h"
-#include "mongo/db/query/query_decorations.h"
+#include "mongo/db/query/query_knob_configuration.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/tree_walker.h"
 #include "mongo/db/server_parameter.h"
@@ -131,17 +131,14 @@ using namespace optimizer;
 namespace {
 
 /**
- * Visitor that is responsible for indicating whether a MatchExpression is eligible for Bonsai by
- * setting the '_eligible' member variable. Expressions which are "test-only" and not officially
- * supported should set _eligible to false.
+ * Visitor that is responsible for indicating whether a MatchExpression is eligible for Bonsai
+ * by setting the '_eligibility' member variable. Expressions which are "test-only" and not
+ * officially supported should set _eligibility to Ineligible.
  */
 class ABTMatchExpressionVisitor : public MatchExpressionConstVisitor {
 public:
-    ABTMatchExpressionVisitor(bool& eligible,
-                              QueryFrameworkControlEnum frameworkControl,
-                              bool queryHasNaturalHint)
-        : _eligible(eligible),
-          _frameworkControl(frameworkControl),
+    ABTMatchExpressionVisitor(bool queryHasNaturalHint)
+        : _eligibility(BonsaiEligibility::FullyEligible),
           _queryHasNaturalHint(queryHasNaturalHint) {}
 
     void visit(const LTEMatchExpression* expr) override {
@@ -171,15 +168,13 @@ public:
         // Dotted path equality to null is not supported.
         const auto fieldRef = expr->fieldRef();
         if (fieldRef && fieldRef->numParts() > 1) {
-            _eligible &= std::none_of(expr->getEqualities().begin(),
-                                      expr->getEqualities().end(),
-                                      [](auto&& elt) { return elt.isNull(); });
+            _eligibility.setIneligibleIf(std::any_of(expr->getEqualities().begin(),
+                                                     expr->getEqualities().end(),
+                                                     [](auto&& elt) { return elt.isNull(); }));
         }
 
         // $in over a regex predicate is not supported.
-        if (!expr->getRegexes().empty()) {
-            _eligible = false;
-        }
+        _eligibility.setIneligibleIf(!expr->getRegexes().empty());
     }
     void visit(const ExistsMatchExpression* expr) override {
         assertSupportedPathExpression(expr);
@@ -373,9 +368,13 @@ public:
         unsupportedExpression(expr);
     }
 
+    const BonsaiEligibility& eligibility() const {
+        return _eligibility;
+    }
+
 private:
     void unsupportedExpression(const MatchExpression* expr) {
-        _eligible = false;
+        _eligibility.setIneligible();
     }
 
     void assertSupportedComparisonMatchExpression(const ComparisonMatchExpression* expr) {
@@ -383,636 +382,639 @@ private:
 
         // Dotted path equality to null is not supported.
         const auto fieldRef = expr->fieldRef();
-        if (fieldRef && fieldRef->numParts() > 1 && expr->getData().isNull()) {
-            _eligible = false;
-        }
+        _eligibility.setIneligibleIf(fieldRef && fieldRef->numParts() > 1 &&
+                                     expr->getData().isNull());
     }
 
     void assertSupportedPathExpression(const PathMatchExpression* expr) {
         const auto fieldRef = FieldRef(expr->path());
-        if (fieldRef.hasNumericPathComponents())
-            _eligible = false;
+        _eligibility.setIneligibleIf(fieldRef.hasNumericPathComponents());
 
-        // In M2, match expressions which compare against _id should fall back because they could
-        // use the _id index unless the query has a $natural hint.
-        if (!fieldRef.empty() && fieldRef.getPart(0) == "_id" &&
-            _frameworkControl == QueryFrameworkControlEnum::kTryBonsai && !_queryHasNaturalHint) {
-            _eligible = false;
+        // Match expressions which compare against _id are only fully eligible if the query has a
+        // $natural hint. Otherwise, they could use the _id index.
+        if (!fieldRef.empty() && fieldRef.getPart(0) == "_id" && !_queryHasNaturalHint) {
+            _eligibility.minOf(BonsaiEligibility::Experimental);
         }
     }
 
-    bool& _eligible;
-    const QueryFrameworkControlEnum _frameworkControl;
+    BonsaiEligibility _eligibility;
     bool _queryHasNaturalHint;
 };
 
 class ABTUnsupportedAggExpressionVisitor : public ExpressionConstVisitor {
 public:
-    ABTUnsupportedAggExpressionVisitor(bool& eligible) : _eligible(eligible) {}
+    ABTUnsupportedAggExpressionVisitor() : _eligibility(BonsaiEligibility::FullyEligible) {}
 
-    void visit(const ExpressionConstant* expr) override final {
+    void visit(const ExpressionConstant* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionAbs* expr) override final {
+    void visit(const ExpressionAbs* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionAdd* expr) override final {
+    void visit(const ExpressionAdd* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionAllElementsTrue* expr) override final {
+    void visit(const ExpressionAllElementsTrue* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionAnd* expr) override final {
+    void visit(const ExpressionAnd* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionAnyElementTrue* expr) override final {
+    void visit(const ExpressionAnyElementTrue* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionArray* expr) override final {
+    void visit(const ExpressionArray* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionArrayElemAt* expr) override final {
+    void visit(const ExpressionArrayElemAt* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionBitAnd* expr) override final {
+    void visit(const ExpressionBitAnd* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionBitOr* expr) override final {
+    void visit(const ExpressionBitOr* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionBitXor* expr) override final {
+    void visit(const ExpressionBitXor* expr) final {
         unsupportedExpression();
     }
-    void visit(const ExpressionBitNot* expr) override final {
+    void visit(const ExpressionBitNot* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionFirst* expr) override final {
+    void visit(const ExpressionFirst* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionLast* expr) override final {
+    void visit(const ExpressionLast* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionObjectToArray* expr) override final {
+    void visit(const ExpressionObjectToArray* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionArrayToObject* expr) override final {
+    void visit(const ExpressionArrayToObject* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionBsonSize* expr) override final {
+    void visit(const ExpressionBsonSize* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionCeil* expr) override final {
+    void visit(const ExpressionCeil* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionCoerceToBool* expr) override final {
+    void visit(const ExpressionCoerceToBool* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionCompare* expr) override final {
+    void visit(const ExpressionCompare* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionConcat* expr) override final {
+    void visit(const ExpressionConcat* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionConcatArrays* expr) override final {
+    void visit(const ExpressionConcatArrays* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionCond* expr) override final {
+    void visit(const ExpressionCond* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionDateFromString* expr) override final {
+    void visit(const ExpressionDateFromString* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionDateFromParts* expr) override final {
+    void visit(const ExpressionDateFromParts* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionDateDiff* expr) override final {
+    void visit(const ExpressionDateDiff* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionDateToParts* expr) override final {
+    void visit(const ExpressionDateToParts* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionDateToString* expr) override final {
+    void visit(const ExpressionDateToString* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionDateTrunc* expr) override final {
+    void visit(const ExpressionDateTrunc* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionDivide* expr) override final {
+    void visit(const ExpressionDivide* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionExp* expr) override final {
+    void visit(const ExpressionExp* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionFieldPath* expr) override final {
+    void visit(const ExpressionFieldPath* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionFilter* expr) override final {
+    void visit(const ExpressionFilter* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionFloor* expr) override final {
+    void visit(const ExpressionFloor* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionIfNull* expr) override final {
+    void visit(const ExpressionIfNull* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionIn* expr) override final {
+    void visit(const ExpressionIn* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionIndexOfArray* expr) override final {
+    void visit(const ExpressionIndexOfArray* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionIndexOfBytes* expr) override final {
+    void visit(const ExpressionIndexOfBytes* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionIndexOfCP* expr) override final {
+    void visit(const ExpressionIndexOfCP* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionIsNumber* expr) override final {
+    void visit(const ExpressionIsNumber* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionLet* expr) override final {
+    void visit(const ExpressionLet* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionLn* expr) override final {
+    void visit(const ExpressionLn* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionLog* expr) override final {
+    void visit(const ExpressionLog* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionLog10* expr) override final {
+    void visit(const ExpressionLog10* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionInternalFLEEqual* expr) override final {
+    void visit(const ExpressionInternalFLEEqual* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionInternalFLEBetween* expr) override final {
+    void visit(const ExpressionInternalFLEBetween* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionMap* expr) override final {
+    void visit(const ExpressionMap* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionMeta* expr) override final {
+    void visit(const ExpressionMeta* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionMod* expr) override final {
+    void visit(const ExpressionMod* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionMultiply* expr) override final {
+    void visit(const ExpressionMultiply* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionNot* expr) override final {
+    void visit(const ExpressionNot* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionObject* expr) override final {
+    void visit(const ExpressionObject* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionOr* expr) override final {
+    void visit(const ExpressionOr* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionPow* expr) override final {
+    void visit(const ExpressionPow* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionRange* expr) override final {
+    void visit(const ExpressionRange* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionReduce* expr) override final {
+    void visit(const ExpressionReduce* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionReplaceOne* expr) override final {
+    void visit(const ExpressionReplaceOne* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionReplaceAll* expr) override final {
+    void visit(const ExpressionReplaceAll* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionSetDifference* expr) override final {
+    void visit(const ExpressionSetDifference* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionSetEquals* expr) override final {
+    void visit(const ExpressionSetEquals* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionSetIntersection* expr) override final {
+    void visit(const ExpressionSetIntersection* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionSetIsSubset* expr) override final {
+    void visit(const ExpressionSetIsSubset* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionSetUnion* expr) override final {
+    void visit(const ExpressionSetUnion* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionSize* expr) override final {
+    void visit(const ExpressionSize* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionReverseArray* expr) override final {
+    void visit(const ExpressionReverseArray* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionSortArray* expr) override final {
+    void visit(const ExpressionSortArray* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionSlice* expr) override final {
+    void visit(const ExpressionSlice* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionIsArray* expr) override final {
+    void visit(const ExpressionIsArray* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionInternalFindAllValuesAtPath* expr) override final {
+    void visit(const ExpressionInternalFindAllValuesAtPath* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionRound* expr) override final {
+    void visit(const ExpressionRound* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionSplit* expr) override final {
+    void visit(const ExpressionSplit* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionSqrt* expr) override final {
+    void visit(const ExpressionSqrt* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionStrcasecmp* expr) override final {
+    void visit(const ExpressionStrcasecmp* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionSubstrBytes* expr) override final {
+    void visit(const ExpressionSubstrBytes* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionSubstrCP* expr) override final {
+    void visit(const ExpressionSubstrCP* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionStrLenBytes* expr) override final {
+    void visit(const ExpressionStrLenBytes* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionBinarySize* expr) override final {
+    void visit(const ExpressionBinarySize* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionStrLenCP* expr) override final {
+    void visit(const ExpressionStrLenCP* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionSubtract* expr) override final {
+    void visit(const ExpressionSubtract* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionSwitch* expr) override final {
+    void visit(const ExpressionSwitch* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionTestApiVersion* expr) override final {
+    void visit(const ExpressionTestApiVersion* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionToLower* expr) override final {
+    void visit(const ExpressionToLower* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionToUpper* expr) override final {
+    void visit(const ExpressionToUpper* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionTrim* expr) override final {
+    void visit(const ExpressionTrim* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionTrunc* expr) override final {
+    void visit(const ExpressionTrunc* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionType* expr) override final {
+    void visit(const ExpressionType* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionZip* expr) override final {
+    void visit(const ExpressionZip* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionConvert* expr) override final {
+    void visit(const ExpressionConvert* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionRegexFind* expr) override final {
+    void visit(const ExpressionRegexFind* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionRegexFindAll* expr) override final {
+    void visit(const ExpressionRegexFindAll* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionRegexMatch* expr) override final {
+    void visit(const ExpressionRegexMatch* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionCosine* expr) override final {
+    void visit(const ExpressionCosine* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionSine* expr) override final {
+    void visit(const ExpressionSine* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionTangent* expr) override final {
+    void visit(const ExpressionTangent* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionArcCosine* expr) override final {
+    void visit(const ExpressionArcCosine* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionArcSine* expr) override final {
+    void visit(const ExpressionArcSine* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionArcTangent* expr) override final {
+    void visit(const ExpressionArcTangent* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionArcTangent2* expr) override final {
+    void visit(const ExpressionArcTangent2* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionHyperbolicArcTangent* expr) override final {
+    void visit(const ExpressionHyperbolicArcTangent* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionHyperbolicArcCosine* expr) override final {
+    void visit(const ExpressionHyperbolicArcCosine* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionHyperbolicArcSine* expr) override final {
+    void visit(const ExpressionHyperbolicArcSine* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionHyperbolicTangent* expr) override final {
+    void visit(const ExpressionHyperbolicTangent* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionHyperbolicCosine* expr) override final {
+    void visit(const ExpressionHyperbolicCosine* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionHyperbolicSine* expr) override final {
+    void visit(const ExpressionHyperbolicSine* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionDegreesToRadians* expr) override final {
+    void visit(const ExpressionDegreesToRadians* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionRadiansToDegrees* expr) override final {
+    void visit(const ExpressionRadiansToDegrees* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionDayOfMonth* expr) override final {
+    void visit(const ExpressionDayOfMonth* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionDayOfWeek* expr) override final {
+    void visit(const ExpressionDayOfWeek* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionDayOfYear* expr) override final {
+    void visit(const ExpressionDayOfYear* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionHour* expr) override final {
+    void visit(const ExpressionHour* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionMillisecond* expr) override final {
+    void visit(const ExpressionMillisecond* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionMinute* expr) override final {
+    void visit(const ExpressionMinute* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionMonth* expr) override final {
+    void visit(const ExpressionMonth* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionSecond* expr) override final {
+    void visit(const ExpressionSecond* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionWeek* expr) override final {
+    void visit(const ExpressionWeek* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionIsoWeekYear* expr) override final {
+    void visit(const ExpressionIsoWeekYear* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionIsoDayOfWeek* expr) override final {
+    void visit(const ExpressionIsoDayOfWeek* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionIsoWeek* expr) override final {
+    void visit(const ExpressionIsoWeek* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionYear* expr) override final {
+    void visit(const ExpressionYear* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionFromAccumulator<AccumulatorAvg>* expr) override final {
+    void visit(const ExpressionFromAccumulator<AccumulatorAvg>* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionFromAccumulatorN<AccumulatorFirstN>* expr) override final {
+    void visit(const ExpressionFromAccumulatorN<AccumulatorFirstN>* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionFromAccumulatorN<AccumulatorLastN>* expr) override final {
+    void visit(const ExpressionFromAccumulatorN<AccumulatorLastN>* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionFromAccumulator<AccumulatorMax>* expr) override final {
+    void visit(const ExpressionFromAccumulator<AccumulatorMax>* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionFromAccumulator<AccumulatorMin>* expr) override final {
+    void visit(const ExpressionFromAccumulator<AccumulatorMin>* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionFromAccumulatorN<AccumulatorMaxN>* expr) override final {
+    void visit(const ExpressionFromAccumulatorN<AccumulatorMaxN>* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionFromAccumulatorN<AccumulatorMinN>* expr) override final {
+    void visit(const ExpressionFromAccumulatorN<AccumulatorMinN>* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionFromAccumulatorQuantile<AccumulatorMedian>* expr) override final {
+    void visit(const ExpressionFromAccumulatorQuantile<AccumulatorMedian>* expr) final {
         unsupportedExpression();
     }
 
-    void visit(
-        const ExpressionFromAccumulatorQuantile<AccumulatorPercentile>* expr) override final {
+    void visit(const ExpressionFromAccumulatorQuantile<AccumulatorPercentile>* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionFromAccumulator<AccumulatorStdDevPop>* expr) override final {
+    void visit(const ExpressionFromAccumulator<AccumulatorStdDevPop>* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionFromAccumulator<AccumulatorStdDevSamp>* expr) override final {
+    void visit(const ExpressionFromAccumulator<AccumulatorStdDevSamp>* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionFromAccumulator<AccumulatorSum>* expr) override final {
+    void visit(const ExpressionFromAccumulator<AccumulatorSum>* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionFromAccumulator<AccumulatorMergeObjects>* expr) override final {
+    void visit(const ExpressionFromAccumulator<AccumulatorMergeObjects>* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionTests::Testable* expr) override final {
+    void visit(const ExpressionTests::Testable* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionInternalJsEmit* expr) override final {
+    void visit(const ExpressionInternalJsEmit* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionInternalFindSlice* expr) override final {
+    void visit(const ExpressionInternalFindSlice* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionInternalFindPositional* expr) override final {
+    void visit(const ExpressionInternalFindPositional* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionInternalFindElemMatch* expr) override final {
+    void visit(const ExpressionInternalFindElemMatch* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionFunction* expr) override final {
+    void visit(const ExpressionFunction* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionRandom* expr) override final {
+    void visit(const ExpressionRandom* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionToHashedIndexKey* expr) override final {
+    void visit(const ExpressionToHashedIndexKey* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionDateAdd* expr) override final {
+    void visit(const ExpressionDateAdd* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionDateSubtract* expr) override final {
+    void visit(const ExpressionDateSubtract* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionSetField* expr) override final {
+    void visit(const ExpressionSetField* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionGetField* expr) override final {
+    void visit(const ExpressionGetField* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionTsSecond* expr) override final {
+    void visit(const ExpressionTsSecond* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionTsIncrement* expr) override final {
+    void visit(const ExpressionTsIncrement* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionInternalOwningShard* expr) override final {
+    void visit(const ExpressionInternalOwningShard* expr) final {
         unsupportedExpression();
     }
 
-    void visit(const ExpressionInternalIndexKey* expr) override final {
+    void visit(const ExpressionInternalIndexKey* expr) final {
         unsupportedExpression();
+    }
+
+    void visit(const ExpressionInternalKeyStringValue* expr) final {
+        unsupportedExpression();
+    }
+
+    const BonsaiEligibility& eligibility() const {
+        return _eligibility;
     }
 
 private:
     void unsupportedExpression() {
-        _eligible = false;
+        _eligibility.setIneligible();
     }
 
-    bool& _eligible;
+    BonsaiEligibility _eligibility;
 };
 
 class ABTTransformerVisitor : public TransformerInterfaceConstVisitor {
 public:
-    ABTTransformerVisitor(bool& eligible) : _eligible(eligible) {}
+    ABTTransformerVisitor() : _eligibility(BonsaiEligibility::FullyEligible) {}
 
     void visit(const projection_executor::ExclusionProjectionExecutor* transformer) override {
         checkUnsupportedInclusionExclusion(transformer);
@@ -1034,9 +1036,13 @@ public:
         unsupportedTransformer(transformer);
     }
 
+    const BonsaiEligibility& eligibility() const {
+        return _eligibility;
+    }
+
 private:
     void unsupportedTransformer(const TransformerInterface* transformer) {
-        _eligible = false;
+        _eligibility.setIneligible();
     }
 
     template <typename T>
@@ -1061,23 +1067,20 @@ private:
             }
         }
 
-        ABTUnsupportedAggExpressionVisitor aggVisitor(_eligible);
+        ABTUnsupportedAggExpressionVisitor aggVisitor;
         stage_builder::ExpressionWalker walker{&aggVisitor, nullptr, nullptr};
         expression_walker::walk(transformer->rootReplacementExpression().get(), &walker);
+        _eligibility.minOf(aggVisitor.eligibility());
     }
 
-    bool& _eligible;
+    BonsaiEligibility _eligibility;
 };
 
+//
+// Check unsupported command options.
+//
 template <class RequestType>
-bool isEligibleCommon(const RequestType& request,
-                      OperationContext* opCtx,
-                      const CollectionPtr& collection,
-                      QueryFrameworkControlEnum frameworkControl) {
-    //
-    // Check unsupported command options.
-    //
-
+BonsaiEligibility eligibilityOfCommandOptions(const RequestType& request) {
     // The FindCommandRequest defaults some parameters to BSONObj() instead of boost::none.
     auto hasParam = [&](auto param) {
         if constexpr (std::is_same_v<decltype(param), boost::optional<BSONObj>>) {
@@ -1086,101 +1089,188 @@ bool isEligibleCommon(const RequestType& request,
             return !param.isEmpty();
         }
     };
-    if (hasParam(request.getCollation()) || hasParam(request.getLet()) ||
-        hasParam(request.getResumeAfter()) || request.getRequestResumeToken() ||
+    if (hasParam(request.getResumeAfter()) || request.getRequestResumeToken() ||
         request.getLegacyRuntimeConstants()) {
-        return false;
+        return BonsaiEligibility::Ineligible;
     }
 
-    // In M2, we should fall back on any index hint that is not a $natural hint.
-    auto hasIndexHint = [&](auto param) {
+    // Below we enforce that the collection collation is empty (aka, "simple"). Therefore we can
+    // support either empty collation or simple collation on the query.
+    auto hasNonSimpleCollation = [](auto param) {
         if constexpr (std::is_same_v<decltype(param), boost::optional<BSONObj>>) {
             return param && !param->isEmpty() &&
-                param->firstElementFieldNameStringData() != query_request_helper::kNaturalSortField;
+                SimpleBSONObjComparator::kInstance.evaluate(*param != CollationSpec::kSimpleSpec);
         } else {
             return !param.isEmpty() &&
-                param.firstElementFieldNameStringData() != query_request_helper::kNaturalSortField;
+                SimpleBSONObjComparator::kInstance.evaluate(param != CollationSpec::kSimpleSpec);
         }
-    };
-    if (frameworkControl == QueryFrameworkControlEnum::kTryBonsai &&
-        hasIndexHint(request.getHint())) {
-        return false;
+    }(request.getCollation());
+    if (hasNonSimpleCollation) {
+        return BonsaiEligibility::Ineligible;
     }
 
-    //
-    // Check unsupported index types.
-    //
-
-    if (!collection)
-        return true;
-
-    const IndexCatalog& indexCatalog = *collection->getIndexCatalog();
-    auto indexIterator =
-        indexCatalog.getIndexIterator(opCtx, IndexCatalog::InclusionPolicy::kReady);
-
-    auto hint = request.getHint();
-    auto queryHasNaturalHint = [&hint]() {
-        if constexpr (std::is_same_v<decltype(hint), boost::optional<BSONObj>>) {
-            return hint && !hint->isEmpty() &&
-                hint->firstElementFieldNameStringData() == query_request_helper::kNaturalSortField;
-        } else {
-            return !hint.isEmpty() &&
-                hint.firstElementFieldNameStringData() == query_request_helper::kNaturalSortField;
-        }
-    }();
-
-    // If the query has a hint specifying $natural, then there is no need to inspect the index
-    // catalog since we know we will generate a collection scan plan.
-    if (!queryHasNaturalHint) {
-        while (indexIterator->more()) {
-            const IndexDescriptor& descriptor = *indexIterator->next()->descriptor();
-            if (descriptor.hidden()) {
-                // An index that is hidden will not be considered by the optimizer, so we don't need
-                // to check its eligibility further.
-                continue;
-            }
-
-            // In M2, allow {id: 'hashed'} index for test coverage purposes, but we don't add it to
-            // the metadata.
-            if (descriptor.isHashedIdIndex()) {
-                continue;
-            }
-
-            // In M2, we should fallback on any non-hidden, non-_id index on a query with no
-            // $natural hint.
-            if (!descriptor.isIdIndex() &&
-                frameworkControl == QueryFrameworkControlEnum::kTryBonsai) {
-                return false;
-            }
-
-            if (descriptor.getIndexType() != IndexType::INDEX_BTREE) {
-                return false;
-            }
-
-            if (descriptor.infoObj().hasField(IndexDescriptor::kExpireAfterSecondsFieldName) ||
-                descriptor.isPartial() || descriptor.isSparse() ||
-                !descriptor.collation().isEmpty()) {
-                return false;
-            }
-        }
-    }
-
-    //
-    // Check unsupported collection types.
-    //
-
-    if (collection->isClustered() || !collection->getCollectionOptions().collation.isEmpty() ||
-        collection->getTimeseriesOptions() || collection->isCapped()) {
-        return false;
-    }
-
-    // Check notablescan.
-    return !storageGlobalParams.noTableScan.load();
+    return BonsaiEligibility::FullyEligible;
 }
 
-boost::optional<bool> shouldForceEligibility(QueryFrameworkControlEnum frameworkControl) {
+BonsaiEligibility eligibilityOfNonNaturalIndexHint(const boost::optional<BSONObj>& param) {
+    if (param) {
+        if (!param->isEmpty() &&
+            param->firstElementFieldNameStringData() != query_request_helper::kNaturalSortField) {
+            // $natural is the only hint fully supported.
+            return BonsaiEligibility::Experimental;
+        }
+    }
+    return BonsaiEligibility::FullyEligible;
+}
+
+BonsaiEligibility eligibilityOfIndexes(IndexCatalog::IndexIterator* indexIterator) {
+    auto eligibility = BonsaiEligibility{BonsaiEligibility::FullyEligible};
+
+    while (indexIterator->more()) {
+        const IndexDescriptor& descriptor = *indexIterator->next()->descriptor();
+        if (descriptor.hidden()) {
+            // An index that is hidden will not be considered by the optimizer, so we don't need
+            // to check its eligibility further.
+            continue;
+        }
+
+        // In M2, allow {id: 'hashed'} index for test coverage purposes, but we don't add it to
+        // the metadata.
+        if (descriptor.isHashedIdIndex()) {
+            continue;
+        }
+
+        // When any non-hidden, non-_id index is present, a query is only fully eligible with a
+        // $natural hint.
+        if (!descriptor.isIdIndex()) {
+            eligibility.minOf(BonsaiEligibility::Experimental);
+        }
+
+        if (descriptor.getIndexType() != IndexType::INDEX_BTREE) {
+            // Return early if ineligible.
+            return BonsaiEligibility::Ineligible;
+        }
+
+        if (descriptor.infoObj().hasField(IndexDescriptor::kExpireAfterSecondsFieldName) ||
+            descriptor.isPartial() || descriptor.isSparse() || !descriptor.collation().isEmpty()) {
+            return BonsaiEligibility::Ineligible;
+        }
+    }
+
+    return eligibility;
+}
+
+// Eligibility determination common across FindCommandRequest and AggregateCommandRequest.
+template <class RequestType>
+BonsaiEligibility determineEligibilityCommon(const RequestType& request,
+                                             OperationContext* opCtx,
+                                             const CollectionPtr& collection) {
+    auto eligibility = BonsaiEligibility{BonsaiEligibility::FullyEligible};
+
+    return eligibility.minOf([&]() { return eligibilityOfCommandOptions(request); })
+        .minOf([&]() { return eligibilityOfNonNaturalIndexHint(request.getHint()); })
+        .minOf([&]() {
+            // Check unsupported index types.
+            if (!collection)
+                return BonsaiEligibility{BonsaiEligibility::FullyEligible};
+
+            auto hint = request.getHint();
+            auto queryHasNaturalHint = [&hint]() {
+                if constexpr (std::is_same_v<decltype(hint), boost::optional<BSONObj>>) {
+                    return hint && !hint->isEmpty() &&
+                        hint->firstElementFieldNameStringData() ==
+                        query_request_helper::kNaturalSortField;
+                } else {
+                    return !hint.isEmpty() &&
+                        hint.firstElementFieldNameStringData() ==
+                        query_request_helper::kNaturalSortField;
+                }
+            }();
+
+            // If the query has a hint specifying $natural, then there is no need to inspect the
+            // index catalog since we know we will generate a collection scan plan.
+            if (!queryHasNaturalHint) {
+                const IndexCatalog& indexCatalog = *collection->getIndexCatalog();
+                auto indexIterator =
+                    indexCatalog.getIndexIterator(opCtx, IndexCatalog::InclusionPolicy::kReady);
+
+                return eligibilityOfIndexes(indexIterator.get());
+            } else {
+                return BonsaiEligibility{BonsaiEligibility::FullyEligible};
+            }
+        })
+        // Check unsupported collection types.
+        .setIneligibleIf(collection &&
+                         (collection->isClustered() ||
+                          !collection->getCollectionOptions().collation.isEmpty() ||
+                          collection->getTimeseriesOptions() || collection->isCapped()))
+        // Check notablescan.
+        .setIneligibleIf(storageGlobalParams.noTableScan.load());
+}
+
+BonsaiEligibility checkSupportedFeatures(ServiceContext* serviceCtx,
+                                         const Pipeline& pipeline,
+                                         bool queryHasNaturalHint) {
+    ABTUnsupportedDocumentSourceVisitorContext visitorCtx{queryHasNaturalHint};
+    auto& reg = getDocumentSourceVisitorRegistry(serviceCtx);
+    DocumentSourceWalker walker(reg, &visitorCtx);
+    walker.walk(pipeline);
+    return visitorCtx.eligibility;
+}
+
+BonsaiEligibility checkSupportedFeatures(const CanonicalQuery& cq) {
+    auto expression = cq.getPrimaryMatchExpression();
+
+    auto hint = cq.getFindCommandRequest().getHint();
+    bool hasNaturalHint = !hint.isEmpty() &&
+        hint.firstElementFieldNameStringData() == query_request_helper::kNaturalSortField;
+
+    ABTMatchExpressionVisitor visitor(hasNaturalHint);
+    MatchExpressionWalker walker(nullptr /*preVisitor*/, nullptr /*inVisitor*/, &visitor);
+    tree_walker::walk<true, MatchExpression>(expression, &walker);
+    auto eligibility = visitor.eligibility();
+
+    return eligibility.minOf([&]() {
+        if (cq.getProj()) {
+            auto projExecutor = projection_executor::buildProjectionExecutor(
+                cq.getExpCtx(),
+                cq.getProj(),
+                ProjectionPolicies::findProjectionPolicies(),
+                projection_executor::BuilderParamsBitSet{
+                    projection_executor::kDefaultBuilderParams});
+            ABTTransformerVisitor visitor{};
+            TransformerInterfaceWalker walker(&visitor);
+            walker.walk(projExecutor.get());
+            return visitor.eligibility();
+        } else {
+            return BonsaiEligibility{BonsaiEligibility::FullyEligible};
+        }
+    });
+}
+
+/**
+ * Use the framework control to determine the minimum required eligibility level.
+ */
+BonsaiEligibility::Eligibility getMinRequiredEligibility(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    auto frameworkControl =
+        expCtx->getQueryKnobConfiguration().getInternalQueryFrameworkControlForOp();
+    switch (frameworkControl) {
+        case QueryFrameworkControlEnum::kForceBonsai:
+            return BonsaiEligibility::Ineligible;
+        case QueryFrameworkControlEnum::kTryBonsaiExperimental:
+            return BonsaiEligibility::Experimental;
+        default:
+            return BonsaiEligibility::FullyEligible;
+    }
+}
+}  // namespace
+
+bool isBonsaiEnabled(const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     // We don't need to consult the feature flag here, since the framework control knob can only
     // be set to enable bonsai if featureFlagCommonQueryFramework is enabled.
+    auto frameworkControl =
+        expCtx->getQueryKnobConfiguration().getInternalQueryFrameworkControlForOp();
     LOGV2_DEBUG(7325101,
                 4,
                 "logging internalQueryFrameworkControl",
@@ -1189,12 +1279,10 @@ boost::optional<bool> shouldForceEligibility(QueryFrameworkControlEnum framework
     switch (frameworkControl) {
         case QueryFrameworkControlEnum::kForceClassicEngine:
         case QueryFrameworkControlEnum::kTrySbeEngine:
+        case QueryFrameworkControlEnum::kTrySbeRestricted:
             return false;
         case QueryFrameworkControlEnum::kTryBonsai:
         case QueryFrameworkControlEnum::kTryBonsaiExperimental:
-            // Return boost::none to indicate that we should not force eligibility of bonsai nor the
-            // classic engine.
-            return boost::none;
         case QueryFrameworkControlEnum::kForceBonsai:
             return true;
     }
@@ -1202,153 +1290,133 @@ boost::optional<bool> shouldForceEligibility(QueryFrameworkControlEnum framework
     MONGO_UNREACHABLE;
 }
 
-bool isEligibleForBonsai(ServiceContext* serviceCtx,
-                         const Pipeline& pipeline,
-                         QueryFrameworkControlEnum frameworkControl,
-                         bool queryHasNaturalHint) {
-    ABTUnsupportedDocumentSourceVisitorContext visitorCtx{frameworkControl, queryHasNaturalHint};
-    auto& reg = getDocumentSourceVisitorRegistry(serviceCtx);
-    DocumentSourceWalker walker(reg, &visitorCtx);
-    walker.walk(pipeline);
-    return visitorCtx.eligible;
-}
-
-bool isEligibleForBonsai(const CanonicalQuery& cq, QueryFrameworkControlEnum frameworkControl) {
-    auto expression = cq.getPrimaryMatchExpression();
-
-    auto hint = cq.getFindCommandRequest().getHint();
-    bool hasNaturalHint = !hint.isEmpty() &&
-        hint.firstElementFieldNameStringData() == query_request_helper::kNaturalSortField;
-
-    bool eligible = true;
-    ABTMatchExpressionVisitor visitor(eligible, frameworkControl, hasNaturalHint);
-    MatchExpressionWalker walker(nullptr /*preVisitor*/, nullptr /*inVisitor*/, &visitor);
-    tree_walker::walk<true, MatchExpression>(expression, &walker);
-
-    if (cq.getProj() && eligible) {
-        auto projExecutor = projection_executor::buildProjectionExecutor(
-            cq.getExpCtx(),
-            cq.getProj(),
-            ProjectionPolicies::findProjectionPolicies(),
-            projection_executor::BuilderParamsBitSet{projection_executor::kDefaultBuilderParams});
-        ABTTransformerVisitor visitor(eligible);
-        TransformerInterfaceWalker walker(&visitor);
-        walker.walk(projExecutor.get());
-    }
-
-    return eligible;
-}
-}  // namespace
-
 MONGO_FAIL_POINT_DEFINE(enableExplainInBonsai);
 
-bool isEligibleForBonsai(const AggregateCommandRequest& request,
-                         const Pipeline& pipeline,
-                         OperationContext* opCtx,
-                         const CollectionPtr& collection) {
-    auto frameworkControl =
-        QueryKnobConfiguration::decoration(opCtx).getInternalQueryFrameworkControlForOp();
-
-    if (auto forceBonsai = shouldForceEligibility(frameworkControl); forceBonsai.has_value()) {
-        return *forceBonsai;
+BonsaiEligibility determineBonsaiEligibility(OperationContext* opCtx,
+                                             const CollectionPtr& collection,
+                                             const AggregateCommandRequest& request,
+                                             const Pipeline& pipeline) {
+    if (!isBonsaiEnabled(pipeline.getContext())) {
+        return BonsaiEligibility::Ineligible;
     }
+
+    return BonsaiEligibility{BonsaiEligibility::FullyEligible,
+                             getMinRequiredEligibility(pipeline.getContext())}
+        .minOf([&]() { return determineEligibilityCommon(request, opCtx, collection); })
+        .setIneligibleIf(request.getRequestReshardingResumeToken().has_value())
+        .setIneligibleIf(request.getExchange().has_value())
+        .minOf([&]() {
+            auto hint = request.getHint();
+            bool hasNaturalHint = hint.has_value() && !hint->isEmpty() &&
+                hint->firstElementFieldNameStringData() == query_request_helper::kNaturalSortField;
+
+            return checkSupportedFeatures(opCtx->getServiceContext(), pipeline, hasNaturalHint);
+        });
+}
+
+BonsaiEligibility determineBonsaiEligibility(OperationContext* opCtx,
+                                             const CollectionPtr& collection,
+                                             const CanonicalQuery& cq) {
+    if (!isBonsaiEnabled(cq.getExpCtx())) {
+        return BonsaiEligibility::Ineligible;
+    }
+
+    auto& request = cq.getFindCommandRequest();
+    return BonsaiEligibility{BonsaiEligibility::FullyEligible,
+                             getMinRequiredEligibility(cq.getExpCtx())}
+        .setIneligibleIf(!cq.useCqfIfEligible())
+        .minOf([&]() { return determineEligibilityCommon(request, opCtx, collection); })
+        .setIneligibleIf(!request.getSort().isEmpty())
+        .setIneligibleIf(!request.getMin().isEmpty())
+        .setIneligibleIf(!request.getMax().isEmpty())
+        .setIneligibleIf(request.getReturnKey())
+        .setIneligibleIf(request.getSingleBatch())
+        .setIneligibleIf(request.getTailable())
+        .setIneligibleIf(request.getSkip().has_value())
+        .setIneligibleIf(request.getLimit().has_value())
+        .setIneligibleIf(request.getNoCursorTimeout())
+        .setIneligibleIf(request.getAllowPartialResults())
+        .setIneligibleIf(request.getAllowSpeculativeMajorityRead())
+        .setIneligibleIf(request.getAwaitData())
+        .setIneligibleIf(request.getReadOnce())
+        .setIneligibleIf(request.getShowRecordId())
+        .setIneligibleIf(request.getTerm().has_value())
+        .minOf([&]() { return checkSupportedFeatures(cq); });
+}
+
+bool isEligibleForBonsaiUnderFrameworkControl(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                              bool isExplain,
+                                              BonsaiEligibility eligibility) {
+    auto frameworkControl =
+        expCtx->getQueryKnobConfiguration().getInternalQueryFrameworkControlForOp();
 
     // Explain is not currently supported but is allowed if the failpoint is set
     // for testing purposes.
-    // TODO SERVER-77719: eventually explain should be permitted by default with tryBonsai, but we
-    // will still want to fall back on explain commands with tryBonsaiExperimental.
-    if (!MONGO_unlikely(enableExplainInBonsai.shouldFail()) && request.getExplain()) {
-        return false;
+    // TODO SERVER-77719: eventually explain should be permitted by default with tryBonsai, but
+    // we will still want to fall back on explain commands with tryBonsaiExperimental.
+    auto satisfiesExplainRequirements = [&]() {
+        return !isExplain || MONGO_unlikely(enableExplainInBonsai.shouldFail());
+    };
+    switch (frameworkControl) {
+        case QueryFrameworkControlEnum::kTryBonsai:
+            return eligibility.isFullyEligible() && satisfiesExplainRequirements();
+        case QueryFrameworkControlEnum::kTryBonsaiExperimental:
+            return eligibility.isExperimentallyEligible() && satisfiesExplainRequirements();
+        case QueryFrameworkControlEnum::kForceBonsai:
+            return true;
+        default:
+            return false;
     }
-
-    bool commandOptionsEligible = isEligibleCommon(request, opCtx, collection, frameworkControl) &&
-        !request.getRequestReshardingResumeToken().has_value() && !request.getExchange();
-
-    // Early return to avoid unnecessary work of walking the input pipeline.
-    if (!commandOptionsEligible) {
-        return false;
-    }
-
-    auto hint = request.getHint();
-    bool hasNaturalHint = hint.has_value() && !hint->isEmpty() &&
-        hint->firstElementFieldNameStringData() == query_request_helper::kNaturalSortField;
-
-    return isEligibleForBonsai(
-        opCtx->getServiceContext(), pipeline, frameworkControl, hasNaturalHint);
 }
 
-bool isEligibleForBonsai(const CanonicalQuery& cq,
-                         OperationContext* opCtx,
-                         const CollectionPtr& collection) {
-    auto frameworkControl =
-        QueryKnobConfiguration::decoration(opCtx).getInternalQueryFrameworkControlForOp();
-    if (auto forceBonsai = shouldForceEligibility(frameworkControl); forceBonsai.has_value()) {
-        return *forceBonsai;
-    }
-
-    if (!cq.useCqfIfEligible()) {
-        return false;
-    }
-
-    // Explain is not currently supported but is allowed if the failpoint is set
-    // for testing purposes.
-    // TODO SERVER-77719: eventually explain should be permitted by default with tryBonsai, but we
-    // will still want to fall back on explain commands with tryBonsaiExperimental.
-    if (!MONGO_unlikely(enableExplainInBonsai.shouldFail()) && cq.getExplain()) {
-        return false;
-    }
-
-    auto request = cq.getFindCommandRequest();
-    bool commandOptionsEligible = isEligibleCommon(request, opCtx, collection, frameworkControl) &&
-        request.getSort().isEmpty() && request.getMin().isEmpty() && request.getMax().isEmpty() &&
-        !request.getReturnKey() && !request.getSingleBatch() && !request.getTailable() &&
-        !request.getSkip() && !request.getLimit() && !request.getNoCursorTimeout() &&
-        !request.getAllowPartialResults() && !request.getAllowSpeculativeMajorityRead() &&
-        !request.getAwaitData() && !request.getReadOnce() && !request.getShowRecordId() &&
-        !request.getTerm();
-
-    // Early return to avoid unnecessary work of walking the input expression.
-    if (!commandOptionsEligible) {
-        return false;
-    }
-
-    return isEligibleForBonsai(cq, frameworkControl);
+bool isEligibleForBonsai(OperationContext* opCtx,
+                         const CollectionPtr& collection,
+                         const AggregateCommandRequest& request,
+                         const Pipeline& pipeline) {
+    auto eligibility = determineBonsaiEligibility(opCtx, collection, request, pipeline);
+    return isEligibleForBonsaiUnderFrameworkControl(
+        pipeline.getContext(), request.getExplain().has_value(), eligibility);
 }
 
-bool isEligibleForBonsai_forTesting(const CanonicalQuery& cq) {
-    const auto frameworkControl =
-        QueryKnobConfiguration::decoration(cq.getOpCtx()).getInternalQueryFrameworkControlForOp();
-    return isEligibleForBonsai(cq, frameworkControl);
+bool isEligibleForBonsai(OperationContext* opCtx,
+                         const CollectionPtr& collection,
+                         const CanonicalQuery& cq) {
+    auto eligibility = determineBonsaiEligibility(opCtx, collection, cq);
+    return isEligibleForBonsaiUnderFrameworkControl(
+        cq.getExpCtx(), cq.getExplain().has_value(), eligibility);
 }
 
-bool isEligibleForBonsai_forTesting(ServiceContext* serviceCtx, const Pipeline& pipeline) {
-    const auto frameworkControl = QueryKnobConfiguration::decoration(pipeline.getContext()->opCtx)
-                                      .getInternalQueryFrameworkControlForOp();
-    return isEligibleForBonsai(
-        serviceCtx, pipeline, frameworkControl, false /* queryHasNaturalHint */);
+BonsaiEligibility isEligibleForBonsai_forTesting(const CanonicalQuery& cq) {
+    return checkSupportedFeatures(cq);
+}
+
+BonsaiEligibility isEligibleForBonsai_forTesting(ServiceContext* serviceCtx,
+                                                 const Pipeline& pipeline) {
+    return checkSupportedFeatures(serviceCtx, pipeline, false /* queryHasNaturalHint */);
 }
 
 }  // namespace mongo
 
 namespace mongo::optimizer {
-// Templated visit function to mark DocumentSources as ineligible for CQF.
+// Templated visit function to mark unsupported DocumentSources as ineligible for CQF.
 template <typename T>
 void visit(ABTUnsupportedDocumentSourceVisitorContext* ctx, const T&) {
-    ctx->eligible = false;
+    ctx->eligibility.setIneligible();
 }
 
 void visit(ABTUnsupportedDocumentSourceVisitorContext* ctx, const DocumentSourceMatch& source) {
-    ABTMatchExpressionVisitor visitor(
-        ctx->eligible, ctx->frameworkControl, ctx->queryHasNaturalHint);
+    ABTMatchExpressionVisitor visitor(ctx->queryHasNaturalHint);
     MatchExpressionWalker walker(nullptr, nullptr, &visitor);
     tree_walker::walk<true, MatchExpression>(source.getMatchExpression(), &walker);
+    ctx->eligibility.minOf(visitor.eligibility());
 }
 
 void visit(ABTUnsupportedDocumentSourceVisitorContext* ctx,
            const DocumentSourceSingleDocumentTransformation& source) {
-    ABTTransformerVisitor visitor(ctx->eligible);
+    ABTTransformerVisitor visitor;
     TransformerInterfaceWalker walker(&visitor);
     walker.walk(&source.getTransformer());
+    ctx->eligibility.minOf(visitor.eligibility());
 }
 
 const ServiceContext::ConstructorActionRegisterer abtUnsupportedRegisterer{

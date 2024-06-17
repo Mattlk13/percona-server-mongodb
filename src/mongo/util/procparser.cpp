@@ -46,10 +46,6 @@
 // IWYU pragma: no_include "boost/algorithm/string/detail/finder.hpp"
 #include <boost/algorithm/string/find_iterator.hpp>
 #include <boost/core/addressof.hpp>
-#include <boost/filesystem/directory.hpp>
-#include <boost/filesystem/file_status.hpp>
-#include <boost/filesystem/operations.hpp>
-#include <boost/filesystem/path.hpp>
 #include <boost/function/function_base.hpp>
 #include <boost/iterator/iterator_facade.hpp>
 #include <boost/move/utility_core.hpp>
@@ -88,6 +84,18 @@
 namespace mongo {
 
 namespace {
+
+template <typename It>
+StringData stringDataFromRange(It first, It last) {
+    if (auto d = std::distance(first, last))
+        return StringData(&*first, static_cast<size_t>(d));
+    return {};
+}
+
+template <typename Range>
+StringData stringDataFromRange(const Range& r) {
+    return stringDataFromRange(r.begin(), r.end());
+}
 
 /**
  * Get USER_HZ for the machine. See time(7) for an explanation.
@@ -204,6 +212,52 @@ const size_t kDiskFieldCount = std::extent<decltype(kDiskFields)>::value;
 }  // namespace
 
 namespace procparser {
+
+using StringSplitIterator = boost::split_iterator<StringData::const_iterator>;
+
+/**
+ * This function is a generic function that passes in logic to parse a proc file. It looks for
+ * keys within the data param and captures the corresponding values. If no keys were found
+ * within the data this function returns a NoSuchKey error.
+ *
+ * @param keys: The elements we are looking for in the data.
+ * @param input: The StringData we are parsing.
+ * @param getKey: Uses a StringSplitIterator to split the line by a user specified
+ * delimiter and returns the first value as the key.
+ * @param getValueAndProcess: Specifies how to get the value after the key and
+ * decides what to do with the key-value pair.
+ */
+Status parseGenericStats(const std::vector<StringData>& keys,
+                         StringData input,
+                         std::function<StringData(StringData, StringSplitIterator&)> getKey,
+                         std::function<void(StringData, StringSplitIterator&)> getValueAndProcess) {
+    bool foundKeys = false;
+
+    for (auto lineIt = StringSplitIterator(
+             input.begin(),
+             input.end(),
+             boost::token_finder([](char c) { return c == '\n'; }, boost::token_compress_on));
+         lineIt != StringSplitIterator();
+         ++lineIt) {
+        StringData line = stringDataFromRange(*lineIt);
+        StringSplitIterator splitLineIterator;
+        auto key = getKey(line, splitLineIterator);
+
+        if (splitLineIterator == StringSplitIterator() ||
+            ++splitLineIterator == StringSplitIterator()) {
+            continue;
+        }
+
+        if (keys.empty() || std::find(keys.begin(), keys.end(), key) != keys.end()) {
+            foundKeys = true;
+            getValueAndProcess(key, splitLineIterator);
+        }
+    }
+    return foundKeys ? Status::OK()
+                     : Status(ErrorCodes::NoSuchKey, "Failed to find any keys in string");
+}
+
+
 // Here is an example of the type of string it supports.
 // Note: intr output has been trimmed
 //
@@ -240,84 +294,41 @@ Status parseProcStat(const std::vector<StringData>& keys,
                      StringData data,
                      int64_t ticksPerSecond,
                      BSONObjBuilder* builder) {
-    bool foundKeys = false;
+    return parseGenericStats(
+        keys,
+        data,
+        [](StringData line, StringSplitIterator& lineIt) {
+            lineIt = StringSplitIterator(
+                line.begin(),
+                line.end(),
+                boost::token_finder([](char c) { return c == ' '; }, boost::token_compress_on));
+            return stringDataFromRange(*lineIt);
+        },
+        [&](StringData key, StringSplitIterator& valueIt) {
+            StringData value = stringDataFromRange(valueIt->begin(), valueIt->end());
 
-    using string_split_iterator = boost::split_iterator<StringData::const_iterator>;
-
-    // Split the file by lines.
-    // token_compress_on means the iterator skips over consecutive '\n'. This should not be a
-    // problem in normal /proc/stat output.
-    for (string_split_iterator lineIt = string_split_iterator(
-             data.begin(),
-             data.end(),
-             boost::token_finder([](char c) { return c == '\n'; }, boost::token_compress_on));
-         lineIt != string_split_iterator();
-         ++lineIt) {
-
-        StringData line((*lineIt).begin(), (*lineIt).end());
-
-        // Split the line by spaces since that is the only delimiter for stat files.
-        // token_compress_on means the iterator skips over consecutive ' '. This is needed for the
-        // first line which is "cpu  <number>".
-        string_split_iterator partIt = string_split_iterator(
-            line.begin(),
-            line.end(),
-            boost::token_finder([](char c) { return c == ' '; }, boost::token_compress_on));
-
-        // Skip processing this line if we do not have a key.
-        if (partIt == string_split_iterator()) {
-            continue;
-        }
-
-        StringData key((*partIt).begin(), (*partIt).end());
-
-        ++partIt;
-
-        // Skip processing this line if we only have a key, and no number.
-        if (partIt == string_split_iterator()) {
-            continue;
-        }
-
-        // Check if the key is in the list. /proc/stat will have extra keys, and
-        // may not have the keys we want.
-        if (keys.empty() || std::find(keys.begin(), keys.end(), key) != keys.end()) {
-
-            foundKeys = true;
-
+            // Cpu is 10 fields, we need to chew through all of them.
+            // Some kernels we support lack the last field or two: guest and/or guest_nice.
             if (key == "cpu") {
-                // Cpu is 10 fields, we need to chew through all of them.
-                // Some kernels we support lack the last field or two: guest and/or guest_nice.
                 for (size_t index = 0;
-                     partIt != string_split_iterator() && index < kAdditionCpuFieldCount;
-                     ++partIt, ++index) {
-
-                    StringData stringValue((*partIt).begin(), (*partIt).end() - (*partIt).begin());
-
-                    uint64_t value;
-
-                    if (!NumberParser{}(stringValue, &value).isOK()) {
-                        value = 0;
+                     valueIt != StringSplitIterator() && index < kAdditionCpuFieldCount;
+                     ++valueIt, ++index) {
+                    uint64_t numVal;
+                    if (!NumberParser{}(stringDataFromRange(*valueIt), &numVal).isOK()) {
+                        numVal = 0;
                     }
-
                     builder->appendNumber(kAdditionCpuFields[index],
-                                          convertTicksToMilliSeconds(value, ticksPerSecond));
+                                          convertTicksToMilliSeconds(numVal, ticksPerSecond));
                 }
             } else {
-                StringData stringValue((*partIt).begin(), (*partIt).end() - (*partIt).begin());
-
-                uint64_t value;
-
-                if (!NumberParser{}(stringValue, &value).isOK()) {
-                    value = 0;
+                uint64_t numVal;
+                if (!NumberParser{}(value, &numVal).isOK()) {
+                    numVal = 0;
                 }
 
-                builder->appendNumber(key, static_cast<long long>(value));
+                builder->appendNumber(key, static_cast<long long>(numVal));
             }
-        }
-    }
-
-    return foundKeys ? Status::OK()
-                     : Status(ErrorCodes::NoSuchKey, "Failed to find any keys in stat string");
+        });
 }
 
 Status parseProcStatFile(StringData filename,
@@ -328,7 +339,11 @@ Status parseProcStatFile(StringData filename,
         return swString.getStatus();
     }
 
-    return parseProcStat(keys, swString.getValue(), getTicksPerSecond(), builder);
+    auto status = parseProcStat(keys, swString.getValue(), getTicksPerSecond(), builder);
+    if (!status.isOK()) {
+        status.addContext(format(FMT_STRING("Parsing {}"), filename));
+    }
+    return status;
 }
 
 // Here is an example of the type of string it supports:
@@ -352,80 +367,42 @@ Status parseProcStatFile(StringData filename,
 Status parseProcMemInfo(const std::vector<StringData>& keys,
                         StringData data,
                         BSONObjBuilder* builder) {
-    bool foundKeys = false;
+    return parseGenericStats(
+        keys,
+        data,
+        [](StringData line, StringSplitIterator& lineIt) {
+            lineIt =
+                StringSplitIterator(line.begin(),
+                                    line.end(),
+                                    boost::token_finder([](char c) { return c == ' ' || c == ':'; },
+                                                        boost::token_compress_on));
+            return stringDataFromRange(*lineIt);
+        },
+        [&](StringData key, StringSplitIterator& valueIt) {
+            StringData value = stringDataFromRange(*valueIt);
 
-    using string_split_iterator = boost::split_iterator<StringData::const_iterator>;
-
-    // Split the file by lines.
-    // token_compress_on means the iterator skips over consecutive '\n'. This should not be a
-    // problem in normal /proc/memInfo output.
-    for (string_split_iterator lineIt = string_split_iterator(
-             data.begin(),
-             data.end(),
-             boost::token_finder([](char c) { return c == '\n'; }, boost::token_compress_on));
-         lineIt != string_split_iterator();
-         ++lineIt) {
-
-        StringData line((*lineIt).begin(), (*lineIt).end());
-
-        // Split the line by spaces and colons since these are the delimiters for meminfo files.
-        // token_compress_on means the iterator skips over consecutive ' '. This is needed for
-        // every line.
-        string_split_iterator partIt =
-            string_split_iterator(line.begin(),
-                                  line.end(),
-                                  boost::token_finder([](char c) { return c == ' ' || c == ':'; },
-                                                      boost::token_compress_on));
-
-        // Skip processing this line if we do not have a key.
-        if (partIt == string_split_iterator()) {
-            continue;
-        }
-
-        StringData key((*partIt).begin(), (*partIt).end());
-
-        ++partIt;
-
-        // Skip processing this line if we only have a key, and no number.
-        if (partIt == string_split_iterator()) {
-            continue;
-        }
-
-        // Check if the key is in the list. /proc/meminfo will have extra keys, and may not have the
-        // keys we want.
-        if (keys.empty() || std::find(keys.begin(), keys.end(), key) != keys.end()) {
-            foundKeys = true;
-
-            StringData stringValue((*partIt).begin(), (*partIt).end());
-
-            uint64_t value;
-
-            if (!NumberParser{}(stringValue, &value).isOK()) {
-                value = 0;
+            uint64_t numVal;
+            if (!NumberParser{}(value, &numVal).isOK()) {
+                numVal = 0;
             }
 
             // Check if the line ends in "kB"
-            ++partIt;
+            ++valueIt;
 
             // If there is one last token, check if it is actually "kB"
-            if (partIt != string_split_iterator()) {
-                StringData kb_token((*partIt).begin(), (*partIt).end());
+            if (valueIt != StringSplitIterator()) {
+                StringData kbToken = stringDataFromRange(*valueIt);
                 auto keyWithSuffix = key.toString();
 
-                if (kb_token == "kB") {
+                if (kbToken == "kB") {
                     keyWithSuffix.append("_kb");
                 }
 
-                builder->appendNumber(keyWithSuffix, static_cast<long long>(value));
+                builder->appendNumber(keyWithSuffix, static_cast<long long>(numVal));
             } else {
-
-                builder->appendNumber(key, static_cast<long long>(value));
+                builder->appendNumber(key, static_cast<long long>(numVal));
             }
-        }
-    }
-
-    return foundKeys ? Status::OK()
-                     : Status(ErrorCodes::NoSuchKey, "Failed to find any keys in meminfo string");
+        });
 }
 
 Status parseProcMemInfoFile(StringData filename,
@@ -436,7 +413,11 @@ Status parseProcMemInfoFile(StringData filename,
         return swString.getStatus();
     }
 
-    return parseProcMemInfo(keys, swString.getValue(), builder);
+    auto status = parseProcMemInfo(keys, swString.getValue(), builder);
+    if (!status.isOK()) {
+        status.addContext(format(FMT_STRING("Parsing {}"), filename));
+    }
+    return status;
 }
 
 //
@@ -456,25 +437,22 @@ Status parseProcMemInfoFile(StringData filename,
 Status parseProcNetstat(const std::vector<StringData>& keys,
                         StringData data,
                         BSONObjBuilder* builder) {
-
-    using string_split_iterator = boost::split_iterator<StringData::const_iterator>;
-
-    string_split_iterator keysIt;
+    StringSplitIterator keysIt;
     bool foundKeys = false;
 
     // Split the file by lines.
     uint32_t lineNum = 0;
-    for (string_split_iterator lineIt = string_split_iterator(
+    for (StringSplitIterator lineIt = StringSplitIterator(
              data.begin(),
              data.end(),
              boost::token_finder([](char c) { return c == '\n'; }, boost::token_compress_on));
-         lineIt != string_split_iterator();
+         lineIt != StringSplitIterator();
          ++lineIt, ++lineNum) {
 
         if (lineNum % 2 == 0) {
 
             // even numbered lines are keys
-            keysIt = string_split_iterator(
+            keysIt = StringSplitIterator(
                 (*lineIt).begin(),
                 (*lineIt).end(),
                 boost::token_finder([](char c) { return c == ' '; }, boost::token_compress_on));
@@ -482,7 +460,7 @@ Status parseProcNetstat(const std::vector<StringData>& keys,
         } else {
 
             // odd numbered lines are values
-            string_split_iterator valuesIt = string_split_iterator(
+            StringSplitIterator valuesIt = StringSplitIterator(
                 (*lineIt).begin(),
                 (*lineIt).end(),
                 boost::token_finder([](char c) { return c == ' '; }, boost::token_compress_on));
@@ -491,13 +469,13 @@ Status parseProcNetstat(const std::vector<StringData>& keys,
 
             // iterate over the keys and values in parallel
             for (uint32_t keyNum = 0;
-                 keysIt != string_split_iterator() && valuesIt != string_split_iterator();
+                 keysIt != StringSplitIterator() && valuesIt != StringSplitIterator();
                  ++keysIt, ++valuesIt, ++keyNum) {
 
                 if (keyNum == 0) {
 
                     // first token is a prefix to be applied to remaining keys
-                    prefix = StringData((*keysIt).begin(), (*keysIt).end());
+                    prefix = stringDataFromRange(*keysIt);
 
                     // ignore line if prefix isn't in requested list
                     if (!keys.empty() && std::find(keys.begin(), keys.end(), prefix) == keys.end())
@@ -506,8 +484,8 @@ Status parseProcNetstat(const std::vector<StringData>& keys,
                 } else {
 
                     // remaining tokens are key/value pairs
-                    StringData key((*keysIt).begin(), (*keysIt).end());
-                    StringData stringValue((*valuesIt).begin(), (*valuesIt).end());
+                    StringData key = stringDataFromRange(*keysIt);
+                    StringData stringValue = stringDataFromRange(*valuesIt);
                     uint64_t value;
                     if (NumberParser{}(stringValue, &value).isOK()) {
                         builder->appendNumber(prefix.toString() + key.toString(),
@@ -536,7 +514,6 @@ Status parseProcNetstatFile(const std::vector<StringData>& keys,
 Status parseProcSockstat(const std::map<StringData, std::set<StringData>>& linesAndKeys,
                          StringData data,
                          BSONObjBuilder* builder) {
-    using string_split_iterator = boost::split_iterator<StringData::const_iterator>;
     auto newlineFinder =
         boost::token_finder([](char c) { return c == '\n'; }, boost::token_compress_on);
     auto spaceAndColonFinder =
@@ -545,14 +522,14 @@ Status parseProcSockstat(const std::map<StringData, std::set<StringData>>& lines
     bool foundKeys = false;
 
     // Split the file by lines.
-    for (string_split_iterator lineIt(data.begin(), data.end(), newlineFinder);
-         lineIt != string_split_iterator();
+    for (StringSplitIterator lineIt(data.begin(), data.end(), newlineFinder);
+         lineIt != StringSplitIterator();
          ++lineIt) {
-        StringData line(lineIt->begin(), lineIt->end());
+        StringData line = stringDataFromRange(*lineIt);
         // Split the line by spaces and colons since these are the delimeters for sockstat files.
-        string_split_iterator partIt(line.begin(), line.end(), spaceAndColonFinder);
+        StringSplitIterator partIt(line.begin(), line.end(), spaceAndColonFinder);
         // Check the line-key, which is the first part of the line, to see if we care about it.
-        StringData lineKey(partIt->begin(), partIt->end());
+        StringData lineKey = stringDataFromRange(*partIt);
         auto bucketIt = linesAndKeys.find(lineKey);
         if (bucketIt == linesAndKeys.end()) {
             // We don't care about this line.
@@ -564,8 +541,8 @@ Status parseProcSockstat(const std::map<StringData, std::set<StringData>>& lines
         BSONObjBuilder sub(builder->subobjStart(lineKey));
         ++partIt;
         auto lineKeySet = bucketIt->second;
-        while (partIt != string_split_iterator()) {
-            StringData key(partIt->begin(), partIt->end());
+        while (partIt != StringSplitIterator()) {
+            StringData key = stringDataFromRange(*partIt);
             if (!lineKeySet.count(key)) {
                 // Don't care about this key/value. Skip past it.
                 ++partIt;
@@ -574,7 +551,7 @@ Status parseProcSockstat(const std::map<StringData, std::set<StringData>>& lines
             }
             // We do care about this key. Get the value.
             ++partIt;
-            StringData stringValue(partIt->begin(), partIt->end());
+            StringData stringValue = stringDataFromRange(*partIt);
             long long value;
             if (!NumberParser{}(stringValue, &value).isOK()) {
                 return Status(ErrorCodes::FailedToParse,
@@ -623,19 +600,17 @@ Status parseProcDiskStats(const std::vector<StringData>& disks,
     std::vector<uint64_t> stats;
     stats.reserve(kDiskFieldCount);
 
-    using string_split_iterator = boost::split_iterator<StringData::const_iterator>;
-
     // Split the file by lines.
     // token_compress_on means the iterator skips over consecutive '\n'. This should not be a
     // problem in normal /proc/diskstats output.
-    for (string_split_iterator lineIt = string_split_iterator(
+    for (StringSplitIterator lineIt = StringSplitIterator(
              data.begin(),
              data.end(),
              boost::token_finder([](char c) { return c == '\n'; }, boost::token_compress_on));
-         lineIt != string_split_iterator();
+         lineIt != StringSplitIterator();
          ++lineIt) {
 
-        StringData line((*lineIt).begin(), (*lineIt).end());
+        StringData line = stringDataFromRange(*lineIt);
 
         // Skip leading whitespace so that the split_iterator starts on non-whitespace otherwise we
         // get an empty first token. Device major numbers (the first number on each line) are right
@@ -646,34 +621,34 @@ Status parseProcDiskStats(const std::vector<StringData>& disks,
 
         // Split the line by spaces since that is the only delimiter for diskstats files.
         // token_compress_on means the iterator skips over consecutive ' '.
-        string_split_iterator partIt = string_split_iterator(
+        StringSplitIterator partIt = StringSplitIterator(
             beginNonWhitespace,
             line.end(),
             boost::token_finder([](char c) { return c == ' '; }, boost::token_compress_on));
 
         // Skip processing this line if the line is blank
-        if (partIt == string_split_iterator()) {
+        if (partIt == StringSplitIterator()) {
             continue;
         }
 
         ++partIt;
 
         // Skip processing this line if we only have a device major number.
-        if (partIt == string_split_iterator()) {
+        if (partIt == StringSplitIterator()) {
             continue;
         }
 
         ++partIt;
 
         // Skip processing this line if we only have a device major minor.
-        if (partIt == string_split_iterator()) {
+        if (partIt == StringSplitIterator()) {
             continue;
         }
 
-        StringData disk((*partIt).begin(), (*partIt).end());
+        StringData disk = stringDataFromRange(*partIt);
 
         // Skip processing this line if we only have a block device name.
-        if (partIt == string_split_iterator()) {
+        if (partIt == StringSplitIterator()) {
             continue;
         }
 
@@ -690,10 +665,10 @@ Status parseProcDiskStats(const std::vector<StringData>& disks,
             // could be a CD-ROM drive that is not used.
             bool hasSomeNonZeroStats = false;
 
-            for (size_t index = 0; partIt != string_split_iterator() && index < kDiskFieldCount;
+            for (size_t index = 0; partIt != StringSplitIterator() && index < kDiskFieldCount;
                  ++partIt, ++index) {
 
-                StringData stringValue((*partIt).begin(), (*partIt).end());
+                StringData stringValue = stringDataFromRange(*partIt);
 
                 uint64_t value;
 
@@ -739,8 +714,8 @@ Status parseProcDiskStatsFile(StringData filename,
 Status parseProcSelfMountStatsImpl(
     StringData data,
     BSONObjBuilder* builder,
-    boost::filesystem::space_info (*getSpace)(const boost::filesystem::path&,
-                                              boost::system::error_code&)) {
+    std::function<boost::filesystem::space_info(const boost::filesystem::path&,
+                                                boost::system::error_code&)> getSpace) {
     invariant(getSpace);
     std::istringstream iss(data.toString());
     for (std::string line; std::getline(iss, line);) {
@@ -769,7 +744,10 @@ Status parseProcSelfMountStatsImpl(
 }
 
 Status parseProcSelfMountStats(StringData data, BSONObjBuilder* builder) {
-    return parseProcSelfMountStatsImpl(data, builder, &boost::filesystem::space);
+    auto bfsSpace = [](auto&&... args) {
+        return boost::filesystem::space(args...);
+    };
+    return parseProcSelfMountStatsImpl(data, builder, bfsSpace);
 }
 
 Status parseProcSelfMountStatsFile(StringData filename, BSONObjBuilder* builder) {
@@ -884,63 +862,26 @@ std::vector<std::string> findPhysicalDisks(StringData sysBlockPath) {
 Status parseProcVMStat(const std::vector<StringData>& keys,
                        StringData data,
                        BSONObjBuilder* builder) {
-    bool foundKeys = false;
+    return parseGenericStats(
+        keys,
+        data,
+        [](StringData line, StringSplitIterator& lineIt) {
+            lineIt = StringSplitIterator(
+                line.begin(),
+                line.end(),
+                boost::token_finder([](char c) { return c == ' '; }, boost::token_compress_on));
+            return stringDataFromRange(*lineIt);
+        },
+        [&](StringData key, StringSplitIterator& valueIt) {
+            StringData value = stringDataFromRange(*valueIt);
 
-    using string_split_iterator = boost::split_iterator<StringData::const_iterator>;
-
-    // Split the file by lines.
-    // token_compress_on means the iterator skips over consecutive '\n'. This should not be a
-    // problem in normal /proc/vmstat output.
-    for (string_split_iterator lineIt = string_split_iterator(
-             data.begin(),
-             data.end(),
-             boost::token_finder([](char c) { return c == '\n'; }, boost::token_compress_on));
-         lineIt != string_split_iterator();
-         ++lineIt) {
-
-        StringData line(lineIt->begin(), lineIt->end());
-
-        // Split the line by spaces since this the delimiters for vmstat files.
-        // token_compress_on means the iterator skips over consecutive ' '. This is needed for
-        // every line.
-        string_split_iterator partIt = string_split_iterator(
-            line.begin(),
-            line.end(),
-            boost::token_finder([](char c) { return c == ' '; }, boost::token_compress_on));
-
-        // Skip processing this line if we do not have a key.
-        if (partIt == string_split_iterator()) {
-            continue;
-        }
-
-        StringData key(partIt->begin(), partIt->end());
-
-        ++partIt;
-
-        // Skip processing this line if we only have a key, and no number.
-        if (partIt == string_split_iterator()) {
-            continue;
-        }
-
-        // Check if the key is in the list. /proc/vmstat will have extra keys, and may not have the
-        // keys we want.
-        if (keys.empty() || std::find(keys.begin(), keys.end(), key) != keys.end()) {
-            foundKeys = true;
-
-            StringData stringValue(partIt->begin(), partIt->end());
-
-            uint64_t value;
-
-            if (!NumberParser{}(stringValue, &value).isOK()) {
-                value = 0;
+            uint64_t numVal;
+            if (!NumberParser{}(value, &numVal).isOK()) {
+                numVal = 0;
             }
 
-            builder->appendNumber(key, static_cast<long long>(value));
-        }
-    }
-
-    return foundKeys ? Status::OK()
-                     : Status(ErrorCodes::NoSuchKey, "Failed to find any keys in vmstat string");
+            builder->appendNumber(key, static_cast<long long>(numVal));
+        });
 }
 
 Status parseProcVMStatFile(StringData filename,
@@ -951,24 +892,27 @@ Status parseProcVMStatFile(StringData filename,
         return swString.getStatus();
     }
 
-    return parseProcVMStat(keys, swString.getValue(), builder);
+    auto status = parseProcVMStat(keys, swString.getValue(), builder);
+    if (!status.isOK()) {
+        status.addContext(format(FMT_STRING("Parsing {}"), filename));
+    }
+    return status;
 }
 
 Status parseProcSysFsFileNr(FileNrKey key, StringData data, BSONObjBuilder* builder) {
     // Format: HANDLES_IN_USE<whitespace>UNUSED_HANDLES<whitespace>MAX_HANDLES<return>
-    using string_split_iterator = boost::split_iterator<StringData::const_iterator>;
-    string_split_iterator partIt = string_split_iterator(
+    StringSplitIterator partIt(
         data.begin(),
         data.end(),
         boost::token_finder([](char c) { return c == ' ' || c == '\t' || c == '\n'; },
                             boost::token_compress_on));
 
-    if (partIt == string_split_iterator()) {
+    if (partIt == StringSplitIterator()) {
         return Status(ErrorCodes::FailedToParse, "Couldn't find first token");
     }
 
     if (key == FileNrKey::kFileHandlesInUse) {
-        StringData stringValue(partIt->begin(), partIt->end());
+        StringData stringValue = stringDataFromRange(*partIt);
         uint64_t value;
         if (!NumberParser{}(stringValue, &value).isOK()) {
             return Status(ErrorCodes::FailedToParse, "Couldn't parse first token to number");
@@ -979,19 +923,19 @@ Status parseProcSysFsFileNr(FileNrKey key, StringData data, BSONObjBuilder* buil
     }
     ++partIt;
 
-    if (partIt == string_split_iterator()) {
+    if (partIt == StringSplitIterator()) {
         return Status(ErrorCodes::FailedToParse, "Couldn't find second token");
     }
     // The second value is the number of allocated but unused file handles, which should always be
     // 0; we ignore this.
     ++partIt;
 
-    if (partIt == string_split_iterator()) {
+    if (partIt == StringSplitIterator()) {
         return Status(ErrorCodes::FailedToParse, "Couldn't find third token");
     }
 
     invariant(key == FileNrKey::kMaxFileHandles);
-    StringData stringValue(partIt->begin(), partIt->end());
+    StringData stringValue = stringDataFromRange(*partIt);
     uint64_t value;
     if (!NumberParser{}(stringValue, &value).isOK()) {
         return Status(ErrorCodes::FailedToParse, "Couldn't parse third token to number");
@@ -1020,39 +964,36 @@ Status parseProcSysFsFileNrFile(StringData filename, FileNrKey key, BSONObjBuild
 // Note: /proc/pressure/cpu only has 'some' entry
 //
 Status parseProcPressure(StringData data, BSONObjBuilder* builder) {
-    using string_split_iterator = boost::split_iterator<StringData::const_iterator>;
-
     // Split the file by lines.
     // token_compress_on means the iterator skips over consecutive '\n'.
-    for (string_split_iterator lineIt = string_split_iterator(
+    for (StringSplitIterator lineIt(
              data.begin(),
              data.end(),
              boost::token_finder([](char c) { return c == '\n'; }, boost::token_compress_on));
-         lineIt != string_split_iterator();
+         lineIt != StringSplitIterator();
          ++lineIt) {
 
-        StringData line((*lineIt).begin(), (*lineIt).end());
+        StringData line = stringDataFromRange(*lineIt);
 
         // Split the line by spaces and equal signs since these are the delimiters for pressure
         // files. token_compress_on means the iterator skips over consecutive ' '. This is needed
         // for every line.
-        string_split_iterator partIt =
-            string_split_iterator(line.begin(),
-                                  line.end(),
-                                  boost::token_finder([](char c) { return c == ' ' || c == '='; },
-                                                      boost::token_compress_on));
+        StringSplitIterator partIt(line.begin(),
+                                   line.end(),
+                                   boost::token_finder([](char c) { return c == ' ' || c == '='; },
+                                                       boost::token_compress_on));
 
         // Skip processing this line if we do not have a key.
-        if (partIt == string_split_iterator()) {
+        if (partIt == StringSplitIterator()) {
             continue;
         }
 
-        StringData time((*partIt).begin(), (*partIt).end());
+        StringData time = stringDataFromRange(*partIt);
 
         ++partIt;
 
         // Skip processing this line if we only have a key, and no arguments.
-        if (partIt == string_split_iterator()) {
+        if (partIt == StringSplitIterator()) {
             continue;
         }
 
@@ -1062,24 +1003,24 @@ Status parseProcPressure(StringData data, BSONObjBuilder* builder) {
         }
 
         // Lookup for 'total' token in the parts.
-        auto totalIt = std::find_if(partIt, string_split_iterator(), [](const auto& vec) {
-            return StringData(vec.begin(), vec.end()) == "total"_sd;
+        auto totalIt = std::find_if(partIt, StringSplitIterator(), [](const auto& vec) {
+            return stringDataFromRange(vec) == "total"_sd;
         });
 
         // If 'total' token is not found on the row return an error.
-        if (totalIt == string_split_iterator()) {
+        if (totalIt == StringSplitIterator()) {
             return Status(ErrorCodes::NoSuchKey, "Failed to find 'total' token");
         }
 
-        StringData totalToken((*totalIt).begin(), (*totalIt).end());
+        [[maybe_unused]] StringData totalToken = stringDataFromRange(*totalIt);
 
         ++totalIt;
 
-        if (totalIt == string_split_iterator()) {
+        if (totalIt == StringSplitIterator()) {
             return Status(ErrorCodes::FailedToParse, "No value found for 'total' token");
         }
 
-        StringData stringValue((*totalIt).begin(), (*totalIt).end());
+        StringData stringValue = stringDataFromRange(*totalIt);
 
         double value;
 

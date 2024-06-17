@@ -30,16 +30,22 @@ assert.commandWorked(primaryColl.createIndex({x: 1}, {safe: true, sparse: true, 
 assert.commandWorked(primaryColl.createIndex({y: 1}, {sparse: true}));
 assert.commandWorked(primaryColl.createIndex({z: 1}, {xyz: false}));
 
+// Make sure the createIndex oplogs are applied on secondary before turning off the failpoint.
+rst.awaitReplication();
 fpPrimary.off();
 fpSecondary.off();
 
 // Verify that validate detects indexes with invalid index options on both the primary and
 // secondary nodes.
 let validateRes = assert.commandWorked(primaryDB.runCommand({validate: collName}));
-assert(!validateRes.valid);
+assert(validateRes.valid, validateRes);
+assert.eq(validateRes.errors.length, 0, validateRes);
+assert.eq(validateRes.warnings.length, 2, validateRes);
 
 validateRes = assert.commandWorked(secondaryDB.runCommand({validate: collName}));
-assert(!validateRes.valid);
+assert(validateRes.valid, validateRes);
+assert.eq(validateRes.errors.length, 0, validateRes);
+assert.eq(validateRes.warnings.length, 2, validateRes);
 
 // Use collMod to remove the invalid index options in the collection.
 assert.commandWorked(primaryDB.runCommand({collMod: collName}));
@@ -56,9 +62,13 @@ checkLog.containsJson(secondary, 23878, {fieldName: "xyz"});
 // Verify that validate no longer detects indexes with invalid options on both the primary and
 // secondary nodes.
 validateRes = assert.commandWorked(primaryDB.runCommand({validate: collName}));
-assert(validateRes.valid);
+assert(validateRes.valid, validateRes);
+assert.eq(validateRes.errors.length, 0, validateRes);
+assert.eq(validateRes.warnings.length, 0, validateRes);
 
 validateRes = assert.commandWorked(secondaryDB.runCommand({validate: collName}));
-assert(validateRes.valid);
+assert(validateRes.valid, validateRes);
+assert.eq(validateRes.errors.length, 0, validateRes);
+assert.eq(validateRes.warnings.length, 0, validateRes);
 
 rst.stopSet();

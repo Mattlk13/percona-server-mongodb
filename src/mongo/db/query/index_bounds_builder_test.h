@@ -185,9 +185,9 @@ public:
      */
     void testTranslateAndIntersect(const std::vector<BSONObj>& toIntersect,
                                    OrderedIntervalList* oilOut,
-                                   IndexBoundsBuilder::BoundsTightness* tightnessOut) {
+                                   IndexBoundsBuilder::BoundsTightness* tightnessOut,
+                                   BSONObj obj) {
         auto testIndex = buildSimpleIndexEntry();
-        auto obj = BSON("$and" << toIntersect);
         auto [expr, inputParamIdMap] = parseMatchExpression(obj);
         BSONElement elt = toIntersect[0].firstElement();
         interval_evaluation_tree::Builder ietBuilder{};
@@ -232,7 +232,7 @@ public:
      * the the result is equal to the given OrderedIntervalList.
      */
     static void assertIET(const std::vector<const MatchExpression*>& inputParamIdMap,
-                          const interval_evaluation_tree::Builder& ietBuilder,
+                          interval_evaluation_tree::Builder& ietBuilder,
                           const BSONElement& elt,
                           const IndexEntry& index,
                           const OrderedIntervalList& oil) {

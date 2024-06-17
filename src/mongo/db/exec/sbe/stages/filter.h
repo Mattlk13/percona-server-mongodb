@@ -66,18 +66,20 @@ public:
                 PlanNodeId planNodeId,
                 bool participateInTrialRunTracking = true)
         : PlanStage(IsConst ? "cfilter"_sd : (IsEof ? "efilter" : "filter"_sd),
+                    nullptr /* yieldPolicy */,
                     planNodeId,
                     participateInTrialRunTracking),
           _filter(std::move(filter)) {
         static_assert(!IsEof || !IsConst);
         _children.emplace_back(std::move(input));
+        tassert(8400101, "Filter must be passed a filter", _filter);
     }
 
     std::unique_ptr<PlanStage> clone() const final {
         return std::make_unique<FilterStage<IsConst, IsEof>>(_children[0]->clone(),
                                                              _filter->clone(),
                                                              _commonStats.nodeId,
-                                                             _participateInTrialRunTracking);
+                                                             participateInTrialRunTracking());
     }
 
     void prepare(CompileCtx& ctx) final {
@@ -154,7 +156,7 @@ public:
         }
     }
 
-    std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const {
+    std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const override {
         auto ret = std::make_unique<PlanStageStats>(_commonStats);
         ret->specific = std::make_unique<FilterStats>(_specificStats);
 

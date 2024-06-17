@@ -134,7 +134,7 @@ public:
                       State state,
                       ProvenanceEnum provenance = ProvenanceEnum::kReshardCollection);
 
-    ~ReshardingMetrics();
+    ~ReshardingMetrics() override;
 
     static std::unique_ptr<ReshardingMetrics> makeInstance(UUID instanceId,
                                                            BSONObj shardKey,
@@ -185,9 +185,8 @@ public:
     template <typename StateOrStateVariant>
     static bool mustRestoreExternallyTrackedRecipientFields(StateOrStateVariant stateOrVariant) {
         if constexpr (std::is_same_v<StateOrStateVariant, State>) {
-            return stdx::visit(
-                [](auto v) { return mustRestoreExternallyTrackedRecipientFieldsImpl(v); },
-                stateOrVariant);
+            return visit([](auto v) { return mustRestoreExternallyTrackedRecipientFieldsImpl(v); },
+                         stateOrVariant);
         } else {
             return mustRestoreExternallyTrackedRecipientFieldsImpl(stateOrVariant);
         }
@@ -214,7 +213,7 @@ public:
 
 protected:
     boost::optional<Milliseconds> getRecipientHighEstimateRemainingTimeMillis() const override;
-    virtual StringData getStateString() const noexcept override;
+    StringData getStateString() const noexcept override;
 
 private:
     std::string createOperationDescription() const noexcept override;

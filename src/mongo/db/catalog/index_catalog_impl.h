@@ -237,7 +237,8 @@ public:
                        int64_t* keysDeletedOut,
                        CheckRecordId checkRecordId = CheckRecordId::Off) const override;
 
-    Status compactIndexes(OperationContext* opCtx) const override;
+    StatusWith<int64_t> compactIndexes(OperationContext* opCtx,
+                                       const CompactOptions& options) const override;
 
     inline std::string getAccessMethodName(const BSONObj& keyPattern) override {
         return _getAccessMethodName(keyPattern);

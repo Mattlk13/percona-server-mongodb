@@ -39,6 +39,7 @@ types:
         description: "The bson_serialization_type changes from [int, string] in the old command's
                       reply field type to int in the new command's reply field type"
         cpp_type: "std::int32_t"
+        is_view: false
 
     intStringBoolToIntString:
         bson_serialization_type:
@@ -48,6 +49,7 @@ types:
                       command's reply field type to [int, string] in the new command's reply
                       field type"
         cpp_type: "std::int32_t"
+        is_view: false
 
     intStringToIntStringBool:
         bson_serialization_type:
@@ -58,6 +60,7 @@ types:
                       reply field type to [int, string, bool] in the new command's reply field
                       type"
         cpp_type: "std::int32_t"
+        is_view: false
 
     intToIntString:
         bson_serialization_type:
@@ -66,6 +69,7 @@ types:
         description: "The bson_serialization_type changes from [int] in the old command
                       parameter's type to [int, string] in the new command parameter's type"
         cpp_type: "std::int32_t"
+        is_view: false
 
     bsonSerializationTypeAnyAllowed:
         bson_serialization_type:
@@ -73,6 +77,7 @@ types:
                                 - any
         description: "The bson_serialization_type contains 'any'"
         cpp_type: "std::int32_t"
+        is_view: false
 
 enums:
     NewReplyFieldEnumSubset:
@@ -447,6 +452,7 @@ structs:
             addedUnstableTypeField:
                 type: string
                 stability: unstable
+                optional: true
 
     AddedInternalTypeFieldStruct:
         description: "This struct contains a field that is added and internal in the new version"
@@ -454,6 +460,7 @@ structs:
             addedInternalTypeField:
                 type: string
                 stability: internal
+                optional: true
 
     KeptUnstableTypeFieldStruct:
         description: "This struct contains a field that is unstable in the new version and also
@@ -796,6 +803,20 @@ commands:
                 optional: true
                 stability: stable
 
+    addedCommandParameterDefault:
+        description: "new command parameter with a default is added and should pass"
+        command_name: addedCommandParameterDefault
+        namespace: ignored
+        cpp_name: addedCommandParameterDefault
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+        fields:
+            newStableParameter:
+                type: string
+                default: ""
+                stability: stable
+
     addedCommandParameterStable:
         description: "new command has an optional stable parameter that is unstable
                       in the corresponding old command and still passes"
@@ -809,6 +830,20 @@ commands:
             newOptionalStableParam:
                 type: string
                 optional: true
+                stability: stable
+
+    addedCommandParameterStableRequired:
+        description: "new command has a stable parameter that is unstable and required
+                      in the corresponding old command and still passes"
+        command_name: addedCommandParameterStableRequired
+        namespace: ignored
+        cpp_name: addedCommandParameterStableRequired
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+        fields:
+            newStableParam:
+                type: string
                 stability: stable
 
     addedCommandParameterStableWithDefault:
@@ -878,6 +913,7 @@ commands:
             newUnstableParam:
                 type: string
                 stability: unstable
+                optional: true
 
     keptUnstableCommandParameter:
         description: "new command has an unstable parameter that also
@@ -1967,6 +2003,15 @@ commands:
                 - check: checkOne
                 - check: checkTwo
                 - check: checkThree
+                - privilege:
+                    resource_pattern: resourcePatternOne
+                    action_type: [actionTypeOne]
+                - privilege:
+                    resource_pattern: resourcePatternTwo
+                    action_type: [actionTypeTwo]
+                - privilege:
+                    resource_pattern: resourcePatternThree
+                    action_type: [actionTypeThree]
 
     addedAggStage:
         description: "new command passes when a agg stage is added"
@@ -2279,3 +2324,17 @@ commands:
                 optional: true
                 stability: stable
         reply_type: ReplyWithNewNestedArrayTypeField
+
+    commandWithUnstableRequiredParameter:
+        description: "the same unstable required field is present in both versions of the command"
+        command_name: commandWithUnstableRequiredParameter
+        namespace: ignored
+        cpp_name: commandWithUnstableRequiredParameter
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+        fields:
+            unstableRequiredParam:
+                type: string
+                stability: unstable
+                optional: false

@@ -87,7 +87,12 @@ public:
     // Recursively convert the provided node into a node suitable for vectorized processing.
     // Return a result with an empty 'expr' inside if the node contains an operation that cannot be
     // processed one block at a time.
-    Tree vectorize(optimizer::ABT& node, const VariableTypes& externalBindings);
+    // The externalBindings argument contains the known types for the slots referenced by the ABT
+    // tree. The externalBitmapSlot argument contains the slot where another stage has already
+    // computed a valid selectivity bitmap.
+    Tree vectorize(optimizer::ABT& node,
+                   const VariableTypes& externalBindings,
+                   boost::optional<sbe::value::SlotId> externalBitmapSlot);
 
     // The default visitor for non-supported nodes, returning an empty value to mean "node not
     // supported".
@@ -114,7 +119,7 @@ public:
 private:
     // Ensure that the generated tree is representing a block of measures (i.e.
     // if it's a block expanded from a cell, fold it).
-    void foldIfNecessary(Tree& tree);
+    void foldIfNecessary(Tree& tree, bool useFoldF = false);
 
     // Return an expression combining all the active bitmap masks currently in scope.
     optimizer::ABT generateMaskArg();

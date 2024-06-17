@@ -39,7 +39,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/stdx/variant.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/duration.h"
@@ -141,7 +141,7 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    static YieldPolicy parseFromBSON(const StringData& element) {
+    static YieldPolicy parseFromBSON(StringData element) {
         const std::string& yieldPolicy = element.toString();
         if (yieldPolicy == "YIELD_AUTO") {
             return YieldPolicy::YIELD_AUTO;
@@ -202,7 +202,7 @@ public:
                     ClockSource* cs,
                     int yieldIterations,
                     Milliseconds yieldPeriod,
-                    stdx::variant<const Yieldable*, YieldThroughAcquisitions> yieldable,
+                    std::variant<const Yieldable*, YieldThroughAcquisitions> yieldable,
                     std::unique_ptr<const YieldPolicyCallbacks> callbacks);
 
     virtual ~PlanYieldPolicy() = default;
@@ -212,7 +212,14 @@ public:
      * YIELD_AUTO and INTERRUPT_ONLY) or release locks or storage engine state (in the case of
      * auto-yielding plans).
      */
-    virtual bool shouldYieldOrInterrupt(OperationContext* opCtx);
+    inline bool shouldYieldOrInterrupt(OperationContext* opCtx) {
+        if (auto t = _fastClock->now().toMillisSinceEpoch();
+            MONGO_unlikely(_forceYield || t > _nextYieldCheckpoint)) {
+            _nextYieldCheckpoint = t + _yieldIntervalMs;
+            return doShouldYieldOrInterrupt(opCtx);
+        }
+        return false;
+    }
 
     /**
      * Resets the yield timer so that we wait for a while before yielding/interrupting again.
@@ -295,8 +302,14 @@ public:
     }
 
     bool usesCollectionAcquisitions() const {
-        return stdx::holds_alternative<YieldThroughAcquisitions>(_yieldable);
+        return holds_alternative<YieldThroughAcquisitions>(_yieldable);
     }
+
+protected:
+    /**
+     * The function that actually do check for interrupt or release locks or storage engine state.
+     */
+    MONGO_COMPILER_NOINLINE virtual bool doShouldYieldOrInterrupt(OperationContext* opCtx);
 
 private:
     /**
@@ -329,11 +342,14 @@ private:
                                       std::function<void()> whileYieldingFn);
 
     const YieldPolicy _policy;
-    stdx::variant<const Yieldable*, YieldThroughAcquisitions> _yieldable;
+    std::variant<const Yieldable*, YieldThroughAcquisitions> _yieldable;
     std::unique_ptr<const YieldPolicyCallbacks> _callbacks;
 
-    bool _forceYield = false;
     ElapsedTracker _elapsedTracker;
+    int64_t _yieldIntervalMs;
+    ClockSource* _fastClock;
+    int64_t _nextYieldCheckpoint{0};
+    bool _forceYield = false;
 };
 
 }  // namespace mongo

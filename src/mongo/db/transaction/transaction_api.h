@@ -283,6 +283,13 @@ public:
      * Returns if the client is eligible to run cluster operations.
      */
     virtual bool runsClusterOperations() const = 0;
+
+    Service* getService() {
+        return _service;
+    }
+
+protected:
+    Service* _service;
 };
 
 /**
@@ -291,6 +298,10 @@ public:
  */
 class DefaultSEPTransactionClientBehaviors : public SEPTransactionClientBehaviors {
 public:
+    DefaultSEPTransactionClientBehaviors(OperationContext* opCtx) {
+        _service = opCtx->getService();
+    }
+
     BSONObj maybeModifyCommand(BSONObj cmdObj) const override {
         return cmdObj;
     }
@@ -298,7 +309,7 @@ public:
     Future<DbResponse> handleRequest(OperationContext* opCtx,
                                      const Message& request) const override;
 
-    bool runsClusterOperations() const {
+    bool runsClusterOperations() const override {
         return false;
     }
 };
@@ -312,45 +323,44 @@ public:
     SEPTransactionClient(OperationContext* opCtx,
                          std::shared_ptr<executor::InlineExecutor> inlineExecutor,
                          std::shared_ptr<executor::InlineExecutor::SleepableExecutor> executor,
+                         std::shared_ptr<executor::TaskExecutor> cancelExecutor,
                          std::unique_ptr<SEPTransactionClientBehaviors> behaviors)
         : _serviceContext(opCtx->getServiceContext()),
           _inlineExecutor(inlineExecutor),
           _executor(executor),
+          _cancelExecutor(cancelExecutor),
           _behaviors(std::move(behaviors)) {}
 
     SEPTransactionClient(const SEPTransactionClient&) = delete;
     SEPTransactionClient operator=(const SEPTransactionClient&) = delete;
 
-    virtual void initialize(std::unique_ptr<details::TxnHooks> hooks) override {
+    void initialize(std::unique_ptr<details::TxnHooks> hooks) override {
         invariant(!_hooks);
         _hooks = std::move(hooks);
     }
 
-    virtual SemiFuture<BSONObj> runCommand(const DatabaseName& dbName, BSONObj cmd) const override;
-    virtual BSONObj runCommandSync(const DatabaseName& dbName, BSONObj cmd) const override;
+    SemiFuture<BSONObj> runCommand(const DatabaseName& dbName, BSONObj cmd) const override;
+    BSONObj runCommandSync(const DatabaseName& dbName, BSONObj cmd) const override;
 
-    virtual SemiFuture<BSONObj> runCommandChecked(const DatabaseName& dbName,
-                                                  BSONObj cmd) const override;
-    virtual BSONObj runCommandCheckedSync(const DatabaseName& dbName, BSONObj cmd) const override;
+    SemiFuture<BSONObj> runCommandChecked(const DatabaseName& dbName, BSONObj cmd) const override;
+    BSONObj runCommandCheckedSync(const DatabaseName& dbName, BSONObj cmd) const override;
 
-    virtual SemiFuture<BatchedCommandResponse> runCRUDOp(
-        const BatchedCommandRequest& cmd, std::vector<StmtId> stmtIds) const override;
-    virtual BatchedCommandResponse runCRUDOpSync(const BatchedCommandRequest& cmd,
+    SemiFuture<BatchedCommandResponse> runCRUDOp(const BatchedCommandRequest& cmd,
                                                  std::vector<StmtId> stmtIds) const override;
+    BatchedCommandResponse runCRUDOpSync(const BatchedCommandRequest& cmd,
+                                         std::vector<StmtId> stmtIds) const override;
 
-    virtual SemiFuture<BulkWriteCommandReply> runCRUDOp(
-        const BulkWriteCommandRequest& cmd) const override;
-    virtual BulkWriteCommandReply runCRUDOpSync(const BulkWriteCommandRequest& cmd) const override;
+    SemiFuture<BulkWriteCommandReply> runCRUDOp(const BulkWriteCommandRequest& cmd) const override;
+    BulkWriteCommandReply runCRUDOpSync(const BulkWriteCommandRequest& cmd) const override;
 
-    virtual SemiFuture<std::vector<BSONObj>> exhaustiveFind(
-        const FindCommandRequest& cmd) const override;
-    virtual std::vector<BSONObj> exhaustiveFindSync(const FindCommandRequest& cmd) const override;
+    SemiFuture<std::vector<BSONObj>> exhaustiveFind(const FindCommandRequest& cmd) const override;
+    std::vector<BSONObj> exhaustiveFindSync(const FindCommandRequest& cmd) const override;
 
-    virtual bool supportsClientTransactionContext() const override {
+    bool supportsClientTransactionContext() const override {
         return true;
     }
 
-    virtual bool runsClusterOperations() const override {
+    bool runsClusterOperations() const override {
         return _behaviors->runsClusterOperations();
     }
 
@@ -370,6 +380,7 @@ private:
     ServiceContext* const _serviceContext;
     std::shared_ptr<executor::InlineExecutor> _inlineExecutor;
     std::shared_ptr<executor::InlineExecutor::SleepableExecutor> _executor;
+    std::shared_ptr<executor::TaskExecutor> _cancelExecutor;
     std::unique_ptr<SEPTransactionClientBehaviors> _behaviors;
     std::unique_ptr<details::TxnHooks> _hooks;
 };

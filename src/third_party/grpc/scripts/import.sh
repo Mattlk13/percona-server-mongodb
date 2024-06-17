@@ -7,8 +7,8 @@ IFS=$'\n\t'
 set -vx
 
 NAME=grpc
-REVISION="v1.46.6"
-VERSION="1.46.6"
+REVISION="v1.59.2"
+VERSION="1.59.2"
 
 DEST_DIR=$(git rev-parse --show-toplevel)/src/third_party/grpc
 if [[ -d $DEST_DIR/dist ]]; then
@@ -33,6 +33,13 @@ rm -rf examples/objective-c
 rm -rf examples/php
 rm -rf examples/python
 rm -rf examples/ruby
+rm -rf src/android
+rm -rf src/csharp
+rm -rf src/objective-c
+rm -rf src/php
+rm -rf src/python
+rm -rf src/ruby
+
 find . -type f -name "*.BUILD" -exec rm -rf {} \;
 find . -type f -name "*.podspec" -exec rm -rf {} \;
 find . -type f -name "*.gemspec" -exec rm -rf {} \;

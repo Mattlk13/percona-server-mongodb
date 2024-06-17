@@ -20,7 +20,6 @@ import {
     getRejectedPlans,
     getWinningPlan
 } from "jstests/libs/analyze_plan.js";
-import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
 import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
 // Asserts that the given cursors produce identical result sets.

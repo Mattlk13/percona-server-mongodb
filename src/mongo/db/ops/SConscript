@@ -16,9 +16,9 @@ env.Library(
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/concurrency/exception_util',
-        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/introspect',
         '$BUILD_DIR/mongo/db/matcher/expressions_mongod_only',
+        '$BUILD_DIR/mongo/db/mongod_options',
         '$BUILD_DIR/mongo/db/query/command_request_response',
         '$BUILD_DIR/mongo/db/query/query_stats/query_stats',
         '$BUILD_DIR/mongo/db/query_exec',
@@ -59,7 +59,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/curop_metrics',
         '$BUILD_DIR/mongo/db/dbhelpers',
         '$BUILD_DIR/mongo/db/introspect',
-        '$BUILD_DIR/mongo/db/query/query_settings_manager',
+        '$BUILD_DIR/mongo/db/query/query_settings/manager',
         '$BUILD_DIR/mongo/db/query/query_stats/query_stats',
         '$BUILD_DIR/mongo/db/record_id_helpers',
         '$BUILD_DIR/mongo/db/repl/oplog',
@@ -70,11 +70,12 @@ env.Library(
         '$BUILD_DIR/mongo/db/stats/counters',
         '$BUILD_DIR/mongo/db/stats/server_read_concern_write_concern_metrics',
         '$BUILD_DIR/mongo/db/stats/top',
+        '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/mongo/db/timeseries/bucket_catalog/bucket_catalog',
         '$BUILD_DIR/mongo/db/timeseries/bucket_compression',
+        '$BUILD_DIR/mongo/db/timeseries/bucket_compression_failure',
         '$BUILD_DIR/mongo/db/timeseries/timeseries_conversion_util',
         '$BUILD_DIR/mongo/db/timeseries/timeseries_options',
-        '$BUILD_DIR/mongo/db/timeseries/timeseries_stats',
         '$BUILD_DIR/mongo/db/timeseries/timeseries_write_util',
         '$BUILD_DIR/mongo/db/transaction/transaction',
         '$BUILD_DIR/mongo/db/transaction/transaction_api',
@@ -121,23 +122,21 @@ env.Library(
 )
 
 env.Library(
-    target='parsed_update_array_filters',
-    source='parsed_update_array_filters.cpp',
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/query_expressions',
-    ],
-)
-
-env.Library(
     target='parsed_update',
-    source='parsed_update_base.cpp',
+    source=[
+        'parsed_update_array_filters.cpp',
+        'parsed_update_base.cpp',
+    ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/disk_use_options_idl',
+        '$BUILD_DIR/mongo/db/query_expressions',
         '$BUILD_DIR/mongo/db/shard_role_api',
         '$BUILD_DIR/mongo/db/timeseries/timeseries_conversion_util',
         '$BUILD_DIR/mongo/db/update/update_driver',
-        'parsed_update_array_filters',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/server_base',
+        '$BUILD_DIR/mongo/db/storage/storage_options',
     ],
 )
 
@@ -164,6 +163,7 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/catalog/catalog_test_fixture',
         '$BUILD_DIR/mongo/db/catalog/collection_crud',
+        '$BUILD_DIR/mongo/db/op_observer/op_observer',
         '$BUILD_DIR/mongo/db/query_exec',
         '$BUILD_DIR/mongo/db/record_id_helpers',
         '$BUILD_DIR/mongo/db/repl/mock_repl_coord_server_fixture',

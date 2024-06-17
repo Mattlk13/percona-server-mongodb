@@ -54,14 +54,14 @@
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/pipeline/pipeline.h"
-#include "mongo/db/query/explain_options.h"
 #include "mongo/db/query/find_command.h"
 #include "mongo/db/query/parsed_find_command.h"
 #include "mongo/db/query/query_shape/query_shape.h"
 #include "mongo/db/query/query_shape/serialization_options.h"
-#include "mongo/db/query/query_stats/agg_key_generator.h"
-#include "mongo/db/query/query_stats/find_key_generator.h"
-#include "mongo/db/query/query_stats/key_generator.h"
+#include "mongo/db/query/query_stats/agg_key.h"
+#include "mongo/db/query/query_stats/aggregated_metric.h"
+#include "mongo/db/query/query_stats/find_key.h"
+#include "mongo/db/query/query_stats/key.h"
 #include "mongo/db/query/query_stats/query_stats.h"
 #include "mongo/db/query/query_stats/transform_algorithm_gen.h"
 #include "mongo/db/service_context_test_fixture.h"
@@ -222,7 +222,7 @@ TEST_F(QueryStatsStoreTest, EvictionTest) {
         fcr->setMaxTimeMS(1000);
         fcr->setNoCursorTimeout(false);
         opCtx->setComment(BSON("comment"
-                               << " foo"));
+                               << " foo bar baz"));
         fcr->setSingleBatch(false);
         fcr->setAllowDiskUse(false);
         fcr->setAllowPartialResults(true);
@@ -274,22 +274,18 @@ TEST_F(QueryStatsStoreTest, GenerateMaxBsonSizeQueryShape) {
     auto parsedFind = uassertStatusOK(parsed_find_command::parse(expCtx, {std::move(fcrCopy)}));
     RAIIServerParameterControllerForTest controller("featureFlagQueryStats", true);
 
-    auto&& globalQueryStatsStoreManager = queryStatsStoreDecoration(opCtx->getServiceContext());
+    auto&& globalQueryStatsStoreManager = QueryStatsStoreManager::get(opCtx->getServiceContext());
     globalQueryStatsStoreManager = std::make_unique<QueryStatsStoreManager>(500000, 1000);
 
     // The shapification process will bloat the input query over the 16 MB memory limit. Assert
     // that calling registerRequest() doesn't throw and that the opDebug isn't registered with a
     // key hash (thus metrics won't be tracked for this query).
-    ASSERT_DOES_NOT_THROW(query_stats::registerRequest(
-        opCtx.get(),
-        nss,
-        [&]() {
-            return std::make_unique<query_stats::FindKey>(
-                expCtx, *parsedFind, query_shape::CollectionType::kCollection);
-        },
-        /*requiresFullQueryStatsFeatureFlag*/ false));
+    ASSERT_DOES_NOT_THROW(query_stats::registerRequest(opCtx.get(), nss, [&]() {
+        return std::make_unique<query_stats::FindKey>(
+            expCtx, *parsedFind, query_shape::CollectionType::kCollection);
+    }));
     auto& opDebug = CurOp::get(*opCtx)->debug();
-    ASSERT_EQ(opDebug.queryStatsKeyHash, boost::none);
+    ASSERT_EQ(opDebug.queryStatsInfo.keyHash, boost::none);
 }
 
 TEST_F(QueryStatsStoreTest, CorrectlyRedactsFindCommandRequestAllFields) {
@@ -516,6 +512,15 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsFindCommandRequestAllFields) {
     fcr.setAllowDiskUse(false);
     fcr.setShowRecordId(true);
     fcr.setMirrored(true);
+    auto readPreference = BSON("mode"
+                               << "nearest"
+                               << "tags"
+                               << BSON_ARRAY(BSON("some"
+                                                  << "tag")
+                                             << BSON("some"
+                                                     << "other tag")));
+    ReadPreferenceSetting::get(expCtx->opCtx) =
+        uassertStatusOK(ReadPreferenceSetting::fromInnerBSON(readPreference));
     key = makeQueryStatsKeyFindRequest(fcr, expCtx, true);
 
     ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
@@ -556,6 +561,11 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsFindCommandRequestAllFields) {
                 "allowDiskUse": false,
                 "showRecordId": true,
                 "mirrored": true
+            },
+            "$readPreference": { 
+                "mode": "nearest", 
+                "tags": [ { "some": "other tag" }, { "some": "tag" } ], 
+                "hedge": { "enabled": true } 
             },
             "collectionType": "collection",
             "hint": {
@@ -611,6 +621,11 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsFindCommandRequestAllFields) {
                 "showRecordId": true,
                 "mirrored": true
             },
+            "$readPreference": { 
+                "mode": "nearest", 
+                "tags": [ { "some": "other tag" }, { "some": "tag" } ], 
+                "hedge": { "enabled": true } 
+            },
             "collectionType": "collection",
             "hint": {
                 "HASH<z>": 1,
@@ -622,13 +637,17 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsFindCommandRequestAllFields) {
             "batchSize": "?number"
         })",
         key);
+}
 
-    FindCommandRequest fcr2(
+TEST_F(QueryStatsStoreTest, CorrectlyRedactsTailableFindCommandRequest) {
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+
+    FindCommandRequest fcr(
         NamespaceStringOrUUID(NamespaceString::createNamespaceString_forTest("testDB.testColl")));
-    fcr2.setAwaitData(true);
-    fcr2.setTailable(true);
-    fcr2.setSort(BSON("$natural" << 1));
-    key = makeQueryStatsKeyFindRequest(fcr2, expCtx, true);
+    fcr.setAwaitData(true);
+    fcr.setTailable(true);
+    fcr.setSort(BSON("$natural" << 1));
+    auto key = makeQueryStatsKeyFindRequest(fcr, expCtx, true);
     ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
         R"({
             "queryShape": {
@@ -813,8 +832,10 @@ TEST_F(QueryStatsStoreTest, DefinesLetVariables) {
     // Note that this ExpressionContext will not have the let variables defined - we expect the
     // 'makeQueryStatsKey' call to do that.
     auto opCtx = makeOperationContext();
+    auto tenantId = "010203040506070809AABBCC"_sd;
     auto fcr = std::make_unique<FindCommandRequest>(
-        NamespaceStringOrUUID(NamespaceString::createNamespaceString_forTest("testDB.testColl")));
+        NamespaceStringOrUUID(NamespaceString::createNamespaceString_forTest(
+            TenantId::parseFromString(tenantId), "testDB.testColl")));
     fcr->setLet(BSON("var" << 2));
     fcr->setFilter(fromjson("{$expr: [{$eq: ['$a', '$$var']}]}"));
     fcr->setProjection(fromjson("{varIs: '$$var'}"));
@@ -848,6 +869,7 @@ TEST_F(QueryStatsStoreTest, DefinesLetVariables) {
                     "_id": true
                 }
             },
+            "tenantId": "010203040506070809aabbcc",
             "collectionType": "collection"
         })",
         hmacApplied);
@@ -879,6 +901,7 @@ TEST_F(QueryStatsStoreTest, DefinesLetVariables) {
                     "HASH<_id>": true
                 }
             },
+            "tenantId": "HASH<010203040506070809aabbcc>",
             "collectionType": "collection"
         })",
         hmacApplied);
@@ -966,7 +989,6 @@ TEST_F(QueryStatsStoreTest, CorrectlyTokenizesAggregateCommandRequestAllFieldsSi
         shapified);
 
     // Add the fields that shouldn't be abstracted.
-    acr.setExplain(ExplainOptions::Verbosity::kExecStats);
     acr.setAllowDiskUse(false);
     acr.setHint(BSON("z" << 1 << "c" << 1));
     acr.setCollation(BSON("locale"
@@ -1027,7 +1049,6 @@ TEST_F(QueryStatsStoreTest, CorrectlyTokenizesAggregateCommandRequestAllFieldsSi
                         }
                     }
                 ],
-                "explain": true,
                 "allowDiskUse": false
             },
             "collectionType": "collection",
@@ -1103,7 +1124,6 @@ TEST_F(QueryStatsStoreTest, CorrectlyTokenizesAggregateCommandRequestAllFieldsSi
                         }
                     }
                 ],
-                "explain": true,
                 "allowDiskUse": false
             },
             "collectionType": "collection",
@@ -1182,7 +1202,6 @@ TEST_F(QueryStatsStoreTest, CorrectlyTokenizesAggregateCommandRequestAllFieldsSi
                         }
                     }
                 ],
-                "explain": true,
                 "allowDiskUse": false
             },
             "comment": "?string",
@@ -1213,12 +1232,8 @@ TEST_F(QueryStatsStoreTest, CorrectlyTokenizesAggregateCommandRequestAllFieldsSi
                     "locale": "simple"
                 },
                 "let": {
-                    "HASH<var1>": {
-                        "$const": "?"
-                    },
-                    "HASH<var2>": {
-                        "$const": "?"
-                    }
+                    "HASH<var1>": "?",
+                    "HASH<var2>": "?"
                 },
                 "command": "aggregate",
                 "pipeline": [
@@ -1252,9 +1267,7 @@ TEST_F(QueryStatsStoreTest, CorrectlyTokenizesAggregateCommandRequestAllFieldsSi
                                 "$first": "$HASH<d>.HASH<e>"
                             },
                             "HASH<f>": {
-                                "$sum": {
-                                    "$const": 1
-                                }
+                                "$sum": 1
                             }
                         }
                     },
@@ -1268,7 +1281,6 @@ TEST_F(QueryStatsStoreTest, CorrectlyTokenizesAggregateCommandRequestAllFieldsSi
                         }
                     }
                 ],
-                "explain": true,
                 "allowDiskUse": false
             },
             "comment": "?",
@@ -1430,4 +1442,161 @@ TEST_F(QueryStatsStoreTest,
         })",
         shapified);
 }
+
+BSONObj intMetricBson(int64_t sum, int64_t min, int64_t max, int64_t sumOfSquares) {
+    return BSON("sum" << sum << "max" << max << "min" << min << "sumOfSquares" << sumOfSquares);
+}
+
+BSONObj boolMetricBson(int trueCount, int falseCount) {
+    return BSON("true" << trueCount << "false" << falseCount);
+}
+
+BSONObj toBSON(AggregatedBool& ab) {
+    BSONObjBuilder builder;
+    ab.appendTo(builder, "b");
+    return builder.obj();
+}
+
+TEST(AggBool, Basic) {
+
+    AggregatedBool ab;
+
+    ASSERT_BSONOBJ_EQ(toBSON(ab), BSON("b" << boolMetricBson(0, 0)));
+
+    // Test true is counted correctly
+    ab.aggregate(true);
+    ab.aggregate(true);
+
+    ASSERT_BSONOBJ_EQ(toBSON(ab), BSON("b" << boolMetricBson(2, 0)));
+
+    // Test false is counted correctly
+    ab.aggregate(false);
+
+    ASSERT_BSONOBJ_EQ(toBSON(ab), BSON("b" << boolMetricBson(2, 1)));
+}
+
+TEST_F(QueryStatsStoreTest, BasicDiskUsage) {
+    QueryStatsStore queryStatsStore{5000000, 1000};
+    const BSONObj emptyIntMetric = intMetricBson(0, std::numeric_limits<int64_t>::max(), 0, 0);
+
+    auto getMetrics = [&](BSONObj query) {
+        auto key = makeFindKeyFromQuery(query);
+        auto lookupResult = queryStatsStore.lookup(absl::HashOf(key));
+        ASSERT_OK(lookupResult);
+        return *lookupResult.getValue();
+    };
+
+    auto collectMetricsBase = [&](BSONObj query) {
+        auto key = makeFindKeyFromQuery(query);
+        auto lookupHash = absl::HashOf(key);
+        auto lookupResult = queryStatsStore.lookup(lookupHash);
+        if (!lookupResult.isOK()) {
+            queryStatsStore.put(lookupHash, QueryStatsEntry{std::move(key)});
+            lookupResult = queryStatsStore.lookup(lookupHash);
+        }
+
+        return lookupResult.getValue();
+    };
+
+    auto query1 = BSON("query" << 1 << "xEquals" << 42);
+
+    // Collect some metrics
+    {
+        auto metrics = collectMetricsBase(query1);
+        metrics->execCount += 1;
+        metrics->lastExecutionMicros += 123456;
+    }
+
+    // Verify the serialization works correctly
+    {
+        auto qse = getMetrics(query1);
+
+        // Empty
+        ASSERT_BSONOBJ_EQ(qse.toBSON(false),
+                          BSONObjBuilder{}
+                              .append("lastExecutionMicros", 123456LL)
+                              .append("execCount", 1LL)
+                              .append("totalExecMicros", emptyIntMetric)
+                              .append("firstResponseExecMicros", emptyIntMetric)
+                              .append("docsReturned", emptyIntMetric)
+                              .append("firstSeenTimestamp", qse.firstSeenTimestamp)
+                              .append("latestSeenTimestamp", Date_t())
+                              .obj());
+
+        // With Disk Usage
+        ASSERT_BSONOBJ_EQ(qse.toBSON(true),
+                          BSONObjBuilder{}
+                              .append("lastExecutionMicros", 123456LL)
+                              .append("execCount", 1LL)
+                              .append("totalExecMicros", emptyIntMetric)
+                              .append("firstResponseExecMicros", emptyIntMetric)
+                              .append("docsReturned", emptyIntMetric)
+                              .append("keysExamined", emptyIntMetric)
+                              .append("docsExamined", emptyIntMetric)
+                              .append("hasSortStage", boolMetricBson(0, 0))
+                              .append("usedDisk", boolMetricBson(0, 0))
+                              .append("fromMultiPlanner", boolMetricBson(0, 0))
+                              .append("fromPlanCache", boolMetricBson(0, 0))
+                              .append("firstSeenTimestamp", qse.firstSeenTimestamp)
+                              .append("latestSeenTimestamp", Date_t())
+                              .obj());
+    }
+
+    // Collect some metrics again but with booleans
+    {
+        auto metrics = collectMetricsBase(query1);
+        metrics->execCount += 1;
+        metrics->lastExecutionMicros += 123456;
+        metrics->usedDisk.aggregate(true);
+        metrics->hasSortStage.aggregate(false);
+    }
+
+    // With some boolean metrics
+    {
+        auto qse2 = getMetrics(query1);
+
+        ASSERT_BSONOBJ_EQ(qse2.toBSON(true),
+                          BSONObjBuilder{}
+                              .append("lastExecutionMicros", 246912LL)
+                              .append("execCount", 2LL)
+                              .append("totalExecMicros", emptyIntMetric)
+                              .append("firstResponseExecMicros", emptyIntMetric)
+                              .append("docsReturned", emptyIntMetric)
+                              .append("keysExamined", emptyIntMetric)
+                              .append("docsExamined", emptyIntMetric)
+                              .append("hasSortStage", boolMetricBson(0, 1))
+                              .append("usedDisk", boolMetricBson(1, 0))
+                              .append("fromMultiPlanner", boolMetricBson(0, 0))
+                              .append("fromPlanCache", boolMetricBson(0, 0))
+                              .append("firstSeenTimestamp", qse2.firstSeenTimestamp)
+                              .append("latestSeenTimestamp", Date_t())
+                              .obj());
+    }
+}
+
+class AggregatedMetricTest : public unittest::Test {
+public:
+    template <typename T>
+    BSONObj toBSON(StringData name, const AggregatedMetric<T>& m) {
+        BSONObjBuilder bob;
+        m.appendTo(bob, name);
+        return bob.obj();
+    }
+
+    template <typename T>
+    void doAggregateTest() {
+        AggregatedMetric<T> m{};
+        for (T x : {1, 2, 5})
+            m.aggregate(x);
+        ASSERT_BSONOBJ_EQ(toBSON("m", m), BSON("m" << intMetricBson(8, 1, 5, 30)));
+    }
+};
+
+TEST_F(AggregatedMetricTest, WorksWithVariousIntegerTypes) {
+    doAggregateTest<uint64_t>();
+    doAggregateTest<uint32_t>();
+    doAggregateTest<int64_t>();
+    doAggregateTest<int32_t>();
+}
+
 }  // namespace mongo::query_stats

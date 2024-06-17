@@ -109,6 +109,7 @@ bool shardKeyHasCollatableType(const BSONObj& shardKey) {
 std::pair<BSONObj, BSONObj> generateUpsertDocument(
     OperationContext* opCtx,
     const UpdateRequest& updateRequest,
+    const UUID& collectionUUID,
     boost::optional<TimeseriesOptions> timeseriesOptions,
     const StringDataComparator* comparator) {
     // We are only using this to parse the query for producing the upsert document.
@@ -134,8 +135,11 @@ std::pair<BSONObj, BSONObj> generateUpsertDocument(
     tassert(7777500,
             "Expected timeseries buckets collection namespace",
             updateRequest.getNamespaceString().isTimeseriesBucketsCollection());
-    auto upsertBucketObj = timeseries::makeBucketDocument(
-        std::vector{upsertDoc}, updateRequest.getNamespaceString(), *timeseriesOptions, comparator);
+    auto upsertBucketObj = timeseries::makeBucketDocument(std::vector{upsertDoc},
+                                                          updateRequest.getNamespaceString(),
+                                                          collectionUUID,
+                                                          *timeseriesOptions,
+                                                          comparator);
     return {upsertBucketObj, upsertDoc};
 }
 
@@ -154,7 +158,12 @@ BSONObj constructUpsertResponse(BatchedCommandResponse& writeRes,
         BulkWriteCommandReply bulkWriteReply(
             BulkWriteCommandResponseCursor(
                 0, {replyItem}, NamespaceString::makeBulkWriteNSS(boost::none)),
-            0);
+            0 /* nErrors */,
+            0 /* nInserted */,
+            writeRes.getN() /* nMatched */,
+            0 /* nModified */,
+            1 /* nUpserted */,
+            0 /* nDeleted */);
         reply = bulkWriteReply.toBSON();
     } else if (commandName == write_ops::FindAndModifyCommandRequest::kCommandName ||
                commandName == write_ops::FindAndModifyCommandRequest::kCommandAlias) {
@@ -206,7 +215,7 @@ bool useTwoPhaseProtocol(OperationContext* opCtx,
     // For existing unittests that do not expect sharding utilities to be initialized, we can set
     // this failpoint if we know the test will not use the two phase write protocol.
     if (!feature_flags::gFeatureFlagUpdateOneWithoutShardKey.isEnabled(
-            serverGlobalParams.featureCompatibility) ||
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) ||
         MONGO_unlikely(skipUseTwoPhaseWriteProtocolCheck.shouldFail())) {
         return false;
     }
@@ -238,9 +247,11 @@ bool useTwoPhaseProtocol(OperationContext* opCtx,
                                                                let,
                                                                legacyRuntimeConstants);
 
-    bool arbitraryTimeseriesWritesEnabled = feature_flags::gTimeseriesDeletesSupport.isEnabled(
-                                                serverGlobalParams.featureCompatibility) ||
-        feature_flags::gTimeseriesUpdatesSupport.isEnabled(serverGlobalParams.featureCompatibility);
+    bool arbitraryTimeseriesWritesEnabled =
+        feature_flags::gTimeseriesDeletesSupport.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) ||
+        feature_flags::gTimeseriesUpdatesSupport.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
     auto shardKey = uassertStatusOK(extractShardKeyFromBasicQueryWithContext(
         expCtx,
         cri.cm.getShardKeyPattern(),

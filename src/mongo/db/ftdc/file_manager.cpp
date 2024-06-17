@@ -63,8 +63,13 @@ namespace mongo {
 
 FTDCFileManager::FTDCFileManager(const FTDCConfig* config,
                                  const boost::filesystem::path& path,
-                                 FTDCCollectorCollection* collection)
-    : _config(config), _writer(_config), _path(path), _rotateCollectors(collection) {}
+                                 FTDCCollectorCollection* collection,
+                                 UseMultiServiceSchema multiServiceSchema)
+    : _config(config),
+      _writer(_config, multiServiceSchema),
+      _path(path),
+      _rotateCollectors(collection),
+      _multiServiceSchema(multiServiceSchema) {}
 
 FTDCFileManager::~FTDCFileManager() {
     close().transitional_ignore();
@@ -74,7 +79,8 @@ StatusWith<std::unique_ptr<FTDCFileManager>> FTDCFileManager::create(
     const FTDCConfig* config,
     const boost::filesystem::path& path,
     FTDCCollectorCollection* collection,
-    Client* client) {
+    Client* client,
+    UseMultiServiceSchema multiServiceSchema) {
     const boost::filesystem::path dir = boost::filesystem::absolute(path);
 
     // We don't expect to ever pass "" to create_directories below, but catch
@@ -92,8 +98,8 @@ StatusWith<std::unique_ptr<FTDCFileManager>> FTDCFileManager::create(
         }
     }
 
-    auto mgr =
-        std::unique_ptr<FTDCFileManager>(new FTDCFileManager(config, dir, std::move(collection)));
+    auto mgr = std::unique_ptr<FTDCFileManager>(
+        new FTDCFileManager(config, dir, std::move(collection), multiServiceSchema));
 
     // Enumerate the metrics files
     auto files = mgr->scanDirectory();
@@ -208,7 +214,7 @@ Status FTDCFileManager::openArchiveFile(
     // collect one-time information
     // This is appened after the file is opened to ensure a user can determine which bson objects
     // where collected from which server instance.
-    auto sample = _rotateCollectors->collect(client);
+    auto sample = _rotateCollectors->collect(client, _multiServiceSchema);
     if (!std::get<0>(sample).isEmpty()) {
         Status s = _writer.writeMetadata(std::get<0>(sample), std::get<1>(sample));
 
@@ -332,6 +338,21 @@ Status FTDCFileManager::rotate(Client* client) {
     }
 
     return openArchiveFile(client, swFile.getValue(), {});
+}
+
+Status FTDCFileManager::writePeriodicMetadataSampleAndRotateIfNeeded(Client* client,
+                                                                     const BSONObj& sample,
+                                                                     Date_t date) {
+    auto status = _writer.writePeriodicMetadataSample(sample, date);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    if (_writer.getSize() > _config->maxFileSizeBytes) {
+        return rotate(client);
+    }
+
+    return Status::OK();
 }
 
 Status FTDCFileManager::writeSampleAndRotateIfNeeded(Client* client,

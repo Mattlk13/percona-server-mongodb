@@ -122,7 +122,7 @@ class MozJSImplScope final : public Scope {
 
 public:
     explicit MozJSImplScope(MozJSScriptEngine* engine, boost::optional<int> jsHeapLimitMB);
-    ~MozJSImplScope();
+    ~MozJSImplScope() override;
 
     void init(const BSONObj* data) override;
 
@@ -161,7 +161,8 @@ public:
     BSONObj getObject(const char* field) override;
     OID getOID(const char* field) override;
     // Note: The resulting BSONBinData is only valid within the scope of the 'withBinData' callback.
-    void getBinData(const char* field, std::function<void(const BSONBinData&)> withBinData);
+    void getBinData(const char* field,
+                    std::function<void(const BSONBinData&)> withBinData) override;
     Timestamp getTimestamp(const char* field) override;
     JSRegEx getRegEx(const char* field) override;
 
@@ -472,7 +473,6 @@ private:
     mutable Mutex _mutex = MONGO_MAKE_LATCH("MozJSImplScope::_mutex");
     stdx::condition_variable _sleepCondition;
     std::string _error;
-    unsigned int _opId;               // op id for this scope
     OperationContext* _opCtx;         // Op context for DbEval
     stdx::thread::id _opCtxThreadId;  // Id of the thread that owns '_opCtx'
     std::size_t _inOp;

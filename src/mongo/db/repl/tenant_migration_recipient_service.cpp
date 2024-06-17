@@ -125,6 +125,7 @@
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/db/tenant_id.h"
 #include "mongo/db/transaction/transaction_participant.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/vector_clock_mutable.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/executor/task_executor.h"
@@ -231,7 +232,7 @@ namespace {
 class OplogFetcherRestartDecisionTenantMigration
     : public OplogFetcher::OplogFetcherRestartDecision {
 public:
-    ~OplogFetcherRestartDecisionTenantMigration(){};
+    ~OplogFetcherRestartDecisionTenantMigration() override{};
     bool shouldContinue(OplogFetcher* fetcher, Status status) final {
         return false;
     }
@@ -291,7 +292,7 @@ public:
         MONGO_UNREACHABLE;
     };
 
-    virtual StatusWith<ReplSetConfig> getCurrentConfig() const final {
+    StatusWith<ReplSetConfig> getCurrentConfig() const final {
         MONGO_UNREACHABLE;
     }
 
@@ -1123,7 +1124,7 @@ void TenantMigrationRecipientService::Instance::_processCommittedTransactionEntr
     sessionTxnRecord.setStartOpTime(boost::none);
     sessionTxnRecord.setLastWriteDate(noopEntry.getWallClockTime());
 
-    AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
+    AutoGetOplogFastPath oplogWrite(opCtx, OplogAccessMode::kWrite);
     writeConflictRetry(
         opCtx, "writeDonorCommittedTxnEntry", NamespaceString::kRsOplogNamespace, [&] {
             WriteUnitOfWork wuow(opCtx);
@@ -1478,11 +1479,8 @@ Status TenantMigrationRecipientService::Instance::_enqueueDocuments(
 
     auto opCtx = cc().makeOperationContext();
     if (info.toApplyDocumentCount != 0) {
-        // Wait for enough space.
-        donorOplogBuffer->waitForSpace(opCtx.get(), info.toApplyDocumentBytes);
-
         // Buffer docs for later application.
-        donorOplogBuffer->push(opCtx.get(), begin, end);
+        donorOplogBuffer->push(opCtx.get(), begin, end, info.toApplyDocumentBytes);
     }
 
     if (info.resumeToken.isNull()) {
@@ -1513,7 +1511,7 @@ Status TenantMigrationRecipientService::Instance::_enqueueDocuments(
     noopEntry.setWallClockTime({});
 
     OplogBuffer::Batch noopVec = {noopEntry.toBSON()};
-    donorOplogBuffer->push(opCtx.get(), noopVec.cbegin(), noopVec.cend());
+    donorOplogBuffer->push(opCtx.get(), noopVec.cbegin(), noopVec.cend(), boost::none);
     return Status::OK();
 }
 
@@ -1888,8 +1886,8 @@ SemiFuture<void> TenantMigrationRecipientService::Instance::_markStateDocAsGarba
 
                     const auto originalRecordId = Helpers::findOne(
                         opCtx, collection.getCollection(), BSON("_id" << _migrationUuid));
-                    const auto originalSnapshot =
-                        Snapshotted<BSONObj>(opCtx->recoveryUnit()->getSnapshotId(), preImageDoc);
+                    const auto originalSnapshot = Snapshotted<BSONObj>(
+                        shard_role_details::getRecoveryUnit(opCtx)->getSnapshotId(), preImageDoc);
 
                     invariant(!originalRecordId.isNull(),
                               str::stream() << "Existing tenant migration state document "
@@ -2119,7 +2117,7 @@ TenantMigrationRecipientService::Instance::_checkIfFcvHasChangedSinceLastAttempt
     // subsequent attempt. Fail if there is any mismatch in FCV or
     // upgrade/downgrade state. (Generic FCV reference): This FCV check should
     // exist across LTS binary versions.
-    auto currentFCV = serverGlobalParams.featureCompatibility.getVersion();
+    auto currentFCV = serverGlobalParams.featureCompatibility.acquireFCVSnapshot().getVersion();
     auto startingFCV = _stateDoc.getRecipientPrimaryStartingFCV();
 
     if (!startingFCV) {
@@ -2361,7 +2359,8 @@ SemiFuture<void> TenantMigrationRecipientService::Instance::run(
         // We defer this until after the state doc is persisted in a started so as to make sure it
         // it safe to abort and forget the migration. (Generic FCV reference): This FCV check should
         // exist across LTS binary versions.
-        if (serverGlobalParams.featureCompatibility.isUpgradingOrDowngrading()) {
+        if (serverGlobalParams.featureCompatibility.acquireFCVSnapshot()
+                .isUpgradingOrDowngrading()) {
             LOGV2(5356304, "Must abort tenant migration as recipient is upgrading or downgrading");
             return true;
         }

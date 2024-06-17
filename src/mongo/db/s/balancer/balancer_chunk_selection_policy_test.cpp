@@ -138,28 +138,12 @@ protected:
     }
 
     /**
-     * Sets up mock network to expect a serverStatus command and returns a BSON response with
-     * a dummy version.
-     */
-    void expectServerStatusCommand() {
-        BSONObjBuilder resultBuilder;
-        CommandHelpers::appendCommandStatusNoThrow(resultBuilder, Status::OK());
-
-        onCommand([&resultBuilder](const RemoteCommandRequest& request) {
-            ASSERT(request.cmdObj["serverStatus"]);
-            resultBuilder.append("version", "MONGO_VERSION");
-            return resultBuilder.obj();
-        });
-    }
-
-    /**
      * Sets up mock network for all the shards to expect the commands executed for computing cluster
      * stats, which include listDatabase and serverStatus.
      */
     void expectGetStatsCommands(int numShards) {
         for (int i = 0; i < numShards; i++) {
             expectListDatabasesCommand();
-            expectServerStatusCommand();
         }
     }
 
@@ -361,50 +345,6 @@ protected:
     // Object under test
     std::unique_ptr<BalancerChunkSelectionPolicy> _chunkSelectionPolicy;
 };
-
-TEST_F(BalancerChunkSelectionTest, ZoneRangesOverlap) {
-    setupShards({kShard0, kShard1});
-
-    // Set up a database and a sharded collection in the metadata.
-    const auto collUUID = UUID::gen();
-    ChunkVersion version({OID::gen(), Timestamp(42)}, {2, 0});
-    setupDatabase(kDbName, kShardId0);
-    setUpCollection(kNamespace, collUUID, version);
-
-    // Set up one chunk for the collection in the metadata.
-    ChunkType chunk =
-        setUpChunk(collUUID, kKeyPattern.globalMin(), kKeyPattern.globalMax(), kShardId0, version);
-
-    auto assertRangeOverlapConflictWhenMoveChunk =
-        [this, &chunk](const StringMap<ChunkRange>& zoneChunkRanges) {
-            // Set up two zones whose ranges overlap.
-            setUpZones(kNamespace, zoneChunkRanges);
-
-            auto future = launchAsync([this, &chunk] {
-                ThreadClient tc(getServiceContext()->getService());
-                auto opCtx = Client::getCurrent()->makeOperationContext();
-
-                auto migrateInfoStatus = _chunkSelectionPolicy.get()->selectSpecificChunkToMove(
-                    opCtx.get(), kNamespace, chunk);
-                ASSERT_EQUALS(ErrorCodes::RangeOverlapConflict,
-                              migrateInfoStatus.getStatus().code());
-            });
-
-            expectGetStatsCommands(2);
-            future.default_timed_get();
-            removeAllZones(kNamespace);
-        };
-
-    assertRangeOverlapConflictWhenMoveChunk(
-        {{"A", {kKeyPattern.globalMin(), BSON(kPattern << -10)}},
-         {"B", {BSON(kPattern << -15), kKeyPattern.globalMax()}}});
-    assertRangeOverlapConflictWhenMoveChunk(
-        {{"A", {kKeyPattern.globalMin(), BSON(kPattern << -5)}},
-         {"B", {BSON(kPattern << -10), kKeyPattern.globalMax()}}});
-    assertRangeOverlapConflictWhenMoveChunk(
-        {{"A", {kKeyPattern.globalMin(), kKeyPattern.globalMax()}},
-         {"B", {BSON(kPattern << -15), kKeyPattern.globalMax()}}});
-}
 
 TEST_F(BalancerChunkSelectionTest, ZoneRangeMaxNotAlignedWithChunkMax) {
     setupShards({appendZones(kShard0, {"A"}), appendZones(kShard1, {"A"})});

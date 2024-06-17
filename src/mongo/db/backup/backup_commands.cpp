@@ -83,7 +83,7 @@ public:
                    BSONObjBuilder& result) override;
     void snipForLogging(mutablebson::Document* cmdObj) const override;
 };
-MONGO_REGISTER_COMMAND(CreateBackupCommand);
+MONGO_REGISTER_COMMAND(CreateBackupCommand).forShard();
 
 bool CreateBackupCommand::errmsgRun(mongo::OperationContext* opCtx,
                                     const DatabaseName& db,

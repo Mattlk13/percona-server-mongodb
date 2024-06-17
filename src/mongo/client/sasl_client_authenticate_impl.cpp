@@ -168,7 +168,7 @@ Status saslConfigureSession(SaslClientSession* session,
     status = bsonExtractStringField(saslParameters, saslCommandUserFieldName, &value);
     if (status.isOK()) {
         session->setParameter(SaslClientSession::parameterUser, value);
-    } else if ((targetDatabase != DatabaseName::kExternal.db()) ||
+    } else if ((targetDatabase != DatabaseName::kExternal.db(omitTenant)) ||
                ((mechanism != auth::kMechanismMongoAWS) &&
                 (mechanism != auth::kMechanismMongoOIDC))) {
         return status;
@@ -185,7 +185,7 @@ Status saslConfigureSession(SaslClientSession* session,
     if (status.isOK()) {
         session->setParameter(SaslClientSession::parameterPassword, value);
     } else if (!(status == ErrorCodes::NoSuchKey &&
-                 targetDatabase == DatabaseName::kExternal.db())) {
+                 targetDatabase == DatabaseName::kExternal.db(omitTenant))) {
         // $external users do not have passwords, hence NoSuchKey is expected
         return status;
     }
@@ -249,7 +249,11 @@ Future<void> asyncSaslConversation(auth::RunCommandHook runCommand,
     // Asynchronously continue the conversation
     const auto dbName = DatabaseNameUtil::deserialize(
         boost::none, targetDatabase, SerializationContext::stateDefault());
-    return runCommand(OpMsgRequest::fromDBAndBody(dbName, commandBuilder.obj()))
+    return runCommand(
+               OpMsgRequestBuilder::create(
+                   auth::ValidatedTenancyScope::kNotRequired /* TODO SERVER-86582 investigate */,
+                   dbName,
+                   commandBuilder.obj()))
         .then([runCommand, session, targetDatabase, saslLogLevel](
                   BSONObj serverResponse) -> Future<void> {
             auto status = getStatusFromCommandResult(serverResponse);

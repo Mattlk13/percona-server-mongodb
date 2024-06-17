@@ -102,7 +102,7 @@ public:
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         StageConstraints constraints{StreamType::kStreaming,
                                      PositionRequirement::kFirst,
-                                     HostTypeRequirement::kAllShardServers,
+                                     HostTypeRequirement::kAllShardHosts,
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kNotAllowed,
                                      TransactionRequirement::kNotAllowed,
@@ -121,7 +121,7 @@ private:
 
     GetNextResult doGetNext() final;
 
-    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final override;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     bool _didEmit = false;
 };

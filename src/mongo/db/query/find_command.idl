@@ -44,6 +44,7 @@ imports:
     - "mongo/db/basic_types.idl"
     - "mongo/db/query/cursor_response.idl"
     - "mongo/db/query/hint.idl"
+    - "mongo/db/query/query_settings/query_settings.idl"
 
 types:
     boolNoOpSerializer:
@@ -52,6 +53,7 @@ types:
         cpp_type: "bool"
         deserializer: "::mongo::parseBoolean"
         serializer: "::mongo::noOpSerializer"
+        is_view: false
     object_owned_nonempty_serialize:
         bson_serialization_type: any
         description: "An owned BSONObj, which gets serialized only when the BSON is not empty.
@@ -60,6 +62,7 @@ types:
         serializer: "::mongo::serializeBSONWhenNotEmpty"
         deserializer: "::mongo::parseOwnedBSON"
         default: mongo::BSONObj()
+        is_view: false
 
 commands:
   find:
@@ -100,6 +103,11 @@ commands:
         type: indexHint
         default: mongo::BSONObj()
         stability: stable
+      querySettings:
+        description: "Query settings for the given query"
+        type: QuerySettings
+        optional: true
+        stability: unstable
       collation:
         description: "Specifies the collation to use for the operation."
         type: object_owned_nonempty_serialize
@@ -249,4 +257,8 @@ commands:
         type: uuid
         optional: true
         stability: unstable
+      includeQueryStatsMetrics:
+        description: "Determines whether or not to include query stats metrics in the response."
+        type: optionalBool
+        stability: internal
 

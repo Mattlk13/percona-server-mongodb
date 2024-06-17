@@ -74,13 +74,13 @@ class PlanCacheEntryBase;
 /**
  * Tracks the approximate cumulative size of the plan cache entries across all the collections.
  */
-extern CounterMetric planCacheTotalSizeEstimateBytes;
+extern Counter64& planCacheTotalSizeEstimateBytes;
 
 /**
  * Tracks the number of query shapes in the plan cache entries across all the collections. Each
  * entry in the plan cache is a unique query shape.
  */
-extern CounterMetric planCacheEntries;
+extern Counter64& planCacheEntries;
 
 /**
  * Represents the security level of a plan to help us dictate if we whould filter it out during
@@ -435,14 +435,14 @@ public:
         }
 
         auto newWorks =
-            stdx::visit(OverloadedVisitor{[](const plan_ranker::StatsDetails& details) {
-                                              return details.candidatePlanStats[0]->common.works;
-                                          },
-                                          [](const plan_ranker::SBEStatsDetails& details) {
-                                              return calculateNumberOfReads(
-                                                  details.candidatePlanStats[0].get());
-                                          }},
-                        why.stats);
+            visit(OverloadedVisitor{[](const plan_ranker::StatsDetails& details) {
+                                        return details.candidatePlanStats[0]->common.works;
+                                    },
+                                    [](const plan_ranker::SBEStatsDetails& details) {
+                                        return calculateNumberOfReads(
+                                            details.candidatePlanStats[0].get());
+                                    }},
+                  why.stats);
 
         auto oldEntryWithPartitionLock = this->getWithPartitionLock(key);
         // Can't use reference to structured bindings in a lambda until C++20 so manually

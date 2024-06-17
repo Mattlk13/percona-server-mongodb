@@ -51,6 +51,7 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/client/read_preference.h"
+#include "mongo/db/admission/execution_admission_context.h"
 #include "mongo/db/api_parameters.h"
 #include "mongo/db/auth/authorization_checks.h"
 #include "mongo/db/auth/authorization_session.h"
@@ -62,7 +63,6 @@
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/cursor_id.h"
@@ -83,6 +83,7 @@
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_explainer.h"
 #include "mongo/db/query/plan_summary_stats.h"
+#include "mongo/db/query/query_stats/query_stats.h"
 #include "mongo/db/read_concern.h"
 #include "mongo/db/read_concern_support_result.h"
 #include "mongo/db/repl/optime.h"
@@ -99,6 +100,7 @@
 #include "mongo/db/stats/top.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/tenant_id.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
@@ -257,15 +259,17 @@ void applyCursorReadConcern(OperationContext* opCtx, repl::ReadConcernArgs rcArg
         switch (rcArgs.getMajorityReadMechanism()) {
             case repl::ReadConcernArgs::MajorityReadMechanism::kMajoritySnapshot: {
                 // Make sure we read from the majority snapshot.
-                opCtx->recoveryUnit()->setTimestampReadSource(
+                shard_role_details::getRecoveryUnit(opCtx)->setTimestampReadSource(
                     RecoveryUnit::ReadSource::kMajorityCommitted);
-                uassertStatusOK(opCtx->recoveryUnit()->majorityCommittedSnapshotAvailable());
+                uassertStatusOK(shard_role_details::getRecoveryUnit(opCtx)
+                                    ->majorityCommittedSnapshotAvailable());
                 break;
             }
             case repl::ReadConcernArgs::MajorityReadMechanism::kSpeculative: {
                 // Mark the operation as speculative and select the correct read source.
                 repl::SpeculativeMajorityReadInfo::get(opCtx).setIsSpeculativeRead();
-                opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoOverlap);
+                shard_role_details::getRecoveryUnit(opCtx)->setTimestampReadSource(
+                    RecoveryUnit::ReadSource::kNoOverlap);
                 break;
             }
         }
@@ -275,8 +279,8 @@ void applyCursorReadConcern(OperationContext* opCtx, repl::ReadConcernArgs rcArg
         !opCtx->inMultiDocumentTransaction()) {
         auto atClusterTime = rcArgs.getArgsAtClusterTime();
         invariant(atClusterTime && *atClusterTime != LogicalTime::kUninitialized);
-        opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided,
-                                                      atClusterTime->asTimestamp());
+        shard_role_details::getRecoveryUnit(opCtx)->setTimestampReadSource(
+            RecoveryUnit::ReadSource::kProvided, atClusterTime->asTimestamp());
     }
 
     // For cursor commands that take locks internally, the read concern on the
@@ -356,7 +360,7 @@ class GetMoreCmd final : public Command {
 public:
     GetMoreCmd() : Command("getMore") {}
 
-    const std::set<std::string>& apiVersions() const {
+    const std::set<std::string>& apiVersions() const override {
         return kApiVersions1;
     }
 
@@ -394,6 +398,10 @@ public:
             return kSupportsReadConcernResult;
         }
 
+        bool isSubjectToIngressAdmissionControl() const override {
+            return !_cmd.getTerm().has_value();
+        }
+
         bool allowsAfterClusterTime() const override {
             return false;
         }
@@ -404,6 +412,10 @@ public:
 
         NamespaceString ns() const override {
             return NamespaceStringUtil::deserialize(_cmd.getDbName(), _cmd.getCollection());
+        }
+
+        const DatabaseName& db() const override {
+            return _cmd.getDbName();
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const override {
@@ -638,7 +650,7 @@ public:
             if (cq && cq->getFindCommandRequest().getReadOnce()) {
                 // The readOnce option causes any storage-layer cursors created during plan
                 // execution to assume read data will not be needed again and need not be cached.
-                opCtx->recoveryUnit()->setReadOnce(true);
+                shard_role_details::getRecoveryUnit(opCtx)->setReadOnce(true);
             }
             exec->reattachToOperationContext(opCtx);
             exec->restoreState(readLock ? &readLock->getCollection() : nullptr);
@@ -776,17 +788,21 @@ public:
                 curOp->debug().cursorExhausted = true;
             }
 
-            nextBatch.done(respondWithId,
-                           nss,
-                           SerializationContext::stateCommandReply(_cmd.getSerializationContext()));
-
-            // Increment this metric once we have generated a response and we know it will return
-            // documents.
+            // Collect and increment metrics now that we have enough information. It's important
+            // we do so before generating the response so that the response can include metrics.
             auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
             metricsCollector.incrementDocUnitsReturned(curOp->getNS(), docUnitsReturned);
             curOp->debug().additiveMetrics.nBatches = 1;
             curOp->setEndOfOpMetrics(numResults);
             collectQueryStatsMongod(opCtx, cursorPin);
+
+            boost::optional<CursorMetrics> metrics = _cmd.getIncludeQueryStatsMetrics()
+                ? boost::make_optional(CurOp::get(opCtx)->debug().getCursorMetrics())
+                : boost::none;
+            nextBatch.done(respondWithId,
+                           nss,
+                           metrics,
+                           SerializationContext::stateCommandReply(_cmd.getSerializationContext()));
 
             if (respondWithId) {
                 cursorDeleter.dismiss();
@@ -809,6 +825,7 @@ public:
 
             // The presence of a term in the request indicates that this is an internal replication
             // oplog read request.
+            boost::optional<ScopedAdmissionPriority<ExecutionAdmissionContext>> admissionPriority;
             if (_cmd.getTerm() && nss == NamespaceString::kRsOplogNamespace) {
                 // Validate term before acquiring locks.
                 auto replCoord = repl::ReplicationCoordinator::get(opCtx);
@@ -824,7 +841,11 @@ public:
                 // Stalling on ticket acquisition can cause complicated deadlocks. Primaries may
                 // depend on data reaching secondaries in order to proceed; and secondaries may get
                 // stalled replicating because of an inability to acquire a read ticket.
-                opCtx->lockState()->setAdmissionPriority(AdmissionContext::Priority::kImmediate);
+                admissionPriority.emplace(opCtx, AdmissionContext::Priority::kExempt);
+            }
+
+            if (_cmd.getIncludeQueryStatsMetrics()) {
+                curOp->debug().queryStatsInfo.metricsRequested = true;
             }
 
             // Perform validation checks which don't cause the cursor to be deleted on failure.
@@ -874,16 +895,19 @@ public:
             }
 
             if (getTestCommandsEnabled()) {
-                validateResult(reply, nss.tenantId());
+                validateResult(opCtx, reply, nss.tenantId());
             }
         }
 
-        void validateResult(rpc::ReplyBuilderInterface* reply, boost::optional<TenantId> tenantId) {
+        void validateResult(OperationContext* opCtx,
+                            rpc::ReplyBuilderInterface* reply,
+                            boost::optional<TenantId> tenantId) {
             auto ret = reply->getBodyBuilder().asTempObj();
 
             // We need to copy the serialization context from the request to the reply object
             CursorGetMoreReply::parse(IDLParserContext("CursorGetMoreReply",
                                                        false /* apiStrict */,
+                                                       auth::ValidatedTenancyScope::get(opCtx),
                                                        tenantId,
                                                        SerializationContext::stateCommandReply(
                                                            _cmd.getSerializationContext())),

@@ -58,7 +58,7 @@ namespace mongo {
 
 class StubShardFilterer : public ShardFilterer {
 public:
-    std::unique_ptr<ShardFilterer> clone() const {
+    std::unique_ptr<ShardFilterer> clone() const override {
         MONGO_UNREACHABLE;
     }
 
@@ -91,12 +91,12 @@ public:
     StubLookupSingleDocumentProcessInterface(std::deque<DocumentSource::GetNextResult> mockResults)
         : _mockResults(std::move(mockResults)) {}
 
-    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+    std::unique_ptr<Pipeline, PipelineDeleter> preparePipelineForExecution(
         Pipeline* ownedPipeline,
         ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
         boost::optional<BSONObj> readConcern = boost::none) final;
 
-    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+    std::unique_ptr<Pipeline, PipelineDeleter> preparePipelineForExecution(
         const AggregateCommandRequest& aggRequest,
         Pipeline* pipeline,
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -113,7 +113,7 @@ public:
         const NamespaceString& nss,
         UUID collectionUUID,
         const Document& documentKey,
-        boost::optional<BSONObj> readConcern);
+        boost::optional<BSONObj> readConcern) override;
 
 private:
     std::deque<DocumentSource::GetNextResult> _mockResults;

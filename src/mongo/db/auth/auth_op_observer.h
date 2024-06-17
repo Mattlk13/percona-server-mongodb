@@ -60,12 +60,19 @@ class AuthOpObserver final : public OpObserverNoop {
 
 public:
     AuthOpObserver();
-    ~AuthOpObserver();
+    ~AuthOpObserver() override;
+
+    // The filtering for this OpObserver is derived from the namespace filters in
+    // AuthorizationManagerImpl and the various AuditInterface implementations, see SERVER-83383.
+    NamespaceFilters getNamespaceFilters() const final {
+        return {NamespaceFilter::kSystem, NamespaceFilter::kSystem};
+    }
 
     void onInserts(OperationContext* opCtx,
                    const CollectionPtr& coll,
                    std::vector<InsertStatement>::const_iterator first,
                    std::vector<InsertStatement>::const_iterator last,
+                   const std::vector<RecordId>& recordIds,
                    std::vector<bool> fromMigrate,
                    bool defaultFromMigrate,
                    OpStateAccumulator* opAccumulator = nullptr) final;

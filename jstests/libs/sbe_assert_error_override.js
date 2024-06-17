@@ -159,7 +159,6 @@ const equivalentErrorCodesList = [
     [5787902, 7548606],
     [5787903, 7548606],
     [5787908, 7548606],
-    [ErrorCodes.BadValue, 4938500],
     [50700, 5156303],
     [50699, 5156302],
     [50697, 5156304],
@@ -174,6 +173,7 @@ const equivalentErrorCodesList = [
     [6050106, 7971205],
     [5643011, ErrorCodes.QueryExceededMemoryLimitNoDiskUseAllowed],
     [5414201, 7870900],
+    [5429414, 7993103],
     [6253506, 7856009],
 ];
 

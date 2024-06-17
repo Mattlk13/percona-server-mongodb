@@ -41,10 +41,12 @@ namespace mongo::optimizer::ce {
 class SBESamplingExecutor : public SamplingExecutor {
 public:
     SBESamplingExecutor(OperationContext* opCtx) : _opCtx(opCtx) {}
-    ~SBESamplingExecutor();
+    ~SBESamplingExecutor() override;
 
-    boost::optional<optimizer::SelectivityType> estimateSelectivity(
-        const Metadata& metadata, int64_t sampleSize, const PlanAndProps& planAndProps) final;
+    std::pair<sbe::value::TypeTags, sbe::value::Value> execute(
+        const Metadata& metadata,
+        const QueryParameterMap& queryParameters,
+        const PlanAndProps& planAndProps) const final;
 
 private:
     OperationContext* _opCtx;

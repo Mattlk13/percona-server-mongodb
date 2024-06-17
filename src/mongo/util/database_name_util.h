@@ -34,11 +34,28 @@
 #include <boost/optional/optional.hpp>
 
 #include "mongo/base/string_data.h"
+#include "mongo/db/auth/validated_tenancy_scope.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/tenant_id.h"
 #include "mongo/util/serialization_context.h"
 
 namespace mongo {
+
+/**
+ * This class is meant for specific authentication use cases, mainly to serialize or deserialize
+ * `authDB`. Engineers should default to use `DatabaseNameUtil` unless the use-case has been
+ * carefully vetted in multitenancy.
+ */
+class AuthDatabaseNameUtil {
+public:
+    /**
+     * This method should only be used in authentication code to deserialize `authDB` (which can be
+     * any value and doesn't have a tenant). All other cases should use `DatabaseNameUtil`.
+     */
+    static DatabaseName deserialize(StringData db) {
+        return DatabaseName(boost::none, db);
+    }
+};
 
 class DatabaseNameUtil {
 public:
@@ -62,14 +79,6 @@ public:
      * eg. serialize(DatabaseName(boost::none, "foo")) -> "foo"
      */
     static std::string serialize(const DatabaseName& dbName, const SerializationContext& context);
-
-    /**
-     * To be used only for durable catalog. We always include the tenantId as prefixed in a
-     * databasename for the catalog.
-     */
-    static std::string serializeForCatalog(
-        const DatabaseName& dbName,
-        const SerializationContext& context = SerializationContext::stateDefault());
 
     /**
      * Deserializes StringData dbName to a DatabaseName object.
@@ -100,12 +109,6 @@ public:
                                     const SerializationContext& context);
 
     /**
-     * To be used only by the storage catalog.
-     */
-    static DatabaseName deserializeForCatalog(
-        StringData db, const SerializationContext& context = SerializationContext::stateDefault());
-
-    /**
      * To be used with Failpoints since they can be database specific. Parses the `data` BSONObj to
      * find an existing `dbFieldName` and returns a DatabaseName object from it.
      */
@@ -119,28 +122,18 @@ public:
 private:
     static DatabaseName parseFromStringExpectTenantIdInMultitenancyMode(StringData dbName);
 
-    static std::string serializeForStorage(const DatabaseName& dbName,
-                                           const SerializationContext& context);
+    static std::string serializeForStorage(const DatabaseName& dbName);
 
     static std::string serializeForCommands(const DatabaseName& dbName,
                                             const SerializationContext& context);
 
-    static std::string serializeForAuthPrevalidated(const DatabaseName& dbName,
-                                                    const SerializationContext& context);
-
-    static DatabaseName deserializeForStorage(boost::optional<TenantId> tenantId,
-                                              StringData db,
-                                              const SerializationContext& context);
+    static DatabaseName deserializeForStorage(boost::optional<TenantId> tenantId, StringData db);
 
     static DatabaseName deserializeForCommands(boost::optional<TenantId> tenantId,
                                                StringData db,
                                                const SerializationContext& context);
 
     static DatabaseName deserializeForCatalog(boost::optional<TenantId> tenantId, StringData db);
-
-    static DatabaseName deserializeForAuthPrevalidated(boost::optional<TenantId> tenantId,
-                                                       StringData db,
-                                                       const SerializationContext& context);
 };
 
 }  // namespace mongo

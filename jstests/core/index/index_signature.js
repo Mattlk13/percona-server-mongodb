@@ -7,9 +7,14 @@
  *   # Asserts on the 'numIndexesAfter' part of the createIndexes command response.
  *   assumes_no_implicit_index_creation,
  *   requires_non_retryable_writes,
+ *   # The test that attempts to create an index with partialFilterExpression:
+ *   # {a: {$gt: 0, $lt: 10}, b: "BLAH"}} depends on a functionality fixed in 7.3.
+ *   requires_fcv_73,
  * ]
  */
-import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {
+    ClusteredCollectionUtil
+} from "jstests/libs/clustered_collections/clustered_collection_util.js";
 import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
 const testDB = db.getSiblingDB(jsTestName());
@@ -36,7 +41,15 @@ function makeSpec(opts) {
 // Runs a createIndex command with the given key pattern and options. Then verifies that the
 // number of indexes changed in accordance with the 'expectedChange' argument.
 function buildIndexAndAssertChangeInIndexCount(keyPattern, indexOptions, expectedChange) {
-    const numIndexesBefore = coll.getIndexes().length;
+    let numIndexesBefore = coll.getIndexes().length;
+    if (ClusteredCollectionUtil.areAllCollectionsClustered(db.getMongo())) {
+        // A clustered collection has no actual index on _id even though listIndexes includes
+        // an "_id" index in its results with {clustered: true}. See SERVER-59798.
+        // This implicit "_id" index however is not included in the createIndexes stats
+        // so we need to adjust "numIndexesBefore" to accordingly.
+        numIndexesBefore--;
+    }
+
     const cmdRes = assert.commandWorked(coll.createIndex(keyPattern, indexOptions));
 
     // In a sharded cluster, the results from all shards are returned in cmdRes.raw.
@@ -110,15 +123,12 @@ partialFilterDupeSpec.name = "partial_filter_dupe_index";
 assert.commandFailedWithCode(coll.createIndex(keyPattern, partialFilterDupeSpec),
                              ErrorCodes.IndexOptionsConflict);
 
-// We don't currently take collation into account when checking partialFilterExpression equivalence.
+// We take collation into account when checking partialFilterExpression equivalence.
 // In this instance we are using a case-insensitive collation, and so the predicate {b: "BLAH"} will
 // match the same set of documents as {b: "blah"} in the initial index's partialFilterExpression.
-// But we do not consider these filters equivalent, and so this is considered a distinct index.
-// TODO SERVER-47664: take collation into account in MatchExpression::equivalent().
-assertNewIndexBuilt(keyPattern, makeSpec({
-                        name: "partial_filter_collator_index",
-                        partialFilterExpression: {a: {$gt: 0, $lt: 10}, b: "BLAH"}
-                    }));
+assertIndexAlreadyExists(
+    keyPattern,
+    makeSpec({name: "initial_index", partialFilterExpression: {a: {$gt: 0, $lt: 10}, b: "BLAH"}}));
 
 // We do not currently sort MatchExpression trees by leaf predicate value in cases where two or more
 // branches are otherwise identical, meaning that we cannot identify certain trivial cases where two

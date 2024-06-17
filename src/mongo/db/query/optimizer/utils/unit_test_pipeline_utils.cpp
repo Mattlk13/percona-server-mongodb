@@ -40,8 +40,6 @@
 #include <boost/optional/optional.hpp>
 #include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include "mongo/base/init.h"  // IWYU pragma: keep
-#include "mongo/base/initializer.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsontypes.h"
@@ -54,6 +52,7 @@
 #include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/pipeline_test_util.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/cost_model/cost_model_gen.h"
 #include "mongo/db/query/optimizer/explain.h"
@@ -64,18 +63,7 @@
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/util/intrusive_counter.h"
 
-
 namespace mongo::optimizer {
-namespace {
-std::unique_ptr<unittest::TempDir> tempDir;
-
-MONGO_INITIALIZER_WITH_PREREQUISITES(ABTPipelineTestInitTempDir, ("SetTempDirDefaultRoot"))
-(InitializerContext*) {
-    if (!tempDir) {
-        tempDir = std::make_unique<unittest::TempDir>("ABTPipelineTest");
-    }
-}
-}  // namespace
 
 std::unique_ptr<mongo::Pipeline, mongo::PipelineDeleter> parsePipeline(
     const NamespaceString& nss,
@@ -99,7 +87,8 @@ std::unique_ptr<mongo::Pipeline, mongo::PipelineDeleter> parsePipeline(
         ctx->setResolvedNamespace(resolvedNss.ns, resolvedNss);
     }
 
-    ctx->tempDir = tempDir->path();
+    static unittest::TempDir tempDir("ABTPipelineTest");
+    ctx->tempDir = tempDir.path();
 
     return Pipeline::parse(request.getPipeline(), ctx);
 }
@@ -110,21 +99,35 @@ ABT translatePipeline(const Metadata& metadata,
                       std::string scanDefName,
                       PrefixId& prefixId,
                       const std::vector<ExpressionContext::ResolvedNamespace>& involvedNss,
-                      bool parameterized) {
+                      bool shouldParameterize,
+                      QueryParameterMap* parameters,
+                      size_t maxFilterDepth,
+                      bool shouldNormalizeMatchExpr) {
     auto opCtx = cc().makeOperationContext();
     auto pipeline =
         parsePipeline(NamespaceString::createNamespaceString_forTest("a." + scanDefName),
                       pipelineStr,
                       *opCtx,
                       involvedNss);
-    if (parameterized)
-        MatchExpression::parameterize(
-            dynamic_cast<DocumentSourceMatch*>(pipeline.get()->peekFront())->getMatchExpression());
+    pipeline->optimizePipeline();
+
+    // We normalize match expressions in the pipeline here to ensure the stability of the predicate
+    // order after optimizations.
+    if (shouldNormalizeMatchExpr) {
+        pipeline = normalizeMatchStageInPipeline(std::move(pipeline));
+    }
+
+    if (shouldParameterize) {
+        pipeline->parameterize();
+    }
+    QueryParameterMap qp;
     return translatePipelineToABT(metadata,
                                   *pipeline.get(),
                                   scanProjName,
                                   make<ScanNode>(scanProjName, std::move(scanDefName)),
-                                  prefixId);
+                                  prefixId,
+                                  parameters ? *parameters : qp,
+                                  maxFilterDepth);
 }
 
 void serializeOptPhases(std::ostream& stream, opt::unordered_set<OptPhase> phaseSet) {
@@ -308,7 +311,7 @@ void formatGoldenTestHeader(StringData variationName,
 
     stream << "==== VARIATION: " << variationName << " ====" << std::endl;
     stream << "-- INPUTS:" << std::endl;
-    if (findCmd != nullptr)
+    if (!findCmd.empty())
         stream << "find command: " << findCmd << std::endl;
     else
         stream << "pipeline: " << pipelineStr << std::endl;
@@ -327,6 +330,22 @@ std::string formatGoldenTestExplain(ABT translated, std::ostream& stream) {
     return explained;
 }
 
+void formatGoldenTestQueryParameters(QueryParameterMap& qp, std::ostream& stream) {
+    stream << "Query parameters:" << std::endl;
+    if (qp.empty()) {
+        stream << "(no parameters)" << std::endl;
+        return;
+    }
+    std::vector<int32_t> params;
+    for (auto&& e : qp) {
+        params.push_back(e.first);
+    }
+    std::sort(params.begin(), params.end());
+    for (auto&& paramId : params) {
+        stream << paramId << ": " << qp.at(paramId).get() << std::endl;
+    }
+}
+
 std::string ABTGoldenTestFixture::testABTTranslationAndOptimization(
     StringData variationName,
     StringData pipelineStr,
@@ -335,15 +354,24 @@ std::string ABTGoldenTestFixture::testABTTranslationAndOptimization(
     Metadata metadata,
     PathToIntervalFn pathToInterval,
     bool phaseManagerDisableScan,
-    const std::vector<ExpressionContext::ResolvedNamespace>& involvedNss) {
+    const std::vector<ExpressionContext::ResolvedNamespace>& involvedNss,
+    bool shouldNormalizeMatchExpr) {
     auto&& stream = _ctx->outStream();
 
     formatGoldenTestHeader(
-        variationName, pipelineStr, nullptr, scanDefName, phaseSet, metadata, stream);
+        variationName, pipelineStr, StringData{}, scanDefName, phaseSet, metadata, stream);
 
     auto prefixId = PrefixId::createForTests();
-    ABT translated = translatePipeline(
-        metadata, pipelineStr, prefixId.getNextId("scan"), scanDefName, prefixId, involvedNss);
+    ABT translated = translatePipeline(metadata,
+                                       pipelineStr,
+                                       prefixId.getNextId("scan"),
+                                       scanDefName,
+                                       prefixId,
+                                       involvedNss,
+                                       false /* shouldParameterize */,
+                                       nullptr /* QueryParameterMap */,
+                                       kMaxPathConjunctionDecomposition /* maxDepth */,
+                                       shouldNormalizeMatchExpr);
     return formatGoldenTestExplain(!phaseSet.empty()
                                        ? optimizeABT(translated,
                                                      phaseSet,
@@ -383,16 +411,19 @@ std::string ABTGoldenTestFixture::testParameterizedABTTranslation(StringData var
         auto cq = std::make_unique<CanonicalQuery>(
             CanonicalQueryParams{.expCtx = makeExpressionContext(opCtx.get(), *findCommand),
                                  .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
-
-        return formatGoldenTestExplain(
-            translateCanonicalQueryToABT(
-                metadata, *cq, ProjectionName{"test"}, make<ScanNode>("test", "test"), prefixId),
-            stream);
+        QueryParameterMap qp;
+        auto abt = translateCanonicalQueryToABT(
+            metadata, *cq, ProjectionName{"test"}, make<ScanNode>("test", "test"), prefixId, qp);
+        formatGoldenTestQueryParameters(qp, stream);
+        return formatGoldenTestExplain(abt, stream);
     }
 
     // Query is aggregation pipeline.
+    QueryParameterMap qp;
     ABT translated = translatePipeline(
-        metadata, pipelineStr, prefixId.getNextId("scan"), scanDefName, prefixId, {}, true);
+        metadata, pipelineStr, prefixId.getNextId("scan"), scanDefName, prefixId, {}, true, &qp);
+    formatGoldenTestQueryParameters(qp, stream);
     return formatGoldenTestExplain(translated, stream);
 }
+
 }  // namespace mongo::optimizer

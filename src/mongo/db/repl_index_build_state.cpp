@@ -37,7 +37,6 @@
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/feature_flag.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/repl/member_state.h"
@@ -49,6 +48,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -129,7 +129,7 @@ void IndexBuildState::setState(State state,
 bool IndexBuildState::_checkIfValidTransition(IndexBuildState::State currentState,
                                               IndexBuildState::State newState) const {
     const auto graceful = feature_flags::gIndexBuildGracefulErrorHandling.isEnabled(
-        serverGlobalParams.featureCompatibility);
+        serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
     switch (currentState) {
         case IndexBuildState::State::kSetup:
             return
@@ -280,7 +280,7 @@ bool ReplIndexBuildState::canVoteForAbort() const {
 
 void ReplIndexBuildState::commit(OperationContext* opCtx) {
     auto skipCheck = _shouldSkipIndexBuildStateTransitionCheck(opCtx);
-    opCtx->recoveryUnit()->onCommit(
+    shard_role_details::getRecoveryUnit(opCtx)->onCommit(
         [this, skipCheck](OperationContext*, boost::optional<Timestamp>) {
             stdx::lock_guard lk(_mutex);
             _indexBuildState.setState(IndexBuildState::kCommitted, skipCheck);
@@ -461,7 +461,7 @@ bool ReplIndexBuildState::tryCommit(OperationContext* opCtx) {
 
     _indexBuildState.setState(IndexBuildState::kApplyCommitOplogEntry,
                               skipCheck,
-                              opCtx->recoveryUnit()->getCommitTimestamp());
+                              shard_role_details::getRecoveryUnit(opCtx)->getCommitTimestamp());
     // Promise can be set only once.
     // We can't skip signaling here if a signal is already set because the previous commit or
     // abort signal might have been sent to handle for primary case.
@@ -477,8 +477,9 @@ ReplIndexBuildState::TryAbortResult ReplIndexBuildState::tryAbort(OperationConte
     // MODE_X lock is held and there cannot be concurrent external aborters.
     auto nssOptional = CollectionCatalog::get(opCtx)->lookupNSSByUUID(opCtx, collectionUUID);
     invariant(!_indexBuildState.isExternalAbort());
-    invariant(nssOptional &&
-              opCtx->lockState()->isCollectionLockedForMode(nssOptional.get(), MODE_X));
+    invariant(
+        nssOptional &&
+        shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(nssOptional.get(), MODE_X));
 
     // Wait until the build is done setting up. This indicates that all required state is
     // initialized to attempt an abort.
@@ -537,9 +538,9 @@ ReplIndexBuildState::TryAbortResult ReplIndexBuildState::tryAbort(OperationConte
     LOGV2(4656003, "Aborting index build", "buildUUID"_attr = buildUUID, "error"_attr = reason);
 
     // Set the state on replState. Once set, the calling thread must complete the abort process.
-    auto abortTimestamp =
-        boost::make_optional<Timestamp>(!opCtx->recoveryUnit()->getCommitTimestamp().isNull(),
-                                        opCtx->recoveryUnit()->getCommitTimestamp());
+    auto abortTimestamp = boost::make_optional<Timestamp>(
+        !shard_role_details::getRecoveryUnit(opCtx)->getCommitTimestamp().isNull(),
+        shard_role_details::getRecoveryUnit(opCtx)->getCommitTimestamp());
     auto skipCheck = _shouldSkipIndexBuildStateTransitionCheck(opCtx);
     Status abortStatus = signalAction == IndexBuildAction::kTenantMigrationAbort
         ? tenant_migration_access_blocker::checkIfCanBuildIndex(opCtx, dbName)
@@ -735,7 +736,7 @@ bool ReplIndexBuildState::_shouldSkipIndexBuildStateTransitionCheck(OperationCon
     const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     if (replCoord->getSettings().isReplSet() && protocol == IndexBuildProtocol::kTwoPhase) {
         if (replCoord->getMemberState() == repl::MemberState::RS_STARTUP2 &&
-            !serverGlobalParams.featureCompatibility.isVersionInitialized()) {
+            !serverGlobalParams.featureCompatibility.acquireFCVSnapshot().isVersionInitialized()) {
             // We're likely at the initial stages of a new logical initial sync attempt, and we
             // haven't yet replicated the FCV from the sync source. Skip the index build state
             // transition checks because they rely on the FCV.

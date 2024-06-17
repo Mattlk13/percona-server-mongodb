@@ -45,7 +45,6 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -71,6 +70,7 @@
 #include "mongo/db/session/session_catalog_mongod.h"
 #include "mongo/db/tenant_id.h"
 #include "mongo/db/transaction/session_catalog_mongod_transaction_interface_impl.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/update/document_diff_serialization.h"
 #include "mongo/db/update/update_oplog_entry_serialization.h"
 #include "mongo/executor/network_interface_mock.h"
@@ -211,6 +211,17 @@ public:
     void assertNoOpMatches(const OplogEntry& op, const MutableOplogEntry& noOp) {
         ASSERT_BSONOBJ_EQ(op.getEntry().toBSON(), *noOp.getObject2());
         ASSERT_EQ(op.getNss(), noOp.getNss());
+        ASSERT_EQ(op.getUuid(), noOp.getUuid());
+        ASSERT_EQ(_migrationUuid, noOp.getFromTenantMigration());
+    }
+
+    void assertSessionApplyOpsNoOpMatches(const OplogEntry& op, const MutableOplogEntry& noOp) {
+        ASSERT_BSONOBJ_EQ(op.getEntry().toBSON(), *noOp.getObject2());
+        // TODO(SERVER-87214): The need to use the logging string here is a result of not
+        // running the tests with multitenancy support.
+        ASSERT_EQ(toStringForLogging(
+                      NamespaceString::createNamespaceString_forTest(_dbName.tenantId(), "")),
+                  toStringForLogging(noOp.getNss()));
         ASSERT_EQ(op.getUuid(), noOp.getUuid());
         ASSERT_EQ(_migrationUuid, noOp.getFromTenantMigration());
     }
@@ -431,6 +442,99 @@ TEST_F(TenantOplogApplierTest, NoOpsForLargeTransaction) {
     applier->shutdown();
     _oplogBuffer.shutdown(_opCtx.get());
     applier->join();
+}
+
+TEST_F(TenantOplogApplierTest, NoOpsForLargeRetryableApplyOps) {
+    createCollectionWithUuid(_opCtx.get(), NamespaceString::kSessionTransactionsTableNamespace);
+    {
+        DBDirectClient client(_opCtx.get());
+        client.createIndexes(NamespaceString::kSessionTransactionsTableNamespace,
+                             {MongoDSessionCatalog::getConfigTxnPartialIndexSpec()});
+    }
+    std::vector<OplogEntry> innerOps1;
+    innerOps1.push_back(makeInsertOplogEntry(11,
+                                             NamespaceString::createNamespaceString_forTest(
+                                                 _dbName.toStringWithTenantId_forTest(), "bar"),
+                                             UUID::gen()));
+    innerOps1.push_back(makeInsertOplogEntry(12,
+                                             NamespaceString::createNamespaceString_forTest(
+                                                 _dbName.toStringWithTenantId_forTest(), "bar"),
+                                             UUID::gen()));
+    std::vector<OplogEntry> innerOps2;
+    innerOps2.push_back(makeInsertOplogEntry(21,
+                                             NamespaceString::createNamespaceString_forTest(
+                                                 _dbName.toStringWithTenantId_forTest(), "bar"),
+                                             UUID::gen()));
+    innerOps2.push_back(makeInsertOplogEntry(22,
+                                             NamespaceString::createNamespaceString_forTest(
+                                                 _dbName.toStringWithTenantId_forTest(), "bar"),
+                                             UUID::gen()));
+    std::vector<OplogEntry> innerOps3;
+    innerOps3.push_back(makeInsertOplogEntry(31,
+                                             NamespaceString::createNamespaceString_forTest(
+                                                 _dbName.toStringWithTenantId_forTest(), "bar"),
+                                             UUID::gen()));
+    innerOps3.push_back(makeInsertOplogEntry(32,
+                                             NamespaceString::createNamespaceString_forTest(
+                                                 _dbName.toStringWithTenantId_forTest(), "bar"),
+                                             UUID::gen()));
+
+    // Retryable writes need session information.
+    OperationSessionInfo sessionInfo;
+    auto lsid = makeLogicalSessionId(_opCtx.get());
+    TxnNumber txnNum(5);
+    sessionInfo.setSessionId(lsid);
+    sessionInfo.setTxnNumber(txnNum);
+
+    // Makes entries with ts from range [2, 5).
+    std::vector<OplogEntry> srcOps = makeRetryableApplyOpsOplogEntries(
+        2, _dbName, sessionInfo, {innerOps1, innerOps2, innerOps3});
+    pushOps(srcOps);
+    for (auto&& op : srcOps) {
+        LOGV2(98789, "Test applyops", "op"_attr = op.toBSONForLogging());
+    }
+
+    auto writerPool = makeTenantMigrationWriterPool();
+
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             OpTime(),
+                                             kDefaultCloneFinishedRecipientOpTime,
+                                             _tenantId,
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
+    ASSERT_OK(applier->startup());
+    // All three ops should come in the same batch.
+    auto firstBatchFuture = applier->getNotificationForOpTime(srcOps[0].getOpTime());
+    ASSERT_EQ(srcOps[2].getOpTime(), firstBatchFuture.get().donorOpTime);
+    applier->shutdown();
+    _oplogBuffer.shutdown(_opCtx.get());
+    applier->join();
+
+    // The session path in TenantOplogApplier bypasses the opObserver, so we can only read
+    // the entries from the oplog.
+    CollectionReader oplogReader(_opCtx.get(), NamespaceString::kRsOplogNamespace);
+    StatusWith<BSONObj> swOp = oplogReader.next();
+    // Oplog entries hold references to the original parsed object, so we must hold onto those
+    // objects.
+    std::vector<BSONObj> bsonEntries;
+    std::vector<MutableOplogEntry> entries;
+    while (swOp.isOK()) {
+        auto bsonEntry = swOp.getValue().getOwned();
+        auto entry = unittest::assertGet(MutableOplogEntry::parse(bsonEntry));
+        if (entry.getOpType() == OpTypeEnum::kNoop &&
+            entry.getFromTenantMigration() == _migrationUuid) {
+            bsonEntries.push_back(bsonEntry);
+            entries.push_back(entry);
+        }
+        swOp = oplogReader.next();
+    }
+    ASSERT_EQ(srcOps.size(), entries.size());
+    for (size_t i = 0; i < srcOps.size(); i++) {
+        assertSessionApplyOpsNoOpMatches(srcOps[i], entries[i]);
+    }
 }
 
 TEST_F(TenantOplogApplierTest, CommitUnpreparedTransaction_DataPartiallyApplied) {
@@ -948,8 +1052,8 @@ TEST_F(TenantOplogApplierTest, ApplyDelete_Success) {
                                   const OplogDeleteEntryArgs& args) {
         onDeleteCalled = true;
         ASSERT_TRUE(opCtx);
-        ASSERT_TRUE(opCtx->lockState()->isDbLockedForMode(nss.dbName(), MODE_IX));
-        ASSERT_TRUE(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_IX));
+        ASSERT_TRUE(shard_role_details::getLocker(opCtx)->isDbLockedForMode(nss.dbName(), MODE_IX));
+        ASSERT_TRUE(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(nss, MODE_IX));
         ASSERT_TRUE(opCtx->writesAreReplicated());
         ASSERT_FALSE(args.fromMigrate);
         ASSERT_EQUALS(nss.dbName().toString_forTest(), _dbName.toStringWithTenantId_forTest());
@@ -1078,7 +1182,7 @@ TEST_F(TenantOplogApplierTest, ApplyCreateCollCommand_Success) {
                                             const BSONObj&) {
         applyCmdCalled = true;
         ASSERT_TRUE(opCtx);
-        ASSERT_TRUE(opCtx->lockState()->isDbLockedForMode(nss.dbName(), MODE_IX));
+        ASSERT_TRUE(shard_role_details::getLocker(opCtx)->isDbLockedForMode(nss.dbName(), MODE_IX));
         ASSERT_TRUE(opCtx->writesAreReplicated());
         ASSERT_EQUALS(nss, collNss);
     };
@@ -1123,7 +1227,7 @@ TEST_F(TenantOplogApplierTest, ApplyCreateIndexesCommand_Success) {
                                        bool fromMigrate) {
         ASSERT_FALSE(applyCmdCalled);
         applyCmdCalled = true;
-        ASSERT_TRUE(opCtx->lockState()->isDbLockedForMode(nss.dbName(), MODE_IX));
+        ASSERT_TRUE(shard_role_details::getLocker(opCtx)->isDbLockedForMode(nss.dbName(), MODE_IX));
         ASSERT_TRUE(opCtx->writesAreReplicated());
         ASSERT_BSONOBJ_EQ(indexDoc,
                           BSON("v" << 2 << "key" << BSON("a" << 1) << "name"

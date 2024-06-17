@@ -2,12 +2,15 @@
 //
 // @tags: [
 //   # The test runs commands that are not allowed with security token: setProfilingLevel.
-//   not_allowed_with_security_token,
+//   not_allowed_with_signed_security_token,
 //   does_not_support_stepdowns,
 //   requires_fcv_70,
 //   requires_profiling,
 // ]
 
+import {
+    ClusteredCollectionUtil
+} from "jstests/libs/clustered_collections/clustered_collection_util.js";
 import {isLinux} from "jstests/libs/os_helpers.js";
 import {getLatestProfilerEntry} from "jstests/libs/profiler.js";
 
@@ -33,7 +36,8 @@ for (i = 0; i < 3; ++i) {
 }
 assert.commandWorked(coll.createIndex({a: 1}, {collation: {locale: "fr"}}));
 
-assert.eq(coll.find({a: 1}).collation({locale: "fr"}).limit(1).itcount(), 1);
+// Use batchSize to avoid express path.
+assert.eq(coll.find({a: 1}).collation({locale: "fr"}).limit(1).batchSize(2).itcount(), 1);
 
 var profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
 
@@ -59,6 +63,27 @@ assert(profileObj.hasOwnProperty("numYield"), profileObj);
 assert(profileObj.hasOwnProperty("locks"), profileObj);
 assert(profileObj.locks.hasOwnProperty("Global"), profileObj);
 assert.eq(profileObj.appName, "MongoDB Shell", profileObj);
+
+// Exclude batchSize to test express path.
+{
+    assert.eq(coll.find({a: 1}).collation({locale: "fr"}).limit(1).itcount(), 1);
+    profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
+
+    assert.eq(profileObj.ns, coll.getFullName(), profileObj);
+    assert.eq(profileObj.keysExamined, 1, profileObj);
+    assert.eq(profileObj.docsExamined, 1, profileObj);
+    assert.eq(profileObj.nreturned, 1, profileObj);
+    assert(profileObj.execStats.hasOwnProperty("stage"), profileObj);
+    if (!ClusteredCollectionUtil.areAllCollectionsClustered(testDB)) {
+        // Clustered collections are not always eligible for express path.
+        assert.eq(profileObj.planSummary, "EXPRESS_IXSCAN { a: 1 }", profileObj);
+        assert(profileObj.execStats.hasOwnProperty("indexName"), profileObj);
+    }
+
+    assert.eq(profileObj.command.filter, {a: 1}, profileObj);
+    assert.eq(profileObj.command.limit, 1, profileObj);
+    assert.eq(profileObj.command.collation, {locale: "fr"});
+}
 
 //
 // Confirm "cursorId" and "hasSortStage" metrics.

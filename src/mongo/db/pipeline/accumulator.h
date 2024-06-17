@@ -45,7 +45,6 @@
 #include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/memory_usage_tracker.h"
 #include "mongo/db/query/query_shape/serialization_options.h"
 #include "mongo/db/query/stats/stats_gen.h"
 #include "mongo/db/query/stats/value_utils.h"
@@ -54,6 +53,7 @@
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/util/assert_util_core.h"
 #include "mongo/util/intrusive_counter.h"
+#include "mongo/util/memory_usage_tracker.h"
 #include "mongo/util/summation.h"
 
 namespace mongo {
@@ -150,6 +150,15 @@ public:
         ExpressionConstant const* ec = dynamic_cast<ExpressionConstant const*>(initializer.get());
         invariant(ec);
         invariant(ec->getValue().nullish());
+
+        // We want to wrap constant expressions in order to avoid re-parsing issues in cases where
+        // an array is being passed through a $literal, e.g. $push: {$literal: [1, a]}. Removing
+        // the wrapper would cause the query to error out since accumulators are unary operators.
+        ExpressionConstant const* argumentConst = dynamic_cast<ExpressionConstant*>(argument.get());
+        if (argumentConst) {
+            return DOC(getOpName() << argumentConst->serializeConstant(
+                           options, argumentConst->getValue(), true));
+        }
 
         return DOC(getOpName() << argument->serialize(options));
     }
@@ -293,17 +302,33 @@ class AccumulatorSum final : public AccumulatorState {
 public:
     static constexpr auto kName = "$sum"_sd;
 
+    /**
+     * These aliases represent two possible sum states in AcculumatorSum:
+     *  - ConstantSumState, which is used in the cases of sums over non-decimal constants such as
+     *    {$sum: 1}. It stores the current sum as a running total.
+     *  - NonConstantSumState which is used in all other cases. It stores the current sum using a
+     *    DoubleDoubleSummation and a DecimalTotal.
+     */
+    using NonConstantSumState = std::pair<DoubleDoubleSummation, Decimal128>;
+    using ConstantSumState = std::variant<int, long long, double>;
+
+
+    static boost::optional<Value> getConstantArgument(boost::intrusive_ptr<Expression> arg);
+
     const char* getOpName() const final {
         return kName.rawData();
     }
 
     explicit AccumulatorSum(ExpressionContext* expCtx);
+    explicit AccumulatorSum(ExpressionContext* expCtx, boost::optional<Value> constantAddend);
 
     void processInternal(const Value& input, bool merging) final;
     Value getValue(bool toBeMerged) final;
     void reset() final;
 
     static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* expCtx);
+    static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* expCtx,
+                                                         boost::optional<Value> constantAddend);
 
     ExpressionNary::Associativity getAssociativity() const final {
         return ExpressionNary::Associativity::kFull;
@@ -314,10 +339,31 @@ public:
     }
 
 private:
+    /**
+     * Helper function that converts this accumulator from tracking a constant sum to a non constant
+     * one.
+     */
+    DoubleDoubleSummation _constantSumToDoubleDoubleSummation();
+
+    /**
+     * Helper function that initializes this accumulator to track a constant sum.
+     */
+    void _initConstant(const BSONType& type);
+
+    /**
+     * Helper functions which implement the behavior for processing the desired sum type.
+     */
+    void _processInternalConstant(const Value& input,
+                                  AccumulatorSum::ConstantSumState& constantTotal);
+    void _processInternalNonConstant(const Value& input,
+                                     AccumulatorSum::NonConstantSumState& nonConstantTotal);
+
+    // Tracks the original constant addend argument.
+    boost::optional<Value> constantAddend = boost::none;
     BSONType totalType = NumberInt;
     BSONType nonDecimalTotalType = NumberInt;
-    DoubleDoubleSummation nonDecimalTotal;
-    Decimal128 decimalTotal;
+    std::variant<NonConstantSumState, ConstantSumState> sum =
+        std::make_pair<>(DoubleDoubleSummation(), Decimal128());
 };
 
 class AccumulatorMinMax : public AccumulatorState {

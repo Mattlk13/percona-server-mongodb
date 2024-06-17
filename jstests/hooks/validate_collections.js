@@ -78,7 +78,25 @@ function validateCollectionsImpl(db, obj) {
         filter = {$and: [filter, ...skippedCollections]};
     }
 
-    let collInfo = db.getCollectionInfos(filter);
+    // In a sharded cluster with in-progress validate command for the config database
+    // (i.e. on the config server), a listCommand command on a mongos or shardsvr mongod that
+    // has stale routing info may fail since a refresh would involve running read commands
+    // against the config database. The read commands are lock free so they are not blocked by
+    // the validate command and instead are subject to failing with a ObjectIsBusy error. Since
+    // this is a transient state, we shoud retry.
+    let collInfo;
+    assert.soon(() => {
+        try {
+            collInfo = db.getCollectionInfos(filter);
+        } catch (ex) {
+            if (ex.code === ErrorCodes.ObjectIsBusy) {
+                return false;
+            }
+            throw ex;
+        }
+        return true;
+    });
+
     for (let collDocument of collInfo) {
         const coll = db.getCollection(collDocument['name']);
         const res = coll.validate(obj);
@@ -139,20 +157,27 @@ function validateCollectionsThread(validatorFunc, host) {
             });
         }
 
-        const dbNames = conn.getDBNames();
-        for (let dbName of dbNames) {
-            const validateRes = validatorFunc(conn.getDB(dbName), {
-                full: true,
-                // TODO (SERVER-24266): Always enforce fast counts, once they are always
-                // accurate.
-                enforceFastCount:
-                    !TestData.skipEnforceFastCountOnValidate && !TestData.allowUncleanShutdowns,
-                enforceTimeseriesBucketsAreAlwaysCompressed:
-                    !TestData.skipEnforceTimeseriesBucketsAreAlwaysCompressedOnValidate,
-                warnOnSchemaValidation: true
-            });
-            if (validateRes.ok !== 1) {
-                return {ok: 0, host: host, validateRes: validateRes};
+        const dbs = conn.getDBs().databases;
+        for (let db of dbs) {
+            const dbName = db.name;
+            const tenant = db.tenantId;
+            const token = tenant ? _createTenantToken({tenant}) : undefined;
+            try {
+                conn._setSecurityToken(token);
+                const validateRes = validatorFunc(conn.getDB(dbName), {
+                    full: true,
+                    // TODO (SERVER-24266): Always enforce fast counts, once they are always
+                    // accurate.
+                    enforceFastCount:
+                        !TestData.skipEnforceFastCountOnValidate && !TestData.allowUncleanShutdowns,
+                    enforceTimeseriesBucketsAreAlwaysCompressed:
+                        !TestData.skipEnforceTimeseriesBucketsAreAlwaysCompressedOnValidate,
+                });
+                if (validateRes.ok !== 1) {
+                    return {ok: 0, host: host, validateRes: validateRes};
+                }
+            } finally {
+                conn._setSecurityToken(undefined);
             }
         }
         return {ok: 1};

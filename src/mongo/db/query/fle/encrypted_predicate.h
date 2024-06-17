@@ -71,7 +71,7 @@ namespace fle {
 // std::reference_wrapper is necessary to avoid copying the Value because references alone cannot be
 // included in a variant. BSONElement can be passed by value because it is just a pointer into an
 // owning BSONObj.
-using BSONValue = stdx::variant<BSONElement, std::reference_wrapper<Value>>;
+using BSONValue = std::variant<BSONElement, std::reference_wrapper<Value>>;
 
 /**
  * Parse a find payload from either a BSONElement or a Value. All ParsedFindPayload types should
@@ -80,11 +80,11 @@ using BSONValue = stdx::variant<BSONElement, std::reference_wrapper<Value>>;
  */
 template <typename T>
 T parseFindPayload(BSONValue payload) {
-    return stdx::visit(OverloadedVisitor{[&](BSONElement payload) { return T(payload); },
-                                         [&](Value payload) {
-                                             return T(payload);
-                                         }},
-                       payload);
+    return visit(OverloadedVisitor{[&](BSONElement payload) { return T(payload); },
+                                   [&](Value payload) {
+                                       return T(payload);
+                                   }},
+                 payload);
 }
 
 /**
@@ -265,7 +265,7 @@ extern MatchTypeToRewriteMap matchPredicateRewriteMap;
  */
 #define REGISTER_ENCRYPTED_AGG_PREDICATE_REWRITE_WITH_FLAG(matchType, rewriteClass, featureFlag) \
     REGISTER_ENCRYPTED_AGG_PREDICATE_REWRITE_GUARDED(                                            \
-        matchType, rewriteClass, featureFlag.isEnabled(serverGlobalParams.featureCompatibility))
+        matchType, rewriteClass, featureFlag.isEnabled(serverGlobalParams.featureCompatibility.acquireFCVSnapshot())
 
 /**
  * Register a MatchExpression rewrite if a condition is true at startup time.
@@ -298,6 +298,6 @@ extern MatchTypeToRewriteMap matchPredicateRewriteMap;
  */
 #define REGISTER_ENCRYPTED_MATCH_PREDICATE_REWRITE_WITH_FLAG(matchType, rewriteClass, featureFlag) \
     REGISTER_ENCRYPTED_MATCH_PREDICATE_REWRITE_GUARDED(                                            \
-        matchType, rewriteClass, featureFlag.isEnabled(serverGlobalParams.featureCompatibility))
+        matchType, rewriteClass, featureFlag.isEnabled(serverGlobalParams.featureCompatibility.acquireFCVSnapshot())
 }  // namespace fle
 }  // namespace mongo

@@ -53,20 +53,23 @@ ABT translateCanonicalQueryToABT(const Metadata& metadata,
                                  const CanonicalQuery& canonicalQuery,
                                  ProjectionName scanProjName,
                                  ABT initialNode,
-                                 PrefixId& prefixId) {
+                                 PrefixId& prefixId,
+                                 QueryParameterMap& queryParameters,
+                                 size_t maxFilterDepth) {
     auto matchExpr = generateMatchExpression(canonicalQuery.getPrimaryMatchExpression(),
                                              true /* allowAggExpression */,
                                              scanProjName,
-                                             prefixId);
+                                             prefixId,
+                                             queryParameters);
 
     {
         // Decompose conjunction in the filter into a serial chain of FilterNodes.
         auto result = decomposeToFilterNodes(
-            initialNode, matchExpr, make<Variable>(scanProjName), 1 /*minDepth*/);
+            initialNode, matchExpr, make<Variable>(scanProjName), 1 /*minDepth*/, maxFilterDepth);
         initialNode = std::move(*result);
     }
 
-    AlgebrizerContext ctx{prefixId, {scanProjName, std::move(initialNode)}};
+    AlgebrizerContext ctx{prefixId, {scanProjName, std::move(initialNode)}, queryParameters};
 
     if (auto sortPattern = canonicalQuery.getSortPattern()) {
         generateCollationNode(ctx, *sortPattern);

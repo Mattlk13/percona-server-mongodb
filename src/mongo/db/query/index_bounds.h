@@ -114,6 +114,13 @@ struct OrderedIntervalList {
      * Returns true if this OIL contains only point intervals (such as [N, N]).
      */
     bool containsOnlyPointIntervals() const;
+
+    template <typename H>
+    friend H AbslHashValue(H state, const OrderedIntervalList& c) {
+        state = absl::HashState::combine_contiguous(
+            std::move(state), c.intervals.data(), c.intervals.size());
+        return H::combine(std::move(state), c.name);
+    }
 };
 
 /**
@@ -206,6 +213,12 @@ struct IndexBounds {
      */
     bool isUnbounded() const;
 
+    template <typename H>
+    friend H AbslHashValue(H state, const IndexBounds& c) {
+        return absl::HashState::combine_contiguous(
+            std::move(state), c.fields.data(), c.fields.size());
+    }
+
     // TODO: we use this for max/min scan.  Consider migrating that.
     bool isSimpleRange;
     BSONObj startKey;
@@ -282,6 +295,19 @@ public:
      * Out parameter only valid if we return MUST_ADVANCE.
      */
     KeyState checkKey(const BSONObj& currentKey, IndexSeekPoint* query);
+
+    /**
+     * The function is same as above `checkKey` plus returning the end key position when the last
+     * field of the index is a range interval.
+     *
+     * The end key will be set to empty if KeyState is not VALID or the last field is not a range
+     * interval.
+     */
+    KeyState checkKeyWithEndPosition(const BSONObj& currentKey,
+                                     IndexSeekPoint* query,
+                                     key_string::Builder& endKey,
+                                     Ordering ord,
+                                     bool forward);
 
     /**
      * Relative position of a key to an interval.

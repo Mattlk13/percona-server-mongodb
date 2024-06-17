@@ -38,8 +38,8 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/admission/execution_admission_context.h"
 #include "mongo/db/concurrency/exception_util.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/delete_stage.h"
@@ -135,10 +135,10 @@ StatusWith<int> deleteNextBatch(OperationContext* opCtx,
     }
 
     const auto rangeDeleterPriority = rangeDeleterHighPriority.load()
-        ? AdmissionContext::Priority::kImmediate
+        ? AdmissionContext::Priority::kExempt
         : AdmissionContext::Priority::kLow;
 
-    ScopedAdmissionPriorityForLock priority{opCtx->lockState(), rangeDeleterPriority};
+    ScopedAdmissionPriority<ExecutionAdmissionContext> priority{opCtx, rangeDeleterPriority};
 
     // Extend bounds to match the index we found
     const KeyPattern indexKeyPattern(shardKeyIdx->keyPattern());
@@ -442,11 +442,28 @@ void restoreRangeDeletionTasksForRename(OperationContext* opCtx, const Namespace
                                 nss, SerializationContext::stateDefault()));
 
     rangeDeletionsForRenameStore.forEach(opCtx, query, [&](const RangeDeletionTask& deletionTask) {
-        try {
-            rangeDeletionsStore.add(opCtx, deletionTask);
-        } catch (const ExceptionFor<ErrorCodes::DuplicateKey>&) {
-            // Task already scheduled in a previous call of this method
-        }
+        // Upsert the range deletion document so that:
+        // - If no document for the same range exists, a task will be registered by the range
+        // deleter insert observer.
+        // - If a document for the same range already exists, no new task will be registered on
+        // the range deleter service because the update observer only registers when the update
+        // action is 'unset the pending field'.
+        auto& uuid = deletionTask.getCollectionUuid();
+        auto& range = deletionTask.getRange();
+        auto upsertQuery =
+            BSON(RangeDeletionTask::kCollectionUuidFieldName
+                 << uuid << RangeDeletionTask::kRangeFieldName + "." + ChunkRange::kMinKey
+                 << range.getMin() << RangeDeletionTask::kRangeFieldName + "." + ChunkRange::kMaxKey
+                 << range.getMax());
+        // Remove _id because it's an immutable field so it can't be part of an update.
+        // But include it as part of the upsert because the _id field is expected to be a uuid
+        // (as opposed to the default OID) in case a new document is inserted.
+        auto upsertDocument = deletionTask.toBSON().removeField(RangeDeletionTask::kIdFieldName);
+        rangeDeletionsStore.upsert(opCtx,
+                                   upsertQuery,
+                                   BSON("$set"
+                                        << upsertDocument << "$setOnInsert"
+                                        << BSON(RangeDeletionTask::kIdFieldName << UUID::gen())));
         return true;
     });
 }

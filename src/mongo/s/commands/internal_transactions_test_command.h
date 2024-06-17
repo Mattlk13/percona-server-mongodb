@@ -39,6 +39,34 @@
 
 namespace mongo {
 
+namespace {
+
+// TODO SERVER-86458
+// RAII object that switches an OperationContext's service role to the router role if it isn't
+// already and if the OperationContext's ServiceContext has a router role Service, restoring the
+// original role on destruction. This should be replaced with a formal, public methodology that
+// achieves role switching in either direction.
+class ScopedRouterBehavior {
+public:
+    ScopedRouterBehavior(OperationContext* opCtx)
+        : _opCtx(std::move(opCtx)), _original(_opCtx->getService()) {
+        auto targetService = opCtx->getServiceContext()->getService(ClusterRole::RouterServer);
+        if (!targetService)
+            targetService = opCtx->getServiceContext()->getService();
+        _opCtx->getClient()->setService(targetService);
+    }
+
+    ~ScopedRouterBehavior() {
+        _opCtx->getClient()->setService(_original);
+    }
+
+private:
+    OperationContext* _opCtx;
+    Service* _original;
+};
+
+}  // namespace
+
 template <typename Impl>
 class InternalTransactionsTestCommandBase : public TypedCommand<Impl> {
 public:
@@ -64,6 +92,10 @@ public:
                 ? Grid::get(opCtx)->getExecutorPool()->getFixedExecutor()
                 : getTransactionExecutor();
 
+            boost::optional<ScopedRouterBehavior> scopedRouterBehavior = boost::none;
+            if (Base::request().getUseClusterClient())
+                scopedRouterBehavior.emplace(opCtx);
+
             // If internalTransactionsTestCommand is received by a mongod, it should be instantiated
             // with the TransactionParticipant's resource yielder. If on a mongos, txn should be
             // instantiated with the TransactionRouter's resource yielder.
@@ -72,54 +104,57 @@ public:
                                     Base::request().kCommandName,
                                     Base::request().getUseClusterClient());
 
-            txn.run(
-                opCtx,
-                [sharedBlock](const txn_api::TransactionClient& txnClient, ExecutorPtr txnExec) {
-                    sharedBlock->responses.clear();
+            txn.run(opCtx,
+                    [sharedBlock, opCtx](const txn_api::TransactionClient& txnClient,
+                                         ExecutorPtr txnExec) {
+                        sharedBlock->responses.clear();
 
-                    // Iterate through commands and record responses for each. Return immediately if
-                    // we encounter a response with a retriedStmtId. This field indicates that the
-                    // command and everything following it have already been executed.
-                    for (const auto& commandInfo : sharedBlock->commandInfos) {
-                        const auto& dbName = commandInfo.getDbName();
-                        const auto& command = commandInfo.getCommand();
-                        auto exhaustCursor = commandInfo.getExhaustCursor();
+                        // Iterate through commands and record responses for each. Return
+                        // immediately if we encounter a response with a retriedStmtId. This field
+                        // indicates that the command and everything following it have already been
+                        // executed.
+                        for (const auto& commandInfo : sharedBlock->commandInfos) {
+                            const auto& dbName = commandInfo.getDbName();
+                            const auto& command = commandInfo.getCommand();
+                            auto exhaustCursor = commandInfo.getExhaustCursor();
 
-                        if (exhaustCursor == boost::optional<bool>(true)) {
-                            // We can't call a getMore without knowing its cursor's id, so we
-                            // use the exhaustiveFind helper to test getMores. Make an OpMsgRequest
-                            // from the command to append $db, which FindCommandRequest expects.
-                            auto findOpMsgRequest = OpMsgRequest::fromDBAndBody(dbName, command);
-                            auto findCommand = FindCommandRequest::parse(
-                                IDLParserContext("FindCommandRequest", false /* apiStrict */),
-                                findOpMsgRequest.body);
+                            if (exhaustCursor == boost::optional<bool>(true)) {
+                                // We can't call a getMore without knowing its cursor's id, so we
+                                // use the exhaustiveFind helper to test getMores. Make an
+                                // OpMsgRequest from the command to append $db, which
+                                // FindCommandRequest expects.
+                                auto findOpMsgRequest = OpMsgRequestBuilder::create(
+                                    auth::ValidatedTenancyScope::get(opCtx), dbName, command);
+                                auto findCommand = FindCommandRequest::parse(
+                                    IDLParserContext("FindCommandRequest", false /* apiStrict */),
+                                    findOpMsgRequest.body);
 
-                            auto docs = txnClient.exhaustiveFindSync(findCommand);
+                                auto docs = txnClient.exhaustiveFindSync(findCommand);
 
-                            BSONObjBuilder resBob;
-                            resBob.append("docs", std::move(docs));
-                            sharedBlock->responses.emplace_back(resBob.obj());
-                            continue;
+                                BSONObjBuilder resBob;
+                                resBob.append("docs", std::move(docs));
+                                sharedBlock->responses.emplace_back(resBob.obj());
+                                continue;
+                            }
+
+                            const auto res = txnClient.runCommandSync(dbName, command);
+
+                            sharedBlock->responses.emplace_back(
+                                CommandHelpers::filterCommandReplyForPassthrough(
+                                    res.removeField("recoveryToken")));
+
+                            uassertStatusOK(getStatusFromWriteCommandReply(res));
+
+                            // Exit if we are reexecuting commands in a retryable write, identified
+                            // by a populated retriedStmtId. eoo() is false if field is found.
+                            const auto isRetryStmt = !(res.getField("retriedStmtIds").eoo() &&
+                                                       res.getField("retriedStmtId").eoo());
+                            if (isRetryStmt) {
+                                break;
+                            }
                         }
-
-                        const auto res = txnClient.runCommandSync(dbName, command);
-
-                        sharedBlock->responses.emplace_back(
-                            CommandHelpers::filterCommandReplyForPassthrough(
-                                res.removeField("recoveryToken")));
-
-                        uassertStatusOK(getStatusFromWriteCommandReply(res));
-
-                        // Exit if we are reexecuting commands in a retryable write, identified by a
-                        // populated retriedStmtId. eoo() is false if field is found.
-                        const auto isRetryStmt = !(res.getField("retriedStmtIds").eoo() &&
-                                                   res.getField("retriedStmtId").eoo());
-                        if (isRetryStmt) {
-                            break;
-                        }
-                    }
-                    return SemiFuture<void>::makeReady();
-                });
+                        return SemiFuture<void>::makeReady();
+                    });
 
             return TestInternalTransactionsCommandReply(std::move(sharedBlock->responses));
         };

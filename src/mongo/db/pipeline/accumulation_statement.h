@@ -78,12 +78,14 @@ namespace mongo {
  * to correctly enable/disable the accumulator.
  */
 #define REGISTER_ACCUMULATOR_WITH_FEATURE_FLAG(key, factory, featureFlag) \
-    REGISTER_ACCUMULATOR_CONDITIONALLY(key,                               \
-                                       factory,                           \
-                                       AllowedWithApiStrict::kAlways,     \
-                                       AllowedWithClientType::kAny,       \
-                                       featureFlag,                       \
-                                       featureFlag.isEnabledAndIgnoreFCVUnsafeAtStartup())
+    REGISTER_ACCUMULATOR_CONDITIONALLY(                                   \
+        key,                                                              \
+        factory,                                                          \
+        AllowedWithApiStrict::kAlways,                                    \
+        AllowedWithClientType::kAny,                                      \
+        featureFlag,                                                      \
+        featureFlag.isEnabledUseLatestFCVWhenUninitialized(               \
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot()))
 
 /**
  * You can specify a condition, evaluated during startup,
@@ -159,8 +161,13 @@ struct AccumulationExpression {
     AccumulationExpression(boost::intrusive_ptr<Expression> initializer,
                            boost::intrusive_ptr<Expression> argument,
                            AccumulatorState::Factory factory,
-                           StringData name)
-        : initializer(initializer), argument(argument), factory(factory), name(name) {
+                           StringData name,
+                           bool groupMatchOptimizationEligible = false)
+        : initializer(initializer),
+          argument(argument),
+          factory(factory),
+          name(name),
+          groupMatchOptimizationEligible(groupMatchOptimizationEligible) {
         invariant(this->initializer);
         invariant(this->argument);
     }
@@ -172,13 +179,15 @@ struct AccumulationExpression {
     boost::intrusive_ptr<Expression> argument;
 
     // A no argument function object that can be called to create an AccumulatorState.
-    const AccumulatorState::Factory factory;
+    AccumulatorState::Factory factory;
 
     // The name of the accumulator expression. It is the caller's responsibility to make sure the
     // memory this points to does not get freed. This can best be accomplished by passing in a
     // pointer to a string constant. This StringData is always required to point to a valid
     // null-terminated string.
-    const StringData name;
+    StringData name;
+
+    bool groupMatchOptimizationEligible;
 };
 
 /**
@@ -192,6 +201,23 @@ AccumulationExpression genericParseSingleExpressionAccumulator(ExpressionContext
     auto initializer = ExpressionConstant::create(expCtx, Value(BSONNULL));
     auto argument = Expression::parseOperand(expCtx, elem, vps);
     return {initializer, argument, [expCtx]() { return AccName::create(expCtx); }, AccName::kName};
+}
+
+/**
+ * A default parser for any accumulator that only takes a single expression as an argument and is
+ * eligible for a match to be pushed ahead if the match is on the id field(s). Returns nthe
+ * expression to be evaluated by the accumulator and an AccumulatorState::Factory.
+ */
+template <class AccName>
+AccumulationExpression genericParseSingleExpressionAccumulatorGroupMatchEligible(
+    ExpressionContext* const expCtx, BSONElement elem, VariablesParseState vps) {
+    auto initializer = ExpressionConstant::create(expCtx, Value(BSONNULL));
+    auto argument = Expression::parseOperand(expCtx, elem, vps);
+    return {initializer,
+            argument,
+            [expCtx]() { return AccName::create(expCtx); },
+            AccName::kName,
+            true};
 }
 
 /**
@@ -215,10 +241,33 @@ inline AccumulationExpression parseCountAccumulator(ExpressionContext* const exp
             "$count takes no arguments, i.e. $count:{}",
             elem.type() == BSONType::Object && elem.Obj().isEmpty());
     auto initializer = ExpressionConstant::create(expCtx, Value(BSONNULL));
-    auto argument = ExpressionConstant::create(expCtx, Value(1));
+    const Value constantAddend = Value(1);
+    auto argument = ExpressionConstant::create(expCtx, constantAddend);
     return {initializer,
             argument,
-            [expCtx]() { return AccumulatorSum::create(expCtx); },
+            [expCtx, constantAddend]() {
+                return AccumulatorSum::create(expCtx, boost::make_optional(constantAddend));
+            },
+            AccumulatorSum::kName};
+}
+
+/**
+ * A $sum accumulation statement parser that handles the case of a constant sum argument such as
+ * {$sum: 1}.
+ */
+template <class AccName>
+AccumulationExpression parseSumAccumulator(ExpressionContext* const expCtx,
+                                           BSONElement elem,
+                                           VariablesParseState vps) {
+    auto initializer = ExpressionConstant::create(expCtx, Value(BSONNULL));
+    auto argument = Expression::parseOperand(expCtx, elem, vps);
+
+    return {initializer,
+            argument,
+            [expCtx, argument]() {
+                return AccumulatorSum::create(expCtx,
+                                              AccumulatorSum::getConstantArgument(argument));
+            },
             AccumulatorSum::kName};
 }
 

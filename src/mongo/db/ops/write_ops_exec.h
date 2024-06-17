@@ -50,7 +50,7 @@
 #include "mongo/db/ops/write_ops_exec_util.h"
 #include "mongo/db/ops/write_ops_gen.h"
 #include "mongo/db/ops/write_ops_parsers.h"
-#include "mongo/db/query/query_settings_gen.h"
+#include "mongo/db/query/query_settings/query_settings_gen.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/session/logical_session_id.h"
@@ -62,11 +62,12 @@
 
 namespace mongo {
 
+class CanonicalQuery;
+class CurOp;
 class DeleteRequest;
 class OpDebug;
 class PlanExecutor;
 class UpdateRequest;
-class CanonicalQuery;
 
 namespace write_ops_exec {
 
@@ -110,17 +111,20 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
                                 const boost::optional<mongo::UUID>& collectionUUID,
                                 bool ordered,
                                 std::vector<InsertStatement>& batch,
+                                OperationSource source,
                                 LastOpFixer* lastOpFixer,
-                                WriteResult* out,
-                                OperationSource source);
+                                WriteResult* out);
 
 /**
  * If the operation succeeded, then returns either a document to return to the client, or
  * boost::none if no matching document to update/remove was found. If the operation failed, throws.
+ * Accepts the name of the operation (e.g. "delete", "update", "findAndModify") for use in the
+ * exception and log messages.
  */
 boost::optional<BSONObj> advanceExecutor(OperationContext* opCtx,
                                          PlanExecutor* exec,
-                                         bool isRemove);
+                                         bool isRemove,
+                                         StringData operationName);
 
 /**
  * Executes an update, supports returning a pre/post image. The returned document is placed into
@@ -138,7 +142,8 @@ UpdateResult performUpdate(OperationContext* opCtx,
 
 /**
  * Executes a delete, supports returning the deleted document. the returned document is placed into
- * docFound (if applicable). Should be called in a writeConflictRetry loop.
+ * docFound (if applicable). Should be called in a writeConflictRetry loop. Returns the number of
+ * documents deleted as a long long to conform to OpDebug interface.
  */
 long long performDelete(OperationContext* opCtx,
                         const NamespaceString& nss,
@@ -150,11 +155,24 @@ long long performDelete(OperationContext* opCtx,
 
 /**
  * Generates a WriteError for a given Status.
+ *
+ * This function may throw.
  */
 boost::optional<write_ops::WriteError> generateError(OperationContext* opCtx,
                                                      const Status& status,
                                                      int index,
                                                      size_t numErrors);
+
+/**
+ * Generates a WriteError for a given Status. Does not handle tenant migration errors.
+ *
+ * Marked as 'noexcept' as we need to safely be able to call this function during exception
+ * handling.
+ */
+boost::optional<write_ops::WriteError> generateErrorNoTenantMigration(OperationContext* opCtx,
+                                                                      const Status& status,
+                                                                      int index,
+                                                                      size_t numErrors) noexcept;
 
 /**
  * Updates the retryable write stats if the write op contains retry.

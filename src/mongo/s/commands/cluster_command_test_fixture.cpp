@@ -54,6 +54,7 @@
 #include "mongo/db/session/logical_session_id_gen.h"
 #include "mongo/db/vector_clock.h"
 #include "mongo/executor/network_test_env.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/commands/cluster_command_test_fixture.h"
@@ -135,10 +136,6 @@ void ClusterCommandTestFixture::expectReturnsError(ErrorCodes::Error code) {
 }
 
 DbResponse ClusterCommandTestFixture::runCommand(BSONObj cmd) {
-    // TODO SERVER-48142 should remove the following fail-point usage.
-    // Skip appending required fields in unit-tests
-    FailPointEnableBlock skipAppendingReqFields("allowSkippingAppendRequiredFieldsToResponse");
-
     // Create a new client/operation context per command
     auto client = getServiceContext()->getService()->makeClient("ClusterCmdClient");
     auto opCtx = client->makeOperationContext();
@@ -156,9 +153,11 @@ DbResponse ClusterCommandTestFixture::runCommand(BSONObj cmd) {
 
     // If bulkWrite then append adminDB.
     if (cmd.firstElementFieldNameStringData() == "bulkWrite") {
-        opMsgRequest = OpMsgRequest::fromDBAndBody(DatabaseName::kAdmin, cmd);
+        opMsgRequest = OpMsgRequestBuilder::create(
+            auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kAdmin, cmd);
     } else {
-        opMsgRequest = OpMsgRequest::fromDBAndBody(kNss.dbName(), cmd);
+        opMsgRequest = OpMsgRequestBuilder::create(
+            auth::ValidatedTenancyScope::get(opCtx.get()), kNss.dbName(), cmd);
     }
 
     AlternativeClientRegion acr(client);
@@ -341,10 +340,70 @@ void ClusterCommandTestFixture::testSnapshotReadConcernWithAfterClusterTime(
     }
 }
 
+void ClusterCommandTestFixture::testIncludeQueryStatsMetrics(BSONObj cmd, bool isTargeted) {
+    const std::string fieldName = "includeQueryStatsMetrics";
+
+    // The given command should not set includeQueryStatsMetrics.
+    ASSERT(cmd[fieldName].eoo());
+
+    BSONObj cmdIncludeTrue = cmd.addField(BSON(fieldName << true).firstElement());
+    BSONObj cmdIncludeFalse = cmd.addField(BSON(fieldName << false).firstElement());
+
+    auto expectFieldIs = [&](bool value) {
+        return [value, &fieldName](const executor::RemoteCommandRequest& request) {
+            auto elt = request.cmdObj[fieldName];
+            ASSERT(!elt.eoo());
+            ASSERT_EQ(elt.boolean(), value);
+        };
+    };
+
+    auto expectNoField = [&](const executor::RemoteCommandRequest& request) {
+        ASSERT(request.cmdObj[fieldName].eoo());
+    };
+
+    {
+        RAIIServerParameterControllerForTest flag("featureFlagQueryStatsDataBearingNodes", true);
+
+        {
+            // No rate limit i.e., no requests are rate limited and each one is allowed to gather
+            // stats. We'll always request metrics, even if the user set includeQueryStatsMetrics
+            // to false.
+            RAIIServerParameterControllerForTest rateLimit("internalQueryStatsRateLimit", -1);
+
+            runCommandInspectRequests(cmd, expectFieldIs(true), isTargeted);
+            runCommandInspectRequests(cmdIncludeTrue, expectFieldIs(true), isTargeted);
+            runCommandInspectRequests(cmdIncludeFalse, expectFieldIs(true), isTargeted);
+        }
+
+        {
+            // Rate limit is 0 i.e., every request is rate-limited.
+            RAIIServerParameterControllerForTest rateLimit("internalQueryStatsRateLimit", 0);
+
+            // If the user doesn't give includeQueryStatsMetrics, we won't insert the field.
+            runCommandInspectRequests(cmd, expectNoField, isTargeted);
+
+            // If the user passed us includeQueryStatsMetrics, we'll pass it through.
+            runCommandInspectRequests(cmdIncludeTrue, expectFieldIs(true), isTargeted);
+            runCommandInspectRequests(cmdIncludeFalse, expectFieldIs(false), isTargeted);
+        }
+    }
+
+    {
+        RAIIServerParameterControllerForTest flag("featureFlagQueryStatsDataBearingNodes", false);
+        RAIIServerParameterControllerForTest rateLimit("internalQueryStatsRateLimit", -1);
+
+        // Having the feature flag disabled means we won't set the field unrequested.
+        runCommandInspectRequests(cmd, expectNoField, isTargeted);
+
+        // We will still pass through the field when the feature flag is false.
+        runCommandInspectRequests(cmdIncludeTrue, expectFieldIs(true), isTargeted);
+        runCommandInspectRequests(cmdIncludeFalse, expectFieldIs(false), isTargeted);
+    }
+}
+
 void ClusterCommandTestFixture::appendTxnResponseMetadata(BSONObjBuilder& bob) {
     // Set readOnly to false to avoid opting in to the read-only optimization.
-    TxnResponseMetadata txnResponseMetadata(false);
-    txnResponseMetadata.serialize(&bob);
+    bob.append(TxnResponseMetadata::kReadOnlyFieldName, false);
 }
 
 // Satisfies dependency from StoreSASLOPtions.

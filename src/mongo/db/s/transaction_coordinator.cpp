@@ -232,14 +232,13 @@ TransactionCoordinator::TransactionCoordinator(
 
                 _transactionCoordinatorMetricsObserver->onStartStep(
                     TransactionCoordinator::Step::kWritingParticipantList,
+                    TransactionCoordinator::Step::kInactive,
                     ServerTransactionCoordinatorsMetrics::get(_serviceContext),
                     _serviceContext->getTickSource(),
                     _serviceContext->getPreciseClockSource()->now());
-
                 if (_participantsDurable)
                     return Future<repl::OpTime>::makeReady(repl::OpTime());
             }
-
             return txn::persistParticipantsList(
                 *_sendPrepareScheduler, _lsid, _txnNumberAndRetryCounter, *_participants);
         })
@@ -270,10 +269,12 @@ TransactionCoordinator::TransactionCoordinator(
                 stdx::lock_guard<Latch> lg(_mutex);
                 invariant(_participantsDurable);
 
+                auto previousStep = _step;
                 _step = Step::kWaitingForVotes;
 
                 _transactionCoordinatorMetricsObserver->onStartStep(
                     TransactionCoordinator::Step::kWaitingForVotes,
+                    previousStep,
                     ServerTransactionCoordinatorsMetrics::get(_serviceContext),
                     _serviceContext->getTickSource(),
                     _serviceContext->getPreciseClockSource()->now());
@@ -336,10 +337,12 @@ TransactionCoordinator::TransactionCoordinator(
                 stdx::lock_guard<Latch> lg(_mutex);
                 invariant(_decision);
 
+                auto previousStep = _step;
                 _step = Step::kWritingDecision;
 
                 _transactionCoordinatorMetricsObserver->onStartStep(
                     TransactionCoordinator::Step::kWritingDecision,
+                    previousStep,
                     ServerTransactionCoordinatorsMetrics::get(_serviceContext),
                     _serviceContext->getTickSource(),
                     _serviceContext->getPreciseClockSource()->now());
@@ -378,10 +381,12 @@ TransactionCoordinator::TransactionCoordinator(
                 stdx::lock_guard<Latch> lg(_mutex);
                 invariant(_decisionDurable);
 
+                auto previousStep = _step;
                 _step = Step::kWaitingForDecisionAcks;
 
                 _transactionCoordinatorMetricsObserver->onStartStep(
                     TransactionCoordinator::Step::kWaitingForDecisionAcks,
+                    previousStep,
                     ServerTransactionCoordinatorsMetrics::get(_serviceContext),
                     _serviceContext->getTickSource(),
                     _serviceContext->getPreciseClockSource()->now());
@@ -415,10 +420,12 @@ TransactionCoordinator::TransactionCoordinator(
             {
                 stdx::lock_guard<Latch> lg(_mutex);
 
+                auto previousStep = _step;
                 _step = Step::kWritingEndOfTransaction;
 
                 _transactionCoordinatorMetricsObserver->onStartStep(
                     TransactionCoordinator::Step::kWritingEndOfTransaction,
+                    previousStep,
                     ServerTransactionCoordinatorsMetrics::get(_serviceContext),
                     _serviceContext->getTickSource(),
                     _serviceContext->getPreciseClockSource()->now());
@@ -437,10 +444,12 @@ TransactionCoordinator::TransactionCoordinator(
             {
                 stdx::lock_guard<Latch> lg(_mutex);
 
+                auto previousStep = _step;
                 _step = Step::kDeletingCoordinatorDoc;
 
                 _transactionCoordinatorMetricsObserver->onStartStep(
                     TransactionCoordinator::Step::kDeletingCoordinatorDoc,
+                    previousStep,
                     ServerTransactionCoordinatorsMetrics::get(_serviceContext),
                     _serviceContext->getTickSource(),
                     _serviceContext->getPreciseClockSource()->now());
@@ -654,7 +663,7 @@ TransactionCoordinator::Step TransactionCoordinator::getStep() const {
     return _step;
 }
 
-void TransactionCoordinator::reportState(BSONObjBuilder& parent) const {
+void TransactionCoordinator::reportState(OperationContext* opCtx, BSONObjBuilder& parent) const {
     BSONObjBuilder doc;
     TickSource* tickSource = _serviceContext->getTickSource();
     TickSource::Tick currentTick = tickSource->getTicks();
@@ -676,7 +685,7 @@ void TransactionCoordinator::reportState(BSONObjBuilder& parent) const {
     const auto& singleStats =
         _transactionCoordinatorMetricsObserver->getSingleTransactionCoordinatorStats();
     singleStats.reportMetrics(doc, tickSource, currentTick);
-    singleStats.reportLastClient(parent);
+    singleStats.reportLastClient(opCtx, parent);
 
     if (_decision)
         doc.append("decision", _decision->toBSON());

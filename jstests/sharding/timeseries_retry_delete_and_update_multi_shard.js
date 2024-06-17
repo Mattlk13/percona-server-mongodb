@@ -5,6 +5,10 @@
  * @tags: [
  *   requires_timeseries,
  *   featureFlagTimeseriesUpdatesSupport,
+ *   # Needed to run createUnsplittableCollection
+ *   # TODO (SERVER-87625) Remove feature flag dependency.
+ *   featureFlagAuthoritativeShardCollection,
+ *   requires_fcv_80
  * ]
  */
 

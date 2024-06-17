@@ -2204,5 +2204,146 @@ TEST_F(AsyncResultsMergerTest, ShouldNotScheduleGetMoresWithoutAnOperationContex
     killFuture.wait();
 }
 
+TEST_F(AsyncResultsMergerTest, IncludeQueryStatsMetricsIncludedInGetMore) {
+    auto runGetMore = [this](bool requestParams) {
+        BSONObj findCmd = fromjson("{find: 'testcoll', sort: {_id: 1}}");
+        std::vector<RemoteCursor> cursors;
+        cursors.push_back(makeRemoteCursor(
+            kTestShardIds[0], kTestShardHosts[0], CursorResponse(kTestNss, 5, {})));
+
+        auto params = makeARMParamsFromExistingCursors(std::move(cursors), findCmd);
+        params.setRequestQueryStatsFromRemotes(requestParams);
+        auto arm =
+            std::make_unique<AsyncResultsMerger>(operationContext(), executor(), std::move(params));
+
+        // Schedule the request for the getMore.
+        auto readyEvent = unittest::assertGet(arm->nextEvent());
+
+        // Stash the request so we can inspect it.
+        auto cmd = getNthPendingRequest(0u).cmdObj;
+
+        // Schedule a response.
+        std::vector<CursorResponse> responses;
+        std::vector<BSONObj> nonEmptyBatch = {fromjson("{_id: 1}")};
+        responses.emplace_back(kTestNss, CursorId(0), nonEmptyBatch);
+        scheduleNetworkResponses(std::move(responses));
+
+        // Kill the ARM.
+        auto killFuture = arm->kill(operationContext());
+        killFuture.wait();
+
+        return cmd;
+    };
+
+    {
+        // The original query was not selected for query stats - we don't expect to see the flag.
+        auto cmd = runGetMore(false);
+        ASSERT_TRUE(cmd["includeQueryStatsMetrics"].eoo());
+    }
+
+    {
+        // The original query was selected for query stats - we expect to see the flag true.
+        auto cmd = runGetMore(true);
+        ASSERT_TRUE(cmd["includeQueryStatsMetrics"].Bool());
+    }
+}
+
+TEST_F(AsyncResultsMergerTest, RemoteMetricsAggregatedLocally) {
+    auto scheduleResponse = [&](CursorId id, std::vector<BSONObj> batch, CursorMetrics metrics) {
+        std::vector<CursorResponse> responses;
+        responses.emplace_back(kTestNss,
+                               id,
+                               std::move(batch),
+                               boost::none /* atClusterTime */,
+                               boost::none /* postBatchResumeToken */,
+                               boost::none /* writeConcernError */,
+                               boost::none /* varsField */,
+                               boost::none /* cursorType */,
+                               std::move(metrics));
+        scheduleNetworkResponses(std::move(responses));
+    };
+
+    CursorId id(123);
+
+    AsyncResultsMergerParams params;
+    params.setNss(kTestNss);
+
+    std::vector<RemoteCursor> cursors;
+    cursors.push_back(
+        makeRemoteCursor(kTestShardIds[0], kTestShardHosts[0], CursorResponse(kTestNss, id, {})));
+    params.setRemotes(std::move(cursors));
+    auto arm =
+        std::make_unique<AsyncResultsMerger>(operationContext(), executor(), std::move(params));
+
+    // Schedule the request for a getMore.
+    auto readyEvent = unittest::assertGet(arm->nextEvent());
+
+    // Schedule a response.
+    scheduleResponse(id,
+                     {fromjson("{_id: 1}")},
+                     CursorMetrics(2 /* keysExamined */,
+                                   5 /* docsExamined */,
+                                   false /* hasSortStage */,
+                                   true /* usedDisk */,
+                                   true /* fromMultiPlanner */,
+                                   true /* fromPlanCache */));
+
+    // Wait for the batch to be processed and read the single object.
+    executor()->waitForEvent(readyEvent);
+    ASSERT_FALSE(unittest::assertGet(arm->nextReady()).isEOF());
+
+    // Schedule the request for a second getMore.
+    readyEvent = unittest::assertGet(arm->nextEvent());
+
+    {
+        auto remoteMetrics = arm->peekMetrics_forTest();
+        ASSERT_EQ(remoteMetrics.keysExamined, 2);
+        ASSERT_EQ(remoteMetrics.docsExamined, 5);
+        ASSERT_EQ(remoteMetrics.hasSortStage, false);
+        ASSERT_EQ(remoteMetrics.usedDisk, true);
+        ASSERT_EQ(remoteMetrics.fromMultiPlanner, true);
+        ASSERT_EQ(remoteMetrics.fromPlanCache, true);
+    }
+
+    // Schedule a second response.
+    scheduleResponse(CursorId(0),
+                     {fromjson("{_id: 2}")},
+                     CursorMetrics(7 /* keysExamined */,
+                                   11 /* docsExamined */,
+                                   false /* hasSortStage */,
+                                   true /* usedDisk */,
+                                   true /* fromMultiPlanner */,
+                                   false /* fromPlanCache */));
+
+    // Wait for the final batch to be processed and read the object.
+    executor()->waitForEvent(readyEvent);
+    ASSERT_FALSE(unittest::assertGet(arm->nextReady()).isEOF());
+
+    {
+        // Metrics aggregated, result should be the sum of the responses.
+        auto remoteMetrics = arm->takeMetrics();
+        ASSERT_EQ(remoteMetrics.keysExamined, 9);
+        ASSERT_EQ(remoteMetrics.docsExamined, 16);
+        ASSERT_EQ(remoteMetrics.hasSortStage, false);
+        ASSERT_EQ(remoteMetrics.usedDisk, true);
+        ASSERT_EQ(remoteMetrics.fromMultiPlanner, true);
+        ASSERT_EQ(remoteMetrics.fromPlanCache, false);
+    }
+
+    {
+        // Metrics should have been reset to a zero state.
+        auto remoteMetrics = arm->peekMetrics_forTest();
+        ASSERT_EQ(remoteMetrics.keysExamined, 0);
+        ASSERT_EQ(remoteMetrics.docsExamined, 0);
+        ASSERT_EQ(remoteMetrics.hasSortStage, false);
+        ASSERT_EQ(remoteMetrics.usedDisk, false);
+        ASSERT_EQ(remoteMetrics.fromMultiPlanner, false);
+        ASSERT_EQ(remoteMetrics.fromPlanCache, true);
+    }
+
+    // Read the EOF
+    ASSERT_TRUE(unittest::assertGet(arm->nextReady()).isEOF());
+}
+
 }  // namespace
 }  // namespace mongo

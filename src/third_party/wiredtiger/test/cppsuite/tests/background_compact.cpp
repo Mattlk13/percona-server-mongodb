@@ -150,7 +150,7 @@ public:
                      * starting a new one.
                      */
                     if (ret == WT_NOTFOUND)
-                        WT_IGNORE_RET_BOOL(tw->txn.commit());
+                        testutil_ignore_ret_bool(tw->txn.commit());
                     else if (ret == WT_ROLLBACK)
                         tw->txn.rollback();
                     else
@@ -300,18 +300,16 @@ public:
         logger::log_msg(
           LOG_INFO, type_string(tw->type) + " thread {" + std::to_string(tw->id) + "} commencing.");
 
-        bool enabled = false;
+        bool enable = false;
+        const std::string compact_cfg_on(
+          "background=true,free_space_target=" + std::to_string(tw->free_space_target_mb) + "MB");
+        const std::string compact_cfg_off("background=false");
 
         while (tw->running()) {
-            enabled = !enabled;
-
-            std::string compact_cfg = enabled ?
-              "background=true,free_space_target=" + std::to_string(tw->free_space_target_mb) +
-                "MB" :
-              "background=false";
-
+            enable = !enable;
             /* We never expect the background compaction to fail when being enabled/disabled. */
-            testutil_check(tw->session->compact(tw->session.get(), nullptr, compact_cfg.c_str()));
+            testutil_check(tw->session->compact(tw->session.get(), nullptr,
+              enable ? compact_cfg_on.c_str() : compact_cfg_off.c_str()));
 
             tw->sleep();
         }

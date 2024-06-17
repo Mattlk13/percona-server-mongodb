@@ -1,10 +1,18 @@
-/*
+/**
  * Tests that bulk write operations succeed on a two shard cluster with both
  * sharded and unsharded data.
- * @tags: [multiversion_incompatible, featureFlagBulkWriteCommand]
+ * @tags: [
+ *   multiversion_incompatible,
+ *   requires_fcv_80,
+ *   temp_disabled_embedded_router_uncategorized,
+ * ]
  */
 
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
 import {getDBNameAndCollNameFromFullNamespace} from "jstests/libs/namespace_utils.js";
+import {
+    moveDatabaseAndUnshardedColls
+} from "jstests/sharding/libs/move_database_and_unsharded_coll_helper.js";
 
 function bulkWriteBasicTest(ordered) {
     jsTestLog(`Running bulkWrite command sharding test with ordered: ${ordered}`);
@@ -29,9 +37,9 @@ function bulkWriteBasicTest(ordered) {
     const staleDbTest2Log = /7279202.*Noting stale database response.*test2/;
 
     jsTestLog("Case 1: Collection does't exist yet.");
-    // Case 1: The collection doesn't exist yet. This results in a StaleConfig error on the
-    // shards and consequently mongos and the shards must all refresh. Then mongos needs to
-    // retry the bulk operation.
+    // Case 1: The collection doesn't exist yet. This results in a CannotImplicitlyCreateCollection
+    // error on the shards and consequently mongos and the shards must all refresh. Then mongos
+    // needs to retry the bulk operation.
 
     // Connect via the first mongos. We do this so that the second mongos remains unused until
     // a later test case.
@@ -70,19 +78,26 @@ function bulkWriteBasicTest(ordered) {
     assert.eq(1, insertedDocs.length, `Inserted docs: '${tojson(insertedDocs)}'`);
     assert(checkLog.checkContainsOnce(st.s0, staleConfigOrangeLog));
 
-    jsTestLog("Case 3: StaleDbVersion when unsharded collection moves between shards.");
     const db_s1 = st.s1.getDB("test");
+
+    const isTrackUnshardedUponCreationEnabled = FeatureFlagUtil.isPresentAndEnabled(
+        st.s.getDB('admin'), "TrackUnshardedCollectionsUponCreation");
+
     // Case 3: Move the 'test2' DB back and forth across shards. This will result in bulkWrite
     // getting a StaleDbVersion error. We run this on s1 so s0 doesn't know about the change.
-    assert.commandWorked(db_s1.adminCommand({movePrimary: 'test2', to: st.shard0.shardName}));
-    assert.commandWorked(db_s1.adminCommand({movePrimary: 'test2', to: st.shard1.shardName}));
+    moveDatabaseAndUnshardedColls(st.s1.getDB('test2'), st.shard0.shardName);
+    moveDatabaseAndUnshardedColls(st.s1.getDB('test2'), st.shard1.shardName);
 
     // Now run the bulk write command on s0.
     assert.commandWorked(db_s0.adminCommand(
         {bulkWrite: 1, ops: [{insert: 0, document: {a: 3}}], nsInfo: [{ns: orange}]}));
     insertedDocs = getCollection(orange).find({}).toArray();
     assert.eq(2, insertedDocs.length, `Inserted docs: '${tojson(insertedDocs)}'`);
-    assert(checkLog.checkContainsOnce(st.s0, staleDbTest2Log));
+
+    // TODO (SERVER-87807): Skip this check also for uponMoveCollection feature flag
+    if (!isTrackUnshardedUponCreationEnabled) {
+        assert(checkLog.checkContainsOnce(st.s0, staleDbTest2Log));
+    }
 
     jsTestLog("Case 4: The collection is sharded and lives on both shards.");
     // Case 4: Shard the collection and manually move chunks so that they live on
@@ -130,12 +145,13 @@ function bulkWriteBasicTest(ordered) {
         // the erroring operation.
         // So overall, we expect:
         // 1) bulkWrite command sent
-        // 2) Collection mango doesn't exist yet. StaleConfig error returned.
-        // 3) StaleConfig error duplicated for all operations.
-        // 4) Retry operation after refreshing
-        // 5) Operations 0, 1 (DuplicateKeyError), and 2 go through. Operation 3 hits
-        // a StaleConfig error, but no error duplication occurs. And finally the operation is
-        // retried and succeeds.
+        // 2) Collection mango doesn't exist yet. CannotImplicitlyCreateCollection error returned.
+        // 3) CannotImplicitlyCreateCollection error duplicated for all operations.
+        // 4) Retry operation after creating collection and refreshing
+        // 5) Operations 0, 1 (DuplicateKeyError), and 2 go through. Operation 3 hits a
+        // CannotImplicitlyCreateCollection error.
+        // 6) Retry operation after creating second collection and refreshing
+        // 7) And finally the operation is retried and succeeds.
         const mango = 'test3.mango';
         const strawberry = 'test3.strawberry';
         assert.commandWorked(db_s0.adminCommand({
@@ -157,14 +173,17 @@ function bulkWriteBasicTest(ordered) {
         insertedDocs = getCollection(strawberry).find({}).toArray();
         assert.eq(2, insertedDocs.length, `Inserted docs: '${tojson(insertedDocs)}'`);
 
-        // The StaleConfig error on op 0 should have been duplicated to all operations.
+        // The CannotImplicitlyCreateCollection error on op 0 should have been duplicated to all
+        // operations.
         for (let i = 1; i < 5; i++) {
             assert(checkLog.checkContainsOnce(
                 st.s0, new RegExp(`7695304.*Duplicating the error.*opIdx":${i}.*mango`)));
         }
 
-        // The StaleConfig error on op 3 should have been duplicated to op 4.
+        // The CannotImplicitlyCreateCollection error on op 3 should have been duplicated to op 4.
         assert(
+            checkLog.checkContainsOnce(
+                st.s0, /8037206.*Noting cannotImplicitlyCreateCollection response.*strawberry/) ||
             checkLog.checkContainsOnce(st.s0, /7279201.*Noting stale config response.*strawberry/));
         assert(checkLog.checkContainsOnce(st.s0,
                                           /7695304.*Duplicating the error.*opIdx":4.*strawberry/));

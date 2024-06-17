@@ -31,6 +31,11 @@
 
 namespace mongo {
 
+ShardingDDLCoordinatorExternalStateForTest::ShardingDDLCoordinatorExternalStateForTest() {
+    allowMigrationsResponse = MockCommandResponse();
+    migrationsAllowedResponse = MockCommandResponse();
+}
+
 void ShardingDDLCoordinatorExternalStateForTest::checkShardedDDLAllowedToStart(
     OperationContext* opCtx, const NamespaceString& nss) const {}
 
@@ -45,9 +50,31 @@ bool ShardingDDLCoordinatorExternalStateForTest::isShardedTimeseries(
     return false;
 }
 
-std::unique_ptr<ShardingDDLCoordinatorExternalState>
+void ShardingDDLCoordinatorExternalStateForTest::allowMigrations(OperationContext* opCtx,
+                                                                 const NamespaceString& nss,
+                                                                 bool allowMigrations) {
+    allowMigrationsResponse.getNext();
+    migrationsAllowed = allowMigrations;
+}
+
+bool ShardingDDLCoordinatorExternalStateForTest::checkAllowMigrations(OperationContext* opCtx,
+                                                                      const NamespaceString& nss) {
+    migrationsAllowedResponse.getNext();
+    return migrationsAllowed;
+}
+
+ShardingDDLCoordinatorExternalStateFactoryForTest::
+    ShardingDDLCoordinatorExternalStateFactoryForTest(
+        std::shared_ptr<ShardingDDLCoordinatorExternalStateForTest> externalState) {
+    _externalState = std::move(externalState);
+}
+
+std::shared_ptr<ShardingDDLCoordinatorExternalState>
 ShardingDDLCoordinatorExternalStateFactoryForTest::create() const {
-    return std::make_unique<ShardingDDLCoordinatorExternalStateForTest>();
+    if (_externalState != nullptr) {
+        return std::move(_externalState);
+    }
+    return std::make_shared<ShardingDDLCoordinatorExternalStateForTest>();
 }
 
 }  // namespace mongo

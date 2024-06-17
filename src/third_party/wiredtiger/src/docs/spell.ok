@@ -15,6 +15,7 @@ BLmRrSVv
 CAS
 CFLAGS
 CMake
+CONF
 COV
 CPPFLAGS
 CPPSuite
@@ -80,6 +81,7 @@ HyperLevelDB
 IAA
 IEC
 IMPL
+ITEM
 ITER
 JDK
 JIRA
@@ -151,6 +153,7 @@ Valgrind
 WILLNEED
 WiredTiger
 WiredTiger's
+WiredTigerCC
 WiredTigerCheckpoint
 WiredTigerException
 WiredTigerHS
@@ -222,6 +225,7 @@ ccache
 cd
 cdb
 cds
+cfg
 changelog
 checkpointed
 checkpointing
@@ -240,6 +244,7 @@ command's
 comparator
 compressibility
 cond
+conf
 config
 configurign
 conn
@@ -264,6 +269,7 @@ curtable
 customerABC
 customizability
 cv
+cval
 cyclomatic
 dN
 dNLen
@@ -320,6 +326,7 @@ encryptor's
 encryptors
 endcode
 endcond
+endditaa
 endian
 endif
 endinternal
@@ -335,6 +342,7 @@ exe
 extensibility
 fadvise
 failchk
+failpoint
 fallocate
 fcoverage
 fd's
@@ -396,7 +404,6 @@ hs
 hsearch
 html
 htmlinclude
-huffman
 hugepage
 iSi
 iaa
@@ -635,6 +642,7 @@ spinlocks
 sql
 src
 ssd
+startditaa
 startsync
 startuml
 startup

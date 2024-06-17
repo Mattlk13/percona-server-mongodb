@@ -3,9 +3,11 @@
  *
  * @tags: [
  *   # The test runs commands that are not allowed with security token: convertToCapped.
- *   not_allowed_with_security_token,
+ *   not_allowed_with_signed_security_token,
  *   requires_non_retryable_commands,
  *   requires_capped,
+ *   # SERVER-85772 enable testing with balancer once convertToCapped supported on arbitrary shards
+ *   assumes_balancer_off,
  * ]
  */
 

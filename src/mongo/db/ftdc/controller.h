@@ -41,7 +41,6 @@
 #include "mongo/db/ftdc/config.h"
 #include "mongo/db/ftdc/file_manager.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/service_context.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/thread.h"
@@ -60,8 +59,13 @@ class FTDCController {
     FTDCController& operator=(const FTDCController&) = delete;
 
 public:
-    FTDCController(const boost::filesystem::path path, FTDCConfig config)
-        : _path(path), _config(std::move(config)), _configTemp(_config) {}
+    FTDCController(boost::filesystem::path path,
+                   FTDCConfig config,
+                   UseMultiServiceSchema multiServiceSchema)
+        : _path(std::move(path)),
+          _config(std::move(config)),
+          _configTemp(_config),
+          _multiServiceSchema(multiServiceSchema) {}
 
     ~FTDCController() = default;
 
@@ -73,6 +77,12 @@ public:
      * MongoD does.
      */
     Status setEnabled(bool enabled);
+
+    /**
+     * Set the frequency of metadata capture. Metadata will be captured once every `freq` times FTDC
+     * data is collected.
+     */
+    void setMetadataCaptureFrequency(std::uint64_t freq);
 
     /**
      * Set the period for data collection.
@@ -111,23 +121,39 @@ public:
     Status setDirectory(const boost::filesystem::path& path);
 
     /**
-     * Add a metric collector to collect periodically. i.e., serverStatus
+     * Add a metadata collector to collect periodically (e.g., Configuration Settings). Does not
+     * lose info on compression. Collects as or less frequently than PeriodicCollector.
+     *
+     * `role` is used to disambiguate role-specific collectors with colliding names.
+     * It must be `ClusterRole::ShardServer`, `ClusterRole::RouterServer`, or `ClusterRole::None`.
      */
-    void addPeriodicCollector(std::unique_ptr<FTDCCollectorInterface> collector);
+    void addPeriodicMetadataCollector(std::unique_ptr<FTDCCollectorInterface> collector,
+                                      ClusterRole role);
 
     /**
-     * Add a collector to collect on server start, and file rotation. i.e. hostInfo
+     * Add a metric collector to collect periodically (e.g., serverStatus).
      *
-     * This is for machine configuration settings, not metrics.
+     * `role` is used to disambiguate role-specific collectors with colliding names.
+     * It must be `ClusterRole::ShardServer`, `ClusterRole::RouterServer`, or `ClusterRole::None`.
      */
-    void addOnRotateCollector(std::unique_ptr<FTDCCollectorInterface> collector);
+    void addPeriodicCollector(std::unique_ptr<FTDCCollectorInterface> collector, ClusterRole role);
+
+    /**
+     * Add a collector that gathers machine or process configuration settings (not metrics).
+     * These are emitted at the top of every log file the server produces, which is
+     * why the "on rotate" terminology is used.
+     *
+     * `role` is used to disambiguate role-specific collectors with colliding names.
+     * It must be `ClusterRole::ShardServer`, `ClusterRole::RouterServer`, or `ClusterRole::None`.
+     */
+    void addOnRotateCollector(std::unique_ptr<FTDCCollectorInterface> collector, ClusterRole role);
 
     /**
      * Start the controller.
      *
      * Spawns a new thread.
      */
-    void start();
+    void start(Service* service);
 
     /**
      * Stop the controller.
@@ -137,9 +163,9 @@ public:
     void stop();
 
     /**
-     * Get the FTDCController from Service.
+     * Get the FTDCController from ServiceContext.
      */
-    static FTDCController* get(Service* service);
+    static FTDCController* get(ServiceContext* serviceContext);
 
     /**
      * Get a reference to most recent document from the periodic collectors.
@@ -150,7 +176,7 @@ private:
     /**
      * Do periodic statistics collection, and all other work on the background thread.
      */
-    void doLoop() noexcept;
+    void doLoop(Service* service) noexcept;
 
 private:
     /**
@@ -201,6 +227,9 @@ private:
     // Config settings that are manipulated by setters via setParameter.
     FTDCConfig _configTemp;
 
+    // Set of periodic metadata collectors
+    FTDCCollectorCollection _periodicMetadataCollectors;
+
     // Set of periodic collectors
     FTDCCollectorCollection _periodicCollectors;
 
@@ -216,6 +245,9 @@ private:
 
     // Background collection and writing thread
     stdx::thread _thread;
+
+    // Whether or not to use the multiversion schema for FTDC files.
+    UseMultiServiceSchema _multiServiceSchema;
 };
 
 }  // namespace mongo

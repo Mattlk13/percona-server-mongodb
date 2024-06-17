@@ -61,15 +61,19 @@ class ShardLocal : public Shard {
     ShardLocal& operator=(const ShardLocal&) = delete;
 
 public:
+    // ShardLocal doesn't have a "real" connection string since it's always a connection to the
+    // local process, so it uses the hardcoded local connection string. Only used in tests.
+    static const ConnectionString kLocalConnectionString;
+
     explicit ShardLocal(const ShardId& id);
 
-    ~ShardLocal() = default;
+    ~ShardLocal() override = default;
 
     /**
      * These functions are implemented for the Shard interface's sake. They should not be called on
      * ShardLocal because doing so triggers invariants.
      */
-    ConnectionString getConnString() const override;
+    const ConnectionString& getConnString() const override;
     std::shared_ptr<RemoteCommandTargeter> getTargeter() const override;
     void updateReplSetMonitor(const HostAndPort& remoteHost,
                               const Status& remoteCommandStatus) override;
@@ -83,11 +87,17 @@ public:
                                  const DatabaseName& dbName,
                                  const BSONObj& cmdObj) override;
 
-    Status runAggregation(
-        OperationContext* opCtx,
-        const AggregateCommandRequest& aggRequest,
-        std::function<bool(const std::vector<BSONObj>& batch,
-                           const boost::optional<BSONObj>& postBatchResumeToken)> callback);
+    Status runAggregation(OperationContext* opCtx,
+                          const AggregateCommandRequest& aggRequest,
+                          std::function<bool(const std::vector<BSONObj>& batch,
+                                             const boost::optional<BSONObj>& postBatchResumeToken)>
+                              callback) override;
+
+    BatchedCommandResponse runBatchWriteCommand(OperationContext* opCtx,
+                                                Milliseconds maxTimeMS,
+                                                const BatchedCommandRequest& batchRequest,
+                                                const WriteConcernOptions& writeConcern,
+                                                RetryPolicy retryPolicy) final;
 
 private:
     StatusWith<Shard::CommandResponse> _runCommand(OperationContext* opCtx,

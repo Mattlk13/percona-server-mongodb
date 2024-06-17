@@ -34,11 +34,14 @@
 #include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/sbe_unittest.h"
 #include "mongo/db/exec/sbe/stages/co_scan.h"
+#include "mongo/db/exec/sbe/values/block_interface.h"
 #include "mongo/db/exec/sbe/values/slot.h"
 #include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/exec/sbe/values/value_printer.h"
 #include "mongo/db/exec/sbe/vm/vm.h"
 #include "mongo/db/exec/sbe/vm/vm_printer.h"
+#include "mongo/db/query/sbe_stage_builder_plan_data.h"
+#include "mongo/db/query/sbe_stage_builder_state.h"
 #include "mongo/unittest/golden_test.h"
 
 namespace mongo::sbe {
@@ -60,13 +63,12 @@ namespace mongo::sbe {
  */
 class EExpressionTestFixture : public virtual SBETestFixture {
 protected:
-    EExpressionTestFixture(std::unique_ptr<sbe::RuntimeEnvironment> runtimeEnv)
-        : _runtimeEnv(runtimeEnv.get()), _ctx(std::move(runtimeEnv)) {
+    EExpressionTestFixture()
+        : _env{std::make_unique<sbe::RuntimeEnvironment>()},
+          _runtimeEnv{_env.runtimeEnv},
+          _ctx{_env.ctx} {
         _ctx.root = &_emptyStage;
     }
-
-    EExpressionTestFixture()
-        : EExpressionTestFixture(std::make_unique<sbe::RuntimeEnvironment>()) {}
 
     value::SlotId bindAccessor(value::SlotAccessor* accessor) {
         auto slot = _slotIdGenerator.generate();
@@ -110,6 +112,14 @@ protected:
         _ctx.aggExpression = true;
         _ctx.accumulator = aggAccessor;
         return expr.compile(_ctx);
+    }
+
+    /**
+     * Compile and run the given expression.
+     */
+    FastTuple<bool, value::TypeTags, value::Value> runExpression(const EExpression& expr) {
+        auto compiledExpr = expr.compile(_ctx);
+        return _vm.run(compiledExpr.get());
     }
 
     /**
@@ -184,111 +194,19 @@ protected:
         ASSERT_EQUALS(resultTag, sbe::value::TypeTags::Nothing);
     }
 
-    static std::pair<value::TypeTags, value::Value> makeBsonArray(const BSONArray& ba) {
-        return value::copyValue(value::TypeTags::bsonArray,
-                                value::bitcastFrom<const char*>(ba.objdata()));
-    }
+    static std::pair<value::TypeTags, value::Value> makeEmptyState(
+        size_t maxSize, int32_t memLimit = std::numeric_limits<int32_t>::max()) {
+        auto [stateTag, stateVal] = value::makeNewArray();
+        auto state = value::getArrayView(stateVal);
 
+        state->push_back(value::makeNewArray() /* internalArr */);
+        state->push_back(makeInt64(0) /* StartIdx */);
+        state->push_back(makeInt64(maxSize) /* MaxSize */);
+        state->push_back(makeInt32(0) /* MemUsage */);
+        state->push_back(makeInt32(memLimit) /* MemLimit */);
+        state->push_back(makeBool(true) /* IsGroupAccum */);
 
-    static std::pair<value::TypeTags, value::Value> makeBsonObject(const BSONObj& bo) {
-        return value::copyValue(value::TypeTags::bsonObject,
-                                value::bitcastFrom<const char*>(bo.objdata()));
-    }
-
-    static std::pair<value::TypeTags, value::Value> makeArraySet(const BSONArray& arr) {
-        auto [tmpTag, tmpVal] = makeBsonArray(arr);
-        value::ValueGuard tmpGuard{tmpTag, tmpVal};
-
-        value::ArrayEnumerator enumerator{tmpTag, tmpVal};
-
-        auto [arrTag, arrVal] = value::makeNewArraySet();
-        value::ValueGuard guard{arrTag, arrVal};
-
-        auto arrView = value::getArraySetView(arrVal);
-
-        while (!enumerator.atEnd()) {
-            auto [tag, val] = enumerator.getViewOfValue();
-            enumerator.advance();
-
-            auto [copyTag, copyVal] = value::copyValue(tag, val);
-            arrView->push_back(copyTag, copyVal);
-        }
-        guard.reset();
-
-        return {arrTag, arrVal};
-    }
-
-    static std::pair<value::TypeTags, value::Value> makeArray(const BSONArray& arr) {
-        auto [tmpTag, tmpVal] = makeBsonArray(arr);
-        value::ValueGuard tmpGuard{tmpTag, tmpVal};
-
-        value::ArrayEnumerator enumerator{tmpTag, tmpVal};
-
-        auto [arrTag, arrVal] = value::makeNewArray();
-        value::ValueGuard guard{arrTag, arrVal};
-
-        auto arrView = value::getArrayView(arrVal);
-
-        while (!enumerator.atEnd()) {
-            auto [tag, val] = enumerator.getViewOfValue();
-            enumerator.advance();
-
-            auto [copyTag, copyVal] = value::copyValue(tag, val);
-            arrView->push_back(copyTag, copyVal);
-        }
-        guard.reset();
-
-        return {arrTag, arrVal};
-    }
-
-    static std::pair<value::TypeTags, value::Value> makeObject(const BSONObj& obj) {
-        auto [tmpTag, tmpVal] = makeBsonObject(obj);
-        value::ValueGuard tmpGuard{tmpTag, tmpVal};
-
-        value::ObjectEnumerator enumerator{tmpTag, tmpVal};
-
-        auto [objTag, objVal] = value::makeNewObject();
-        value::ValueGuard guard{objTag, objVal};
-
-        auto objView = value::getObjectView(objVal);
-
-        while (!enumerator.atEnd()) {
-            auto [tag, val] = enumerator.getViewOfValue();
-            auto [copyTag, copyVal] = value::copyValue(tag, val);
-            objView->push_back(enumerator.getFieldName(), copyTag, copyVal);
-            enumerator.advance();
-        }
-        guard.reset();
-
-        return {objTag, objVal};
-    }
-
-    static std::pair<value::TypeTags, value::Value> makeNothing() {
-        return {value::TypeTags::Nothing, value::bitcastFrom<int64_t>(0)};
-    }
-
-    static std::pair<value::TypeTags, value::Value> makeNull() {
-        return {value::TypeTags::Null, value::bitcastFrom<int64_t>(0)};
-    }
-
-    static std::pair<value::TypeTags, value::Value> makeInt32(int32_t value) {
-        return {value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(value)};
-    }
-
-    static std::pair<value::TypeTags, value::Value> makeInt64(int64_t value) {
-        return {value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(value)};
-    }
-
-    static std::pair<value::TypeTags, value::Value> makeDouble(double value) {
-        return {value::TypeTags::NumberDouble, value::bitcastFrom<double>(value)};
-    }
-
-    static std::pair<value::TypeTags, value::Value> makeBool(bool value) {
-        return {value::TypeTags::Boolean, value::bitcastFrom<bool>(value)};
-    }
-
-    static std::pair<value::TypeTags, value::Value> makeTimestamp(Timestamp timestamp) {
-        return {value::TypeTags::Timestamp, value::bitcastFrom<uint64_t>(timestamp.asULL())};
+        return {stateTag, stateVal};
     }
 
     static std::unique_ptr<EConstant> makeC(value::TypeTags tag, value::Value value) {
@@ -302,8 +220,9 @@ protected:
 protected:
     value::SlotIdGenerator _slotIdGenerator;
     CoScanStage _emptyStage{kEmptyPlanNodeId};
+    stage_builder::Environment _env;
     RuntimeEnvironment* _runtimeEnv;
-    CompileCtx _ctx;
+    CompileCtx& _ctx;
     vm::ByteCode _vm;
     std::vector<std::pair<value::SlotId, value::SlotAccessor*>> boundAccessors;
 };

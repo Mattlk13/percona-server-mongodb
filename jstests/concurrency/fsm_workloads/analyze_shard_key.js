@@ -705,6 +705,20 @@ export const $config = extendWorkload(kBaseConfig, function($config, $super) {
             // Inaccurate fast count is only expected when there is unclean shutdown.
             return TestData.runningWithShardStepdowns;
         }
+        if (err.code === ErrorCodes.BadValue && err.errmsg && err.errmsg.includes("hint") &&
+            err.errmsg.includes("existing index")) {
+            // The analyzeShardKey metrics calculation requires that the shard key has a
+            // supporting index. In concurrency test suites, it is possible that the
+            // analyzeShardKey aggregate query targets a node before the index exists on that
+            // node. e.g. During background chunk migration, the chunk might be moved from one
+            // shard to a recipient shard such that the recipient doesn't have indexes built
+            // before the analyzeShardKey command targets it.
+            // In these cases, we should just retry the analyzeShardKey command.
+            print(
+                `Failed to analyze the shard key because the candidateKeyField index was not found. ${
+                    tojsononeline(err)}`);
+            return true;
+        }
         return false;
     };
 
@@ -772,7 +786,7 @@ export const $config = extendWorkload(kBaseConfig, function($config, $super) {
     // 'analyzeShardKeySplitPointExpirationSecs' and 'ttlMonitorSleepSecs' server parameters to make
     // the clean up occur as the workload runs, and then restore the original values during
     // teardown().
-    $config.data.splitPointExpirationSecs = 10;
+    $config.data.splitPointExpirationSecs = 30;
     $config.data.ttlMonitorSleepSecs = 5;
     $config.data.originalSplitPointExpirationSecs = {};
     $config.data.originalTTLMonitorSleepSecs = {};

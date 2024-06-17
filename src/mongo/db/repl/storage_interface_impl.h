@@ -150,6 +150,11 @@ public:
                            const BSONObj& query,
                            const TimestampedBSONObj& update) override;
 
+    Status updateDocuments(OperationContext* opCtx,
+                           const NamespaceString& nss,
+                           const BSONObj& query,
+                           const TimestampedBSONObj& update) override;
+
     StatusWith<BSONObj> findById(OperationContext* opCtx,
                                  const NamespaceStringOrUUID& nsOrUUID,
                                  const BSONElement& idKey) override;
@@ -167,10 +172,10 @@ public:
                           const NamespaceString& nss,
                           const BSONObj& filter) override;
 
-    boost::optional<BSONObj> findOplogEntryLessThanOrEqualToTimestamp(
+    boost::optional<OpTimeAndWallTime> findOplogOpTimeLessThanOrEqualToTimestamp(
         OperationContext* opCtx, const CollectionPtr& oplog, const Timestamp& timestamp) override;
 
-    boost::optional<BSONObj> findOplogEntryLessThanOrEqualToTimestampRetryOnWCE(
+    boost::optional<OpTimeAndWallTime> findOplogOpTimeLessThanOrEqualToTimestampRetryOnWCE(
         OperationContext* opCtx, const CollectionPtr& oplog, const Timestamp& timestamp) override;
 
     Timestamp getEarliestOplogTimestamp(OperationContext* opCtx) override;
@@ -194,6 +199,8 @@ public:
                             bool force = false) override;
 
     void setInitialDataTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
+
+    Timestamp getInitialDataTimestamp(ServiceContext* serviceCtx) const override;
 
     Timestamp recoverToStableTimestamp(OperationContext* opCtx) override;
 

@@ -42,6 +42,7 @@
 #include "mongo/base/static_assert.h"
 #include "mongo/base/string_data.h"
 #include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/db/pipeline/skip_and_limit.h"
 #include "mongo/db/sorter/sorter.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/random.h"
@@ -139,27 +140,27 @@ class IntIterator : public IWIterator {
 public:
     IntIterator(int start = 0, int stop = INT_MAX, int increment = 1)
         : _current(start), _increment(increment), _stop(stop) {}
-    void openSource() {}
-    void closeSource() {}
-    bool more() {
+    void openSource() override {}
+    void closeSource() override {}
+    bool more() override {
         if (_increment == 0)
             return true;
         if (_increment > 0)
             return _current < _stop;
         return _current > _stop;
     }
-    IWPair next() {
+    IWPair next() override {
         IWPair out(_current, -_current);
         _current += _increment;
         return out;
     }
-    IntWrapper nextWithDeferredValue() {
+    IntWrapper nextWithDeferredValue() override {
         MONGO_UNREACHABLE;
     }
-    IntWrapper getDeferredValue() {
+    IntWrapper getDeferredValue() override {
         MONGO_UNREACHABLE;
     }
-    const IntWrapper& current() {
+    const IntWrapper& current() override {
         MONGO_UNREACHABLE;
     }
 
@@ -171,21 +172,21 @@ private:
 
 class EmptyIterator : public IWIterator {
 public:
-    void openSource() {}
-    void closeSource() {}
-    bool more() {
+    void openSource() override {}
+    void closeSource() override {}
+    bool more() override {
         return false;
     }
-    Data next() {
+    Data next() override {
         MONGO_UNREACHABLE;
     }
-    IntWrapper nextWithDeferredValue() {
+    IntWrapper nextWithDeferredValue() override {
         MONGO_UNREACHABLE;
     }
-    IntWrapper getDeferredValue() {
+    IntWrapper getDeferredValue() override {
         MONGO_UNREACHABLE;
     }
-    const IntWrapper& current() {
+    const IntWrapper& current() override {
         MONGO_UNREACHABLE;
     }
 };
@@ -197,24 +198,24 @@ public:
         invariant(limit > 0);
     }
 
-    void openSource() {}
-    void closeSource() {}
+    void openSource() override {}
+    void closeSource() override {}
 
-    bool more() {
+    bool more() override {
         return _remaining && _source->more();
     }
-    Data next() {
+    Data next() override {
         invariant(more());
         _remaining--;
         return _source->next();
     }
-    IntWrapper nextWithDeferredValue() {
+    IntWrapper nextWithDeferredValue() override {
         MONGO_UNREACHABLE;
     }
-    IntWrapper getDeferredValue() {
+    IntWrapper getDeferredValue() override {
         MONGO_UNREACHABLE;
     }
-    const IntWrapper& current() {
+    const IntWrapper& current() override {
         MONGO_UNREACHABLE;
     }
 
@@ -358,23 +359,23 @@ public:
             class UnsortedIter : public IWIterator {
             public:
                 UnsortedIter() : _pos(0) {}
-                void openSource() {}
-                void closeSource() {}
-                bool more() {
+                void openSource() override {}
+                void closeSource() override {}
+                bool more() override {
                     return _pos < sizeof(unsorted) / sizeof(unsorted[0]);
                 }
-                IWPair next() {
+                IWPair next() override {
                     IWPair ret(unsorted[_pos], -unsorted[_pos]);
                     _pos++;
                     return ret;
                 }
-                IntWrapper nextWithDeferredValue() {
+                IntWrapper nextWithDeferredValue() override {
                     MONGO_UNREACHABLE;
                 }
-                IntWrapper getDeferredValue() {
+                IntWrapper getDeferredValue() override {
                     MONGO_UNREACHABLE;
                 }
-                const IntWrapper& current() {
+                const IntWrapper& current() override {
                     MONGO_UNREACHABLE;
                 }
                 size_t _pos;
@@ -693,6 +694,46 @@ private:
     }
 };
 
+class PauseAndResume : public Basic {
+    void addData(IWSorter* sorter) override {
+        sorter->add(0, 0);
+        sorter->add(3, -3);
+        sorter->add(4, -4);
+        IWIterator* iter = sorter->pause();
+        int unsorted[] = {0, 3, 4};
+        for (int i = 0; i < 3; i++) {
+            ASSERT_EQ(unsorted[i], iter->next().first);
+        }
+        ASSERT_FALSE(iter->more());
+        delete iter;
+        sorter->resume();
+        sorter->add(2, -2);
+        sorter->add(1, -1);
+        iter = sorter->pause();
+        int unsorted1[] = {0, 3, 4, 2, 1};
+        for (int i = 0; i < 5; i++) {
+            ASSERT_EQ(unsorted1[i], iter->next().first);
+        }
+        ASSERT_FALSE(iter->more());
+        delete iter;
+        sorter->resume();
+    }
+
+    size_t numAdded() const override {
+        return 5;
+    }
+
+    // returns an iterator with the correct results
+    std::shared_ptr<IWIterator> correct() override {
+        return std::make_shared<IntIterator>(0, 5);  // 0, 1, ... 4
+    }
+
+    // like correct but with opposite sort direction
+    std::shared_ptr<IWIterator> correctReverse() override {
+        return std::make_shared<IntIterator>(4, -1, -1);  // 4, 3, ... 0
+    }
+};
+
 class Limit : public Basic {
     SortOptions adjustSortOptions(SortOptions opts) override {
         return opts.Limit(5);
@@ -722,6 +763,96 @@ class LimitExtreme : public Basic {
         return opts.Limit(Limit);
     }
 };
+
+class PauseAndResumeLimit : public Limit {
+    SortOptions adjustSortOptions(SortOptions opts) override {
+        return opts.Limit(5);
+    }
+    void addData(IWSorter* sorter) override {
+        sorter->add(3, -3);
+        sorter->add(0, 0);
+        sorter->add(4, -4);
+        IWIterator* iter = sorter->pause();
+        // pause returns data still in the original order because we havent reached the limit
+        int unsorted[] = {3, 0, 4};
+        for (int i = 0; i < 3; i++) {
+            ASSERT_EQ(unsorted[i], iter->next().first);
+        }
+        ASSERT_FALSE(iter->more());
+        delete iter;
+        sorter->resume();
+        sorter->add(2, -2);
+        sorter->add(1, -1);
+        sorter->add(-1, 1);
+        iter = sorter->pause();
+        // pause will return top 5 elements in some order (they are from a heap but not yet sorted)
+        std::vector<int> vec;
+        for (int i = 0; i < 5; i++) {
+            vec.push_back(iter->next().first);
+        }
+        sort(vec.begin(), vec.end());
+        ASSERT_TRUE(vec.back() == 3 || vec.back() == 4);  // either 4 or 3 depending on asc or desc
+        ASSERT_EQ(vec.size(), 5);
+        ASSERT_FALSE(iter->more());  // check to make sure we only got limit number of entries
+        delete iter;
+        sorter->resume();
+    }
+
+    size_t numAdded() const override {
+        return 6;
+    }
+
+    // returns an iterator with the correct results
+    std::shared_ptr<IWIterator> correct() override {
+        return std::make_shared<IntIterator>(-1, 4);
+    }
+
+    // like correct but with opposite sort direction
+    std::shared_ptr<IWIterator> correctReverse() override {
+        return std::make_shared<IntIterator>(4, -1, -1);
+    }
+};
+
+class PauseAndResumeLimitOne : public Limit {
+    SortOptions adjustSortOptions(SortOptions opts) override {
+        return opts.Limit(1);
+    }
+    void addData(IWSorter* sorter) override {
+        sorter->add(3, -3);
+        sorter->add(0, 0);
+        sorter->add(4, -4);
+        IWIterator* iter = sorter->pause();
+        auto val = iter->next().first;
+        ASSERT_TRUE(val == 0 || val == 4);
+        ASSERT_FALSE(iter->more());
+        sorter->resume();
+        sorter->add(2, -2);
+        sorter->add(1, -1);
+        sorter->add(-1, 1);
+        delete iter;
+        iter = sorter->pause();
+        val = iter->next().first;
+        ASSERT_TRUE(val == -1 || val == 4);  // either 4 or -1 depending on asc or desc
+        ASSERT_FALSE(iter->more());  // check to make sure we only got limit number of entries
+        delete iter;
+        sorter->resume();
+    }
+
+    size_t numAdded() const override {
+        return 6;
+    }
+
+    // returns an iterator with the correct results
+    std::shared_ptr<IWIterator> correct() override {
+        return std::make_shared<IntIterator>(-1, 0);
+    }
+
+    // like correct but with opposite sort direction
+    std::shared_ptr<IWIterator> correctReverse() override {
+        return std::make_shared<IntIterator>(4, 3, -1);
+    }
+};
+
 
 class Dupes : public Basic {
     void addData(IWSorter* sorter) override {
@@ -819,7 +950,7 @@ public:
 template <long long Limit, bool Random = true>
 class LotsOfDataWithLimit : public LotsOfDataLittleMemory<Random> {
     typedef LotsOfDataLittleMemory<Random> Parent;
-    SortOptions adjustSortOptions(SortOptions opts) {
+    SortOptions adjustSortOptions(SortOptions opts) override {
         // Make sure our tests will spill or not as desired
         MONGO_STATIC_ASSERT(MEM_LIMIT / 2 > (100 * sizeof(IWPair)));
         MONGO_STATIC_ASSERT(MEM_LIMIT < (5000 * sizeof(IWPair)));
@@ -846,9 +977,9 @@ class LotsOfDataWithLimit : public LotsOfDataLittleMemory<Random> {
 };
 }  // namespace SorterTests
 
-class SorterSuite : public mongo::unittest::OldStyleSuiteSpecification {
+class SorterSuite : public unittest::OldStyleSuiteSpecification {
 public:
-    SorterSuite() : mongo::unittest::OldStyleSuiteSpecification("sorter") {}
+    SorterSuite() : unittest::OldStyleSuiteSpecification("sorter") {}
 
     template <typename T>
     static constexpr uint64_t kMaxAsU64 = std::numeric_limits<T>::max();
@@ -884,10 +1015,13 @@ public:
         add<SorterTests::LimitExtreme<kMaxAsU64<int64_t> - 1>>();
         add<SorterTests::LimitExtreme<kMaxAsU64<int64_t> + 1>>();
         add<SorterTests::LimitExtreme<kMaxAsU64<int64_t> / 8 + 1>>();
+        add<SorterTests::PauseAndResume>();
+        add<SorterTests::PauseAndResumeLimit>();
+        add<SorterTests::PauseAndResumeLimitOne>();
     }
 };
 
-mongo::unittest::OldStyleSuiteInitializer<SorterSuite> extSortTests;
+unittest::OldStyleSuiteInitializer<SorterSuite> extSortTests;
 
 /**
  * This suite includes test cases for resumable index builds where the Sorter is reconstructed from

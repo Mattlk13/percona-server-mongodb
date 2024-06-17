@@ -3,7 +3,7 @@
  *
  * @tags: [
  *   # The test runs commands that are not allowed with security token: applyOps.
- *   not_allowed_with_security_token,
+ *   not_allowed_with_signed_security_token,
  *   # Cannot implicitly shard accessed collections because of collection existing when none
  *   # expected.
  *   assumes_no_implicit_collection_creation_after_drop,
@@ -71,7 +71,14 @@ assert(!collObj.hasOwnProperty("idIndex"), tojson(collObj));
 // Test basic usage with DBCommandCursor.
 //
 
-var getListCollectionsCursor = function(options, subsequentBatchSize) {
+var getListCollectionsCursor = function(options = {}, subsequentBatchSize) {
+    // SERVER-81986: After SERVER-72229, there can be an implicitly created collection named
+    // "system.profile" during an FCV upgrade. The presence of this collection can break some
+    // assertions in this test. This makes sure that we filter out that collection.
+    if (typeof options == "object" && options.filter === undefined) {
+        options.filter = {name: {$ne: "system.profile"}};
+    }
+
     return new DBCommandCursor(
         mydb, mydb.runCommand("listCollections", options), subsequentBatchSize);
 };

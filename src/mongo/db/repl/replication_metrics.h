@@ -95,7 +95,8 @@ public:
                                      Date_t lastElectionDate,
                                      long long electionTerm,
                                      OpTime lastCommittedOpTime,
-                                     OpTime lastSeenOpTime,
+                                     OpTime latestWrittenOpTime,
+                                     OpTime latestAppliedOpTime,
                                      int numVotesNeeded,
                                      double priorityAtElection,
                                      Milliseconds electionTimeoutMillis,
@@ -121,6 +122,8 @@ public:
                                        Date_t lastVoteDate,
                                        int electionCandidateMemberId,
                                        std::string voteReason,
+                                       OpTime lastWrittenOpTime,
+                                       OpTime maxWrittenOpTimeInSet,
                                        OpTime lastAppliedOpTime,
                                        OpTime maxAppliedOpTimeInSet,
                                        double priorityAtElection);
@@ -130,9 +133,9 @@ public:
     void clearParticipantNewTermDates();
 
 
-private:
     class ElectionMetricsSSS;
 
+private:
     void _updateAverageCatchUpOps(WithLock lk);
 
     mutable Mutex _mutex = MONGO_MAKE_LATCH("ReplicationMetrics::_mutex");

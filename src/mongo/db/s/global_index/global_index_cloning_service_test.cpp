@@ -65,6 +65,7 @@
 #include "mongo/db/s/global_index/global_index_cloning_service.h"
 #include "mongo/db/s/global_index/global_index_util.h"
 #include "mongo/db/s/resharding/resharding_service_test_helpers.h"
+#include "mongo/db/s/sharding_test_helpers.h"
 #include "mongo/db/server_parameter.h"
 #include "mongo/db/session/logical_session_cache.h"
 #include "mongo/db/session/logical_session_cache_noop.h"
@@ -83,6 +84,7 @@
 #include "mongo/s/database_version.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 #include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/s/sharding_test_fixture_common.h"
 #include "mongo/s/type_collection_common_types_gen.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/unittest/framework.h"
@@ -102,6 +104,7 @@ using OpObserverForTest =
                                                                          GlobalIndexClonerDoc>;
 using PauseDuringStateTransitions =
     resharding_service_test_helpers::PauseDuringStateTransitions<GlobalIndexClonerStateEnum>;
+using Fault = sharding_test_helpers::Fault;
 
 const ShardId kRecipientShardId{"myShardId"};
 const NamespaceString kSourceNss =
@@ -138,41 +141,16 @@ public:
                                                true /* allowMigrations */,
                                                chunks);
 
-        return ChunkManager(_someDonorId,
-                            DatabaseVersion(UUID::gen(), Timestamp(1, 1)),
-                            _makeStandaloneRoutingTableHistory(std::move(rt)),
-                            boost::none /* clusterTime */);
+        return ChunkManager(
+            _someDonorId,
+            DatabaseVersion(UUID::gen(), Timestamp(1, 1)),
+            ShardingTestFixtureCommon::makeStandaloneRoutingTableHistory(std::move(rt)),
+            boost::none /* clusterTime */);
     }
 
 private:
-    RoutingTableHistoryValueHandle _makeStandaloneRoutingTableHistory(
-        RoutingTableHistory rt) const {
-        const auto version = rt.getVersion();
-        return RoutingTableHistoryValueHandle(
-            std::make_shared<RoutingTableHistory>(std::move(rt)),
-            ComparableChunkVersion::makeComparableChunkVersion(version));
-    }
-
     const UUID _sourceUUID{UUID::gen()};
     const ShardId _someDonorId{"otherShardId"};
-};
-
-class Fault {
-public:
-    Fault(Status error, int triggerCount = 1)
-        : _error(std::move(error)), _remainingTriggerCount(triggerCount) {}
-
-    void throwIfEnabled() {
-        if (_remainingTriggerCount == 0 || _remainingTriggerCount-- == 0) {
-            return;
-        }
-
-        uassertStatusOK(_error);
-    }
-
-private:
-    const Status _error;
-    int _remainingTriggerCount{0};
 };
 
 template <typename T>

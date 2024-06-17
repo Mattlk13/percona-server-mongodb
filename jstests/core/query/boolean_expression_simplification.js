@@ -2,12 +2,20 @@
  * Tests boolean expression simplifer produces expected results.
  * @tags: [
  * requires_fcv_72,
- * # TODO SERVER-76509: Enable Boolean expression simplification in Bonsai.
- * cqf_incompatible,
+ * # explain command, used by the test, does not support majority read concern.
+ *  assumes_read_concern_local,
  * ]
  */
 
 import {getPlanStages, getWinningPlanFromExplain} from "jstests/libs/analyze_plan.js";
+
+const parameterName = "internalQueryEnableBooleanExpressionsSimplifier";
+const isSImplifierEnabled =
+    assert.commandWorked(db.adminCommand({getParameter: 1, [parameterName]: 1}))[parameterName];
+if (!isSImplifierEnabled) {
+    jsTest.log("Skipping the Boolean simplier tests, since the simplifier is disabled...");
+    quit();
+}
 
 /**
  * Checks possible representations of an empty filter in query plans, which can be empty object '{}'

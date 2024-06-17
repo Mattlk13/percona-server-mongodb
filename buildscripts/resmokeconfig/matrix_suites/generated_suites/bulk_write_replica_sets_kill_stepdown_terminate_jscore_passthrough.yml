@@ -42,6 +42,7 @@ executor:
     mongod_options:
       enableMajorityReadConcern: ''
       set_parameters:
+        enableAutoCompaction: 1
         enableElectionHandoff: 0
         enableTestCommands: 1
         logComponentVerbosity:
@@ -86,7 +87,6 @@ selector:
   - jstests/core/**/project_with_collation.js
   - jstests/core/**/currentop.js
   - jstests/core/**/fsync.js
-  - jstests/core/**/killop_drop_collection.js
   - jstests/core/**/explain_upsert.js
   - jstests/core/**/indexes_multiple_commands.js
   - jstests/core/**/create_indexes.js
@@ -110,8 +110,9 @@ selector:
   - jstests/core/write/update/batch_write_command_update.js
   - jstests/core/write/delete/batch_write_command_delete.js
   - jstests/core/failcommand_failpoint.js
-  - jstests/core/version_api_v1_command_coverage.js
   - jstests/core/write/write_commands_reject_unknown_fields.js
+  - jstests/core/query/explain/explain_uuid.js
+  - jstests/core/query/explain/explain_includes_command.js
   - jstests/fle2/**/*.js
   - src/mongo/db/modules/*/jstests/fle2/**/*.js
   exclude_with_any_tags:

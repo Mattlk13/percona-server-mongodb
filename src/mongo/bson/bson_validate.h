@@ -32,19 +32,22 @@
 #include <cstdint>
 
 #include "mongo/base/status.h"
+#include "mongo/bson/bson_validate_gen.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsontypes.h"
 
 namespace mongo {
 
-enum class BSONValidateMode {
-    // Only fast structural BSON consistency checks.
-    kDefault,
-    // Structural BSON consistency and extra fast checks on BSON specifications.
-    kExtended,
-    // Structural BSON consistency and extra comprehensive checks on BSON specifications.
-    kFull,
+enum ValidationVersion {
+    /* Original validator */
+    V1_Original = 1,
+    /* Adds validation for the content of Column-typed BinData */
+    V2_Column = 2
 };
+
+// When adding new versions of BSON validation, update both this and the range and the
+// default for the server parameter in src/mongo/bson/bson_validate.idl
+static constexpr ValidationVersion currentValidationVersion = V2_Column;
 
 /**
  * Checks that the buf holds a BSON object as defined in http://bsonspec.org/spec.html.
@@ -69,7 +72,16 @@ enum class BSONValidateMode {
  */
 Status validateBSON(const char* buf,
                     uint64_t maxLength,
-                    BSONValidateMode mode = BSONValidateMode::kDefault) noexcept;
+                    BSONValidateModeEnum mode = BSONValidateModeEnum::kDefault,
+                    ValidationVersion validationVersion = currentValidationVersion) noexcept;
 
-Status validateBSON(const BSONObj& obj, BSONValidateMode mode = BSONValidateMode::kDefault);
+Status validateBSON(const BSONObj& obj,
+                    BSONValidateModeEnum mode = BSONValidateModeEnum::kDefault,
+                    ValidationVersion validationVersion = currentValidationVersion) noexcept;
+
+Status validateBSONColumn(const char* buf,
+                          int maxLength,
+                          BSONValidateModeEnum mode = BSONValidateModeEnum::kDefault,
+                          ValidationVersion validationVersion = currentValidationVersion) noexcept;
+
 }  // namespace mongo

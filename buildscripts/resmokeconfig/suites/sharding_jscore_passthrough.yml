@@ -3,6 +3,7 @@ test_kind: js_test
 selector:
   roots:
   - jstests/core/**/*.js
+  - jstests/core_sharding/**/*.js
   - jstests/fle2/**/*.js
   - src/mongo/db/modules/*/jstests/fle2/**/*.js
   exclude_files:
@@ -16,7 +17,6 @@ selector:
   - jstests/core/**/compact_keeps_indexes.js  # compact.
   - jstests/core/**/currentop.js  # uses fsync.
   - jstests/core/**/dbhash.js  # dbhash.
-  - jstests/core/**/dbhash2.js  # dbhash.
   - jstests/core/**/fsync.js  # uses fsync.
   - jstests/core/**/geo_s2cursorlimitskip.js  # profiling.
   - jstests/core/**/geo_update_btree2.js  # notablescan.
@@ -27,12 +27,10 @@ selector:
   - jstests/core/**/top.js  # top.
   # The following tests fail because mongos behaves differently from mongod when testing certain
   # functionality. The differences are in a comment next to the failing test.
-  - jstests/core/**/explain_missing_database.js  # Behavior with no db different on mongos.
   - jstests/core/**/geo_2d_explain.js  # executionSuccess in different spot in explain().
   - jstests/core/**/geo_s2explain.js  # inputStage in different spot in explain().
   - jstests/core/**/geo_s2sparse.js  # keysPerIndex in different spot in validate().
   - jstests/core/**/operation_latency_histogram.js  # Stats are counted differently on mongos, SERVER-24880.
-  - jstests/core/**/killop_drop_collection.js # Uses fsyncLock.
   # The following tests fail because of divergent dropCollection behavior between standalones and
   # sharded clusters. These tests expect a second drop command to error, whereas in sharded clusters
   # we expect a second drop to return status OK.

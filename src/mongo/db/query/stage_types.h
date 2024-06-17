@@ -142,6 +142,7 @@ enum StageType {
     // Stages for DocumentSources.
     STAGE_GROUP,
     STAGE_EQ_LOOKUP,
+    STAGE_EQ_LOOKUP_UNWIND,
     STAGE_SEARCH,
     STAGE_WINDOW,
     STAGE_SENTINEL,
@@ -176,5 +177,5 @@ StringData stageTypeToString(StageType stageType);
  * Returns the explain() stage type string for a STAGE_COLLSCAN stage that is performing a clustered
  * collection scan in SBE, to match Classic's explain() output.
  */
-StringData sbeClusteredCollectionScanToString();
+StringData clusteredCollectionScanSbeToString();
 }  // namespace mongo

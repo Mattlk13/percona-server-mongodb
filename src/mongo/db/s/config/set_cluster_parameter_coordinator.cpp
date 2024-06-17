@@ -58,7 +58,6 @@
 #include "mongo/db/persistent_task_store.h"
 #include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/s/config/set_cluster_parameter_coordinator.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/sharding_logging.h"
@@ -66,9 +65,6 @@
 #include "mongo/db/tenant_id.h"
 #include "mongo/db/vector_clock.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/logv2/log.h"
-#include "mongo/logv2/log_attr.h"
-#include "mongo/logv2/log_component.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
@@ -91,81 +87,65 @@ const WriteConcernOptions kMajorityWriteConcern{WriteConcernOptions::kMajority,
 bool SetClusterParameterCoordinator::hasSameOptions(const BSONObj& otherDocBSON) const {
     const auto otherDoc =
         StateDoc::parse(IDLParserContext("SetClusterParameterCoordinatorDocument"), otherDocBSON);
-    return SimpleBSONObjComparator::kInstance.evaluate(_doc.getParameter() ==
-                                                       otherDoc.getParameter()) &&
-        _doc.getTenantId() == otherDoc.getTenantId();
+
+    return _evalStateDocumentThreadSafe([&](const StateDoc& doc) -> bool {
+        return SimpleBSONObjComparator::kInstance.evaluate(doc.getParameter() ==
+                                                           otherDoc.getParameter()) &&
+            doc.getTenantId() == otherDoc.getTenantId();
+    });
 }
 
 boost::optional<BSONObj> SetClusterParameterCoordinator::reportForCurrentOp(
     MongoProcessInterface::CurrentOpConnectionsMode connMode,
     MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept {
-    BSONObjBuilder cmdBob;
-    cmdBob.appendElements(_doc.getParameter());
 
     BSONObjBuilder bob;
-    bob.append("type", "op");
-    bob.append("desc", "SetClusterParameterCoordinator");
-    bob.append("op", "command");
-    auto tenantId = _doc.getTenantId();
-    if (tenantId.is_initialized()) {
-        bob.append("tenantId", tenantId->toString());
-    }
-    bob.append("currentPhase", _doc.getPhase());
-    bob.append("command", cmdBob.obj());
-    bob.append("active", true);
+
+    _evalStateDocumentThreadSafe([&](const StateDoc& doc) {
+        BSONObjBuilder cmdBob;
+        cmdBob.appendElements(_doc.getParameter());
+
+        bob.append("type", "op");
+        bob.append("desc", "SetClusterParameterCoordinator");
+        bob.append("op", "command");
+        auto tenantId = _doc.getTenantId();
+        if (tenantId.is_initialized()) {
+            bob.append("tenantId", tenantId->toString());
+        }
+        bob.append("currentPhase", _doc.getPhase());
+        bob.append("command", cmdBob.obj());
+        bob.append("active", true);
+    });
+
     return bob.obj();
 }
 
-void SetClusterParameterCoordinator::_enterPhase(Phase newPhase) {
-    StateDoc newDoc(_doc);
-    newDoc.setPhase(newPhase);
-
-    LOGV2_DEBUG(6343101,
-                2,
-                "SetClusterParameterCoordinator phase transition",
-                "newPhase"_attr = SetClusterParameterCoordinatorPhase_serializer(newDoc.getPhase()),
-                "oldPhase"_attr = SetClusterParameterCoordinatorPhase_serializer(_doc.getPhase()));
-
-    auto opCtx = cc().makeOperationContext();
-
-    if (_doc.getPhase() == Phase::kUnset) {
-        PersistentTaskStore<StateDoc> store(NamespaceString::kConfigsvrCoordinatorsNamespace);
-        try {
-            store.add(opCtx.get(), newDoc, WriteConcerns::kMajorityWriteConcernNoTimeout);
-        } catch (const ExceptionFor<ErrorCodes::DuplicateKey>&) {
-            // A series of step-up and step-down events can cause a node to try and insert the
-            // document when it has already been persisted locally, but we must still wait for
-            // majority commit.
-            const auto replCoord = repl::ReplicationCoordinator::get(opCtx.get());
-            const auto lastLocalOpTime = replCoord->getMyLastAppliedOpTime();
-            WaitForMajorityService::get(opCtx->getServiceContext())
-                .waitUntilMajorityForWrite(lastLocalOpTime, opCtx.get()->getCancellationToken())
-                .get(opCtx.get());
-        }
-    } else {
-        _updateStateDocument(opCtx.get(), newDoc);
-    }
-
-    _doc = std::move(newDoc);
-}
-
-bool SetClusterParameterCoordinator::_isClusterParameterSetAtTimestamp(OperationContext* opCtx) {
-    auto parameterElem = _doc.getParameter().firstElement();
-    auto parameterName = parameterElem.fieldName();
-    auto parameter = _doc.getParameter()[parameterName].Obj();
+boost::optional<Timestamp> SetClusterParameterCoordinator::_getPersistedClusterParameterTime(
+    OperationContext* opCtx) const {
+    auto parameterName = _doc.getParameter().firstElement().fieldName();
     const auto& configShard = ShardingCatalogManager::get(opCtx)->localConfigShard();
     auto configsvrParameters = uassertStatusOK(configShard->exhaustiveFindOnConfig(
         opCtx,
         ReadPreferenceSetting(ReadPreference::PrimaryOnly),
         repl::ReadConcernLevel::kMajorityReadConcern,
         NamespaceString::makeClusterParametersNSS(_doc.getTenantId()),
-        BSON("_id" << parameterName << "clusterParameterTime" << *_doc.getClusterParameterTime()),
+        BSON("_id" << parameterName),
         BSONObj(),
         boost::none));
 
     dassert(configsvrParameters.docs.size() <= 1);
 
-    return !configsvrParameters.docs.empty();
+    if (configsvrParameters.docs.empty()) {
+        return boost::none;
+    }
+
+    BSONObj& parameterDoc = configsvrParameters.docs.front();
+    BSONElement clusterParameterTimeElem = parameterDoc.getField(
+        SetClusterParameterCoordinatorDocument::kClusterParameterTimeFieldName);
+
+    dassert(!clusterParameterTimeElem.eoo() && !clusterParameterTimeElem.isNull());
+
+    return clusterParameterTimeElem.timestamp();
 }
 
 void SetClusterParameterCoordinator::_sendSetClusterParameterToAllShards(
@@ -177,8 +157,9 @@ void SetClusterParameterCoordinator::_sendSetClusterParameterToAllShards(
     LOGV2_DEBUG(6387001, 1, "Sending setClusterParameter to shards:", "shards"_attr = shards);
 
     ShardsvrSetClusterParameter request(_doc.getParameter());
-    request.setDbName(DatabaseNameUtil::deserialize(
-        _doc.getTenantId(), DatabaseName::kAdmin.db(), SerializationContext::stateDefault()));
+    request.setDbName(DatabaseNameUtil::deserialize(_doc.getTenantId(),
+                                                    DatabaseName::kAdmin.db(omitTenant),
+                                                    SerializationContext::stateDefault()));
     request.setClusterParameterTime(*_doc.getClusterParameterTime());
     sharding_util::sendCommandToShards(
         opCtx,
@@ -192,8 +173,10 @@ void SetClusterParameterCoordinator::_commit(OperationContext* opCtx) {
     LOGV2_DEBUG(6387002, 1, "Updating configsvr cluster parameter");
 
     SetClusterParameter setClusterParameterRequest(_doc.getParameter());
-    setClusterParameterRequest.setDbName(DatabaseNameUtil::deserialize(
-        _doc.getTenantId(), DatabaseName::kAdmin.db(), SerializationContext::stateDefault()));
+    setClusterParameterRequest.setDbName(
+        DatabaseNameUtil::deserialize(_doc.getTenantId(),
+                                      DatabaseName::kAdmin.db(omitTenant),
+                                      SerializationContext::stateDefault()));
     std::unique_ptr<ServerParameterService> parameterService =
         std::make_unique<ClusterParameterService>();
     DBDirectClient client(opCtx);
@@ -226,13 +209,49 @@ ExecutorFuture<void> SetClusterParameterCoordinator::_runImpl(
                 // Select a clusterParameter time.
                 auto vt = VectorClock::get(opCtx)->getTime();
                 auto clusterParameterTime = vt.clusterTime();
-                _doc.setClusterParameterTime(clusterParameterTime.asTimestamp());
+
+                _updateStateDocumentWith(opCtx, [&](StateDoc& doc) {
+                    doc.setClusterParameterTime(clusterParameterTime.asTimestamp());
+                });
             }
         })
         .then(_buildPhaseHandler(
             Phase::kSetClusterParameter, [this, executor = executor, anchor = shared_from_this()] {
                 auto opCtxHolder = cc().makeOperationContext();
                 auto* opCtx = opCtxHolder.get();
+
+                // Get 'clusterParameterTime' stored on disk.
+                auto persistedClusterParameterTime = _getPersistedClusterParameterTime(opCtx);
+
+                // If the parameter was already set on the config server, there is
+                // nothing else to do.
+                if (persistedClusterParameterTime &&
+                    *persistedClusterParameterTime == *_doc.getClusterParameterTime()) {
+                    return;
+                }
+
+                // If 'previousTime' is provided, check whether the cluster parameter value was
+                // modified (by a concurrent update) since 'previousTime' by comparing
+                // 'clusterParameterTime' stored on disk with 'previousTime'. The 'previousTime'
+                // equal to 'LogicalTime::kUninitialized' denotes a special case when the cluster
+                // parameter value is still unset. In such a case, we expect that
+                // 'persistedClusterParameterTime' does not have a value.
+                if (auto previousTime = _doc.getPreviousTime()) {
+                    _detectedConcurrentUpdate = (*previousTime == LogicalTime::kUninitialized)
+                        ? persistedClusterParameterTime.has_value()
+                        : !(persistedClusterParameterTime &&
+                            *persistedClusterParameterTime == previousTime->asTimestamp());
+
+                    // If the cluster parameter value was modified since 'previousTime' (detected
+                    // concurrent update), do not proceed with updating server cluster parameter.
+                    if (_detectedConcurrentUpdate) {
+                        LOGV2_DEBUG(7880300,
+                                    1,
+                                    "encountered unexpected 'clusterParameterTime'",
+                                    "previousTime"_attr = previousTime->asTimestamp());
+                        return;
+                    }
+                }
 
                 auto catalogManager = ShardingCatalogManager::get(opCtx);
                 ShardingLogging::get(opCtx)->logChange(opCtx,
@@ -243,13 +262,7 @@ ExecutorFuture<void> SetClusterParameterCoordinator::_runImpl(
                                                        catalogManager->localConfigShard(),
                                                        catalogManager->localCatalogClient());
 
-                // If the parameter was already set on the config server, there is
-                // nothing else to do.
-                if (_isClusterParameterSetAtTimestamp(opCtx)) {
-                    return;
-                }
-
-                _doc = _updateSession(opCtx, _doc);
+                _updateSession(opCtx);
                 const auto session = _getCurrentSession();
 
                 {

@@ -70,8 +70,7 @@ const auto kShardKey = BSON("newKey" << 1);
 class ReshardingMetricsTest : public ShardingDataTransformMetricsTestFixture {
 
 public:
-    virtual std::unique_ptr<ShardingDataTransformCumulativeMetrics> initializeCumulativeMetrics()
-        override {
+    std::unique_ptr<ShardingDataTransformCumulativeMetrics> initializeCumulativeMetrics() override {
         return std::make_unique<ReshardingCumulativeMetrics>();
     }
 
@@ -87,7 +86,7 @@ public:
                                                    getCumulativeMetrics());
     }
 
-    virtual StringData getRootSectionName() override {
+    StringData getRootSectionName() override {
         return kResharding;
     }
 
@@ -138,12 +137,12 @@ public:
     }
 
     CommonReshardingMetadata createCommonReshardingMetadata(const UUID& operationId) {
-        CommonReshardingMetadata metadata{operationId,
-                                          kTestNamespace,
-                                          getSourceCollectionId(),
-                                          resharding::constructTemporaryReshardingNss(
-                                              kTestNamespace.db_forTest(), getSourceCollectionId()),
-                                          kShardKey};
+        CommonReshardingMetadata metadata{
+            operationId,
+            kTestNamespace,
+            getSourceCollectionId(),
+            resharding::constructTemporaryReshardingNss(kTestNamespace, getSourceCollectionId()),
+            kShardKey};
         metadata.setStartTime(getClockSource()->now() - kRunningTime);
         return metadata;
     }
@@ -224,7 +223,7 @@ public:
     void createMetricsAndAssertIncrementsCumulativeMetricsField(
         const std::function<void(ReshardingMetrics*)>& mutate,
         Section section,
-        const StringData& fieldName) {
+        StringData fieldName) {
         auto metrics = createInstanceMetrics(getClockSource(), UUID::gen(), Role::kCoordinator);
         assertIncrementsCumulativeMetricsField(
             metrics.get(),

@@ -131,25 +131,6 @@ public:
 
     std::size_t sizeWriteOps() const;
 
-    void setWriteConcern(const BSONObj& writeConcern) {
-        _writeConcern = writeConcern.getOwned();
-    }
-
-    void unsetWriteConcern() {
-        _writeConcern = boost::none;
-    }
-
-    bool hasWriteConcern() const {
-        return _writeConcern.is_initialized();
-    }
-
-    const BSONObj& getWriteConcern() const {
-        invariant(_writeConcern);
-        return *_writeConcern;
-    }
-
-    bool isVerboseWC() const;
-
     void setShardVersion(ShardVersion shardVersion) {
         _shardVersion = std::move(shardVersion);
     }
@@ -184,6 +165,11 @@ public:
 
     const boost::optional<LegacyRuntimeConstants>& getLegacyRuntimeConstants() const;
     const boost::optional<BSONObj>& getLet() const;
+
+    /**
+     * Utility which handles evaluating and storing any let parameters based on the request type.
+     */
+    void evaluateAndReplaceLetParams(OperationContext* opCtx);
 
     const write_ops::WriteCommandRequestBase& getWriteCommandRequestBase() const;
     void setWriteCommandRequestBase(write_ops::WriteCommandRequestBase writeCommandBase);
@@ -266,13 +252,9 @@ private:
 
     boost::optional<ShardVersion> _shardVersion;
     boost::optional<DatabaseVersion> _dbVersion;
-
-    boost::optional<BSONObj> _writeConcern;
 };
 
 
-// TODO SERVER-76655: Update getter names to be consistent with the names we choose for arguments in
-// bulkWrite.
 /**
  * Provides access to information for an update operation. Used to abstract over whether a
  * BatchItemRef is pointing to a `mongo::write_ops::UpdateOpEntry` (if it's from an `update`
@@ -299,6 +281,19 @@ public:
             return _bulkWriteUpdateRequest->getFilter();
         }
     }
+
+    /**
+     * Returns the arrayFilters the update operation this `UpdateRef` refers to.
+     */
+    const boost::optional<std::vector<mongo::BSONObj>>& getArrayFilters() const {
+        if (_batchUpdateRequest) {
+            return _batchUpdateRequest->getArrayFilters();
+        } else {
+            tassert(7961100, "invalid bulkWrite update op reference", _bulkWriteUpdateRequest);
+            return _bulkWriteUpdateRequest->getArrayFilters();
+        }
+    }
+
     /**
      * Returns the `multi` value for the update operation this `UpdateRef` refers to.
      */
@@ -369,8 +364,6 @@ private:
     boost::optional<const mongo::BulkWriteUpdateOp&> _bulkWriteUpdateRequest;
 };
 
-// TODO SERVER-76655: Update getter names to be consistent with the names we choose for arguments in
-// bulkWrite.
 /**
  * Provides access to information for an update operation. Used to abstract over whether a
  * BatchItemRef is pointing to a `mongo::write_ops::DeleteOpEntry` (if it's from a `delete`
@@ -538,5 +531,7 @@ private:
      */
     BatchedCommandRequest::BatchType _batchType;
 };
+
+BatchedCommandRequest::BatchType convertOpType(BulkWriteCRUDOp::OpType opType);
 
 }  // namespace mongo

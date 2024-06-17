@@ -276,14 +276,15 @@ private:
     bool _isPerfOnly;
 };
 
-/**
- * This comparator is used to compare paths with Get, Traverse, and Id.
- */
-struct IndexPathLessComparator {
-    bool operator()(const ABT& path1, const ABT& path2) const;
+struct IndexPathHash {
+    size_t operator()(const ABT& node) const;
 };
 
-using IndexPathSet = std::set<ABT, IndexPathLessComparator>;
+/**
+ * Allows fast index path lookup with an unordered map whose keys
+ * are index paths and values are the number of times each one occurs across all indexes.
+ */
+using IndexPathOccurrences = opt::unordered_map<ABT, int, IndexPathHash>;
 
 struct PartialSchemaKeyComparator {
     struct Less {
@@ -310,7 +311,7 @@ struct PartialSchemaRequirementComparator {
  * Used to track cardinality estimates per predicate inside a PartialSchemaRequirement. The order of
  * estimates is the same as the leaf order in the primary PartialSchemaRequirements.
  */
-using PartialSchemaKeyCE = std::vector<std::pair<PartialSchemaKey, CEType>>;
+using PartialSchemaKeyCE = std::vector<std::pair<PartialSchemaKey, CERecord>>;
 
 using PartialSchemaKeySet = std::set<PartialSchemaKey, PartialSchemaKeyComparator::Less>;
 
@@ -331,11 +332,11 @@ using ResidualRequirements = BoolExpr<ResidualRequirement>;
 struct ResidualRequirementWithOptionalCE {
     ResidualRequirementWithOptionalCE(PartialSchemaKey key,
                                       PartialSchemaRequirement req,
-                                      boost::optional<CEType> ce);
+                                      boost::optional<CERecord> ce);
 
     PartialSchemaKey _key;
     PartialSchemaRequirement _req;
-    boost::optional<CEType> _ce;
+    boost::optional<CERecord> _ce;
 };
 using ResidualRequirementsWithOptionalCE = BoolExpr<ResidualRequirementWithOptionalCE>;
 

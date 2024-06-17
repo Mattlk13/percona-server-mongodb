@@ -129,6 +129,8 @@ ERROR_ID_UNSTABLE_COMMAND_TYPE_FIELD_CHANGED_TO_STABLE = "ID0085"
 ERROR_ID_NEW_REPLY_FIELD_ADDED_AS_STABLE = "ID0086"
 ERROR_ID_NEW_COMMAND_PARAM_FIELD_ADDED_AS_STABLE = "ID0087"
 ERROR_ID_NEW_COMMAND_TYPE_FIELD_ADDED_AS_STABLE = "ID0088"
+ERROR_ID_NEW_COMMAND_TYPE_FIELD_ADDED_AS_UNSTABLE_REQUIRED = "ID0089"
+ERROR_ID_NEW_COMMAND_PARAM_FIELD_ADDED_AS_UNSTABLE_REQUIRED = "ID0090"
 
 
 class IDLCompatibilityCheckerError(Exception):
@@ -431,20 +433,20 @@ class IDLCompatibilityContext(object):
 
         Add an error about an added required command parameter or command type field that did not
         exist in the old command.
-        The added parameter or command type field should be optional.
+        The added parameter or command type field should be optional or have a default.
         """
         if is_command_parameter:
             self._add_error(
                 ERROR_ID_ADDED_REQUIRED_COMMAND_PARAMETER, command_name,
                 "New definition of field or sub-field '%s' for command '%s' is required when it should "
-                "be optional." % (field_name, command_name), file)
+                "be optional or have a default value." % (field_name, command_name), file)
         else:
             self._add_error(
                 ERROR_ID_NEW_COMMAND_TYPE_FIELD_ADDED_REQUIRED, command_name,
                 "The new definition of command '%s' or its sub-struct has type '%s' with an added and "
                 "required type field '%s' that did not exist "
-                "in the old definition of struct type." % (command_name, type_name, field_name),
-                file)
+                "in the old definition of struct type. The field should be optional or have a default value."
+                % (command_name, type_name, field_name), file)
 
     def add_new_param_or_command_type_field_missing_error(self, command_name: str, field_name: str,
                                                           file: str, type_name: str,
@@ -497,7 +499,7 @@ class IDLCompatibilityContext(object):
         if is_command_parameter:
             self._add_error(
                 ERROR_ID_COMMAND_PARAMETER_STABLE_REQUIRED_NO_DEFAULT, struct_name,
-                "'%s' has a stable required field '%s' with no default that was unstable in the"
+                "'%s' has a stable required field '%s' with no default that was unstable and not required in the"
                 " old definition of the struct."
                 "The new definition of the field should be optional or have a default value" %
                 (struct_name, field_name), file)
@@ -505,7 +507,7 @@ class IDLCompatibilityContext(object):
             self._add_error(
                 ERROR_ID_NEW_COMMAND_TYPE_FIELD_STABLE_REQUIRED_NO_DEFAULT, struct_name,
                 ("'%s' has type '%s' with a stable and required type field '%s' with no default "
-                 "that was unstable in the old definition of the struct type."
+                 "that was unstable and not required in the old definition of the struct type."
                  "The new definition of the field should be optional or have a default value") %
                 (struct_name, type_name, field_name), file)
 
@@ -1146,6 +1148,21 @@ class IDLCompatibilityContext(object):
                 ERROR_ID_NEW_COMMAND_TYPE_FIELD_ADDED_AS_STABLE, command_name,
                 ("The command '%s' has newly-added type '%s' which may not be defined as stable "
                  "unless that addition is explicitly allowed.") % (command_name, field_name), file)
+
+    def add_new_param_or_type_field_added_as_unstable_required_error(
+            self, command_name: str, field_name: str, file: str,
+            is_command_parameter: bool) -> None:
+        """Add an error that a new unstable command param or type field may not be added as required."""
+        if is_command_parameter:
+            self._add_error(
+                ERROR_ID_NEW_COMMAND_PARAM_FIELD_ADDED_AS_UNSTABLE_REQUIRED, command_name,
+                ("The command '%s' has newly-added unstable param field '%s' which should be optional."
+                 ) % (command_name, field_name), file)
+        else:
+            self._add_error(
+                ERROR_ID_NEW_COMMAND_TYPE_FIELD_ADDED_AS_UNSTABLE_REQUIRED, command_name,
+                ("The command '%s' has newly-added unstable type field '%s' which should be optional."
+                 ) % (command_name, field_name), file)
 
 
 def _assert_unique_error_messages() -> None:

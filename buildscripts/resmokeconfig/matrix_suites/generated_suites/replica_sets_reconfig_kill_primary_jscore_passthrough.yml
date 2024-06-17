@@ -44,6 +44,7 @@ executor:
     mongod_options:
       enableMajorityReadConcern: ''
       set_parameters:
+        enableAutoCompaction: 1
         enableElectionHandoff: 0
         enableTestCommands: 1
         logComponentVerbosity:
@@ -88,7 +89,6 @@ selector:
   - jstests/core/**/exhaust.js
   - jstests/core/**/currentop.js
   - jstests/core/**/fsync.js
-  - jstests/core/**/killop_drop_collection.js
   - jstests/core/**/shell_connection_strings.js
   - jstests/core/**/explain_upsert.js
   - jstests/core/**/indexes_multiple_commands.js

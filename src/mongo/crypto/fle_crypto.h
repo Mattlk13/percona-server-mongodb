@@ -234,6 +234,35 @@ public:
 };
 
 /**
+ * Generate token anchor padding root
+ */
+class FLEAnchorPaddingGenerator {
+public:
+    /**
+     * AnchorPaddingRootToken = HMAC(ESCToken, d) = S^esc_f_d = Fs[f,1,2,d]
+     *  d = 136 bit blob of zero = 17 octets of 0
+     */
+    static AnchorPaddingRootToken generateAnchorPaddingRootToken(ESCToken token);
+};
+
+/**
+ * Generate token anchor padding derived tokens
+ */
+class FLEAnchorPaddingDerivedGenerator {
+public:
+    /**
+     * AnchorPaddingKeyToken = HMAC(AnchorPaddingRootToken, 1) = Fs[f,1,2,d,1]
+     */
+    static AnchorPaddingKeyToken generateAnchorPaddingKeyToken(AnchorPaddingRootToken token);
+
+    /**
+     * AnchorPaddingValueToken = HMAC(AnchorPaddingRootToken, 2) = Fs[f,1,2,d,2]
+     */
+    static AnchorPaddingValueToken generateAnchorPaddingValueToken(AnchorPaddingRootToken token);
+};
+
+
+/**
  * ESC Collection schema
  * {
  *    _id : HMAC(ESCTwiceDerivedTagToken, type || pos )
@@ -404,83 +433,100 @@ public:
     virtual ECStats getStats() const = 0;
 };
 
-class ESCCollection {
+template <class TagToken, class ValueToken>
+class ESCCollectionCommon {
+public:
+    /**
+     * Decrypt a regular document.
+     */
+    static StatusWith<ESCDocument> decryptDocument(const ValueToken& valueToken, BSONObj& doc);
+
+    /**
+     * Decrypt a regular document.
+     */
+    static StatusWith<ESCDocument> decryptDocument(const ValueToken& valueToken, BSONObj&& doc);
+
+    /**
+     * Generate the _id value for an anchor record
+     */
+    static PrfBlock generateAnchorId(const TagToken& tagToken, uint64_t apos);
+
+    /**
+     * Generate the _id value for a null anchor record
+     */
+    static PrfBlock generateNullAnchorId(const TagToken& tagToken);
+
+    /**
+     * Calculate AnchorBinaryHops as described in OST.
+     */
+    static boost::optional<uint64_t> anchorBinaryHops(const FLEStateCollectionReader& reader,
+                                                      const TagToken& tagToken,
+                                                      const ValueToken& valueToken,
+                                                      FLEStatusSection::EmuBinaryTracker& tracker);
+};
+
+/**
+ * Specialization of ESCollectionCommon for ESCTwiceDerived(Tag|Value)Tokens
+ * with additional methods specific to encrypted data.
+ */
+class ESCCollection
+    : public ESCCollectionCommon<ESCTwiceDerivedTagToken, ESCTwiceDerivedValueToken> {
 public:
     /**
      * Generate the _id value
      */
-    static PrfBlock generateId(ESCTwiceDerivedTagToken tagToken, boost::optional<uint64_t> index);
+    static PrfBlock generateId(const ESCTwiceDerivedTagToken& tagToken,
+                               boost::optional<uint64_t> index);
 
     /**
      * Generate a null document which will be the "first" document for a given field.
      */
-    static BSONObj generateNullDocument(ESCTwiceDerivedTagToken tagToken,
-                                        ESCTwiceDerivedValueToken valueToken,
+    static BSONObj generateNullDocument(const ESCTwiceDerivedTagToken& tagToken,
+                                        const ESCTwiceDerivedValueToken& valueToken,
                                         uint64_t pos,
                                         uint64_t count);
 
     /**
      * Generate a insert ESC document.
      */
-    static BSONObj generateInsertDocument(ESCTwiceDerivedTagToken tagToken,
-                                          ESCTwiceDerivedValueToken valueToken,
+    static BSONObj generateInsertDocument(const ESCTwiceDerivedTagToken& tagToken,
+                                          const ESCTwiceDerivedValueToken& valueToken,
                                           uint64_t index,
                                           uint64_t count);
 
     /**
      * Generate a compaction placeholder ESC document.
      */
-    static BSONObj generateCompactionPlaceholderDocument(ESCTwiceDerivedTagToken tagToken,
-                                                         ESCTwiceDerivedValueToken valueToken,
-                                                         uint64_t index,
-                                                         uint64_t count);
+    static BSONObj generateCompactionPlaceholderDocument(
+        const ESCTwiceDerivedTagToken& tagToken,
+        const ESCTwiceDerivedValueToken& valueToken,
+        uint64_t index,
+        uint64_t count);
 
     /**
      * Decrypt the null document.
      */
-    static StatusWith<ESCNullDocument> decryptNullDocument(ESCTwiceDerivedValueToken valueToken,
-                                                           BSONObj& doc);
+    static StatusWith<ESCNullDocument> decryptNullDocument(
+        const ESCTwiceDerivedValueToken& valueToken, BSONObj& doc);
 
     /**
      * Decrypt the null document.
      */
-    static StatusWith<ESCNullDocument> decryptNullDocument(ESCTwiceDerivedValueToken valueToken,
-                                                           BSONObj&& doc);
-
-    /**
-     * Decrypt a regular document.
-     */
-    static StatusWith<ESCDocument> decryptDocument(ESCTwiceDerivedValueToken valueToken,
-                                                   BSONObj& doc);
-
-    /**
-     * Decrypt a regular document.
-     */
-    static StatusWith<ESCDocument> decryptDocument(ESCTwiceDerivedValueToken valueToken,
-                                                   BSONObj&& doc);
+    static StatusWith<ESCNullDocument> decryptNullDocument(
+        const ESCTwiceDerivedValueToken& valueToken, BSONObj&& doc);
 
     /**
      * Search for the highest document id for a given field/value pair based on the token.
      */
     static boost::optional<uint64_t> emuBinary(const FLEStateCollectionReader& reader,
-                                               ESCTwiceDerivedTagToken tagToken,
-                                               ESCTwiceDerivedValueToken valueToken);
+                                               const ESCTwiceDerivedTagToken& tagToken,
+                                               const ESCTwiceDerivedValueToken& valueToken);
 
     // ===== Protocol Version 2 =====
     /**
      * Generate the _id value for a non-anchor record
      */
     static PrfBlock generateNonAnchorId(const ESCTwiceDerivedTagToken& tagToken, uint64_t cpos);
-
-    /**
-     * Generate the _id value for an anchor record
-     */
-    static PrfBlock generateAnchorId(const ESCTwiceDerivedTagToken& tagToken, uint64_t apos);
-
-    /**
-     * Generate the _id value for a null anchor record
-     */
-    static PrfBlock generateNullAnchorId(const ESCTwiceDerivedTagToken& tagToken);
 
     /**
      * Generate a non-anchor ESC document for inserts.
@@ -533,10 +579,6 @@ public:
     static EmuBinaryResult emuBinaryV2(const FLEStateCollectionReader& reader,
                                        const ESCTwiceDerivedTagToken& tagToken,
                                        const ESCTwiceDerivedValueToken& valueToken);
-    static boost::optional<uint64_t> anchorBinaryHops(const FLEStateCollectionReader& reader,
-                                                      const ESCTwiceDerivedTagToken& tagToken,
-                                                      const ESCTwiceDerivedValueToken& valueToken,
-                                                      FLEStatusSection::EmuBinaryTracker& tracker);
     static boost::optional<uint64_t> binaryHops(const FLEStateCollectionReader& reader,
                                                 const ESCTwiceDerivedTagToken& tagToken,
                                                 const ESCTwiceDerivedValueToken& valueToken,
@@ -555,6 +597,25 @@ public:
         FLETagQueryInterface::TagQueryType type);
 };
 
+/**
+ * Specialization of ESCollectionCommon for AnchorPadding(Key|Value)Tokens
+ * with a custom anchor padding document generator.
+ */
+class ESCCollectionAnchorPadding
+    : public ESCCollectionCommon<AnchorPaddingKeyToken, AnchorPaddingValueToken> {
+public:
+    static PrfBlock generateNullAnchorId(const AnchorPaddingKeyToken& tagToken);
+    static PrfBlock generateAnchorId(const AnchorPaddingKeyToken& tagToken, uint64_t apos);
+
+    static BSONObj generateNullAnchorDocument(const AnchorPaddingKeyToken& keyToken,
+                                              const AnchorPaddingValueToken& valueToken,
+                                              uint64_t apos,
+                                              uint64_t /* cpos ignored */);
+
+    static BSONObj generatePaddingDocument(const AnchorPaddingKeyToken& keyToken,
+                                           const AnchorPaddingValueToken& valueToken,
+                                           uint64_t apos);
+};
 
 /**
  * ECC Collection
@@ -821,18 +882,6 @@ public:
      * Validate the tags array exists and is of the right type.
      */
     static void validateTagsArray(const BSONObj& doc);
-
-    /**
-     * Validate document
-     *
-     * Checks performed
-     * 1. Fields, if present, are indexed the way specified
-     * 2. All fields can be decrypted successfully
-     * 3. There is a tag for each field and no extra tags
-     */
-    static void validateDocument(const BSONObj& doc,
-                                 const EncryptedFieldConfig& efc,
-                                 FLEKeyVault* keyVault);
 };
 
 /*
@@ -867,16 +916,28 @@ public:
  *
  * struct {
  *    uint8_t[32] esc;
+ *    uint8_t isLeaf; // Optional: 0 or 1 for range operations, absent for equality.
  * }
  */
 struct EncryptedStateCollectionTokensV2 {
 public:
-    EncryptedStateCollectionTokensV2(ESCDerivedFromDataTokenAndContentionFactorToken s) : esc(s) {}
+    EncryptedStateCollectionTokensV2(ESCDerivedFromDataTokenAndContentionFactorToken s,
+                                     boost::optional<bool> leaf)
+        : esc(s), isLeaf(std::move(leaf)) {}
     static StatusWith<EncryptedStateCollectionTokensV2> decryptAndParse(ECOCToken token,
                                                                         ConstDataRange cdr);
     StatusWith<std::vector<uint8_t>> serialize(ECOCToken token);
 
+    bool isEquality() const {
+        return isLeaf == boost::none;
+    }
+
+    bool isRange() const {
+        return isLeaf != boost::none;
+    }
+
     ESCDerivedFromDataTokenAndContentionFactorToken esc;
+    boost::optional<bool> isLeaf;
 };
 
 struct ECOCCompactionDocumentV2 {
@@ -889,9 +950,19 @@ struct ECOCCompactionDocumentV2 {
         return H::combine(std::move(h), doc.fieldName, doc.esc);
     }
 
+    bool isEquality() const {
+        return isLeaf == boost::none;
+    }
+
+    bool isRange() const {
+        return isLeaf != boost::none;
+    }
+
     // Id is not included as it unimportant
     std::string fieldName;
     ESCDerivedFromDataTokenAndContentionFactorToken esc;
+    boost::optional<bool> isLeaf;
+    boost::optional<AnchorPaddingRootToken> anchorPaddingRootToken;
 };
 
 /**
@@ -1324,6 +1395,15 @@ public:
 struct CompactionToken {
     std::string fieldPathName;
     ECOCToken token;
+    boost::optional<AnchorPaddingRootToken> anchorPaddingToken;
+
+    bool isEquality() const {
+        return anchorPaddingToken == boost::none;
+    }
+
+    bool isRange() const {
+        return anchorPaddingToken != boost::none;
+    }
 };
 
 class CompactionHelpers {
@@ -1372,88 +1452,6 @@ struct ParsedFindEqualityPayload {
     explicit ParsedFindEqualityPayload(ConstDataRange cdr);
 };
 
-
-/**
- * FLE2 Range Utility functions
- */
-
-/**
- * Describe the encoding of an BSON int32
- *
- * NOTE: It is not a mistake that a int32 is encoded as uint32.
- */
-struct OSTType_Int32 {
-    OSTType_Int32(uint32_t v, uint32_t minP, uint32_t maxP) : value(v), min(minP), max(maxP) {}
-
-    uint32_t value;
-    uint32_t min;
-    uint32_t max;
-};
-
-OSTType_Int32 getTypeInfo32(int32_t value,
-                            boost::optional<int32_t> min,
-                            boost::optional<int32_t> max);
-
-/**
- * Describe the encoding of an BSON int64
- *
- * NOTE: It is not a mistake that a int64 is encoded as uint64.
- */
-struct OSTType_Int64 {
-    OSTType_Int64(uint64_t v, uint64_t minP, uint64_t maxP) : value(v), min(minP), max(maxP) {}
-
-    uint64_t value;
-    uint64_t min;
-    uint64_t max;
-};
-
-OSTType_Int64 getTypeInfo64(int64_t value,
-                            boost::optional<int64_t> min,
-                            boost::optional<int64_t> max);
-
-
-/**
- * Describe the encoding of an BSON double (i.e. IEEE 754 Binary64)
- *
- * NOTE: It is not a mistake that a double is encoded as uint64.
- */
-struct OSTType_Double {
-    OSTType_Double(uint64_t v, uint64_t minP, uint64_t maxP) : value(v), min(minP), max(maxP) {}
-
-    uint64_t value;
-    uint64_t min;
-    uint64_t max;
-};
-
-OSTType_Double getTypeInfoDouble(double value,
-                                 boost::optional<double> min,
-                                 boost::optional<double> max,
-                                 boost::optional<uint32_t> precision);
-/**
- * Describe the encoding of an BSON Decimal (i.e. IEEE 754 Decimal128)
- *
- * NOTE: It is not a mistake that a decimal is encoded as uint128.
- */
-
-struct OSTType_Decimal128 {
-    OSTType_Decimal128(boost::multiprecision::uint128_t v,
-                       boost::multiprecision::uint128_t minP,
-                       boost::multiprecision::uint128_t maxP)
-        : value(v), min(minP), max(maxP) {}
-
-    boost::multiprecision::uint128_t value;
-    boost::multiprecision::uint128_t min;
-    boost::multiprecision::uint128_t max;
-};
-
-boost::multiprecision::uint128_t toInt128FromDecimal128(Decimal128 dec);
-
-OSTType_Decimal128 getTypeInfoDecimal128(Decimal128 value,
-                                         boost::optional<Decimal128> min,
-                                         boost::optional<Decimal128> max,
-                                         boost::optional<uint32_t> precision);
-
-
 struct FLEFindEdgeTokenSet {
     EDCDerivedFromDataToken edc;
     ESCDerivedFromDataToken esc;
@@ -1486,36 +1484,49 @@ struct ParsedFindRangePayload {
 
 class Edges {
 public:
-    Edges(std::string leaf, int sparsity);
+    Edges(std::string leaf, int sparsity, int trimFactor);
     std::vector<StringData> get();
+    std::size_t size() const;
+    const std::string& getLeaf() const {
+        return _leaf;
+    }
 
 private:
     std::string _leaf;
     int _sparsity;
+    int _trimFactor;
 };
 
 std::unique_ptr<Edges> getEdgesInt32(int32_t value,
                                      boost::optional<int32_t> min,
                                      boost::optional<int32_t> max,
-                                     int sparsity);
+                                     int sparsity,
+                                     int trimFactor);
 
 std::unique_ptr<Edges> getEdgesInt64(int64_t value,
                                      boost::optional<int64_t> min,
                                      boost::optional<int64_t> max,
-                                     int sparsity);
+                                     int sparsity,
+                                     int trimFactor);
 
 std::unique_ptr<Edges> getEdgesDouble(double value,
                                       boost::optional<double> min,
                                       boost::optional<double> max,
                                       boost::optional<uint32_t> precision,
-                                      int sparsity);
+                                      int sparsity,
+                                      int trimFactor);
 
 std::unique_ptr<Edges> getEdgesDecimal128(Decimal128 value,
                                           boost::optional<Decimal128> min,
                                           boost::optional<Decimal128> max,
                                           boost::optional<uint32_t> precision,
+                                          int sparsity,
+                                          int trimFactor);
 
-                                          int sparsity);
+// Equivalent to a full edges calculation without creating an intemediate vector.
+// getEdgesT(min, min, max, precision, sparsity, trimFactor).size()
+std::uint64_t getEdgesLength(const QueryTypeConfig& config);
+
 /**
  * Mincover calculator
  */
@@ -1526,7 +1537,8 @@ std::vector<std::string> minCoverInt32(int32_t lowerBound,
                                        bool includeUpperBound,
                                        boost::optional<int32_t> min,
                                        boost::optional<int32_t> max,
-                                       int sparsity);
+                                       int sparsity,
+                                       int trimFactor);
 
 std::vector<std::string> minCoverInt64(int64_t lowerBound,
                                        bool includeLowerBound,
@@ -1534,7 +1546,8 @@ std::vector<std::string> minCoverInt64(int64_t lowerBound,
                                        bool includeUpperBound,
                                        boost::optional<int64_t> min,
                                        boost::optional<int64_t> max,
-                                       int sparsity);
+                                       int sparsity,
+                                       int trimFactor);
 
 std::vector<std::string> minCoverDouble(double lowerBound,
                                         bool includeLowerBound,
@@ -1543,7 +1556,8 @@ std::vector<std::string> minCoverDouble(double lowerBound,
                                         boost::optional<double> min,
                                         boost::optional<double> max,
                                         boost::optional<uint32_t> precision,
-                                        int sparsity);
+                                        int sparsity,
+                                        int trimFactor);
 
 std::vector<std::string> minCoverDecimal128(Decimal128 lowerBound,
                                             bool includeLowerBound,
@@ -1552,7 +1566,8 @@ std::vector<std::string> minCoverDecimal128(Decimal128 lowerBound,
                                             boost::optional<Decimal128> min,
                                             boost::optional<Decimal128> max,
                                             boost::optional<uint32_t> precision,
-                                            int sparsity);
+                                            int sparsity,
+                                            int trimFactor);
 
 class FLEUtil {
 public:
@@ -1580,6 +1595,11 @@ public:
  */
 PrfBlock PrfBlockfromCDR(const ConstDataRange& block);
 
+template <typename TokenT>
+TokenT FLETokenFromCDR(const ConstDataRange& block) {
+    return TokenT(PrfBlockfromCDR(block));
+}
+
 ConstDataRange binDataToCDR(BSONElement element);
 
 template <typename T>
@@ -1602,6 +1622,8 @@ boost::optional<EncryptedBinDataType> getEncryptedBinDataType(const BSONElement&
 
 bool hasQueryType(const EncryptedField& field, QueryTypeEnum queryType);
 bool hasQueryType(const EncryptedFieldConfig& config, QueryTypeEnum queryType);
+
+QueryTypeConfig getQueryType(const EncryptedField& field, QueryTypeEnum queryType);
 
 /**
  * Get the set of edges that minimally cover a range query specified by the given range spec and

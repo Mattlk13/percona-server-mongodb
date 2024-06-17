@@ -45,15 +45,24 @@ namespace mongo::optimizer::ce {
 class SamplingTransport;
 
 /**
- * Abstract sampling executor. It receives a physical plan defined in the 'planAndProps' argument of
- * its method estimateSelectivity(), and using the provided operation context and metadata, answers
- * the question what selectivity of the predicate which this plan encodes is.
+ * Interface used by 'SamplingEstimator' for executing queries.
  */
 class SamplingExecutor {
 public:
     virtual ~SamplingExecutor() = default;
-    virtual boost::optional<optimizer::SelectivityType> estimateSelectivity(
-        const Metadata& metadata, int64_t sampleSize, const PlanAndProps& planAndProps) = 0;
+
+    /**
+     * Executes the given query, expecting zero or one values in the result.
+     *
+     * The query must bind a single projection, and must return zero or one rows.
+     * This function returns the one value, or Nothing.
+     *
+     * Caller must destroy the returned SBE value.
+     */
+    virtual std::pair<sbe::value::TypeTags, sbe::value::Value> execute(
+        const Metadata& metadata,
+        const QueryParameterMap& queryParameters,
+        const PlanAndProps& planAndProps) const = 0;
 };
 
 /**
@@ -66,14 +75,17 @@ class SamplingEstimator : public cascades::CardinalityEstimator {
 public:
     SamplingEstimator(OptPhaseManager phaseManager,
                       int64_t numRecords,
+                      DebugInfo debugInfo,
+                      PrefixId& prefixId,
                       std::unique_ptr<cascades::CardinalityEstimator> fallbackCE,
                       std::unique_ptr<SamplingExecutor> executor);
-    ~SamplingEstimator();
+    ~SamplingEstimator() override;
 
-    CEType deriveCE(const Metadata& metadata,
-                    const cascades::Memo& memo,
-                    const properties::LogicalProps& logicalProps,
-                    ABT::reference_type logicalNodeRef) const final;
+    CERecord deriveCE(const Metadata& metadata,
+                      const cascades::Memo& memo,
+                      const properties::LogicalProps& logicalProps,
+                      const QueryParameterMap& queryParameters,
+                      ABT::reference_type logicalNodeRef) const final;
 
 private:
     std::unique_ptr<SamplingTransport> _transport;

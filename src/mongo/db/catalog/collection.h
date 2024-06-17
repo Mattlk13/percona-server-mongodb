@@ -124,6 +124,10 @@ struct CollectionUpdateArgs {
     // Set if the diff insert operation needs to check for the field's existence.
     bool mustCheckExistenceForInsertOperations = false;
 
+    // If not null, stores the replicated RecordId of the document - the RecordId is expected to
+    // replicated across nodes with the update.
+    RecordId replicatedRecordId;
+
     // Set if OpTimes were reserved for the update ahead of time.
     std::vector<OplogSlot> oplogSlots;
 };
@@ -225,7 +229,7 @@ public:
     };
 
     Collection() = default;
-    virtual ~Collection() = default;
+    ~Collection() override = default;
 
     /**
      * Clones this Collection instance. Some members are deep copied and some are shallow copied.
@@ -408,9 +412,10 @@ public:
                                                          boost::optional<bool> value) = 0;
 
     /**
-     * Returns true if the passed in time-series bucket document contains mixed-schema data.
+     * Returns true if the passed in time-series bucket document contains mixed-schema data. Returns
+     * a non-OK status if the bucket's min/max is malformed.
      */
-    virtual bool doesTimeseriesBucketsDocContainMixedSchemaData(
+    virtual StatusWith<bool> doesTimeseriesBucketsDocContainMixedSchemaData(
         const BSONObj& bucketsDoc) const = 0;
 
     /**
@@ -450,9 +455,30 @@ public:
     virtual void updateClusteredIndexTTLSetting(OperationContext* opCtx,
                                                 boost::optional<int64_t> expireAfterSeconds) = 0;
 
+    static bool everUsesCappedSnapshots(const NamespaceString& nss) {
+        // The oplog tracks its visibility through support from the storage engine.
+        if (nss.isOplog()) {
+            return false;
+        }
+
+        // Only use the behavior for non-replicated capped collections (which can accept concurrent
+        // writes).
+        if (nss.isReplicated()) {
+            return false;
+        }
+        return true;
+    }
+
     virtual Status updateCappedSize(OperationContext* opCtx,
                                     boost::optional<long long> newCappedSize,
                                     boost::optional<long long> newCappedMax) = 0;
+
+    /**
+     * Updates the 'recordIdsReplicated' setting to false.
+     * The collection will no longer guarantee the same recordId for a given document across all
+     * nodes in the a replica set.
+     */
+    virtual void unsetRecordIdsReplicated(OperationContext* opCtx) = 0;
 
     //
     // Index
@@ -646,6 +672,8 @@ public:
     // Stats
     //
 
+    virtual bool areRecordIdsReplicated() const = 0;
+
     virtual bool isCapped() const = 0;
     virtual long long getCappedMaxDocs() const = 0;
     virtual long long getCappedMaxSize() const = 0;
@@ -757,7 +785,7 @@ public:
 
     CollectionPtr(const CollectionPtr&) = delete;
     CollectionPtr(CollectionPtr&&);
-    ~CollectionPtr();
+    ~CollectionPtr() override;
 
     CollectionPtr& operator=(const CollectionPtr&) = delete;
     CollectionPtr& operator=(CollectionPtr&&);

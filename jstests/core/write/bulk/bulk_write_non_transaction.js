@@ -5,16 +5,20 @@
  * will cause a transaction abortion which will make the overrides infinite loop.
  *
  * @tags: [
- *   not_allowed_with_security_token,
+ *   not_allowed_with_signed_security_token,
  *   # The test runs commands that are not allowed with security token: bulkWrite.
  *   command_not_supported_in_serverless,
  *   # Contains commands that fail which will fail the entire transaction
  *   does_not_support_transactions,
- *   # TODO SERVER-52419 Remove this tag.
- *   featureFlagBulkWriteCommand,
+ *   operations_longer_than_stepdown_interval,
+ *   requires_fcv_80
  * ]
  */
-import {cursorEntryValidator, cursorSizeValidator} from "jstests/libs/bulk_write_utils.js";
+import {
+    cursorEntryValidator,
+    cursorSizeValidator,
+    summaryFieldsValidator
+} from "jstests/libs/bulk_write_utils.js";
 
 var coll = db.getCollection("coll");
 var coll1 = db.getCollection("coll1");
@@ -160,7 +164,8 @@ res = db.adminCommand({
 
 assert.commandWorked(res);
 cursorSizeValidator(res, 2);
-assert.eq(res.numErrors, 1, "bulkWrite command response: " + tojson(res));
+summaryFieldsValidator(
+    res, {nErrors: 1, nInserted: 0, nDeleted: 0, nMatched: 0, nModified: 0, nUpserted: 1});
 
 cursorEntryValidator(res.cursor.firstBatch[0],
                      {ok: 0, idx: 0, n: 0, nModified: 0, code: ErrorCodes.ImmutableField});
@@ -184,7 +189,8 @@ res = db.adminCommand({
 
 assert.commandWorked(res);
 cursorSizeValidator(res, 1);
-assert.eq(res.numErrors, 1, "bulkWrite command response: " + tojson(res));
+summaryFieldsValidator(
+    res, {nErrors: 1, nInserted: 0, nDeleted: 0, nMatched: 0, nModified: 0, nUpserted: 0});
 
 cursorEntryValidator(res.cursor.firstBatch[0],
                      {ok: 0, idx: 0, n: 0, nModified: 0, code: ErrorCodes.ImmutableField});
@@ -217,7 +223,8 @@ res = db.adminCommand({
 
 assert.commandWorked(res);
 cursorSizeValidator(res, 3);
-assert.eq(res.numErrors, 1, "bulkWrite command response: " + tojson(res));
+summaryFieldsValidator(
+    res, {nErrors: 1, nInserted: 2, nDeleted: 0, nMatched: 0, nModified: 0, nUpserted: 0});
 
 assert.eq(res.cursor.id, 0);
 cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, n: 1, idx: 0});
@@ -250,7 +257,8 @@ res = db.adminCommand({
 
 assert.commandWorked(res);
 cursorSizeValidator(res, 2);
-assert.eq(res.numErrors, 1, "bulkWrite command response: " + tojson(res));
+summaryFieldsValidator(
+    res, {nErrors: 1, nInserted: 1, nDeleted: 0, nMatched: 0, nModified: 0, nUpserted: 0});
 
 assert.eq(res.cursor.id, 0);
 cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, n: 1, idx: 0});
@@ -281,7 +289,8 @@ res = db.adminCommand({
 
 assert.commandWorked(res);
 cursorSizeValidator(res, 2);
-assert.eq(res.numErrors, 1, "bulkWrite command response: " + tojson(res));
+summaryFieldsValidator(
+    res, {nErrors: 1, nInserted: 1, nDeleted: 0, nMatched: 0, nModified: 0, nUpserted: 0});
 
 assert.eq(res.cursor.id, 0);
 cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, n: 1, idx: 0});
@@ -309,7 +318,8 @@ res = db.adminCommand({
 
 assert.commandWorked(res);
 cursorSizeValidator(res, 3);
-assert.eq(res.numErrors, 1, "bulkWrite command response: " + tojson(res));
+summaryFieldsValidator(
+    res, {nErrors: 1, nInserted: 2, nDeleted: 0, nMatched: 0, nModified: 0, nUpserted: 0});
 
 assert.eq(res.cursor.id, 0);
 cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, n: 1, idx: 0});
@@ -332,7 +342,7 @@ res = db.adminCommand({
     bypassDocumentValidation: false,
 });
 assert.commandWorked(res);
-assert.eq(res.numErrors, 1, "bulkWrite command response: " + tojson(res));
+assert.eq(res.nErrors, 1, "bulkWrite command response: " + tojson(res));
 
 assert.eq(0, coll.count({_id: 3}));
 coll.drop();
@@ -350,7 +360,8 @@ res = db.adminCommand({
 
 assert.commandWorked(res);
 cursorSizeValidator(res, 3);
-assert.eq(res.numErrors, 1, "bulkWrite command response: " + tojson(res));
+summaryFieldsValidator(
+    res, {nErrors: 1, nInserted: 1, nDeleted: 0, nMatched: 1, nModified: 1, nUpserted: 0});
 
 cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1});
 cursorEntryValidator(res.cursor.firstBatch[1], {ok: 1, idx: 1, n: 1, nModified: 1});
@@ -375,7 +386,8 @@ res = db.adminCommand({
 
 assert.commandWorked(res);
 cursorSizeValidator(res, 1);
-assert.eq(res.numErrors, 1, "bulkWrite command response: " + tojson(res));
+summaryFieldsValidator(
+    res, {nErrors: 1, nInserted: 0, nDeleted: 0, nMatched: 0, nModified: 0, nUpserted: 0});
 
 cursorEntryValidator(res.cursor.firstBatch[0], {ok: 0, idx: 0, n: 0, nModified: 0, code: 51198});
 assert.eq(res.cursor.firstBatch[0].errmsg,
@@ -401,7 +413,8 @@ res = db.adminCommand({
 
 assert.commandWorked(res);
 cursorSizeValidator(res, 1);
-assert.eq(res.numErrors, 1, "bulkWrite command response: " + tojson(res));
+summaryFieldsValidator(
+    res, {nErrors: 1, nInserted: 0, nDeleted: 0, nMatched: 0, nModified: 0, nUpserted: 0});
 
 cursorEntryValidator(res.cursor.firstBatch[0], {ok: 0, idx: 0, n: 0, nModified: 0, code: 9});
 assert.eq(res.cursor.firstBatch[0].errmsg,
@@ -409,7 +422,7 @@ assert.eq(res.cursor.firstBatch[0].errmsg,
 
 coll.drop();
 
-// Test errorsOnly.
+// Test errorsOnly with a failure.
 res = db.adminCommand({
     bulkWrite: 1,
     ops: [{insert: 0, document: {_id: 1}}, {insert: 0, document: {_id: 1}}],
@@ -419,11 +432,92 @@ res = db.adminCommand({
 
 assert.commandWorked(res, "bulkWrite command response: " + tojson(res));
 cursorSizeValidator(res, 1);
-assert.eq(res.numErrors, 1, "bulkWrite command response: " + tojson(res));
+summaryFieldsValidator(
+    res, {nErrors: 1, nInserted: 1, nDeleted: 0, nMatched: 0, nModified: 0, nUpserted: 0});
 
 assert(res.cursor.id == 0, "bulkWrite command response: " + tojson(res));
 cursorEntryValidator(res.cursor.firstBatch[0], {ok: 0, n: 0, idx: 1, code: 11000});
 assert(!res.cursor.firstBatch[1], "bulkWrite command response: " + tojson(res));
 assert.eq(res.cursor.ns, "admin.$cmd.bulkWrite", "bulkWrite command response: " + tojson(res));
+
+coll.drop();
+
+// Explained upsert against an empty collection should succeed and be a no-op.
+res = db.adminCommand({
+    explain: {
+        bulkWrite: 1,
+        ops: [
+            {update: 0, filter: {_id: 1}, updateMods: {$set: {skey: "MongoDB2"}}, upsert: true},
+        ],
+        nsInfo: [{ns: "test.coll"}],
+        ordered: false
+    }
+});
+assert.commandWorked(res);
+
+// Collection should still not exist.
+assert.eq(coll.find().itcount(), 0);
+
+assert.eq(res.executionStats.totalDocsExamined, 0, "bulkWrite explain response: " + tojson(res));
+
+coll.drop();
+
+// Explained update should succeed and be a no-op.
+coll.insert({_id: 1, skey: "MongoDB"});
+res = db.adminCommand({
+    explain: {
+        bulkWrite: 1,
+        ops: [
+            {update: 0, filter: {_id: 1}, updateMods: {$set: {skey: "MongoDB2"}}},
+        ],
+        nsInfo: [{ns: "test.coll"}],
+        ordered: false
+    }
+});
+assert.commandWorked(res);
+
+assert.eq(coll.find({skey: "MongoDB"}).itcount(), 1);
+
+assert.eq(res.executionStats.totalDocsExamined, 1, "bulkWrite explain response: " + tojson(res));
+
+coll.drop();
+
+// Explained delete should succeed and be a no-op.
+coll.insert({_id: 1});
+res = db.adminCommand({
+    explain: {
+        bulkWrite: 1,
+        ops: [
+            {delete: 0, filter: {_id: 1}},
+        ],
+        nsInfo: [{ns: "test.coll"}],
+        ordered: false
+    }
+});
+assert.commandWorked(res);
+
+assert.eq(coll.find().itcount(), 1);
+
+assert.eq(res.executionStats.totalDocsExamined, 1, "bulkWrite explain response: " + tojson(res));
+
+coll.drop();
+
+coll.insert({_id: 1, skey: "MongoDB"});
+coll.insert({_id: 2, skey: "MongoDB"});
+res = db.adminCommand({
+    explain: {
+        bulkWrite: 1,
+        ops: [
+            {delete: 0, filter: {skey: "MongoDB"}, multi: true},
+        ],
+        nsInfo: [{ns: "test.coll"}],
+        ordered: false
+    }
+});
+assert.commandWorked(res);
+
+assert.eq(coll.find().itcount(), 2);
+
+assert.eq(res.executionStats.totalDocsExamined, 2, "bulkWrite explain response: " + tojson(res));
 
 coll.drop();

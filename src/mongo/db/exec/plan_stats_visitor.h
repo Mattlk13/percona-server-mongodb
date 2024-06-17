@@ -48,6 +48,7 @@ struct HashAggStats;
 struct HashLookupStats;
 struct WindowStats;
 struct SearchStats;
+struct TsBucketToBlockStats;
 }  // namespace sbe
 
 struct AndHashStats;
@@ -78,6 +79,7 @@ struct TextOrStats;
 struct TrialStats;
 struct GroupStats;
 struct DocumentSourceCursorStats;
+struct DocumentSourceMergeCursorsStats;
 struct DocumentSourceLookupStats;
 struct UnionWithStats;
 struct DocumentSourceFacetStats;
@@ -114,6 +116,7 @@ public:
     virtual void visit(tree_walker::MaybeConstPtr<IsConst, sbe::HashLookupStats> stats) = 0;
     virtual void visit(tree_walker::MaybeConstPtr<IsConst, sbe::WindowStats> stats) = 0;
     virtual void visit(tree_walker::MaybeConstPtr<IsConst, sbe::SearchStats> stats) = 0;
+    virtual void visit(tree_walker::MaybeConstPtr<IsConst, sbe::TsBucketToBlockStats> stats) = 0;
 
     virtual void visit(tree_walker::MaybeConstPtr<IsConst, AndHashStats> stats) = 0;
     virtual void visit(tree_walker::MaybeConstPtr<IsConst, AndSortedStats> stats) = 0;
@@ -143,6 +146,8 @@ public:
     virtual void visit(tree_walker::MaybeConstPtr<IsConst, TrialStats> stats) = 0;
     virtual void visit(tree_walker::MaybeConstPtr<IsConst, GroupStats> stats) = 0;
     virtual void visit(tree_walker::MaybeConstPtr<IsConst, DocumentSourceCursorStats> stats) = 0;
+    virtual void visit(
+        tree_walker::MaybeConstPtr<IsConst, DocumentSourceMergeCursorsStats> stats) = 0;
     virtual void visit(tree_walker::MaybeConstPtr<IsConst, DocumentSourceLookupStats> stats) = 0;
     virtual void visit(tree_walker::MaybeConstPtr<IsConst, UnionWithStats> stats) = 0;
     virtual void visit(tree_walker::MaybeConstPtr<IsConst, DocumentSourceFacetStats> stats) = 0;
@@ -173,6 +178,7 @@ struct PlanStatsVisitorBase : public PlanStatsVisitor<IsConst> {
     void visit(tree_walker::MaybeConstPtr<IsConst, sbe::HashLookupStats> stats) override {}
     void visit(tree_walker::MaybeConstPtr<IsConst, sbe::WindowStats> stats) override {}
     void visit(tree_walker::MaybeConstPtr<IsConst, sbe::SearchStats> stats) override {}
+    void visit(tree_walker::MaybeConstPtr<IsConst, sbe::TsBucketToBlockStats> stats) override {}
 
     void visit(tree_walker::MaybeConstPtr<IsConst, AndHashStats> stats) override {}
     void visit(tree_walker::MaybeConstPtr<IsConst, AndSortedStats> stats) override {}
@@ -202,6 +208,8 @@ struct PlanStatsVisitorBase : public PlanStatsVisitor<IsConst> {
     void visit(tree_walker::MaybeConstPtr<IsConst, TrialStats> stats) override {}
     void visit(tree_walker::MaybeConstPtr<IsConst, GroupStats> stats) override {}
     void visit(tree_walker::MaybeConstPtr<IsConst, DocumentSourceCursorStats> stats) override {}
+    void visit(
+        tree_walker::MaybeConstPtr<IsConst, DocumentSourceMergeCursorsStats> stats) override {}
     void visit(tree_walker::MaybeConstPtr<IsConst, DocumentSourceLookupStats> stats) override {}
     void visit(tree_walker::MaybeConstPtr<IsConst, UnionWithStats> stats) override {}
     void visit(tree_walker::MaybeConstPtr<IsConst, DocumentSourceFacetStats> stats) override {}

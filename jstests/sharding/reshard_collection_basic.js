@@ -6,6 +6,7 @@
 //
 
 import {DiscoverTopology} from "jstests/libs/discover_topology.js";
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
 import {ReshardCollectionCmdTest} from "jstests/sharding/libs/reshard_collection_util.js";
 
 const st = new ShardingTest({mongos: 1, shards: 2});
@@ -79,6 +80,14 @@ assert.commandFailedWithCode(mongos.adminCommand({
 }),
                              ErrorCodes.CannotCreateChunkDistribution);
 
+jsTest.log("Fail if zone provided is invalid for storage.");
+assert.commandFailedWithCode(mongos.adminCommand({
+    reshardCollection: ns,
+    key: {"_id": "hashed"},
+    zones: [{min: {"_id": {"$minKey": 1}}, max: {"_id": {"$maxKey": 1}}, zone: "Namezone"}]
+}),
+                             ErrorCodes.BadValue);
+
 jsTestLog("Fail if splitting collection into multiple chunks while it is still empty.");
 assert.commandFailedWithCode(
     mongos.adminCommand({reshardCollection: ns, key: {b: 1}, numInitialChunks: 2}), 4952606);
@@ -102,9 +111,17 @@ assert.commandFailedWithCode(mongos.adminCommand({
 }),
                              ErrorCodes.BadValue);
 
-jsTestLog("Fail if attempting insert to an unsharded 'system.resharding.' collection");
-assert.commandFailedWithCode(mongos.getDB('test').system.resharding.mycoll.insert({_id: 1, a: 1}),
-                             ErrorCodes.NamespaceNotSharded);
+// TODO SERVER-87189 remove this test case since a user-created unsharded collection is now always
+// tracked. A temporary db.system.resharding.collection must now exist as unsplittable as well to
+// support moveCollection.
+const isTrackUnshardedUponCreationEnabled = FeatureFlagUtil.isPresentAndEnabled(
+    st.s.getDB('admin'), "TrackUnshardedCollectionsUponCreation");
+if (!isTrackUnshardedUponCreationEnabled) {
+    jsTestLog("Fail if attempting insert to an unsharded 'system.resharding.' collection");
+    assert.commandFailedWithCode(
+        mongos.getDB('test').system.resharding.mycoll.insert({_id: 1, a: 1}),
+        [ErrorCodes.NamespaceNotFound, ErrorCodes.NamespaceNotSharded]);
+}
 
 /**
  * Success cases

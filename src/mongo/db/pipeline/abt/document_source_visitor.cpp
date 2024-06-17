@@ -367,13 +367,17 @@ void visit(ABTDocumentSourceTranslationVisitorContext* visitorCtx,
     ABT matchExpr = generateMatchExpression(source.getMatchExpression(),
                                             true /*allowAggExpressions*/,
                                             entry._rootProjection,
-                                            ctx.getPrefixId());
+                                            ctx.getPrefixId(),
+                                            ctx.getQueryParameters());
 
     {
         // If we have a top-level composition, flatten it into a chain of separate FilterNodes. We
         // are adding the entire subtree to the context.
-        auto result = decomposeToFilterNodes(
-            entry._node, matchExpr, make<Variable>(entry._rootProjection), 1 /*minDepth*/);
+        auto result = decomposeToFilterNodes(entry._node,
+                                             matchExpr,
+                                             make<Variable>(entry._rootProjection),
+                                             1 /*minDepth*/,
+                                             visitorCtx->maxFilterDepth);
         ctx.setNode(entry._rootProjection, std::move(*result));
         entry = ctx.getNode();
     }
@@ -424,8 +428,12 @@ void visit(ABTDocumentSourceTranslationVisitorContext* visitorCtx,
         : make<ValueScanNode>(ProjectionNameVector{scanProjName},
                               createInitialScanProps(scanProjName, scanDefName));
 
-    ABT pipelineABT = translatePipelineToABT(
-        metadata, pipeline, scanProjName, std::move(initialNode), ctx.getPrefixId());
+    ABT pipelineABT = translatePipelineToABT(metadata,
+                                             pipeline,
+                                             scanProjName,
+                                             std::move(initialNode),
+                                             ctx.getPrefixId(),
+                                             ctx.getQueryParameters());
 
     uassert(6624425, "Expected root node for union pipeline", pipelineABT.is<RootNode>());
     ABT pipelineABTWithoutRoot = pipelineABT.cast<RootNode>()->getChild();
@@ -552,9 +560,11 @@ ABT translatePipelineToABT(const Metadata& metadata,
                            const Pipeline& pipeline,
                            ProjectionName scanProjName,
                            ABT initialNode,
-                           PrefixId& prefixId) {
-    AlgebrizerContext ctx(prefixId, {scanProjName, std::move(initialNode)});
-    ABTDocumentSourceTranslationVisitorContext visitorCtx(ctx, metadata);
+                           PrefixId& prefixId,
+                           QueryParameterMap& queryParameters,
+                           size_t maxFilterDepth) {
+    AlgebrizerContext ctx(prefixId, {scanProjName, std::move(initialNode)}, queryParameters);
+    ABTDocumentSourceTranslationVisitorContext visitorCtx(ctx, metadata, maxFilterDepth);
 
     ServiceContext* serviceCtx = pipeline.getContext()->opCtx->getServiceContext();
     auto& reg = getDocumentSourceVisitorRegistry(serviceCtx);

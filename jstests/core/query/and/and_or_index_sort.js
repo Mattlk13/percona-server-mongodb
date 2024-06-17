@@ -1,6 +1,7 @@
 /**
  * Some more tests $and/$or being nested in various ways.
  */
+
 const coll = db.jstests_and_or_index_sort;
 coll.drop();
 

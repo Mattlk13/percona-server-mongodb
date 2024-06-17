@@ -186,7 +186,8 @@ ExchangeConsumer::ExchangeConsumer(std::unique_ptr<PlanStage> input,
                                    std::unique_ptr<EExpression> orderLess,
                                    PlanNodeId planNodeId,
                                    bool participateInTrialRunTracking)
-    : PlanStage("exchange"_sd, planNodeId, participateInTrialRunTracking) {
+    : PlanStage(
+          "exchange"_sd, nullptr /* yieldPolicy */, planNodeId, participateInTrialRunTracking) {
     _children.emplace_back(std::move(input));
     _state = std::make_shared<ExchangeState>(
         numOfProducers, std::move(fields), policy, std::move(partition), std::move(orderLess));
@@ -203,13 +204,15 @@ ExchangeConsumer::ExchangeConsumer(std::unique_ptr<PlanStage> input,
 ExchangeConsumer::ExchangeConsumer(std::shared_ptr<ExchangeState> state,
                                    PlanNodeId planNodeId,
                                    bool participateInTrialRunTracking)
-    : PlanStage("exchange"_sd, planNodeId, participateInTrialRunTracking), _state(state) {
+    : PlanStage(
+          "exchange"_sd, nullptr /* yieldPolicy */, planNodeId, participateInTrialRunTracking),
+      _state(state) {
     _tid = _state->addConsumer(this);
     _orderPreserving = _state->isOrderPreserving();
 }
 std::unique_ptr<PlanStage> ExchangeConsumer::clone() const {
     return std::make_unique<ExchangeConsumer>(
-        _state, _commonStats.nodeId, _participateInTrialRunTracking);
+        _state, _commonStats.nodeId, participateInTrialRunTracking());
 }
 void ExchangeConsumer::prepare(CompileCtx& ctx) {
     for (size_t idx = 0; idx < _state->fields().size(); ++idx) {
@@ -505,7 +508,9 @@ ExchangeProducer::ExchangeProducer(std::unique_ptr<PlanStage> input,
                                    std::shared_ptr<ExchangeState> state,
                                    PlanNodeId planNodeId,
                                    bool participateInTrialRunTracking)
-    : PlanStage("exchangep"_sd, planNodeId, participateInTrialRunTracking), _state(state) {
+    : PlanStage(
+          "exchangep"_sd, nullptr /* yieldPolicy */, planNodeId, participateInTrialRunTracking),
+      _state(state) {
     _children.emplace_back(std::move(input));
 
     _tid = _state->addProducer(this);
@@ -679,7 +684,7 @@ const SpecificStats* ExchangeProducer::getSpecificStats() const {
 bool ExchangeBuffer::appendData(std::vector<value::SlotAccessor*>& data) {
     ++_count;
     for (auto accesor : data) {
-        auto [tag, val] = accesor->copyOrMoveValue();
+        auto [tag, val] = accesor->getCopyOfValue();
         value::ValueGuard guard{tag, val};
         _typeTags.push_back(tag);
         _values.push_back(val);

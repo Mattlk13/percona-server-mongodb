@@ -139,11 +139,7 @@ rpc::UniqueReply DBClientBase::parseCommandReplyMessage(const std::string& host,
         uassertStatusOK(_metadataReader(opCtx, commandReply->getCommandReply(), host));
     }
 
-    // StaleConfig is thrown because clients acting as routers handle the exception at a higher
-    // level. Routing clients only expect StaleConfig from shards, so the exception should not be
-    // thrown when connected to a mongos, which allows StaleConfig to be returned to clients that
-    // connect to a mongos with DBClient, e.g. the shell.
-    if (!isMongos()) {
+    if (_shouldThrowOnStaleConfigError) {
         auto status = getStatusFromCommandResult(commandReply->getCommandReply());
         if (status == ErrorCodes::StaleConfig) {
             uassertStatusOK(status.withContext("stale config in runCommand"));
@@ -201,6 +197,15 @@ void appendMetadata(OperationContext* opCtx,
     request.body = bob.obj();
 }
 }  // namespace
+
+auth::ValidatedTenancyScope DBClientBase::_createInnerRequestVTS(
+    const boost::optional<TenantId>& tenantId) const {
+    if (tenantId) {
+        return auth::ValidatedTenancyScopeFactory::create(
+            tenantId.get(), auth::ValidatedTenancyScopeFactory::TrustedForInnerOpMsgRequestTag{});
+    }
+    return auth::ValidatedTenancyScope::kNotRequired;
+}
 
 DBClientBase* DBClientBase::runFireAndForgetCommand(OpMsgRequest request) {
     // Make sure to reconnect if needed before building our request.
@@ -262,21 +267,9 @@ std::tuple<bool, DBClientBase*> DBClientBase::runCommandWithTarget(const Databas
     // TODO: This will be downconverted immediately if the underlying
     // requestBuilder is a legacyRequest builder. Not sure what the best
     // way to get around that is without breaking the abstraction.
-    auto request = _upconvertRequest(dbName, cmd, options);
+    auto request =
+        rpc::upconvertRequest(dbName, cmd, options, _createInnerRequestVTS(dbName.tenantId()));
     auto result = runCommandWithTarget(std::move(request));
-
-    info = result.first->getCommandReply().getOwned();
-    return std::make_tuple(isOk(info), result.second);
-}
-
-std::tuple<bool, std::shared_ptr<DBClientBase>> DBClientBase::runCommandWithTarget(
-    const DatabaseName& dbName,
-    BSONObj cmd,
-    BSONObj& info,
-    std::shared_ptr<DBClientBase> me,
-    int options) {
-    auto request = _upconvertRequest(dbName, cmd, options);
-    auto result = runCommandWithTarget(std::move(request), std::move(me));
 
     info = result.first->getCommandReply().getOwned();
     return std::make_tuple(isOk(info), result.second);
@@ -617,7 +610,8 @@ unique_ptr<DBClientCursor> DBClientBase::getMore(const NamespaceString& nss, lon
 }
 
 namespace {
-OpMsgRequest createInsertRequest(const NamespaceString& nss,
+OpMsgRequest createInsertRequest(const auth::ValidatedTenancyScope& vts,
+                                 const NamespaceString& nss,
                                  const vector<BSONObj>& v,
                                  bool ordered,
                                  boost::optional<BSONObj> writeConcernObj) {
@@ -627,13 +621,14 @@ OpMsgRequest createInsertRequest(const NamespaceString& nss,
     if (writeConcernObj) {
         cmdBuilder.append(WriteConcernOptions::kWriteConcernField, *writeConcernObj);
     }
-    auto request = OpMsgRequestBuilder::create(nss.dbName(), cmdBuilder.obj());
+    auto request = OpMsgRequestBuilder::create(vts, nss.dbName(), cmdBuilder.obj());
     request.sequences.push_back({"documents", v});
 
     return request;
 }
 
-OpMsgRequest createUpdateRequest(const NamespaceString& nss,
+OpMsgRequest createUpdateRequest(const auth::ValidatedTenancyScope& vts,
+                                 const NamespaceString& nss,
                                  const BSONObj& filter,
                                  BSONObj updateSpec,
                                  bool upsert,
@@ -644,7 +639,7 @@ OpMsgRequest createUpdateRequest(const NamespaceString& nss,
     if (writeConcernObj) {
         cmdBuilder.append(WriteConcernOptions::kWriteConcernField, *writeConcernObj);
     }
-    auto request = OpMsgRequestBuilder::create(nss.dbName(), cmdBuilder.obj());
+    auto request = OpMsgRequestBuilder::create(vts, nss.dbName(), cmdBuilder.obj());
     request.sequences.push_back(
         {"updates",
          {BSON("q" << filter << "u" << updateSpec << "upsert" << upsert << "multi" << multi)}});
@@ -652,7 +647,8 @@ OpMsgRequest createUpdateRequest(const NamespaceString& nss,
     return request;
 }
 
-OpMsgRequest createRemoveRequest(const NamespaceString& nss,
+OpMsgRequest createRemoveRequest(const auth::ValidatedTenancyScope& vts,
+                                 const NamespaceString& nss,
                                  const BSONObj& filter,
                                  bool removeMany,
                                  boost::optional<BSONObj> writeConcernObj) {
@@ -663,7 +659,7 @@ OpMsgRequest createRemoveRequest(const NamespaceString& nss,
     if (writeConcernObj) {
         cmdBuilder.append(WriteConcernOptions::kWriteConcernField, *writeConcernObj);
     }
-    auto request = OpMsgRequestBuilder::create(nss.dbName(), cmdBuilder.obj());
+    auto request = OpMsgRequestBuilder::create(vts, nss.dbName(), cmdBuilder.obj());
     request.sequences.push_back({"deletes", {BSON("q" << filter << "limit" << limit)}});
 
     return request;
@@ -674,7 +670,8 @@ BSONObj DBClientBase::insertAcknowledged(const NamespaceString& nss,
                                          const vector<BSONObj>& v,
                                          bool ordered,
                                          boost::optional<BSONObj> writeConcernObj) {
-    OpMsgRequest request = createInsertRequest(nss, v, ordered, writeConcernObj);
+    OpMsgRequest request = createInsertRequest(
+        _createInnerRequestVTS(nss.tenantId()), nss, v, ordered, writeConcernObj);
     rpc::UniqueReply reply = runCommand(std::move(request));
     return reply->getCommandReply();
 }
@@ -690,7 +687,8 @@ void DBClientBase::insert(const NamespaceString& nss,
                           const vector<BSONObj>& v,
                           bool ordered,
                           boost::optional<BSONObj> writeConcernObj) {
-    auto request = createInsertRequest(nss, v, ordered, writeConcernObj);
+    auto request = createInsertRequest(
+        _createInnerRequestVTS(nss.tenantId()), nss, v, ordered, writeConcernObj);
     runFireAndForgetCommand(std::move(request));
 }
 
@@ -698,7 +696,8 @@ BSONObj DBClientBase::removeAcknowledged(const NamespaceString& nss,
                                          const BSONObj& filter,
                                          bool removeMany,
                                          boost::optional<BSONObj> writeConcernObj) {
-    OpMsgRequest request = createRemoveRequest(nss, filter, removeMany, writeConcernObj);
+    OpMsgRequest request = createRemoveRequest(
+        _createInnerRequestVTS(nss.tenantId()), nss, filter, removeMany, writeConcernObj);
     rpc::UniqueReply reply = runCommand(std::move(request));
     return reply->getCommandReply();
 }
@@ -707,7 +706,8 @@ void DBClientBase::remove(const NamespaceString& nss,
                           const BSONObj& filter,
                           bool removeMany,
                           boost::optional<BSONObj> writeConcernObj) {
-    auto request = createRemoveRequest(nss, filter, removeMany, writeConcernObj);
+    auto request = createRemoveRequest(
+        _createInnerRequestVTS(nss.tenantId()), nss, filter, removeMany, writeConcernObj);
     runFireAndForgetCommand(std::move(request));
 }
 
@@ -717,7 +717,13 @@ BSONObj DBClientBase::updateAcknowledged(const NamespaceString& nss,
                                          bool upsert,
                                          bool multi,
                                          boost::optional<BSONObj> writeConcernObj) {
-    auto request = createUpdateRequest(nss, filter, updateSpec, upsert, multi, writeConcernObj);
+    auto request = createUpdateRequest(_createInnerRequestVTS(nss.tenantId()),
+                                       nss,
+                                       filter,
+                                       updateSpec,
+                                       upsert,
+                                       multi,
+                                       writeConcernObj);
     rpc::UniqueReply reply = runCommand(std::move(request));
     return reply->getCommandReply();
 }
@@ -728,13 +734,21 @@ void DBClientBase::update(const NamespaceString& nss,
                           bool upsert,
                           bool multi,
                           boost::optional<BSONObj> writeConcernObj) {
-    auto request = createUpdateRequest(nss, filter, updateSpec, upsert, multi, writeConcernObj);
+    auto request = createUpdateRequest(_createInnerRequestVTS(nss.tenantId()),
+                                       nss,
+                                       filter,
+                                       updateSpec,
+                                       upsert,
+                                       multi,
+                                       writeConcernObj);
     runFireAndForgetCommand(std::move(request));
 }
 
 void DBClientBase::killCursor(const NamespaceString& nss, long long cursorId) {
-    runFireAndForgetCommand(OpMsgRequestBuilder::create(
-        nss.dbName(), KillCursorsCommandRequest(nss, {cursorId}).toBSON(BSONObj{})));
+    runFireAndForgetCommand(
+        OpMsgRequestBuilder::create(_createInnerRequestVTS(nss.tenantId()),
+                                    nss.dbName(),
+                                    KillCursorsCommandRequest(nss, {cursorId}).toBSON(BSONObj{})));
 }
 
 namespace {
@@ -930,18 +944,6 @@ void DBClientBase::createIndexes(const NamespaceString& nss,
         invariant(!runCommandStatus.isOK());
         uassertStatusOK(runCommandStatus);
     }
-}
-
-OpMsgRequest DBClientBase::_upconvertRequest(const DatabaseName& dbName,
-                                             BSONObj legacyCmdObj,
-                                             int options) {
-    if (isAlwaysAppendDollarTenant_forTest() && dbName.tenantId()) {
-        BSONObjBuilder bob = BSONObjBuilder(std::move(legacyCmdObj));
-        dbName.tenantId()->serializeToBSON("$tenant", &bob);
-        legacyCmdObj = bob.obj();
-    }
-
-    return rpc::upconvertRequest(dbName, std::move(legacyCmdObj), options);
 }
 
 BSONElement getErrField(const BSONObj& o) {

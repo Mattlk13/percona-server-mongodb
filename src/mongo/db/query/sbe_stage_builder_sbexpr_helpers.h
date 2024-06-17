@@ -34,9 +34,73 @@
 #include "mongo/db/query/sbe_stage_builder_sbexpr.h"
 
 namespace mongo::stage_builder {
+namespace {
+inline void makeSbExprOptSbSlotVecHelper(SbExprOptSbSlotVector& result) {}
+
+template <typename... Ts>
+inline void makeSbExprOptSbSlotVecHelper(SbExprOptSbSlotVector& result, SbExpr expr, Ts&&... rest) {
+    result.emplace_back(std::move(expr), boost::none);
+    makeSbExprOptSbSlotVecHelper(result, std::forward<Ts>(rest)...);
+}
+
+template <typename... Ts>
+inline void makeSbExprOptSbSlotVecHelper(SbExprOptSbSlotVector& result,
+                                         std::pair<SbExpr, sbe::value::SlotId> p,
+                                         Ts&&... rest) {
+    result.emplace_back(std::move(p.first), boost::make_optional(p.second));
+    makeSbExprOptSbSlotVecHelper(result, std::forward<Ts>(rest)...);
+}
+
+template <typename... Ts>
+inline void makeSbExprOptSbSlotVecHelper(SbExprOptSbSlotVector& result,
+                                         std::pair<SbExpr, SbSlot> p,
+                                         Ts&&... rest) {
+    result.emplace_back(std::move(p.first), boost::make_optional(p.second.getId()));
+    makeSbExprOptSbSlotVecHelper(result, std::forward<Ts>(rest)...);
+}
+
+template <typename... Ts>
+inline void makeSbExprOptSbSlotVecHelper(SbExprOptSbSlotVector& result,
+                                         std::pair<SbExpr, boost::optional<sbe::value::SlotId>> p,
+                                         Ts&&... rest) {
+    result.emplace_back(std::move(p.first), p.second);
+    makeSbExprOptSbSlotVecHelper(result, std::forward<Ts>(rest)...);
+}
+
+template <typename... Ts>
+inline void makeSbExprOptSbSlotVecHelper(SbExprOptSbSlotVector& result,
+                                         std::pair<SbExpr, boost::optional<SbSlot>> p,
+                                         Ts&&... rest) {
+    result.emplace_back(std::move(p.first),
+                        p.second ? boost::make_optional(p.second->getId()) : boost::none);
+    makeSbExprOptSbSlotVecHelper(result, std::forward<Ts>(rest)...);
+}
+}  // namespace
+
+template <typename... Ts>
+auto makeSbExprOptSbSlotVec(Ts&&... pack) {
+    SbExprOptSbSlotVector v;
+    if constexpr (sizeof...(pack) > 0) {
+        v.reserve(sizeof...(Ts));
+        makeSbExprOptSbSlotVecHelper(v, std::forward<Ts>(pack)...);
+    }
+    return v;
+}
+
+/**
+ * SbExprBuilder is a helper class that offers numerous methods for building expressions. These
+ * methods take all take their input expressions in the form of SbExprs and return their result
+ * in the form of an SbExpr.
+ */
 class SbExprBuilder {
 public:
+    using CaseValuePair = SbExpr::CaseValuePair;
+
     SbExprBuilder(StageBuilderState& state) : _state(state) {}
+
+    SbExpr cloneExpr(const SbExpr& expr) {
+        return expr.clone();
+    }
 
     SbExpr makeVariable(SbVar var) {
         return var;
@@ -83,6 +147,7 @@ public:
 
     SbExpr makeFail(ErrorCodes::Error error, StringData errorMessage);
 
+    SbExpr makeFillEmpty(SbExpr expr, SbExpr altExpr);
     SbExpr makeFillEmptyFalse(SbExpr expr);
     SbExpr makeFillEmptyTrue(SbExpr expr);
     SbExpr makeFillEmptyNull(SbExpr expr);
@@ -92,8 +157,10 @@ public:
 
     SbExpr generateNullOrMissing(SbExpr expr);
     SbExpr generatePositiveCheck(SbExpr expr);
+    SbExpr generateNullMissingOrUndefined(SbExpr expr);
 
     SbExpr generateNullOrMissing(SbVar var);
+    SbExpr generateNullMissingOrUndefined(SbVar var);
     SbExpr generateNonStringCheck(SbVar var);
     SbExpr generateNonTimestampCheck(SbVar var);
     SbExpr generateNegativeCheck(SbVar var);
@@ -141,11 +208,271 @@ public:
             getEPrimBinaryOp(logicOp), std::move(leaves), _state);
     }
 
-private:
-    std::unique_ptr<sbe::EExpression> extractExpr(SbExpr& e);
+    std::unique_ptr<sbe::EExpression> lower(SbExpr& e, const VariableTypes* varTypes = nullptr) {
+        return e.extractExpr(_state, varTypes);
+    }
 
-    sbe::EExpression::Vector extractExpr(SbExpr::Vector& sbExprs);
+    sbe::EExpression::Vector lower(SbExpr::Vector& sbExprs,
+                                   const VariableTypes* varTypes = nullptr);
+
+    sbe::value::SlotId lower(SbSlot s, const VariableTypes* = nullptr) {
+        return s.getId();
+    }
+
+    boost::optional<sbe::value::SlotId> lower(boost::optional<SbSlot> s,
+                                              const VariableTypes* = nullptr) {
+        return s ? boost::make_optional(s->getId()) : boost::none;
+    }
+
+    sbe::value::SlotVector lower(const SbSlotVector& sbSlots, const VariableTypes* = nullptr);
+
+    sbe::SlotExprPairVector lower(SbExprSbSlotVector& sbSlotSbExprVec,
+                                  const VariableTypes* varTypes = nullptr);
 
     StageBuilderState& _state;
+};
+
+/**
+ * The SbBuilder class extends SbExprBuilder with additional methods for creating SbStages.
+ */
+class SbBuilder : public SbExprBuilder {
+public:
+    using SbExprBuilder::lower;
+
+    SbBuilder(StageBuilderState& state, PlanNodeId nodeId)
+        : SbExprBuilder(state), _nodeId(nodeId) {}
+
+    inline PlanNodeId getNodeId() const {
+        return _nodeId;
+    }
+    inline void setNodeId(PlanNodeId nodeId) {
+        _nodeId = nodeId;
+    }
+
+    inline std::pair<SbStage, SbSlotVector> makeProject(SbStage stage,
+                                                        SbExprOptSbSlotVector projects) {
+        return makeProject(std::move(stage), nullptr, std::move(projects));
+    }
+
+    inline std::pair<SbStage, SbSlotVector> makeProject(SbStage stage,
+                                                        const VariableTypes& varTypes,
+                                                        SbExprOptSbSlotVector projects) {
+        return makeProject(std::move(stage), &varTypes, std::move(projects));
+    }
+
+    template <typename... Args>
+    inline std::pair<SbStage, SbSlotVector> makeProject(SbStage stage, SbExpr arg, Args&&... args) {
+        return makeProject(std::move(stage),
+                           nullptr,
+                           makeSbExprOptSbSlotVec(std::move(arg), std::forward<Args>(args)...));
+    }
+
+    template <typename T, typename... Args>
+    inline std::pair<SbStage, SbSlotVector> makeProject(SbStage stage,
+                                                        std::pair<SbExpr, T> arg,
+                                                        Args&&... args) {
+        return makeProject(std::move(stage),
+                           nullptr,
+                           makeSbExprOptSbSlotVec(std::move(arg), std::forward<Args>(args)...));
+    }
+
+    template <typename... Args>
+    inline std::pair<SbStage, SbSlotVector> makeProject(SbStage stage,
+                                                        const VariableTypes& varTypes,
+                                                        SbExpr arg,
+                                                        Args&&... args) {
+        return makeProject(std::move(stage),
+                           &varTypes,
+                           makeSbExprOptSbSlotVec(std::move(arg), std::forward<Args>(args)...));
+    }
+
+    template <typename T, typename... Args>
+    inline std::pair<SbStage, SbSlotVector> makeProject(SbStage stage,
+                                                        const VariableTypes& varTypes,
+                                                        std::pair<SbExpr, T> arg,
+                                                        Args&&... args) {
+        return makeProject(std::move(stage),
+                           &varTypes,
+                           makeSbExprOptSbSlotVec(std::move(arg), std::forward<Args>(args)...));
+    }
+
+    std::pair<SbStage, SbSlotVector> makeProject(SbStage stage,
+                                                 const VariableTypes* varTypes,
+                                                 SbExprOptSbSlotVector projects);
+
+    std::tuple<SbStage, SbSlotVector, SbSlotVector> makeHashAgg(
+        SbStage stage,
+        const SbSlotVector& groupBySlots,
+        SbAggExprVector sbAggExprs,
+        boost::optional<sbe::value::SlotId> collatorSlot,
+        bool allowDiskUse,
+        SbExprSbSlotVector mergingExprs,
+        PlanYieldPolicy* yieldPolicy) {
+        return makeHashAgg(std::move(stage),
+                           nullptr,
+                           groupBySlots,
+                           std::move(sbAggExprs),
+                           collatorSlot,
+                           allowDiskUse,
+                           std::move(mergingExprs),
+                           yieldPolicy);
+    }
+
+    std::tuple<SbStage, SbSlotVector, SbSlotVector> makeHashAgg(
+        SbStage stage,
+        const VariableTypes& varTypes,
+        const SbSlotVector& groupBySlots,
+        SbAggExprVector sbAggExprs,
+        boost::optional<sbe::value::SlotId> collatorSlot,
+        bool allowDiskUse,
+        SbExprSbSlotVector mergingExprs,
+        PlanYieldPolicy* yieldPolicy) {
+        return makeHashAgg(std::move(stage),
+                           &varTypes,
+                           groupBySlots,
+                           std::move(sbAggExprs),
+                           collatorSlot,
+                           allowDiskUse,
+                           std::move(mergingExprs),
+                           yieldPolicy);
+    }
+
+    std::tuple<SbStage, SbSlotVector, SbSlotVector> makeHashAgg(
+        SbStage stage,
+        const VariableTypes* varTypes,
+        const SbSlotVector& groupBySlots,
+        SbAggExprVector sbAggExprs,
+        boost::optional<sbe::value::SlotId> collatorSlot,
+        bool allowDiskUse,
+        SbExprSbSlotVector mergingExprs,
+        PlanYieldPolicy* yieldPolicy);
+
+    std::tuple<SbStage, SbSlotVector, SbSlotVector> makeBlockHashAgg(
+        SbStage stage,
+        const SbSlotVector& groupBySlots,
+        SbAggExprVector sbAggExprs,
+        SbSlot selectivityBitmapSlot,
+        const SbSlotVector& blockAccArgSlots,
+        SbSlot bitmapInternalSlot,
+        const SbSlotVector& accumulatorDataSlots,
+        bool allowDiskUse,
+        SbExprSbSlotVector mergingExprs,
+        PlanYieldPolicy* yieldPolicy) {
+        return makeBlockHashAgg(std::move(stage),
+                                nullptr,
+                                groupBySlots,
+                                std::move(sbAggExprs),
+                                selectivityBitmapSlot,
+                                blockAccArgSlots,
+                                bitmapInternalSlot,
+                                accumulatorDataSlots,
+                                allowDiskUse,
+                                std::move(mergingExprs),
+                                yieldPolicy);
+    }
+
+    std::tuple<SbStage, SbSlotVector, SbSlotVector> makeBlockHashAgg(
+        SbStage stage,
+        const VariableTypes& varTypes,
+        const SbSlotVector& groupBySlots,
+        SbAggExprVector sbAggExprs,
+        SbSlot selectivityBitmapSlot,
+        const SbSlotVector& blockAccArgSlots,
+        SbSlot bitmapInternalSlot,
+        const SbSlotVector& accumulatorDataSlots,
+        bool allowDiskUse,
+        SbExprSbSlotVector mergingExprs,
+        PlanYieldPolicy* yieldPolicy) {
+        return makeBlockHashAgg(std::move(stage),
+                                &varTypes,
+                                groupBySlots,
+                                std::move(sbAggExprs),
+                                selectivityBitmapSlot,
+                                blockAccArgSlots,
+                                bitmapInternalSlot,
+                                accumulatorDataSlots,
+                                allowDiskUse,
+                                std::move(mergingExprs),
+                                yieldPolicy);
+    }
+
+    std::tuple<SbStage, SbSlotVector, SbSlotVector> makeBlockHashAgg(
+        SbStage stage,
+        const VariableTypes* varTypes,
+        const SbSlotVector& groupBySlots,
+        SbAggExprVector sbAggExprs,
+        SbSlot selectivityBitmapSlot,
+        const SbSlotVector& blockAccArgSbSlots,
+        SbSlot bitmapInternalSlot,
+        const SbSlotVector& accumulatorDataSbSlots,
+        bool allowDiskUse,
+        SbExprSbSlotVector mergingExprs,
+        PlanYieldPolicy* yieldPolicy);
+
+    std::tuple<SbStage, SbSlotVector> makeAggProject(SbStage stage, SbAggExprVector sbAggExprs) {
+        return makeAggProject(std::move(stage), nullptr, std::move(sbAggExprs));
+    }
+
+    std::tuple<SbStage, SbSlotVector> makeAggProject(SbStage stage,
+                                                     const VariableTypes& varTypes,
+                                                     SbAggExprVector sbAggExprs) {
+        return makeAggProject(std::move(stage), &varTypes, std::move(sbAggExprs));
+    }
+
+    std::tuple<SbStage, SbSlotVector> makeAggProject(SbStage stage,
+                                                     const VariableTypes* varTypes,
+                                                     SbAggExprVector sbAggExprs);
+
+    SbStage makeWindow(SbStage stage,
+                       const SbSlotVector& currSlots,
+                       const SbSlotVector& boundTestingSlots,
+                       size_t partitionSlotCount,
+                       std::vector<SbWindow> windows,
+                       boost::optional<sbe::value::SlotId> collatorSlot,
+                       bool allowDiskUse) {
+        return makeWindow(std::move(stage),
+                          nullptr,
+                          currSlots,
+                          boundTestingSlots,
+                          partitionSlotCount,
+                          std::move(windows),
+                          collatorSlot,
+                          allowDiskUse);
+    }
+
+    SbStage makeWindow(SbStage stage,
+                       const VariableTypes& varTypes,
+                       const SbSlotVector& currSlots,
+                       const SbSlotVector& boundTestingSlots,
+                       size_t partitionSlotCount,
+                       std::vector<SbWindow> windows,
+                       boost::optional<sbe::value::SlotId> collatorSlot,
+                       bool allowDiskUse) {
+        return makeWindow(std::move(stage),
+                          &varTypes,
+                          currSlots,
+                          boundTestingSlots,
+                          partitionSlotCount,
+                          std::move(windows),
+                          collatorSlot,
+                          allowDiskUse);
+    }
+
+    SbStage makeWindow(SbStage stage,
+                       const VariableTypes* varTypes,
+                       const SbSlotVector& currSlots,
+                       const SbSlotVector& boundTestingSlots,
+                       size_t partitionSlotCount,
+                       std::vector<SbWindow> windows,
+                       boost::optional<sbe::value::SlotId> collatorSlot,
+                       bool allowDiskUse);
+
+protected:
+    sbe::WindowStage::Window lower(SbWindow& sbWindow, const VariableTypes* varTypes = nullptr);
+
+    std::vector<sbe::WindowStage::Window> lower(std::vector<SbWindow>& sbWindows,
+                                                const VariableTypes* varTypes = nullptr);
+
+    PlanNodeId _nodeId;
 };
 }  // namespace mongo::stage_builder

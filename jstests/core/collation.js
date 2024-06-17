@@ -4,7 +4,7 @@
 // @tags: [
 //   # The test runs commands that are not allowed with security token: applyOps,
 //   # cloneCollectionAsCapped, mapReduce, reIndex.
-//   not_allowed_with_security_token,
+//   not_allowed_with_signed_security_token,
 //   assumes_no_implicit_collection_creation_after_drop,
 //   # Asserts that some queries use a collection scan.
 //   assumes_no_implicit_index_creation,
@@ -21,10 +21,12 @@
 
 // Integration tests for the collation feature.
 import {
+    getOptimizer,
     getPlanStage,
     getSingleNodeExplain,
     getWinningPlan,
     isCollscan,
+    isIdhackOrExpress,
     isIxscan,
     planHasStage
 } from "jstests/libs/analyze_plan.js";
@@ -268,15 +270,20 @@ assertIndexHasCollation({e: 1}, {locale: "simple"});
 
 // Test that an index with a non-simple collation contains collator-generated comparison keys
 // rather than the verbatim indexed strings.
-coll = testDb.collation_index2;
-coll.drop();
-assert.commandWorked(coll.createIndex({a: 1}, {collation: {locale: "fr_CA"}}));
-assert.commandWorked(coll.createIndex({b: 1}));
-assert.commandWorked(coll.insert({a: "foo", b: "foo"}));
-assert.eq(1, coll.find().collation({locale: "fr_CA"}).hint({a: 1}).returnKey().itcount());
-assert.neq("foo", coll.find().collation({locale: "fr_CA"}).hint({a: 1}).returnKey().next().a);
-assert.eq(1, coll.find().collation({locale: "fr_CA"}).hint({b: 1}).returnKey().itcount());
-assert.eq("foo", coll.find().collation({locale: "fr_CA"}).hint({b: 1}).returnKey().next().b);
+if (!TestData.isHintsToQuerySettingsSuite) {
+    // This guard excludes this test case from being run on the cursor_hints_to_query_settings
+    // suite. The suite replaces cursor hints with query settings. Query settings do not force
+    // indexes, and therefore empty filter will result in collection scans.
+    coll = testDb.collation_index2;
+    coll.drop();
+    assert.commandWorked(coll.createIndex({a: 1}, {collation: {locale: "fr_CA"}}));
+    assert.commandWorked(coll.createIndex({b: 1}));
+    assert.commandWorked(coll.insert({a: "foo", b: "foo"}));
+    assert.eq(1, coll.find().collation({locale: "fr_CA"}).hint({a: 1}).returnKey().itcount());
+    assert.neq("foo", coll.find().collation({locale: "fr_CA"}).hint({a: 1}).returnKey().next().a);
+    assert.eq(1, coll.find().collation({locale: "fr_CA"}).hint({b: 1}).returnKey().itcount());
+    assert.eq("foo", coll.find().collation({locale: "fr_CA"}).hint({b: 1}).returnKey().next().b);
+}
 
 // Test that a query with a string comparison can use an index with a non-simple collation if it
 // has a matching collation.
@@ -669,16 +676,25 @@ assert.commandWorked(coll.dropIndexes());
 
 // Find should return correct results when collation specified and compatible partial index
 // exists.
-assert.commandWorked(coll.createIndex(
-    {str: 1},
-    {partialFilterExpression: {str: {$lte: "FOO"}}, collation: {locale: "en_US", strength: 2}}));
-assert.eq(
-    1, coll.find({str: "foo"}).collation({locale: "en_US", strength: 2}).hint({str: 1}).itcount());
-assert.commandWorked(coll.insert({_id: 3, str: "goo"}));
-assert.eq(
-    0, coll.find({str: "goo"}).collation({locale: "en_US", strength: 2}).hint({str: 1}).itcount());
-assert.commandWorked(coll.remove({_id: 3}));
-assert.commandWorked(coll.dropIndexes());
+if (!TestData.isHintsToQuerySettingsSuite) {
+    // This guard excludes this test case from being run on cursor_hints_to_query_settings suite.
+    // The suite replaces cursor hints with query settings. Query settings do not force
+    // partial/sparse indexes with incomplete result sets as described in SERVER-26413, and as such
+    // will yield different results.
+    assert.commandWorked(coll.createIndex({str: 1}, {
+        partialFilterExpression: {str: {$lte: "FOO"}},
+        collation: {locale: "en_US", strength: 2}
+    }));
+    assert.eq(
+        1,
+        coll.find({str: "foo"}).collation({locale: "en_US", strength: 2}).hint({str: 1}).itcount());
+    assert.commandWorked(coll.insert({_id: 3, str: "goo"}));
+    assert.eq(
+        0,
+        coll.find({str: "goo"}).collation({locale: "en_US", strength: 2}).hint({str: 1}).itcount());
+    assert.commandWorked(coll.remove({_id: 3}));
+    assert.commandWorked(coll.dropIndexes());
+}
 
 // Queries that use a index with a non-matching collation should add a sort
 // stage if needed.
@@ -759,15 +775,15 @@ assert.commandWorked(coll.insert({_id: "FOO"}));
 assert.eq(2, coll.find({_id: "foo"}).collation({locale: "en_US", strength: 2}).itcount());
 
 if (!isClustered) {
-    // Find on _id should use idhack stage when query inherits collection default collation.
+    // Find on _id should use fast path when query inherits collection default collation.
     coll = testDb.collation_find10;
     coll.drop();
     assert.commandWorked(testDb.createCollection(coll.getName(), {collation: {locale: "en_US"}}));
     explainRes = coll.explain("executionStats").find({_id: "foo"}).finish();
     assert.commandWorked(explainRes);
-    assert.neq(null, getPlanStage(explainRes.executionStats.executionStages, "IDHACK"), explainRes);
+    assert(isIdhackOrExpress(testDb, getWinningPlan(explainRes.queryPlanner)));
 
-    // Find on _id should use idhack stage when explicitly given query collation matches
+    // Find on _id should use fastpath when explicitly given query collation matches
     // collection default.
     coll = testDb.collation_find11;
     coll.drop();
@@ -775,18 +791,17 @@ if (!isClustered) {
     explainRes =
         coll.explain("executionStats").find({_id: "foo"}).collation({locale: "en_US"}).finish();
     assert.commandWorked(explainRes);
-    assert.neq(null, getPlanStage(explainRes.executionStats.executionStages, "IDHACK"), explainRes);
+    assert(isIdhackOrExpress(testDb, getWinningPlan(explainRes.queryPlanner)));
 
-    // Find on _id should not use idhack stage when query collation does not match collection
-    // default.
+    // Find on _id should not use fastpath when query collation does not match
+    // collection default.
     coll = testDb.collation_find12;
     coll.drop();
     assert.commandWorked(testDb.createCollection(coll.getName(), {collation: {locale: "en_US"}}));
     explainRes =
         coll.explain("executionStats").find({_id: "foo"}).collation({locale: "fr_CA"}).finish();
     assert.commandWorked(explainRes);
-
-    assert.eq(null, getPlanStage(explainRes.executionStats.executionStages, "IDHACK"), explainRes);
+    assert(!isIdhackOrExpress(testDb, getWinningPlan(explainRes.queryPlanner)));
 }
 
 // Find should select compatible index when no collation specified and collection has a default
@@ -796,7 +811,20 @@ coll.drop();
 assert.commandWorked(testDb.createCollection(coll.getName(), {collation: {locale: "en_US"}}));
 assert.commandWorked(coll.createIndex({a: 1}, {collation: {locale: "en_US"}}));
 var explain = coll.find({a: "foo"}).explain("queryPlanner");
-assert(isIxscan(testDb, getWinningPlan(explain.queryPlanner)));
+
+// Assert the plan is using an index scan.
+switch (getOptimizer(explain)) {
+    case "classic":
+        assert(isIxscan(testDb, getWinningPlan(explain.queryPlanner)));
+        break;
+    case "CQF":
+        // TODO SERVER-77719: Ensure that the decision for using the scan lines up with CQF
+        // optimizer. M2: allow only collscans, M4: check bonsai behavior for index scan.
+        assert(isCollscan(testDb, getWinningPlan(explain.queryPlanner)));
+        break;
+    default:
+        break;
+}
 
 // Find should select compatible index when no collation specified and collection default
 // collation is "simple".
@@ -805,7 +833,20 @@ coll.drop();
 assert.commandWorked(testDb.createCollection(coll.getName(), {collation: {locale: "simple"}}));
 assert.commandWorked(coll.createIndex({a: 1}, {collation: {locale: "simple"}}));
 var explain = coll.find({a: "foo"}).explain("queryPlanner");
-assert(isIxscan(testDb, getWinningPlan(explain.queryPlanner)));
+
+// Assert the plan is using an index scan.
+switch (getOptimizer(explain)) {
+    case "classic":
+        assert(isIxscan(testDb, getWinningPlan(explain.queryPlanner)));
+        break;
+    case "CQF":
+        // TODO SERVER-77719: Ensure that the decision for using the scan lines up with CQF
+        // optimizer. M2: allow only collscans, M4: check bonsai behavior for index scan.
+        assert(isCollscan(testDb, getWinningPlan(explain.queryPlanner)));
+        break;
+    default:
+        break;
+}
 
 // Find should not use index when no collation specified, index collation is "simple", and
 // collection has a non-"simple" default collation.

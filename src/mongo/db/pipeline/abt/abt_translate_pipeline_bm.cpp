@@ -37,8 +37,8 @@
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/bonsai_query_bm_fixture.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/pipeline/abt/abt_translate_bm_fixture.h"
 #include "mongo/db/pipeline/abt/document_source_visitor.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
@@ -57,13 +57,13 @@ namespace {
 /**
  * Benchmarks translation from optimized Pipeline to ABT.
  */
-class PipelineABTTranslateBenchmark : public ABTTranslateBenchmarkFixture {
+class PipelineABTTranslateBenchmark : public BonsaiQueryBenchmarkFixture {
 public:
     PipelineABTTranslateBenchmark() {}
 
-    void benchmarkABTTranslate(benchmark::State& state,
-                               BSONObj matchSpec,
-                               BSONObj projectSpec) override final {
+    void benchmarkQueryMatchProject(benchmark::State& state,
+                                    BSONObj matchSpec,
+                                    BSONObj projectSpec) final {
         std::vector<BSONObj> pipeline;
         if (!matchSpec.isEmpty()) {
             pipeline.push_back(BSON("$match" << matchSpec));
@@ -71,11 +71,10 @@ public:
         if (!projectSpec.isEmpty()) {
             pipeline.push_back(BSON("$project" << projectSpec));
         }
-        benchmarkABTTranslate(state, pipeline);
+        benchmarkPipeline(state, pipeline);
     }
 
-    void benchmarkABTTranslate(benchmark::State& state,
-                               const std::vector<BSONObj>& pipeline) override final {
+    void benchmarkPipeline(benchmark::State& state, const std::vector<BSONObj>& pipeline) final {
         QueryTestServiceContext testServiceContext;
         auto opCtx = testServiceContext.makeOperationContext();
         auto expCtx = make_intrusive<ExpressionContextForTest>(
@@ -88,9 +87,11 @@ public:
         std::unique_ptr<Pipeline, PipelineDeleter> parsedPipeline =
             Pipeline::parse(pipeline, expCtx);
         parsedPipeline->optimizePipeline();
+        QueryParameterMap queryParameters;
 
         if (!isEligibleForBonsai_forTesting(testServiceContext.getServiceContext(),
-                                            *parsedPipeline.get())) {
+                                            *parsedPipeline.get())
+                 .isFullyEligible()) {
             state.SkipWithError("Pipeline is not supported by CQF");
             return;
         }
@@ -102,7 +103,8 @@ public:
                                        *parsedPipeline,
                                        scanProjName,
                                        make<ScanNode>(scanProjName, "collection"),
-                                       prefixId));
+                                       prefixId,
+                                       queryParameters));
             benchmark::ClobberMemory();
         }
     }

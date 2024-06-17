@@ -42,13 +42,14 @@
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_operation_source.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/timeseries/bucket_catalog/bucket_catalog.h"
 #include "mongo/db/timeseries/bucket_catalog/bucket_catalog_helpers.h"
 #include "mongo/db/timeseries/timeseries_extended_range.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/tracked_types.h"
 
 namespace mongo {
 
@@ -56,6 +57,7 @@ void TimeSeriesOpObserver::onInserts(OperationContext* opCtx,
                                      const CollectionPtr& coll,
                                      std::vector<InsertStatement>::const_iterator first,
                                      std::vector<InsertStatement>::const_iterator last,
+                                     const std::vector<RecordId>& recordIds,
                                      std::vector<bool> fromMigrate,
                                      bool defaultFromMigrate,
                                      OpStateAccumulator* opAccumulator) {
@@ -72,7 +74,7 @@ void TimeSeriesOpObserver::onInserts(OperationContext* opCtx,
     // DOES need to be -- that will cause correctness issues). Additionally, if the user tried
     // to insert measurements with dates outside the standard range, chances are they will do so
     // again, and we will have only set the flag a little early.
-    invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_IX));
+    invariant(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(nss, MODE_IX));
     // Hold reference to the catalog for collection lookup without locks to be safe.
     auto catalog = CollectionCatalog::get(opCtx);
     auto bucketsColl = catalog->lookupCollectionByNamespace(opCtx, nss);
@@ -86,6 +88,17 @@ void TimeSeriesOpObserver::onInserts(OperationContext* opCtx,
             bucketsColl->setRequiresTimeseriesExtendedRangeSupport(opCtx);
         }
     }
+
+    uassert(ErrorCodes::CannotInsertTimeseriesBucketsWithMixedSchema,
+            "Cannot write time-series bucket containing mixed schema data, please run collMod "
+            "with timeseriesBucketsMayHaveMixedSchemaData and retry your insert",
+            !opCtx->isEnforcingConstraints() ||
+                bucketsColl->getTimeseriesBucketsMayHaveMixedSchemaData().value_or(false) ||
+                std::none_of(first, last, [bucketsColl](auto&& insert) {
+                    auto mixedSchema =
+                        bucketsColl->doesTimeseriesBucketsDocContainMixedSchemaData(insert.doc);
+                    return mixedSchema.isOK() && mixedSchema.getValue();
+                }));
 }
 
 void TimeSeriesOpObserver::onUpdate(OperationContext* opCtx,
@@ -98,8 +111,21 @@ void TimeSeriesOpObserver::onUpdate(OperationContext* opCtx,
     }
 
     if (args.updateArgs->source != OperationSource::kTimeseriesInsert) {
+        auto mixedSchema = [&args] {
+            auto result = args.coll->doesTimeseriesBucketsDocContainMixedSchemaData(
+                args.updateArgs->updatedDoc);
+            return result.isOK() && result.getValue();
+        };
+
+        uassert(ErrorCodes::CannotInsertTimeseriesBucketsWithMixedSchema,
+                "Cannot write time-series bucket containing mixed schema data, please run collMod "
+                "with timeseriesBucketsMayHaveMixedSchemaData and retry your update",
+                !opCtx->isEnforcingConstraints() ||
+                    args.coll->getTimeseriesBucketsMayHaveMixedSchemaData().value_or(false) ||
+                    !mixedSchema());
+
         OID bucketId = args.updateArgs->updatedDoc["_id"].OID();
-        timeseries::bucket_catalog::handleDirectWrite(opCtx, nss, bucketId);
+        timeseries::bucket_catalog::handleDirectWrite(opCtx, args.coll->uuid(), bucketId);
     }
 }
 
@@ -115,12 +141,7 @@ void TimeSeriesOpObserver::aboutToDelete(OperationContext* opCtx,
     }
 
     OID bucketId = doc["_id"].OID();
-    timeseries::bucket_catalog::handleDirectWrite(opCtx, nss, bucketId);
-}
-
-void TimeSeriesOpObserver::onDropDatabase(OperationContext* opCtx, const DatabaseName& dbName) {
-    auto& bucketCatalog = timeseries::bucket_catalog::BucketCatalog::get(opCtx);
-    timeseries::bucket_catalog::clear(bucketCatalog, dbName);
+    timeseries::bucket_catalog::handleDirectWrite(opCtx, coll->uuid(), bucketId);
 }
 
 repl::OpTime TimeSeriesOpObserver::onDropCollection(OperationContext* opCtx,
@@ -131,8 +152,7 @@ repl::OpTime TimeSeriesOpObserver::onDropCollection(OperationContext* opCtx,
                                                     bool markFromMigrate) {
     if (collectionName.isTimeseriesBucketsCollection()) {
         auto& bucketCatalog = timeseries::bucket_catalog::BucketCatalog::get(opCtx);
-        timeseries::bucket_catalog::clear(bucketCatalog,
-                                          collectionName.getTimeseriesViewNamespace());
+        timeseries::bucket_catalog::clear(bucketCatalog, uuid);
     }
 
     return {};
@@ -140,23 +160,17 @@ repl::OpTime TimeSeriesOpObserver::onDropCollection(OperationContext* opCtx,
 
 void TimeSeriesOpObserver::onReplicationRollback(OperationContext* opCtx,
                                                  const RollbackObserverInfo& rbInfo) {
-    stdx::unordered_set<NamespaceString> timeseriesNamespaces;
-    for (const auto& ns : rbInfo.rollbackNamespaces) {
-        if (ns.isTimeseriesBucketsCollection()) {
-            timeseriesNamespaces.insert(ns.getTimeseriesViewNamespace());
-        }
-    }
-
-    if (timeseriesNamespaces.empty()) {
+    if (!std::any_of(
+            rbInfo.rollbackNamespaces.begin(),
+            rbInfo.rollbackNamespaces.end(),
+            [](const NamespaceString& ns) { return ns.isTimeseriesBucketsCollection(); })) {
         return;
     }
 
     auto& bucketCatalog = timeseries::bucket_catalog::BucketCatalog::get(opCtx);
-    timeseries::bucket_catalog::clear(
-        bucketCatalog,
-        [timeseriesNamespaces = std::move(timeseriesNamespaces)](const NamespaceString& bucketNs) {
-            return timeseriesNamespaces.contains(bucketNs);
-        });
+    tracked_vector<UUID> clearedCollectionUUIDs = make_tracked_vector<UUID>(
+        bucketCatalog.trackingContext, rbInfo.rollbackUUIDs.begin(), rbInfo.rollbackUUIDs.end());
+    timeseries::bucket_catalog::clear(bucketCatalog, std::move(clearedCollectionUUIDs));
 }
 
 }  // namespace mongo

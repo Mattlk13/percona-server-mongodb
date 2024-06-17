@@ -39,6 +39,7 @@
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bson_validate.h"
+#include "mongo/bson/bson_validate_gen.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
@@ -91,7 +92,7 @@ void BM_arrayBuilder(benchmark::State& state) {
 void BM_arrayLookup(benchmark::State& state) {
     BSONArrayBuilder builder;
     auto len = state.range(0);
-    auto totalLen = len * 0;
+    auto totalBytes = len * 0;
     for (auto j = 0; j < len; j++)
         builder.append(j);
     BSONObj array = builder.done();
@@ -99,9 +100,25 @@ void BM_arrayLookup(benchmark::State& state) {
     for (auto _ : state) {
         benchmark::ClobberMemory();
         benchmark::DoNotOptimize(array[len]);
-        totalLen += len;
+        totalBytes += array.objsize();
     }
-    state.SetItemsProcessed(totalLen);
+    state.SetBytesProcessed(totalBytes);
+}
+
+void BM_bsonIteratorSortedConstruction(benchmark::State& state) {
+    BSONArrayBuilder builder;
+    auto len = state.range(0);
+    auto totalBytes = len * 0;
+    for (auto j = 0; j < len; j++)
+        builder.append(j);
+    BSONObj array = builder.done();
+
+    for (auto _ : state) {
+        benchmark::ClobberMemory();
+        benchmark::DoNotOptimize(BSONObjIteratorSorted(array));
+        totalBytes += array.objsize();
+    }
+    state.SetBytesProcessed(totalBytes);
 }
 
 void BM_validate(benchmark::State& state) {
@@ -135,7 +152,7 @@ void BM_validate_contents(benchmark::State& state) {
     BSONObj array = builder.done();
 
     const auto& elem = array[0].Obj();
-    auto status = validateBSON(elem.objdata(), elem.objsize(), BSONValidateMode::kFull);
+    auto status = validateBSON(elem.objdata(), elem.objsize(), BSONValidateModeEnum::kFull);
     if (!status.isOK())
         LOGV2(6752100, "Validate failed", "elem"_attr = elem, "status"_attr = status);
     invariant(status.isOK());
@@ -143,7 +160,7 @@ void BM_validate_contents(benchmark::State& state) {
     for (auto _ : state) {
         benchmark::ClobberMemory();
         benchmark::DoNotOptimize(
-            validateBSON(array.objdata(), array.objsize(), BSONValidateMode::kFull));
+            validateBSON(array.objdata(), array.objsize(), BSONValidateModeEnum::kFull));
         totalSize += array.objsize();
     }
     state.SetBytesProcessed(totalSize);
@@ -151,6 +168,7 @@ void BM_validate_contents(benchmark::State& state) {
 
 BENCHMARK(BM_arrayBuilder)->Ranges({{{1}, {100'000}}});
 BENCHMARK(BM_arrayLookup)->Ranges({{{1}, {100'000}}});
+BENCHMARK(BM_bsonIteratorSortedConstruction)->Ranges({{{1}, {100'000}}});
 BENCHMARK(BM_validate)->Ranges({{{1}, {1'000}}});
 BENCHMARK(BM_validate_contents)->Ranges({{{1}, {1'000}}});
 

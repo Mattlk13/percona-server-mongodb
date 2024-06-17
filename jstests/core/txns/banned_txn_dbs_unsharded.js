@@ -3,7 +3,7 @@
 //
 // @tags: [
 //  # The test runs commands that are not allowed with security token: endSession.
-//  not_allowed_with_security_token,
+//  not_allowed_with_signed_security_token,
 //  assumes_against_mongod_not_mongos,
 //  assumes_unsharded_collection,
 //  uses_transactions,
@@ -38,7 +38,11 @@ function runTest(sessionDB) {
                                  ErrorCodes.NoSuchTransaction);
 }
 
-runTest(session.getDatabase("config"));
+if (!TestData.testingReplicaSetEndpoint) {
+    // This test drops a collection the config database, which is not allowed via a router on a
+    // sharded cluster.
+    runTest(session.getDatabase("config"));
+}
 runTest(session.getDatabase("local"));
 
 session.endSession();

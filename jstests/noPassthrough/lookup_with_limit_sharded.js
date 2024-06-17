@@ -10,6 +10,7 @@
  * @tags: [
  *   requires_replication,
  *   requires_sharding,
+ *   featureFlagSbeFull
  * ]
  */
 import {
@@ -19,17 +20,9 @@ import {
     getSingleNodeExplain,
     getWinningPlan,
 } from "jstests/libs/analyze_plan.js";
-import {checkSBEEnabled} from "jstests/libs/sbe_util.js";
 
 const st = new ShardingTest({shards: 2, config: 1});
 const db = st.s.getDB("test");
-
-if (!checkSBEEnabled(db)) {
-    jsTestLog("Skipping test because SBE $lookup is not enabled.");
-    st.stop();
-    quit();
-}
-
 const coll = db.lookup_with_limit;
 const other = db.lookup_with_limit_other;
 coll.drop();
@@ -97,7 +90,7 @@ const unwindPipeline = [
     {$unwind: "$from_other"},
     {$limit: 5}
 ];
-checkUnshardedResults(unwindPipeline, ["COLLSCAN"], ["$lookup", "$limit"]);
+checkUnshardedResults(unwindPipeline, ["COLLSCAN", "EQ_LOOKUP_UNWIND", "LIMIT"], []);
 
 // Check that lookup->unwind->sort->limit is reordered to lookup->sort, with the unwind stage being
 // absorbed into the lookup stage and preventing the limit from swapping before it, and the limit
@@ -108,7 +101,7 @@ const sortPipeline = [
     {$sort: {x: 1}},
     {$limit: 5}
 ];
-checkUnshardedResults(sortPipeline, "COLLSCAN", ["$lookup", "$sort"]);
+checkUnshardedResults(sortPipeline, ["COLLSCAN", "EQ_LOOKUP_UNWIND", "SORT"], []);
 
 // Check that sort->lookup->limit is reordered to sort->lookup, with the limit stage being absorbed
 // into the sort stage and creating a top-k sort, which is pushed down to query system.

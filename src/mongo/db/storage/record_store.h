@@ -51,6 +51,7 @@
 #include "mongo/db/exec/collection_scan_common.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/storage/compact_options.h"
 #include "mongo/db/storage/ident.h"
 #include "mongo/db/storage/key_format.h"
 #include "mongo/db/storage/record_data.h"
@@ -118,8 +119,8 @@ struct Record {
  *     the end of the collection.
  *   - Reverse cursors must ignore the visibility filter. That means that they initially return the
  *     newest committed record in the collection and may skip over uncommitted records.
- *   - SeekableRecordCursor::seekExact() must ignore the visibility filter and return the requested
- *     document even if it is supposed to be invisible.
+ *   - SeekableRecordCursor::seek() and SeekableRecordCursor::seekExact() on forward cursors must
+ *     never return invisible documents.
  * TODO SERVER-18934 Handle this above the storage engine layer so storage engines don't have to
  * deal with capped visibility.
  */
@@ -197,26 +198,34 @@ public:
 class SeekableRecordCursor : public RecordCursor {
 public:
     /**
+     * Tells bounded 'seek' whether the bound excludes or includes the bound 'start'.
+     */
+    enum class BoundInclusion {
+        kExclude,
+        kInclude,
+    };
+
+    /**
+     * Seeks to a Record with the provided bound 'start'.
+     *
+     * For forward cursors, 'start' is a lower bound.
+     * For reverse cursors, 'start' is an upper bound.
+     *
+     * When 'boundInclusion' is 'kInclusive', positions the cursor at 'start' or the next record,
+     * if one exists. When 'boundInclusion' is 'kExclusive', positions the cursor at the first
+     * record after 'start', if one exists.
+     *
+     * Returns the Record at the cursor or boost::none if no matching records are found.
+     */
+    virtual boost::optional<Record> seek(const RecordId& start, BoundInclusion boundInclusion) = 0;
+
+    /**
      * Seeks to a Record with the provided id.
      *
      * If an exact match can't be found, boost::none will be returned and the resulting position
      * of the cursor is unspecified.
      */
     virtual boost::optional<Record> seekExact(const RecordId& id) = 0;
-
-    /**
-     * Positions this cursor near 'start' or an adjacent record if 'start' does not exist. If there
-     * is not an exact match, the cursor is positioned on the directionally previous Record. If no
-     * earlier record exists, the cursor is positioned on the directionally following record.
-     * Returns boost::none if the RecordStore is empty.
-     *
-     * For forward cursors, returns the Record with the highest RecordId less than or equal to
-     * 'start'. If no such record exists, positions on the next highest RecordId after 'start'.
-     *
-     * For reverse cursors, returns the Record with the lowest RecordId greater than or equal to
-     * 'start'. If no such record exists, positions on the next lowest RecordId before 'start'.
-     */
-    virtual boost::optional<Record> seekNear(const RecordId& start) = 0;
 
     /**
      * Prepares for state changes in underlying data without necessarily saving the current
@@ -613,13 +622,11 @@ public:
     }
 
     /**
-     * Attempt to reduce the storage space used by this RecordStore. If the freeSpaceTargetMB is
-     * provided, compaction will only proceed if the free storage space available is greater than
-     * the provided value.
-     *
+     * Attempt to reduce the storage space used by this RecordStore.
      * Only called if compactSupported() returns true.
+     * Returns an estimated number of bytes when doing a dry run.
      */
-    Status compact(OperationContext* opCtx, boost::optional<int64_t> freeSpaceTargetMB);
+    StatusWith<int64_t> compact(OperationContext* opCtx, const CompactOptions& options);
 
     /**
      * Performs record store specific validation to ensure consistency of underlying data
@@ -787,7 +794,8 @@ protected:
                                        const RecordId& end,
                                        bool inclusive,
                                        const AboutToDeleteRecordCallback& aboutToDelete) = 0;
-    virtual Status doCompact(OperationContext* opCtx, boost::optional<int64_t> freeSpaceTargetMB) {
+
+    virtual StatusWith<int64_t> doCompact(OperationContext* opCtx, const CompactOptions& options) {
         MONGO_UNREACHABLE;
     }
 

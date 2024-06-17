@@ -28,6 +28,7 @@
  */
 
 
+#include "mongo/bson/util/bsoncolumnbuilder.h"
 #include <fmt/format.h>
 // IWYU pragma: no_include "cxxabi.h"
 #include <algorithm>
@@ -80,9 +81,8 @@ BSONObj toBsonAndCheckKeySize(const key_string::BuilderBase<T>& ks, Ordering ord
     auto KeyStringBuilderSize = ks.getSize();
 
     // Validate size of the key in key_string::Builder.
-    ASSERT_EQUALS(
-        KeyStringBuilderSize,
-        key_string::getKeySize(ks.getBuffer(), KeyStringBuilderSize, ord, ks.getTypeBits()));
+    ASSERT_EQUALS(KeyStringBuilderSize,
+                  key_string::getKeySize(ks.getBuffer(), KeyStringBuilderSize, ord, ks.version));
     return key_string::toBson(ks.getBuffer(), KeyStringBuilderSize, ord, ks.getTypeBits());
 }
 
@@ -91,7 +91,7 @@ BSONObj toBsonAndCheckKeySize(const key_string::Value& ks, Ordering ord) {
 
     // Validate size of the key in key_string::Value.
     ASSERT_EQUALS(KeyStringSize,
-                  key_string::getKeySize(ks.getBuffer(), KeyStringSize, ord, ks.getTypeBits()));
+                  key_string::getKeySize(ks.getBuffer(), KeyStringSize, ord, ks.getVersion()));
     return key_string::toBson(ks.getBuffer(), KeyStringSize, ord, ks.getTypeBits());
 }
 
@@ -279,7 +279,7 @@ TEST_F(KeyStringBuilderTest, TooManyElementsInCompoundKey) {
     // No exceptions should be thrown.
     key_string::toBsonSafe(data, size, ALL_ASCENDING, ks.getTypeBits());
     key_string::decodeDiscriminator(ks.getBuffer(), ks.getSize(), ALL_ASCENDING, ks.getTypeBits());
-    key_string::getKeySize(ks.getBuffer(), ks.getSize(), ALL_ASCENDING, ks.getTypeBits());
+    key_string::getKeySize(ks.getBuffer(), ks.getSize(), ALL_ASCENDING, ks.version);
 }
 
 TEST_F(KeyStringBuilderTest, MaxElementsInCompoundKey) {
@@ -294,7 +294,7 @@ TEST_F(KeyStringBuilderTest, MaxElementsInCompoundKey) {
     // No exceptions should be thrown.
     key_string::toBsonSafe(data, size, ALL_ASCENDING, ks.getTypeBits());
     key_string::decodeDiscriminator(ks.getBuffer(), ks.getSize(), ALL_ASCENDING, ks.getTypeBits());
-    key_string::getKeySize(ks.getBuffer(), ks.getSize(), ALL_ASCENDING, ks.getTypeBits());
+    key_string::getKeySize(ks.getBuffer(), ks.getSize(), ALL_ASCENDING, ks.version);
 }
 
 TEST_F(KeyStringBuilderTest, EmbeddedNullString) {
@@ -388,6 +388,33 @@ TEST_F(KeyStringBuilderTest, Simple1) {
 
 TEST_F(KeyStringBuilderTest, DeprecatedBinData) {
     ROUNDTRIP(version, BSON("" << BSONBinData(nullptr, 0, ByteArrayDeprecated)));
+}
+
+TEST_F(KeyStringBuilderTest, ValidColumn) {
+    BSONColumnBuilder cb;
+    cb.append(BSON("a"
+                   << "deadbeef")
+                  .getField("a"));
+    cb.append(BSON("a" << 1).getField("a"));
+    cb.append(BSON("a" << 2).getField("a"));
+    cb.append(BSON("a" << 1).getField("a"));
+    BSONBinData columnData = cb.finalize();
+    BSONObj objData = BSON("" << columnData);
+
+    ROUNDTRIP(version, objData);
+}
+
+TEST_F(KeyStringBuilderTest, InvalidColumn) {
+    const BSONObj objData = BSON("" << BSONBinData("foobar", 6, Column));
+    const key_string::Builder builder(version, objData, ALL_ASCENDING);
+    auto KeyStringBuilderSize = builder.getSize();
+    ASSERT(KeyStringBuilderSize > 0);
+
+    ASSERT_THROWS_CODE(
+        key_string::toBsonSafe(
+            builder.getBuffer(), KeyStringBuilderSize, ALL_ASCENDING, builder.getTypeBits()),
+        AssertionException,
+        50833);
 }
 
 TEST_F(KeyStringBuilderTest, ActualBytesDouble) {
@@ -728,10 +755,48 @@ TEST_F(KeyStringBuilderTest, KeyStringBuilderDiscriminator) {
     ks.appendBSONElement(doc["fieldA"]);
     ks.appendBSONElement(doc["fieldB"]);
     key_string::Value data = ks.release();
-    uint8_t appendedDescriminator = (uint8_t)(*(data.getBuffer() + (data.getSize() - 2)));
+    uint8_t appendedDiscriminator = (uint8_t)(*(data.getBuffer() + (data.getSize() - 2)));
     uint8_t end = (uint8_t)(*(data.getBuffer() + (data.getSize() - 1)));
-    ASSERT_EQ((uint8_t)'\001', appendedDescriminator);
+    ASSERT_EQ((uint8_t)'\001', appendedDiscriminator);
     ASSERT_EQ((uint8_t)'\004', end);
+}
+
+TEST_F(KeyStringBuilderTest, KeyStringValueCompareWithoutDiscriminator1) {
+    // test that when passed in a Discriminator it gets added.
+    BSONObj doc = BSON("fieldA" << 1 << "fieldB" << 2);
+
+    key_string::HeapBuilder ks1(
+        key_string::Version::V1, ALL_ASCENDING, key_string::Discriminator::kExclusiveBefore);
+    ks1.appendBSONElement(doc["fieldA"]);
+    ks1.appendBSONElement(doc["fieldB"]);
+    key_string::Value data1 = ks1.release();
+
+    key_string::HeapBuilder ks2(
+        key_string::Version::V1, ALL_ASCENDING, key_string::Discriminator::kExclusiveAfter);
+    ks2.appendBSONElement(doc["fieldA"]);
+    ks2.appendBSONElement(doc["fieldB"]);
+    key_string::Value data2 = ks2.release();
+
+    ASSERT_EQ(data1.compareWithoutDiscriminator(data2), 0);
+}
+
+TEST_F(KeyStringBuilderTest, KeyStringValueCompareWithoutDiscriminator2) {
+    // test that when passed in a Discriminator it gets added.
+    BSONObj doc = BSON("fieldA" << 1 << "fieldB" << 2);
+
+    key_string::HeapBuilder ks1(
+        key_string::Version::V1, ALL_ASCENDING, key_string::Discriminator::kExclusiveBefore);
+    ks1.appendBSONElement(doc["fieldA"]);
+    ks1.appendBSONElement(doc["fieldB"]);
+    key_string::Value data1 = ks1.release();
+
+    key_string::HeapBuilder ks2(
+        key_string::Version::V1, ALL_ASCENDING, key_string::Discriminator::kExclusiveAfter);
+    ks2.appendBSONElement(doc["fieldA"]);
+    ks2.appendBSONElement(doc["fieldA"]);
+    key_string::Value data2 = ks2.release();
+
+    ASSERT_EQ(data1.compareWithoutDiscriminator(data2), 1);
 }
 
 TEST_F(KeyStringBuilderTest, DoubleInvalidIntegerPartV0) {

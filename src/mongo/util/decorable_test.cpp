@@ -29,6 +29,7 @@
 
 #include <cstdint>
 #include <fmt/format.h>
+#include <memory>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -266,131 +267,94 @@ TEST_F(DecorableTest, Overaligned) {
 }
 #endif  // 0
 
-struct CustomBoxedDecoration {
-    int x = 123;
-};
-
 /**
- * When the CustomBoxedDecoration is used as a decoration, what is *really*
- * attached is a CustomBoxedDecorationBox containing one of them as a `value`.
- *
- * The traits of CustomBoxedDecoration define a custom `unbox` method to
- * retrieve the value from the box.
+ * Tests that a type that `decorable_detail::pretendTrivialInit` resolves to false for is properly
+ * constructed.
  */
-constexpr auto decorationBoxingTraitsFor(std::type_identity<CustomBoxedDecoration>) {
-    struct Box {
-        char padFront[17];  // mess with its alignment and offsets
-        CustomBoxedDecoration value;
-        char padBack[48];  // and make it bigger
-    };
-    // All except unbox are the operations that would be used for Box.
-    struct BoxingTraits : decorable_detail::BasicBoxingTraits<Box> {
-        const CustomBoxedDecoration* unbox(const void* boxAddress) const {
-            return &static_cast<const Box*>(boxAddress)->value;
-        }
-        constexpr ptrdiff_t offsetOfValue() const {
-            return offsetof(Box, value);
+TEST_F(DecorableTest, DoNotZeroInitOther) {
+    struct X : Decorable<X> {};
+    class B : public A {
+    public:
+        B() : A() {
+            value = 123;
         }
     };
-    return BoxingTraits{};
+    static auto decorator = X::declareDecoration<B>();
+    ASSERT_EQ(stats.constructed, 0);
+    X x;
+    ASSERT_EQ(stats.constructed, 1);
+    ASSERT_EQ(x[decorator].value, 123);
 }
 
-struct HasCustomBoxedDecoration : Decorable<HasCustomBoxedDecoration> {
-    int dummyInt = 54321;
-};
-static auto customBoxedDecorationToken =
-    HasCustomBoxedDecoration::declareDecoration<CustomBoxedDecoration>();
+class DecorableZeroInitTest : public DecorableTest {
+public:
+    // Test decorated type needs copy assign and constructor removed so that types without copy
+    // assign or constructor can be used as decorations (such as std::unique_ptr).
+    struct X : Decorable<X> {
+        X(const X&) = delete;
+        X& operator=(const X&) = delete;
+        X() = default;
+    };
 
-TEST_F(DecorableTest, WithCustomBoxedDecoration) {
-    HasCustomBoxedDecoration decorated{};
-    auto& deco = decorated[customBoxedDecorationToken];
-    ASSERT_EQ(deco.x, 123);
-    deco.x = 456;
-    ASSERT_EQ(deco.x, 456);
-
-    auto& decoOwner = customBoxedDecorationToken.owner(deco);
-    ASSERT_EQ(&decoOwner, &decorated);
-}
-
-struct HasLazyDecoration : Decorable<HasLazyDecoration> {
-    int dummyInt = 54321;
-};
-static auto lazyDecorationToken = HasLazyDecoration::declareDecoration<std::string>();
-
-TEST_F(DecorableTest, WithLazyDecoration) {
-    HasLazyDecoration decorated{};
-    auto& deco = decorated[lazyDecorationToken];
-    ASSERT_EQ(deco, "");
-    std::string expect = "Hello, decorated World!";
-    deco = expect;
-    ASSERT_EQ(deco, expect);
-
-    auto& decoOwner = lazyDecorationToken.owner(deco);
-    ASSERT_EQ(&decoOwner, &decorated);
-}
-
-template <typename D>
-struct BasicCanary {
-    static inline int _ctors = 0;
-    static inline int _dtors = 0;
-
-    static int ctors() {
-        return _ctors;
-    }
-    static int dtors() {
-        return _dtors;
+    template <typename DecorationType>
+    bool isZeroBytes(const DecorationType& decoObj) {
+        auto first = reinterpret_cast<const unsigned char*>(&decoObj);
+        auto last = first + sizeof(decoObj);
+        return std::find_if(first, last, [](auto c) { return c != 0; }) == last;
     }
 
-    BasicCanary() {
-        ++_ctors;
+    /**
+     * Tests that value initializing the template type does not change the already zeroed buffer.
+     * This ensures that construction of these types can safely be skipped.
+     */
+    template <typename T>
+    void doBufferNoChangeTest() {
+        auto buf = std::make_unique<std::array<unsigned char, sizeof(T)>>();
+        invariant(isZeroBytes(*buf));
+        invariant(reinterpret_cast<std::uintptr_t>(buf.get()) % alignof(T) == 0);
+        auto ptr = new (buf->data()) T{};
+        ScopeGuard ptrCleanup = [&] {
+            ptr->~T();
+        };
+        ASSERT(isZeroBytes(*buf));
     }
 
-    ~BasicCanary() {
-        ++_dtors;
+    /**
+     * Helper to test that constructors of the types used in `decorable_detail::pretendTrivialInit`
+     * do not change the zeroed out decoration buffer.
+     */
+    template <typename DecorationType>
+    void doZeroInitTest() {
+        static auto decorator = X::template declareDecoration<DecorationType>();
+        auto x = std::make_unique<X>();
+
+        auto&& decorationObj = (*x)[decorator];
+        ASSERT(isZeroBytes(decorationObj));
     }
 };
 
-struct EagerCanary : BasicCanary<EagerCanary> {};
-
-struct LazyCanary : BasicCanary<LazyCanary> {
-    using is_lazy_decoration = void;
-};
-
-struct DecoratedByLazy : Decorable<DecoratedByLazy> {
-    int dummyInt = 54321;
-};
-static auto lazyCanaryToken = DecoratedByLazy::declareDecoration<LazyCanary>();
-static auto eagerCanaryToken = DecoratedByLazy::declareDecoration<EagerCanary>();
-
-TEST_F(DecorableTest, LazyTraits) {
-    ASSERT_FALSE(decorable_detail::allowLazy<int>);
-    ASSERT_FALSE(decorable_detail::allowLazy<int*>);
-    ASSERT_FALSE(decorable_detail::allowLazy<std::string*>);
-    ASSERT_FALSE(decorable_detail::allowLazy<EagerCanary>);
-    ASSERT(decorable_detail::allowLazy<std::string>);
-    ASSERT(decorable_detail::allowLazy<LazyCanary>);
-    ASSERT(decorable_detail::allowLazy<BSONObj>);
-    ASSERT(decorable_detail::allowLazy<std::vector<int>>);
+TEST_F(DecorableZeroInitTest, BufferNoChangeBoostOptional) {
+    doBufferNoChangeTest<boost::optional<A>>();
 }
 
-TEST_F(DecorableTest, LazyDecorationIsLazyTest) {
-    auto lazyCtorsOrig = LazyCanary::ctors();
-    auto lazyDtorsOrig = LazyCanary::dtors();
-    auto eagerCtorsOrig = EagerCanary::ctors();
-    auto eagerDtorsOrig = EagerCanary::dtors();
+TEST_F(DecorableZeroInitTest, BufferNoChangeStdUniquePtr) {
+    doBufferNoChangeTest<std::unique_ptr<A>>();
+}
 
-    auto decorated = std::make_unique<DecoratedByLazy>();
-    ASSERT_EQ(LazyCanary::ctors(), lazyCtorsOrig);
-    ASSERT_EQ(EagerCanary::ctors(), eagerCtorsOrig + 1) << "created at construction";
+TEST_F(DecorableZeroInitTest, BufferNoChangeStdSharedPtr) {
+    doBufferNoChangeTest<std::shared_ptr<A>>();
+}
 
-    (*decorated)[lazyCanaryToken];
-    ASSERT_EQ(LazyCanary::ctors(), lazyCtorsOrig + 1) << "created on first access";
-    (*decorated)[eagerCanaryToken];
-    ASSERT_EQ(EagerCanary::ctors(), eagerCtorsOrig + 1);
+TEST_F(DecorableZeroInitTest, ZeroInitBoostOptionalDecoration) {
+    doZeroInitTest<boost::optional<A>>();
+}
 
-    decorated = {};
-    ASSERT_EQ(LazyCanary::dtors(), lazyDtorsOrig + 1);
-    ASSERT_EQ(EagerCanary::dtors(), eagerDtorsOrig + 1);
+TEST_F(DecorableZeroInitTest, ZeroInitStdUniquePtrDecoration) {
+    doZeroInitTest<std::unique_ptr<A>>();
+}
+
+TEST_F(DecorableZeroInitTest, ZeroInitStdSharedPtrDecoration) {
+    doZeroInitTest<std::shared_ptr<A>>();
 }
 
 }  // namespace

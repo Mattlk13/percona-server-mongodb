@@ -35,8 +35,18 @@ export function runTimeseriesRetryDeleteAndUpdateTest(
 
         const coll = testDB.getCollection('timeseries_retry_delete_and_update_' + collCount++);
         coll.drop();
-        assert.commandWorked(testDB.createCollection(
-            coll.getName(), {timeseries: {timeField: timeFieldName, metaField: metaFieldName}}));
+        if (conn.isMongos()) {
+            // TODO (SERVER-87625): Use moveCollection instead of createUnsplittableCollection
+            // command once moveCollection registers timeseries collections to the sharding catalog.
+            assert.commandWorked(testDB.runCommand({
+                createUnsplittableCollection: coll.getName(),
+                timeseries: {timeField: timeFieldName, metaField: metaFieldName}
+            }));
+        } else {
+            assert.commandWorked(testDB.createCollection(
+                coll.getName(),
+                {timeseries: {timeField: timeFieldName, metaField: metaFieldName}}));
+        }
         setUpCollection(testDB, coll, metaFieldName);
 
         assert.commandWorked(testDB.runCommand({

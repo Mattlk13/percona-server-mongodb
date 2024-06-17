@@ -60,7 +60,7 @@ class UserWriteBlockModeOpObserver final : public OpObserverNoop {
 
 public:
     UserWriteBlockModeOpObserver() = default;
-    ~UserWriteBlockModeOpObserver() = default;
+    ~UserWriteBlockModeOpObserver() override = default;
 
     // Operations to check for allowed writes.
 
@@ -70,6 +70,7 @@ public:
                    const CollectionPtr& coll,
                    std::vector<InsertStatement>::const_iterator first,
                    std::vector<InsertStatement>::const_iterator last,
+                   const std::vector<RecordId>& recordIds,
                    std::vector<bool> fromMigrate,
                    bool defaultFromMigrate,
                    OpStateAccumulator* opAccumulator = nullptr) final;

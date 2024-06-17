@@ -81,8 +81,8 @@ public:
         return true;
     }
 
-    virtual StatusWith<CursorResponse> runAggregation(
-        OperationContext* opCtx, AggregateCommandRequest& request) const final {
+    StatusWith<CursorResponse> runAggregation(OperationContext* opCtx,
+                                              AggregateCommandRequest& request) const final {
         auto aggCmdObj = aggregation_request_helper::serializeToCommandObj(request);
 
         rpc::OpMsgReplyBuilder replyBuilder;
@@ -94,7 +94,8 @@ public:
                           ActionType::inprog)};
         }
 
-        auto status = runAggregate(opCtx, request, std::move(aggCmdObj), privileges, &replyBuilder);
+        auto status = runAggregate(
+            opCtx, request, {request}, std::move(aggCmdObj), privileges, &replyBuilder);
 
         if (!status.isOK()) {
             return status;
@@ -112,7 +113,7 @@ public:
             SerializationContext::stateCommandReply(request.getSerializationContext()));
     }
 
-    virtual void appendToResponse(BSONObjBuilder* result) const final {
+    void appendToResponse(BSONObjBuilder* result) const final {
         if (lockedForWriting()) {
             result->append("fsyncLock", true);
             result->append("info",

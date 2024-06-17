@@ -28,6 +28,7 @@
  */
 
 
+#include "mongo/logv2/log_severity.h"
 #include <boost/optional.hpp>
 #include <boost/smart_ptr.hpp>
 #include <fmt/format.h>
@@ -58,7 +59,6 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/error_labels.h"
-#include "mongo/db/initialize_api_parameters.h"
 #include "mongo/db/initialize_operation_session_info.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/logical_time_validator.h"
@@ -80,6 +80,7 @@
 #include "mongo/db/stats/api_version_metrics.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/transaction_validation.h"
+#include "mongo/db/validate_api_parameters.h"
 #include "mongo/db/vector_clock.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/logv2/log.h"
@@ -93,21 +94,21 @@
 #include "mongo/rpc/message.h"
 #include "mongo/rpc/metadata.h"
 #include "mongo/rpc/metadata/client_metadata.h"
-#include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/protocol.h"
 #include "mongo/rpc/reply_builder_interface.h"
 #include "mongo/rpc/rewrite_state_change_errors.h"
 #include "mongo/rpc/topology_version_gen.h"
 #include "mongo/s/analyze_shard_key_role.h"
+#include "mongo/s/cannot_implicitly_create_collection_info.h"
 #include "mongo/s/catalog_cache.h"
+#include "mongo/s/cluster_ddl.h"
 #include "mongo/s/commands/strategy.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/load_balancer_support.h"
 #include "mongo/s/mongos_topology_coordinator.h"
 #include "mongo/s/query_analysis_sampler.h"
 #include "mongo/s/session_catalog_router.h"
-#include "mongo/s/shard_invalidated_for_targeting_exception.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/transaction_router.h"
 #include "mongo/transport/hello_metrics.h"
@@ -127,49 +128,22 @@
 
 namespace mongo {
 namespace {
+using namespace fmt::literals;
 
 MONGO_FAIL_POINT_DEFINE(hangBeforeCheckingMongosShutdownInterrupt);
 const auto kOperationTime = "operationTime"_sd;
 
-/**
- * Invoking `shouldGossipLogicalTime()` is expected to always return "true" during normal execution.
- * SERVER-48013 uses this property to avoid the cost of calling this function during normal
- * execution. However, it might be desired to do the validation for test purposes (e.g.,
- * unit-tests). This fail-point allows going through a code path that does the check and quick
- * returns from `appendRequiredFieldsToResponse()` if `shouldGossipLogicalTime()` returns "false".
- * TODO SERVER-48142 should remove the following fail-point.
- */
-MONGO_FAIL_POINT_DEFINE(allowSkippingAppendRequiredFieldsToResponse);
-
 Future<void> runCommandInvocation(std::shared_ptr<RequestExecutionContext> rec,
                                   std::shared_ptr<CommandInvocation> invocation) {
-    bool usesDedicatedThread = [&] {
-        auto client = rec->getOpCtx()->getClient();
-        if (auto context = transport::ServiceExecutorContext::get(client); context) {
-            return context->usesDedicatedThread();
-        }
-        tassert(5453902,
-                "Threading model may only be absent for internal and direct clients",
-                !client->hasRemote() || client->isInDirectClient());
-        return true;
-    }();
+    static constexpr bool useDedicatedThread = true;
     return CommandHelpers::runCommandInvocation(
-        std::move(rec), std::move(invocation), usesDedicatedThread);
+        std::move(rec), std::move(invocation), useDedicatedThread);
 }
 
 /**
  * Append required fields to command response.
  */
 void appendRequiredFieldsToResponse(OperationContext* opCtx, BSONObjBuilder* responseBuilder) {
-    // TODO SERVER-48142 should remove the following block.
-    if (MONGO_unlikely(allowSkippingAppendRequiredFieldsToResponse.shouldFail())) {
-        auto validator = LogicalTimeValidator::get(opCtx);
-        if (!validator->shouldGossipLogicalTime()) {
-            LOGV2_DEBUG(4801301, 3, "Skipped gossiping logical time");
-            return;
-        }
-    }
-
     // The appended operationTime must always be <= the appended $clusterTime, so in case we need to
     // use $clusterTime as the operationTime below, take a $clusterTime value which is guaranteed to
     // be <= the value output by gossipOut().
@@ -179,7 +153,7 @@ void appendRequiredFieldsToResponse(OperationContext* opCtx, BSONObjBuilder* res
     bool clusterTimeWasOutput = VectorClock::get(opCtx)->gossipOut(opCtx, responseBuilder);
 
     // Ensure that either both operationTime and $clusterTime are output, or neither.
-    if (clusterTimeWasOutput) {
+    if (MONGO_likely(clusterTimeWasOutput)) {
         auto operationTime = OperationTimeTracker::get(opCtx)->getMaxOperationTime();
         if (VectorClock::isValidComponentTime(operationTime)) {
             LOGV2_DEBUG(22764,
@@ -212,9 +186,7 @@ Future<void> invokeInTransactionRouter(TransactionRouter::Router& txnRouter,
     return runCommandInvocation(rec, std::move(invocation))
         .tapError([rec = std::move(rec)](Status status) {
             if (auto code = status.code(); ErrorCodes::isSnapshotError(code) ||
-                ErrorCodes::isNeedRetargettingError(code) ||
-                code == ErrorCodes::ShardInvalidatedForTargeting ||
-                code == ErrorCodes::StaleDbVersion ||
+                ErrorCodes::isNeedRetargettingError(code) || code == ErrorCodes::StaleDbVersion ||
                 code == ErrorCodes::ShardCannotRefreshDueToLocksHeld ||
                 code == ErrorCodes::WouldChangeOwningShard) {
                 // Don't abort on possibly retryable errors.
@@ -275,29 +247,21 @@ void ExecCommandClient::_prologue() {
     auto opCtx = _rec->getOpCtx();
     auto result = _rec->getReplyBuilder();
     const auto& request = _rec->getRequest();
-    const Command* c = _invocation->definition();
 
-    const auto dbname = request.getDatabase();
+    const auto& dbname = _invocation->db();
     uassert(ErrorCodes::IllegalOperation,
             "Can't use 'local' database through mongos",
-            dbname != DatabaseName::kLocal.db());
+            !dbname.isLocalDB());
     uassert(ErrorCodes::InvalidNamespace,
-            "Invalid database name: '{}'"_format(dbname),
-            DatabaseName::validDBName(dbname, DatabaseName::DollarInDbNameBehavior::Allow));
+            "Invalid database name: '{}'"_format(dbname.toStringForErrorMsg()),
+            DatabaseName::isValid(dbname, DatabaseName::DollarInDbNameBehavior::Allow));
 
-    StringMap<int> topLevelFields;
+    StringDataSet topLevelFields(8);
     for (auto&& element : request.body) {
         StringData fieldName = element.fieldNameStringData();
-        if (fieldName == "help" && element.type() == Bool && element.Bool()) {
-            auto body = result->getBodyBuilder();
-            body.append("help", "help for: {} {}"_format(c->getName(), c->help()));
-            CommandHelpers::appendSimpleCommandStatus(body, true, "");
-            iassert(Status(ErrorCodes::SkipCommandExecution, "Already served help command"));
-        }
-
         uassert(ErrorCodes::FailedToParse,
                 "Parsed command object contains duplicate top level key: {}"_format(fieldName),
-                topLevelFields[fieldName]++ == 0);
+                topLevelFields.insert(fieldName).second);
     }
 
     try {
@@ -307,16 +271,6 @@ void ExecCommandClient::_prologue() {
         CommandHelpers::appendCommandStatusNoThrow(body, e.toStatus());
         iassert(Status(ErrorCodes::SkipCommandExecution, "Failed to check authorization"));
     }
-
-    // attach tracking
-    rpc::TrackingMetadata trackingMetadata;
-    trackingMetadata.initWithOperName(c->getName());
-    rpc::TrackingMetadata::get(opCtx) = trackingMetadata;
-
-    // Extract and process metadata from the command request body.
-    ReadPreferenceSetting::get(opCtx) =
-        uassertStatusOK(ReadPreferenceSetting::fromContainingBSON(request.body));
-    VectorClock::get(opCtx)->gossipIn(opCtx, request.body, !c->requiresAuth());
 }
 
 Future<void> ExecCommandClient::_run() {
@@ -368,18 +322,6 @@ void ExecCommandClient::_onCompletion() {
     auto opCtx = _rec->getOpCtx();
     auto body = _rec->getReplyBuilder()->getBodyBuilder();
     appendRequiredFieldsToResponse(opCtx, &body);
-
-    auto seCtx = transport::ServiceExecutorContext::get(opCtx->getClient());
-    if (!seCtx) {
-        // We were run by a background worker.
-        return;
-    }
-
-    if (!_invocation->isSafeForBorrowedThreads()) {
-        // If the last command wasn't safe for a borrowed thread,
-        // then let's move off of it.
-        seCtx->setThreadModel(seCtx->kSynchronous);
-    }
 }
 
 Future<void> ExecCommandClient::run() {
@@ -417,6 +359,10 @@ public:
 
     Future<void> run();
 
+    const CommonRequestArgs& getCommonRequestArgs() const {
+        return _requestArgs;
+    }
+
 private:
     class RunInvocation;
     class RunAndRetry;
@@ -438,6 +384,7 @@ private:
     OperationSessionInfoFromClient _osi;
     boost::optional<WriteConcernOptions> _wc;
     boost::optional<bool> _isHello;
+    CommonRequestArgs _requestArgs;
 };
 
 /*
@@ -485,12 +432,12 @@ private:
     // Exception handler for error codes that may trigger a retry. All methods will throw `status`
     // unless an attempt to retry is possible.
     void _checkRetryForTransaction(Status& status);
-    void _onShardInvalidatedForTargeting(Status& status);
     void _onNeedRetargetting(Status& status);
     void _onStaleDbVersion(Status& status);
     void _onSnapshotError(Status& status);
     void _onShardCannotRefreshDueToLocksHeldError(Status& status);
     void _onTenantMigrationAborted(Status& status);
+    void _onCannotImplicitlyCreateCollection(Status& status);
 
     ParseAndRunCommand* const _parc;
 
@@ -505,7 +452,12 @@ void ParseAndRunCommand::_updateStatsAndApplyErrorLabels(const Status& status) {
     if (!command)
         return;
 
-    command->incrementCommandsFailed();
+
+    if (status.code() == ErrorCodes::QueryRejectedBySettings) {
+        command->incrementCommandsRejected();
+    } else {
+        command->incrementCommandsFailed();
+    }
 
     // WriteConcern error (wcCode) is set to boost::none because:
     // 1. TransientTransaction error label handling for commitTransaction command in mongos is
@@ -519,6 +471,7 @@ void ParseAndRunCommand::_updateStatsAndApplyErrorLabels(const Status& status) {
                                       boost::none,
                                       false /* isInternalClient */,
                                       true /* isMongos */,
+                                      false /* isComingFromRouter */,
                                       repl::OpTime{},
                                       repl::OpTime{});
     _errorBuilder->appendElements(errorLabels);
@@ -555,6 +508,13 @@ void ParseAndRunCommand::_parseCommand() {
 
     CommandHelpers::uassertShouldAttemptParse(opCtx, command, request);
 
+    _requestArgs = CommonRequestArgs::parse(IDLParserContext("request",
+                                                             false,
+                                                             request.validatedTenancyScope,
+                                                             request.getValidatedTenantId(),
+                                                             request.getSerializationContext()),
+                                            request.body);
+
     // Parse the 'maxTimeMS' command option, and use it to set a deadline for the operation on
     // the OperationContext. Be sure to do this as soon as possible so that further processing by
     // subsequent code has the deadline available. The 'maxTimeMS' option unfortunately has a
@@ -565,24 +525,25 @@ void ParseAndRunCommand::_parseCommand() {
     // maxTimeMS altogether on a getMore command.
     uassert(ErrorCodes::InvalidOptions,
             "no such command option $maxTimeMs; use maxTimeMS instead",
-            request.body[query_request_helper::queryOptionMaxTimeMS].eoo());
+            !_requestArgs.getDollarMaxTimeMS());
 
     // If the command includes a 'comment' field, set it on the current OpCtx.
-    if (auto commentField = request.body["comment"]) {
+    if (auto& commentField = _requestArgs.getComment()) {
         stdx::lock_guard<Client> lk(*client);
-        opCtx->setComment(commentField.wrap());
+        opCtx->setComment(commentField->getElement().wrap());
     }
 
-    auto const apiParamsFromClient = initializeAPIParameters(request.body, command);
+    validateAPIParameters(request.body, _requestArgs.getAPIParametersFromClient(), command);
 
     {
         // We must obtain the client lock to set APIParameters on the operation context, as it may
         // be concurrently read by CurrentOp.
         stdx::lock_guard<Client> lk(*client);
-        APIParameters::get(opCtx) = APIParameters::fromClient(apiParamsFromClient);
+        APIParameters::get(opCtx) =
+            APIParameters::fromClient(_requestArgs.getAPIParametersFromClient());
     }
 
-    rpc::readRequestMetadata(opCtx, request, command->requiresAuth());
+    rpc::readRequestMetadata(opCtx, _requestArgs, request, command->requiresAuth());
 
     _invocation = command->parse(opCtx, request);
     CommandInvocation::set(opCtx, _invocation);
@@ -591,15 +552,19 @@ void ParseAndRunCommand::_parseCommand() {
     // the command does not define a fully-qualified namespace, set CurOp to the generic command
     // namespace db.$cmd.
     _ns.emplace(_invocation->ns());
-    const auto nss = (NamespaceString(request.getDbName()) == *_ns
+    const auto nss = (NamespaceString(_invocation->db()) == *_ns
                           ? NamespaceString::makeCommandNamespace(_invocation->ns().dbName())
                           : _invocation->ns());
 
     // Fill out all currentOp details.
     CurOp::get(opCtx)->setGenericOpRequestDetails(nss, command, request.body, _opType);
 
-    _osi = initializeOperationSessionInfo(
-        opCtx, request, command->requiresAuth(), command->attachLogicalSessionsToOpCtx(), true);
+    _osi = initializeOperationSessionInfo(opCtx,
+                                          request.getValidatedTenantId(),
+                                          _requestArgs.getOperationSessionInfoFromClientBase(),
+                                          command->requiresAuth(),
+                                          command->attachLogicalSessionsToOpCtx(),
+                                          true);
 
     auto allowTransactionsOnConfigDatabase =
         !serverGlobalParams.clusterRole.hasExclusively(ClusterRole::RouterServer) ||
@@ -626,13 +591,25 @@ void ParseAndRunCommand::_parseCommand() {
         // We must obtain the client lock to set ReadConcernArgs on the operation context, as it may
         // be concurrently read by CurrentOp.
         stdx::lock_guard<Client> lk(*client);
-        readConcernParseStatus = readConcernArgs.initialize(request.body);
+        if (_requestArgs.getReadConcern()) {
+            readConcernParseStatus = readConcernArgs.parse(*_requestArgs.getReadConcern());
+        }
     }
 
-    if (!readConcernParseStatus.isOK()) {
+    if (MONGO_unlikely(!readConcernParseStatus.isOK())) {
         auto builder = replyBuilder->getBodyBuilder();
         CommandHelpers::appendCommandStatusNoThrow(builder, readConcernParseStatus);
         iassert(Status(ErrorCodes::SkipCommandExecution, "Failed to parse read concern"));
+    }
+
+    if (MONGO_unlikely(_requestArgs.getHelp().value_or(false))) {
+        const Command* c = _invocation->definition();
+        auto result = _rec->getReplyBuilder();
+        auto body = result->getBodyBuilder();
+        body.append(CommandHelpers::kHelpFieldName,
+                    "help for: {} {}"_format(c->getName(), c->help()));
+        CommandHelpers::appendSimpleCommandStatus(body, true, "");
+        iassert(Status(ErrorCodes::SkipCommandExecution, "Already served help command"));
     }
 }
 
@@ -646,9 +623,10 @@ Status ParseAndRunCommand::RunInvocation::_setup() {
     auto command = _parc->_rec->getCommand();
     const auto& request = _parc->_rec->getRequest();
     auto replyBuilder = _parc->_rec->getReplyBuilder();
+    auto requestArgs = _parc->getCommonRequestArgs();
 
-    const int maxTimeMS =
-        uassertStatusOK(parseMaxTimeMS(request.body[query_request_helper::cmdOptionMaxTimeMS]));
+    const int maxTimeMS = uassertStatusOK(
+        parseMaxTimeMS(requestArgs.getMaxTimeMS().value_or(IDLAnyType()).getElement()));
     if (maxTimeMS > 0 && command->getLogicalOp() != LogicalOp::opGetMore) {
         opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMS}, ErrorCodes::MaxTimeMSExpired);
     }
@@ -675,7 +653,7 @@ Status ParseAndRunCommand::RunInvocation::_setup() {
         return Status(ErrorCodes::SkipCommandExecution, status.reason());
     };
 
-    if (_parc->_isHello.value()) {
+    if (MONGO_unlikely(_parc->_isHello.value())) {
         // Preload generic ClientMetadata ahead of our first hello request. After the first
         // request, metaElement should always be empty.
         auto metaElem = request.body[kMetadataDocumentName];
@@ -684,10 +662,10 @@ Status ParseAndRunCommand::RunInvocation::_setup() {
 
     enforceRequireAPIVersion(opCtx, command);
 
-    auto& apiParams = APIParameters::get(opCtx);
-    auto& apiVersionMetrics = APIVersionMetrics::get(opCtx->getServiceContext());
     if (auto clientMetadata = ClientMetadata::get(opCtx->getClient())) {
-        auto appName = clientMetadata->getApplicationName().toString();
+        auto& apiParams = APIParameters::get(opCtx);
+        auto& apiVersionMetrics = APIVersionMetrics::get(opCtx->getServiceContext());
+        auto appName = clientMetadata->getApplicationName();
         apiVersionMetrics.update(appName, apiParams);
     }
 
@@ -722,7 +700,7 @@ Status ParseAndRunCommand::RunInvocation::_setup() {
     }
 
     bool supportsWriteConcern = invocation->supportsWriteConcern();
-    if (!supportsWriteConcern && request.body.hasField(WriteConcernOptions::kWriteConcernField)) {
+    if (MONGO_unlikely(!supportsWriteConcern && requestArgs.getWriteConcern())) {
         // This command doesn't do writes so it should not be passed a writeConcern.
         const auto errorMsg = "Command does not support writeConcern";
         return appendStatusToReplyAndSkipCommandExecution({ErrorCodes::InvalidOptions, errorMsg});
@@ -735,30 +713,53 @@ Status ParseAndRunCommand::RunInvocation::_setup() {
     bool customDefaultWriteConcernWasApplied = false;
     bool isInternalClientValue = isInternalClient(opCtx);
 
-    if (supportsWriteConcern && !clientSuppliedWriteConcern &&
+    bool canApplyDefaultWC = supportsWriteConcern &&
         (!TransactionRouter::get(opCtx) || command->isTransactionCommand()) &&
-        !opCtx->getClient()->isInDirectClient()) {
-        if (isInternalClientValue) {
-            uassert(
-                5569900,
-                "received command without explicit writeConcern on an internalClient connection {}"_format(
-                    redact(request.body.toString())),
-                request.body.hasField(WriteConcernOptions::kWriteConcernField));
-        } else {
-            // This command is not from a DBDirectClient or internal client, and supports WC, but
-            // wasn't given one - so apply the default, if there is one.
-            const auto rwcDefaults =
+        !opCtx->getClient()->isInDirectClient();
+
+    if (canApplyDefaultWC) {
+        auto getDefaultWC = ([&]() {
+            auto rwcDefaults =
                 ReadWriteConcernDefaults::get(opCtx->getServiceContext()).getDefault(opCtx);
-            if (const auto wcDefault = rwcDefaults.getDefaultWriteConcern()) {
-                _parc->_wc = *wcDefault;
-                const auto defaultWriteConcernSource = rwcDefaults.getDefaultWriteConcernSource();
-                customDefaultWriteConcernWasApplied = defaultWriteConcernSource &&
-                    defaultWriteConcernSource == DefaultWriteConcernSourceEnum::kGlobal;
-                LOGV2_DEBUG(22766,
-                            2,
-                            "Applying default writeConcern on command",
-                            "command"_attr = request.getCommandName(),
-                            "writeConcern"_attr = *wcDefault);
+            auto wcDefault = rwcDefaults.getDefaultWriteConcern();
+            const auto defaultWriteConcernSource = rwcDefaults.getDefaultWriteConcernSource();
+            customDefaultWriteConcernWasApplied = defaultWriteConcernSource &&
+                defaultWriteConcernSource == DefaultWriteConcernSourceEnum::kGlobal;
+            return wcDefault;
+        });
+
+        if (!clientSuppliedWriteConcern) {
+            if (isInternalClientValue) {
+                uassert(
+                    5569900,
+                    "received command without explicit writeConcern on an internalClient connection {}"_format(
+                        redact(request.body.toString())),
+                    requestArgs.getWriteConcern());
+            } else {
+                // This command is not from a DBDirectClient or internal client, and supports WC,
+                // but wasn't given one - so apply the default, if there is one.
+                const auto wcDefault = getDefaultWC();
+                // Default WC can be 'boost::none' if the implicit default is used and set to 'w:1'.
+                if (wcDefault) {
+                    _parc->_wc = *wcDefault;
+                    LOGV2_DEBUG(22766,
+                                2,
+                                "Applying default writeConcern on command",
+                                "command"_attr = request.getCommandName(),
+                                "writeConcern"_attr = *wcDefault);
+                }
+            }
+        }
+        // Client supplied a write concern object without 'w' field.
+        else if (_parc->_wc->isExplicitWithoutWField()) {
+            const auto wcDefault = getDefaultWC();
+            // Default WC can be 'boost::none' if the implicit default is used and set to 'w:1'.
+            if (wcDefault) {
+                clientSuppliedWriteConcern = false;
+                _parc->_wc->w = wcDefault->w;
+                if (_parc->_wc->syncMode == WriteConcernOptions::SyncMode::UNSET) {
+                    _parc->_wc->syncMode = wcDefault->syncMode;
+                }
             }
         }
     }
@@ -907,13 +908,12 @@ Status ParseAndRunCommand::RunInvocation::_setup() {
     //
     // Individual transaction statements are checked later on, after we've unstashed the transaction
     // resources.
-    if (!TransactionRouter::get(opCtx) && readConcernArgs.hasLevel()) {
-        if (!readConcernSupport.readConcernSupport.isOK()) {
-            const std::string errorMsg = "Command {} does not support {}"_format(
-                invocation->definition()->getName(), readConcernArgs.toString());
-            return appendStatusToReplyAndSkipCommandExecution(
-                readConcernSupport.readConcernSupport.withContext(errorMsg));
-        }
+    if (MONGO_unlikely(!TransactionRouter::get(opCtx) && readConcernArgs.hasLevel() &&
+                       !readConcernSupport.readConcernSupport.isOK())) {
+        const std::string errorMsg = "Command {} does not support {}"_format(
+            invocation->definition()->getName(), readConcernArgs.toString());
+        return appendStatusToReplyAndSkipCommandExecution(
+            readConcernSupport.readConcernSupport.withContext(errorMsg));
     }
 
     // Remember whether or not this operation is starting a transaction, in case something later in
@@ -1021,17 +1021,10 @@ void ParseAndRunCommand::RunAndRetry::_checkRetryForTransaction(Status& status) 
         txnRouter.onSnapshotError(opCtx, status);
     } else {
         invariant(ErrorCodes::isA<ErrorCategory::NeedRetargettingError>(status) ||
-                  status.code() == ErrorCodes::ShardInvalidatedForTargeting ||
                   status.code() == ErrorCodes::StaleDbVersion ||
                   status.code() == ErrorCodes::ShardCannotRefreshDueToLocksHeld);
 
         if (!txnRouter.canContinueOnStaleShardOrDbError(_parc->_commandName, status)) {
-            if (status.code() == ErrorCodes::ShardInvalidatedForTargeting) {
-                auto catalogCache = Grid::get(opCtx)->catalogCache();
-                (void)catalogCache->getCollectionRoutingInfoWithPlacementRefresh(
-                    opCtx, status.extraInfo<ShardInvalidatedForTargetingInfo>()->getNss());
-            }
-
             addContextForTransactionAbortingError(txnRouter.txnIdToString(),
                                                   txnRouter.getLatestStmtId(),
                                                   status,
@@ -1046,19 +1039,6 @@ void ParseAndRunCommand::RunAndRetry::_checkRetryForTransaction(Status& status) 
     abortGuard.dismiss();
 }
 
-void ParseAndRunCommand::RunAndRetry::_onShardInvalidatedForTargeting(Status& status) {
-    invariant(status.code() == ErrorCodes::ShardInvalidatedForTargeting);
-
-    auto opCtx = _parc->_rec->getOpCtx();
-    auto catalogCache = Grid::get(opCtx)->catalogCache();
-    catalogCache->setOperationShouldBlockBehindCatalogCacheRefresh(opCtx, true);
-
-    _checkRetryForTransaction(status);
-
-    if (!_canRetry())
-        iassert(status);
-}
-
 void ParseAndRunCommand::RunAndRetry::_onNeedRetargetting(Status& status) {
     invariant(ErrorCodes::isA<ErrorCategory::NeedRetargettingError>(status));
 
@@ -1068,11 +1048,20 @@ void ParseAndRunCommand::RunAndRetry::_onNeedRetargetting(Status& status) {
 
     auto opCtx = _parc->_rec->getOpCtx();
     const auto staleNs = staleInfo->getNss();
+    const auto& originalNs = _parc->_invocation->ns();
     auto catalogCache = Grid::get(opCtx)->catalogCache();
     catalogCache->invalidateShardOrEntireCollectionEntryForShardedCollection(
         staleNs, staleInfo->getVersionWanted(), staleInfo->getShardId());
 
-    catalogCache->setOperationShouldBlockBehindCatalogCacheRefresh(opCtx, true);
+    if ((staleNs.isTimeseriesBucketsCollection() || originalNs.isTimeseriesBucketsCollection()) &&
+        staleNs != originalNs) {
+        // A timeseries might've been created, so we need to invalidate the original namespace
+        // version.
+        Grid::get(opCtx)
+            ->catalogCache()
+            ->invalidateShardOrEntireCollectionEntryForShardedCollection(
+                originalNs, boost::none, staleInfo->getShardId());
+    }
 
     _checkRetryForTransaction(status);
 
@@ -1131,6 +1120,17 @@ void ParseAndRunCommand::RunAndRetry::_onTenantMigrationAborted(Status& status) 
         iassert(status);
 }
 
+void ParseAndRunCommand::RunAndRetry::_onCannotImplicitlyCreateCollection(Status& status) {
+    invariant(status.code() == ErrorCodes::CannotImplicitlyCreateCollection);
+
+    auto opCtx = _parc->_rec->getOpCtx();
+
+    auto extraInfo = status.extraInfo<CannotImplicitlyCreateCollectionInfo>();
+    invariant(extraInfo);
+
+    cluster::createCollectionWithRouterLoop(opCtx, extraInfo->getNss());
+}
+
 Future<void> ParseAndRunCommand::RunAndRetry::run() {
     return makeReadyFutureWith([&] {
                // Try kMaxNumStaleVersionRetries times. On the last try, exceptions are
@@ -1140,10 +1140,6 @@ Future<void> ParseAndRunCommand::RunAndRetry::run() {
                _setup();
                return _run();
            })
-        .onError<ErrorCodes::ShardInvalidatedForTargeting>([this](Status status) {
-            _onShardInvalidatedForTargeting(status);
-            return run();  // Retry
-        })
         .onErrorCategory<ErrorCategory::NeedRetargettingError>([this](Status status) {
             _onNeedRetargetting(status);
             return run();  // Retry
@@ -1162,6 +1158,10 @@ Future<void> ParseAndRunCommand::RunAndRetry::run() {
         })
         .onError<ErrorCodes::TenantMigrationAborted>([this](Status status) {
             _onTenantMigrationAborted(status);
+            return run();  // Retry
+        })
+        .onError<ErrorCodes::CannotImplicitlyCreateCollection>([this](Status status) {
+            _onCannotImplicitlyCreateCollection(status);
             return run();  // Retry
         });
 }
@@ -1200,11 +1200,8 @@ public:
     Future<DbResponse> run();
 
 private:
-    std::string _getDatabaseStringForLogging() const try {
-        // `getDatabase` throws if the request doesn't have a '$db' field.
-        return _rec->getRequest().getDatabase().toString();
-    } catch (const DBException& ex) {
-        return ex.toString();
+    StringData _getDatabaseStringForLogging() const {
+        return _rec->getRequest().readDatabaseForLogging();
     }
 
     void _parseMessage();

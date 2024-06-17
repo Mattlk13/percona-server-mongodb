@@ -18,9 +18,10 @@
  *
  * @tags: [
  *   # SERVER-56565 avoid CS stepdowns, since  an election may trigger a  refresh of stale metadata
- *   #              that form part of the test setup.
+ *   # that form part of the test setup.
  *   does_not_support_stepdowns,
- *  ]
+ *   temp_disabled_embedded_router_uncategorized,
+ * ]
  */
 import {
     buildCommandProfile,
@@ -84,11 +85,14 @@ let testCases = {
     _mergeAuthzCollections: {skip: "primary only"},
     _migrateClone: {skip: "primary only"},
     _mongotConnPoolStats: {skip: "internal command"},
+    _shardsvrBeginMigrationBlockingOperation: {skip: "internal command"},
+    _shardsvrChangePrimary: {skip: "internal command"},
     _shardsvrCheckMetadataConsistency: {skip: "internal command"},
     _shardsvrCheckMetadataConsistencyParticipant: {skip: "internal command"},
     _shardsvrCleanupStructuredEncryptionData: {skip: "primary only"},
     _shardsvrCompactStructuredEncryptionData: {skip: "primary only"},
     _shardsvrCoordinateMultiUpdate: {skip: "primary only"},
+    _shardsvrEndMigrationBlockingOperation: {skip: "internal command"},
     _shardsvrMergeAllChunksOnShard: {skip: "primary only"},
     _shardsvrMovePrimary: {skip: "primary only"},
     _shardsvrMovePrimaryEnterCriticalSection: {skip: "primary only"},
@@ -135,6 +139,7 @@ let testCases = {
     applyOps: {skip: "primary only"},
     authSchemaUpgrade: {skip: "primary only"},
     authenticate: {skip: "does not return user data"},
+    autoSplitVector: {skip: "primary only"},
     balancerCollectionStatus: {skip: "primary only"},
     balancerStart: {skip: "primary only"},
     balancerStatus: {skip: "primary only"},
@@ -142,6 +147,7 @@ let testCases = {
     buildInfo: {skip: "does not return user data"},
     bulkWrite: {skip: "primary only"},
     captrunc: {skip: "primary only"},
+    changePrimary: {skip: "primary only"},
     checkMetadataConsistency: {skip: "primary only"},
     checkShardingIndex: {skip: "primary only"},
     cleanupOrphaned: {skip: "primary only"},
@@ -382,6 +388,7 @@ let testCases = {
     startRecordingTraffic: {skip: "does not return user data"},
     startSession: {skip: "does not return user data"},
     stopRecordingTraffic: {skip: "does not return user data"},
+    sysprofile: {skip: "internal command"},
     testDeprecation: {skip: "does not return user data"},
     testDeprecationInVersion2: {skip: "does not return user data"},
     testInternalTransactions: {skip: "primary only"},
@@ -391,6 +398,7 @@ let testCases = {
     top: {skip: "does not return user data"},
     transitionFromDedicatedConfigServer: {skip: "primary only"},
     transitionToDedicatedConfigServer: {skip: "primary only"},
+    transitionToShardedCluster: {skip: "primary only"},
     unshardCollection: {skip: "primary only"},
     update: {skip: "primary only"},
     updateRole: {skip: "primary only"},

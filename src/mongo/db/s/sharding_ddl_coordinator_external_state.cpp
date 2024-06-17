@@ -30,6 +30,7 @@
 #include "mongo/db/s/sharding_ddl_coordinator_external_state.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/global_user_write_block_state.h"
+#include "mongo/db/s/sharding_ddl_util.h"
 #include "mongo/db/vector_clock_mutable.h"
 #include "mongo/s/grid.h"
 
@@ -66,9 +67,24 @@ bool ShardingDDLCoordinatorExternalStateImpl::isShardedTimeseries(
     }
 }
 
-std::unique_ptr<ShardingDDLCoordinatorExternalState>
+void ShardingDDLCoordinatorExternalStateImpl::allowMigrations(OperationContext* opCtx,
+                                                              const NamespaceString& nss,
+                                                              bool allowMigrations) {
+    if (allowMigrations) {
+        sharding_ddl_util::resumeMigrations(opCtx, nss, boost::none);
+    } else {
+        sharding_ddl_util::stopMigrations(opCtx, nss, boost::none);
+    }
+}
+
+bool ShardingDDLCoordinatorExternalStateImpl::checkAllowMigrations(OperationContext* opCtx,
+                                                                   const NamespaceString& nss) {
+    return sharding_ddl_util::checkAllowMigrations(opCtx, nss);
+}
+
+std::shared_ptr<ShardingDDLCoordinatorExternalState>
 ShardingDDLCoordinatorExternalStateFactoryImpl::create() const {
-    return std::make_unique<ShardingDDLCoordinatorExternalStateImpl>();
+    return std::make_shared<ShardingDDLCoordinatorExternalStateImpl>();
 }
 
 }  // namespace mongo

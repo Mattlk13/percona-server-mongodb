@@ -50,6 +50,11 @@ namespace mongo {
  *
  * Does not throw exceptions.
  */
+
+class CollatorInterface;
+
+constexpr CollatorInterface* kSimpleCollator = nullptr;
+
 class CollatorInterface : public StringDataComparator {
     CollatorInterface(const CollatorInterface&) = delete;
     CollatorInterface& operator=(const CollatorInterface&) = delete;
@@ -94,7 +99,7 @@ public:
      */
     CollatorInterface(Collation spec) : _spec(std::move(spec)) {}
 
-    virtual ~CollatorInterface() {}
+    ~CollatorInterface() override {}
 
     virtual std::unique_ptr<CollatorInterface> clone() const = 0;
     virtual std::shared_ptr<CollatorInterface> cloneShared() const = 0;
@@ -104,7 +109,7 @@ public:
      * 0 if 'left' is greater than 'right' w.r.t. the collation, and 0 if 'left' and 'right' are
      * equal w.r.t. the collation.
      */
-    virtual int compare(StringData left, StringData right) const = 0;
+    int compare(StringData left, StringData right) const override = 0;
 
     /**
      * Hashes the string such that strings which are equal under this collation also have equal
@@ -147,26 +152,32 @@ public:
     }
 
     /**
-     * Returns true if lhs and rhs are both nullptr, or if they point to equivalent collators.
+     * Returns true if lhs and rhs are both the simple collator (nullptr), or if they point to
+     * equivalent collators.
      */
     static bool collatorsMatch(const CollatorInterface* lhs, const CollatorInterface* rhs) {
-        if (lhs == nullptr && rhs == nullptr) {
+        if (isSimpleCollator(lhs) && isSimpleCollator(rhs)) {
             return true;
         }
-        if (lhs == nullptr || rhs == nullptr) {
+        if (isSimpleCollator(lhs) || isSimpleCollator(rhs)) {
             return false;
         }
         return (*lhs == *rhs);
     }
 
     /**
-     * Returns a clone of 'collator'. If 'collator' is nullptr, returns the null collator.
+     * Returns a clone of 'collator'.
+     * If 'collator' is the simple collator (nullptr), returns it again.
      */
     static std::unique_ptr<CollatorInterface> cloneCollator(const CollatorInterface* collator) {
-        if (!collator) {
-            return {nullptr};
+        if (isSimpleCollator(collator)) {
+            return std::unique_ptr<CollatorInterface>{kSimpleCollator};
         }
         return collator->clone();
+    }
+
+    static bool isSimpleCollator(const CollatorInterface* collator) {
+        return collator == kSimpleCollator;
     }
 
 protected:

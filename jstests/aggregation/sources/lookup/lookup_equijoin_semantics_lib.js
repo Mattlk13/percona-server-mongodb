@@ -16,7 +16,7 @@
 
 import {assertArrayEq} from "jstests/aggregation/extras/utils.js";
 import {getAggPlanStages} from "jstests/libs/analyze_plan.js";
-import {checkSBEEnabled} from "jstests/libs/sbe_util.js";
+import {checkSbeRestrictedOrFullyEnabled} from "jstests/libs/sbe_util.js";
 
 export const JoinAlgorithm = {
     HJ: {name: "HJ", strategy: "HashJoin"},
@@ -47,7 +47,7 @@ export function setupCollections(testConfig, localRecords, foreignRecords, forei
 export function checkJoinConfiguration(testConfig, explain) {
     const {currentJoinAlgorithm} = testConfig;
     const eqLookupNodes = getAggPlanStages(explain, "EQ_LOOKUP");
-    if (checkSBEEnabled(db)) {
+    if (checkSbeRestrictedOrFullyEnabled(db)) {
         if (eqLookupNodes.length > 0) {
             // The $lookup stage has been lowered. Check that it's using the expected join strategy.
             assert.eq(currentJoinAlgorithm.strategy, eqLookupNodes[0].strategy, "Join strategy");
@@ -264,16 +264,20 @@ export function runTests(testConfig) {
             {_id: 11, a: [[null, 1], 2]},
         ];
 
-        if (checkSBEEnabled(db)) {
+        // "undefined" should only match "undefined".
+        runTest_SingleForeignRecord(testConfig, {
+            testDescription: "Undefined in foreign, top-level field in local",
+            localRecords: docs,
+            localField: "a",
+            foreignRecord: {_id: 0, b: undefined},
+            foreignField: "b",
+            idsExpectedToMatch: []
+        });
+
+        // $lookup is allowed to run with sbe when internalQueryFrameworkControl is set to
+        // 'trySbeRestricted'.
+        if (checkSbeRestrictedOrFullyEnabled(db)) {
             // When lowered to SBE, "undefined" should only match "undefined".
-            runTest_SingleForeignRecord(testConfig, {
-                testDescription: "Undefined in foreign, top-level field in local",
-                localRecords: docs,
-                localField: "a",
-                foreignRecord: {_id: 0, b: undefined},
-                foreignField: "b",
-                idsExpectedToMatch: []
-            });
             runTest_SingleForeignRecord(testConfig, {
                 testDescription: "Undefined in foreign, undefined in array in local",
                 localRecords: [{_id: 0, a: undefined}, {_id: 1, a: [undefined, 1]}],
@@ -300,22 +304,12 @@ export function runTests(testConfig) {
                 idsExpectedToMatch: []
             });
         } else {
-            // Due to legacy reasons, in the classic engine "undefined" either matches to null or
-            // triggers an error.
-            runTest_SingleForeignRecord(testConfig, {
-                testDescription: "Undefined in foreign, top-level field in local",
-                localRecords: docs,
-                localField: "a",
-                foreignRecord: {_id: 0, b: undefined},
-                foreignField: "b",
-                idsExpectedToMatch: [0, 1, 2, 3]
-            });
-
-            // If the left-hand side collection has a value of undefined for "localField", then the
-            // query will fail. This is a consequence of the fact that queries which explicitly
-            // compare to undefined, such as {$eq:undefined}, are banned. Arguably this behavior
-            // could be improved, but we are unlikely to change it given that the undefined BSON
-            // type has been deprecated for many years.
+            // Due to legacy reasons, in the classic engine if the left-hand side collection has a
+            // value of undefined for "localField", then the query will fail. This is a consequence
+            // of the fact that queries which explicitly compare to undefined, such as
+            // {$eq:undefined}, are banned. Arguably this behavior could be improved, but we are
+            // unlikely to change it given that the undefined BSON type has been deprecated for many
+            // years.
             runTest_ExpectFailure(testConfig, {
                 testDescription: "Undefined in local, top-level field in foreign",
                 localRecords: {_id: 0, b: undefined},

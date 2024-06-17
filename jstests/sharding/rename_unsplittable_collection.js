@@ -1,9 +1,10 @@
 /*
  * Test the rename command against unsplittable collections.
  * @tags: [
- *   featureFlagTrackUnshardedCollectionsOnShardingCatalog,
- *   multiversion_incompatible,
  *   assumes_balancer_off,
+ *   # Needed to run createUnsplittableCollection
+ *   featureFlagAuthoritativeShardCollection,
+ *   requires_fcv_80
  * ]
  */
 

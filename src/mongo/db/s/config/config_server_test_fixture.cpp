@@ -47,7 +47,7 @@
 #include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/op_observer/op_observer_impl.h"
 #include "mongo/db/op_observer/op_observer_registry.h"
-#include "mongo/db/op_observer/oplog_writer_impl.h"
+#include "mongo/db/op_observer/operation_logger_impl.h"
 #include "mongo/db/ops/write_ops_gen.h"
 #include "mongo/db/ops/write_ops_parsers.h"
 #include "mongo/db/query/cursor_response.h"
@@ -78,6 +78,7 @@
 #include "mongo/s/config_server_catalog_cache_loader.h"
 #include "mongo/s/database_version.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
+#include "mongo/s/routing_information_cache.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
@@ -99,7 +100,7 @@ ReadPreferenceSetting kReadPref(ReadPreference::PrimaryOnly);
 }  // namespace
 
 ConfigServerTestFixture::ConfigServerTestFixture(Options options, bool setUpMajorityReads)
-    : ShardingMongodTestFixture(std::move(options), setUpMajorityReads) {}
+    : ShardingMongoDTestFixture(std::move(options), setUpMajorityReads) {}
 
 ConfigServerTestFixture::~ConfigServerTestFixture() = default;
 
@@ -111,14 +112,15 @@ void ConfigServerTestFixture::setUpAndInitializeConfigDb() {
 }
 
 void ConfigServerTestFixture::setUp() {
-    ShardingMongodTestFixture::setUp();
+    ShardingMongoDTestFixture::setUp();
 
     // TODO: SERVER-26919 set the flag on the mock repl coordinator just for the window where it
     // actually needs to bypass the op observer.
     replicationCoordinator()->alwaysAllowWrites(true);
 
     // Initialize sharding components as a config server.
-    serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::ConfigServer};
+    serverGlobalParams.clusterRole = {
+        ClusterRole::ShardServer, ClusterRole::ConfigServer, ClusterRole::RouterServer};
 
     // The catalog manager requires a special executor used for operations during addShard.
     auto specialNet(std::make_unique<executor::NetworkInterfaceMock>());
@@ -131,6 +133,7 @@ void ConfigServerTestFixture::setUp() {
         std::make_unique<NetworkTestEnv>(_executorForAddShard, _mockNetworkForAddShard);
     auto configServerCatalogCacheLoader = std::make_unique<ConfigServerCatalogCacheLoader>();
     CatalogCacheLoader::set(getServiceContext(), std::move(configServerCatalogCacheLoader));
+    RoutingInformationCache::set(getServiceContext());
 
     uassertStatusOK(initializeGlobalShardingStateForMongodForTest(ConnectionString::forLocal()));
 
@@ -150,9 +153,7 @@ void ConfigServerTestFixture::tearDown() {
 
     ShardingCatalogManager::clearForTests(getServiceContext());
 
-    CatalogCacheLoader::clearForTests(getServiceContext());
-
-    ShardingMongodTestFixture::tearDown();
+    ShardingMongoDTestFixture::tearDown();
 }
 
 std::unique_ptr<ShardingCatalogClient> ConfigServerTestFixture::makeShardingCatalogClient() {
@@ -197,7 +198,7 @@ Status ConfigServerTestFixture::insertToConfigCollection(OperationContext* opCtx
             insertOp.setDocuments({doc});
             return insertOp.toBSON({});
         }(),
-        Shard::kDefaultConfigCommandTimeout,
+        Milliseconds(defaultConfigCommandTimeoutMS.load()),
         Shard::RetryPolicy::kNoRetry);
 
     BatchedCommandResponse batchResponse;
@@ -225,7 +226,7 @@ Status ConfigServerTestFixture::updateToConfigCollection(OperationContext* opCtx
             }()});
             return updateOp.toBSON({});
         }(),
-        Shard::kDefaultConfigCommandTimeout,
+        Milliseconds(defaultConfigCommandTimeoutMS.load()),
         Shard::RetryPolicy::kNoRetry);
 
 
@@ -252,7 +253,7 @@ Status ConfigServerTestFixture::deleteToConfigCollection(OperationContext* opCtx
             }()});
             return deleteOp.toBSON({});
         }(),
-        Shard::kDefaultConfigCommandTimeout,
+        Milliseconds(defaultConfigCommandTimeoutMS.load()),
         Shard::RetryPolicy::kNoRetry);
 
 
@@ -305,9 +306,11 @@ StatusWith<ShardType> ConfigServerTestFixture::getShardDoc(OperationContext* opC
     return ShardType::fromBSON(doc.getValue());
 }
 
-CollectionType ConfigServerTestFixture::setupCollection(const NamespaceString& nss,
-                                                        const KeyPattern& shardKey,
-                                                        const std::vector<ChunkType>& chunks) {
+CollectionType ConfigServerTestFixture::setupCollection(
+    const NamespaceString& nss,
+    const KeyPattern& shardKey,
+    const std::vector<ChunkType>& chunks,
+    std::function<void(CollectionType& coll)> collectionCustomizer) {
     auto dbDoc = findOneOnConfigCollection(
         operationContext(),
         NamespaceString::kConfigDatabasesNamespace,
@@ -329,6 +332,8 @@ CollectionType ConfigServerTestFixture::setupCollection(const NamespaceString& n
                         Date_t::now(),
                         chunks[0].getCollectionUUID(),
                         shardKey);
+    collectionCustomizer(coll);
+
     ASSERT_OK(
         insertToConfigCollection(operationContext(), CollectionType::ConfigNS, coll.toBSON()));
 
@@ -411,7 +416,7 @@ StatusWith<std::vector<BSONObj>> ConfigServerTestFixture::getIndexes(OperationCo
                                             ReadPreferenceSetting{ReadPreference::PrimaryOnly},
                                             ns.dbName(),
                                             BSON("listIndexes" << ns.coll().toString()),
-                                            Shard::kDefaultConfigCommandTimeout,
+                                            Milliseconds(defaultConfigCommandTimeoutMS.load()),
                                             Shard::RetryPolicy::kIdempotent);
     if (!response.isOK()) {
         return response.getStatus();
@@ -452,7 +457,7 @@ void ConfigServerTestFixture::setupOpObservers() {
     auto opObserverRegistry =
         checked_cast<OpObserverRegistry*>(getServiceContext()->getOpObserver());
     opObserverRegistry->addObserver(
-        std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterImpl>()));
+        std::make_unique<OpObserverImpl>(std::make_unique<OperationLoggerImpl>()));
     opObserverRegistry->addObserver(std::make_unique<ConfigServerOpObserver>());
 }
 

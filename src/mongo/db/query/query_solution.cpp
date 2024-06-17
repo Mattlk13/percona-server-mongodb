@@ -62,6 +62,9 @@
 #include "mongo/db/keypattern.h"
 #include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/matcher/expression_geo.h"
+#include "mongo/db/pipeline/search/document_source_search.h"
+#include "mongo/db/pipeline/search/document_source_search_meta.h"
+#include "mongo/db/pipeline/search/search_helper.h"
 #include "mongo/db/query/collation/collation_index_key.h"
 #include "mongo/db/query/index_bounds_builder.h"
 #include "mongo/db/query/interval.h"
@@ -211,7 +214,28 @@ bool QuerySolutionNode::isEligibleForPlanCache() const {
     return true;
 }
 
+std::pair<const QuerySolutionNode*, size_t> QuerySolutionNode::getFirstNodeByType(
+    StageType type) const {
+    const QuerySolutionNode* result = nullptr;
+    size_t count = 0;
+    if (getType() == type) {
+        result = this;
+        count++;
+    }
+
+    for (auto&& child : children) {
+        auto [subTreeResult, subTreeCount] = child->getFirstNodeByType(type);
+        if (!result) {
+            result = subTreeResult;
+        }
+        count += subTreeCount;
+    }
+
+    return {result, count};
+}
+
 std::string QuerySolution::summaryString() const {
+    using namespace fmt::literals;
     tassert(5968205, "QuerySolutionNode cannot be null in this QuerySolution", _root);
 
     StringBuilder sb;
@@ -326,8 +350,11 @@ void QuerySolution::extendWith(std::unique_ptr<QuerySolutionNode> extensionRoot)
                 parentOfSentinel->children.size() == 1);
         current = parentOfSentinel->children[0].get();
     }
+    QuerySolutionNode* oldRoot = _root.get();
     parentOfSentinel->children[0] = std::move(_root);
     setRoot(std::move(extensionRoot));
+    // setRoot may re-assign node ids, so we assign this value after calling setRoot.
+    _unextendedRootId = oldRoot->nodeId();
 }
 
 void QuerySolution::setRoot(std::unique_ptr<QuerySolutionNode> root) {
@@ -339,15 +366,16 @@ void QuerySolution::setRoot(std::unique_ptr<QuerySolutionNode> root) {
     assignNodeIds(idGenerator, *_root);
 }
 
-std::unique_ptr<QuerySolutionNode> QuerySolution::extractRoot() {
-    return std::move(_root);
-}
-
 std::vector<NamespaceStringOrUUID> QuerySolution::getAllSecondaryNamespaces(
     const NamespaceString& mainNss) {
     std::set<NamespaceString> secondaryNssSet;
     getAllSecondaryNamespacesHelper(_root.get(), mainNss, secondaryNssSet);
     return {secondaryNssSet.begin(), secondaryNssSet.end()};
+}
+
+std::pair<const QuerySolutionNode*, size_t> QuerySolution::getFirstNodeByType(
+    StageType type) const {
+    return _root->getFirstNodeByType(type);
 }
 
 //
@@ -370,7 +398,11 @@ void CollectionScanNode::computeProperties() {
 
 void CollectionScanNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
-    *ss << "COLLSCAN\n";
+    if (doClusteredCollectionScanClassic() || doClusteredCollectionScanSbe()) {
+        *ss << "CLUSTERED_IDXSCAN\n";
+    } else {
+        *ss << "COLLSCAN\n";
+    }
     addIndent(ss, indent + 1);
     *ss << "ns = " << toStringForLogging(nss) << '\n';
     if (nullptr != filter) {
@@ -388,6 +420,9 @@ std::unique_ptr<QuerySolutionNode> CollectionScanNode::clone() const {
     copy->tailable = this->tailable;
     copy->direction = this->direction;
     copy->isClustered = this->isClustered;
+    copy->minRecord = this->minRecord;
+    copy->maxRecord = this->maxRecord;
+    copy->clusteredIndex = this->clusteredIndex;
     copy->isOplog = this->isOplog;
     copy->shouldTrackLatestOplogTimestamp = this->shouldTrackLatestOplogTimestamp;
     copy->assertTsHasNotFallenOff = this->assertTsHasNotFallenOff;
@@ -1348,7 +1383,7 @@ void ReplaceRootNode::appendToString(str::stream* ss, int indent) const {
         addIndent(ss, indent + 1);
         *ss << "newRoot:\n";
 
-        *ss << newRoot->serialize(SerializationOptions{}).toString();
+        *ss << newRoot->serialize().toString();
     }
     addCommon(ss, indent);
     addIndent(ss, indent + 1);
@@ -1448,6 +1483,10 @@ std::unique_ptr<QuerySolutionNode> SortKeyGeneratorNode::clone() const {
 // SortNode
 //
 
+SortNode::SortNode(const SortNode& other) {
+    other.cloneSortData(this);
+}
+
 void SortNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "SORT\n";
@@ -1467,25 +1506,27 @@ void SortNode::cloneSortData(SortNode* copy) const {
     cloneBaseData(copy);
     copy->pattern = this->pattern;
     copy->limit = this->limit;
+    copy->canBeParameterized = this->canBeParameterized;
     copy->addSortKeyMetadata = this->addSortKeyMetadata;
 }
 
 std::unique_ptr<QuerySolutionNode> SortNodeDefault::clone() const {
-    auto copy = std::make_unique<SortNodeDefault>();
-    cloneSortData(copy.get());
-    return copy;
+    return std::make_unique<SortNodeDefault>(*this);
 }
 
 std::unique_ptr<QuerySolutionNode> SortNodeSimple::clone() const {
-    auto copy = std::make_unique<SortNodeSimple>();
-    cloneSortData(copy.get());
-    return copy;
+    return std::make_unique<SortNodeSimple>(*this);
 }
 
 //
 // LimitNode
 //
 
+LimitNode::LimitNode(const LimitNode& other) {
+    other.cloneBaseData(this);
+    limit = other.limit;
+    canBeParameterized = other.canBeParameterized;
+}
 
 void LimitNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
@@ -1500,17 +1541,18 @@ void LimitNode::appendToString(str::stream* ss, int indent) const {
 }
 
 std::unique_ptr<QuerySolutionNode> LimitNode::clone() const {
-    auto copy = std::make_unique<LimitNode>();
-    cloneBaseData(copy.get());
-
-    copy->limit = this->limit;
-
-    return copy;
+    return std::make_unique<LimitNode>(*this);
 }
 
 //
 // SkipNode
 //
+
+SkipNode::SkipNode(const SkipNode& other) {
+    other.cloneBaseData(this);
+    skip = other.skip;
+    canBeParameterized = other.canBeParameterized;
+}
 
 void SkipNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
@@ -1524,12 +1566,7 @@ void SkipNode::appendToString(str::stream* ss, int indent) const {
 }
 
 std::unique_ptr<QuerySolutionNode> SkipNode::clone() const {
-    auto copy = std::make_unique<SkipNode>();
-    cloneBaseData(copy.get());
-
-    copy->skip = this->skip;
-
-    return copy;
+    return std::make_unique<SkipNode>(*this);
 }
 
 //
@@ -1779,12 +1816,11 @@ void GroupNode::appendToString(str::stream* ss, int indent) const {
             if (idx > 0) {
                 *ss << ", ";
             }
-            *ss << "{" << groupName << ": " << exprObj->serialize(SerializationOptions{}).toString()
-                << "}";
+            *ss << "{" << groupName << ": " << exprObj->serialize().toString() << "}";
             ++idx;
         }
     } else {
-        *ss << "{_id: " << groupByExpression->serialize(SerializationOptions{}).toString() << "}";
+        *ss << "{_id: " << groupByExpression->serialize().toString() << "}";
     }
     *ss << '\n';
     addIndent(ss, indent + 1);
@@ -1836,6 +1872,9 @@ void EqLookupNode::appendToString(str::stream* ss, int indent) const {
         addIndent(ss, indent + 1);
         *ss << "indexKeyPattern = " << idxEntry->keyPattern << "\n";
     }
+    addIndent(ss, indent + 1);
+    *ss << "shouldProduceBson = " << shouldProduceBson << "\n";
+
     addCommon(ss, indent);
     addIndent(ss, indent + 1);
     *ss << "Child:" << '\n';
@@ -1843,16 +1882,71 @@ void EqLookupNode::appendToString(str::stream* ss, int indent) const {
 }
 
 std::unique_ptr<QuerySolutionNode> EqLookupNode::clone() const {
-    auto copy = std::make_unique<EqLookupNode>(children[0]->clone(),
-                                               foreignCollection,
-                                               joinFieldLocal,
-                                               joinFieldForeign,
-                                               joinField,
-                                               lookupStrategy,
-                                               idxEntry,
-                                               shouldProduceBson);
-    return copy;
+    return std::make_unique<EqLookupNode>(children[0]->clone(),
+                                          foreignCollection,
+                                          joinFieldLocal,
+                                          joinFieldForeign,
+                                          joinField,
+                                          lookupStrategy,
+                                          idxEntry,
+                                          shouldProduceBson);
 }
+
+/**
+ * EqLookupUnwindNode.
+ */
+void EqLookupUnwindNode::appendToString(str::stream* ss, int indent) const {
+    addIndent(ss, indent);
+    *ss << "EQ_LOOKUP_UNWIND\n";
+
+    addIndent(ss, indent + 1);
+    *ss << "from = " << toStringForLogging(foreignCollection) << "\n";
+    addIndent(ss, indent + 1);
+    *ss << "as = " << joinField.fullPath() << "\n";
+    addIndent(ss, indent + 1);
+    *ss << "localField = " << joinFieldLocal.fullPath() << "\n";
+    addIndent(ss, indent + 1);
+    *ss << "foreignField = " << joinFieldForeign.fullPath() << "\n";
+    addIndent(ss, indent + 1);
+    *ss << "lookupStrategy = " << EqLookupNode::serializeLookupStrategy(lookupStrategy) << "\n";
+    if (idxEntry) {
+        addIndent(ss, indent + 1);
+        *ss << "indexName = " << idxEntry->identifier.catalogName << "\n";
+        addIndent(ss, indent + 1);
+        *ss << "indexKeyPattern = " << idxEntry->keyPattern << "\n";
+    }
+    addIndent(ss, indent + 1);
+    *ss << "shouldProduceBson = " << shouldProduceBson << "\n";
+
+    addIndent(ss, indent + 1);
+    *ss << "preserveNullAndEmptyArrays = " << unwindNode.preserveNullAndEmptyArrays << "\n";
+    if (unwindNode.indexPath) {
+        addIndent(ss, indent + 1);
+        *ss << "indexPath = " << unwindNode.indexPath->fullPath() << "\n";
+    }
+
+    addCommon(ss, indent);
+    addIndent(ss, indent + 1);
+    *ss << "Child:" << '\n';
+    children[0]->appendToString(ss, indent + 2);
+}
+
+std::unique_ptr<QuerySolutionNode> EqLookupUnwindNode::clone() const {
+    return std::make_unique<EqLookupUnwindNode>(children[0]->clone(),
+                                                // Shared data members.
+                                                joinField,
+                                                // $lookup-specific data members.
+                                                foreignCollection,
+                                                joinFieldLocal,
+                                                joinFieldForeign,
+                                                lookupStrategy,
+                                                idxEntry,
+                                                shouldProduceBson,
+                                                // $unwind-specific data members.
+                                                unwindNode.preserveNullAndEmptyArrays,
+                                                unwindNode.indexPath);
+}
+
 /**
  * SentinelNode.
  */
@@ -1884,6 +1978,29 @@ void SearchNode::appendToString(str::stream* ss, int indent) const {
     }
 }
 
+std::unique_ptr<SearchNode> SearchNode::getSearchNode(DocumentSource* stage) {
+    if (search_helpers::isSearchStage(stage)) {
+        auto searchStage = dynamic_cast<mongo::DocumentSourceSearch*>(stage);
+        auto node = std::make_unique<SearchNode>(false,
+                                                 searchStage->getSearchQuery(),
+                                                 searchStage->getLimit(),
+                                                 searchStage->getSortSpec(),
+                                                 searchStage->getRemoteCursorId(),
+                                                 searchStage->getRemoteCursorVars());
+        return node;
+    } else if (search_helpers::isSearchMetaStage(stage)) {
+        auto searchStage = dynamic_cast<mongo::DocumentSourceSearchMeta*>(stage);
+        return std::make_unique<SearchNode>(true,
+                                            searchStage->getSearchQuery(),
+                                            boost::none /* limit */,
+                                            boost::none /* sortSpec */,
+                                            searchStage->getRemoteCursorId(),
+                                            searchStage->getRemoteCursorVars());
+    } else {
+        tasserted(7855801, str::stream() << "Unknown stage type" << stage->getSourceName());
+    }
+}
+
 /**
  * WindowNode.
  */
@@ -1896,8 +2013,7 @@ void WindowNode::appendToString(str::stream* ss, int indent) const {
     *ss << "WINDOW\n";
     if (partitionBy) {
         addIndent(ss, indent + 1);
-        *ss << "partitionBy = " << (*partitionBy)->serialize(SerializationOptions{}).toString()
-            << '\n';
+        *ss << "partitionBy = " << (*partitionBy)->serialize().toString() << '\n';
     }
     if (sortBy) {
         addIndent(ss, indent + 1);
@@ -1916,7 +2032,7 @@ void WindowNode::appendToString(str::stream* ss, int indent) const {
         outputField.expr->bounds().serialize(boundsDoc, SerializationOptions{});
         auto boundsBson = boundsDoc.freeze().toBson();
         *ss << "{" << outputField.fieldName << ": {" << outputField.expr->getOpName() << ": "
-            << outputField.expr->input()->serialize(SerializationOptions{}).toString()
+            << outputField.expr->input()->serialize().toString()
             << "window: " << boundsBson.toString() << "}}";
     }
     *ss << "]" << '\n';

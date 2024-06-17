@@ -100,7 +100,9 @@ void BM_FIND_ONE_OP_MSG(benchmark::State& state) {
                        << "$clusterTime" << getClusterTime());
 
     auto request = OpMsgRequestBuilder::create(
-        DatabaseName::createDatabaseName_forTest(boost::none, "ycsb"), doc);
+        auth::ValidatedTenancyScope::kNotRequired /* db is not tenanted */,
+        DatabaseName::createDatabaseName_forTest(boost::none, "ycsb"),
+        doc);
 
     for (auto _ : state) {
         // This code gets timed
@@ -166,7 +168,9 @@ void BM_INSERT_ONE_OP_MSG(benchmark::State& state) {
                        << getClusterTime());
 
     auto request = OpMsgRequestBuilder::create(
-        DatabaseName::createDatabaseName_forTest(boost::none, "ycsb"), doc);
+        auth::ValidatedTenancyScope::kNotRequired /* db is not tenanted */,
+        DatabaseName::createDatabaseName_forTest(boost::none, "ycsb"),
+        doc);
     request.sequences.push_back({"documents", {getInsertDoc()}});
 
     for (auto _ : state) {
@@ -219,7 +223,9 @@ void BM_UPDATE_ONE_OP_MSG(benchmark::State& state) {
                        "lsid" << BSON("id" << u) << "$clusterTime" << getClusterTime());
 
     auto request = OpMsgRequestBuilder::create(
-        DatabaseName::createDatabaseName_forTest(boost::none, "ycsb"), doc);
+        auth::ValidatedTenancyScope::kNotRequired /* db is not tenanted */,
+        DatabaseName::createDatabaseName_forTest(boost::none, "ycsb"),
+        doc);
     request.sequences.push_back({"updates", {getUpdateDoc()}});
 
     for (auto _ : state) {
@@ -316,6 +322,50 @@ void BM_ARRAY_BSON(benchmark::State& state) {
 }
 
 BENCHMARK(BM_ARRAY_BSON)->Arg(10)->Arg(1000)->Arg(10000)->Unit(benchmark::kNanosecond);
+
+void BM_CHECK_AND_ASSERT_TYPES(benchmark::State& state) {
+    // Perform setup here.
+    // We construct a WriteCommandRequestBase with just the "bypassDocumentValidation"
+    // field set, which is of type safeBool, to run the generated checkAndAssertTypes()
+    // function.
+    auto request = BSON("bypassDocumentValidation" << 1);
+
+    for (auto _ : state) {
+        // This code gets timed
+        benchmark::DoNotOptimize(
+            write_ops::WriteCommandRequestBase::parse(IDLParserContext("test"), request));
+    }
+}
+
+BENCHMARK(BM_CHECK_AND_ASSERT_TYPES);
+
+void BM_ArrayOfStringEnum10(benchmark::State& state) {
+    namespace t = idl::test;
+    auto nEntries = state.range();
+    auto doc = [&] {
+        std::vector<t::HasStringEnum10> vec;
+        for (int i = 0; i < nEntries; i++) {
+            idl::test::HasStringEnum10 has;
+            has.setE(static_cast<t::StringEnum10Enum>(i % 10));
+            vec.push_back(has);
+        }
+        t::ArrayOfHasStringEnum10 arrStruct;
+        arrStruct.setValue(vec);
+
+        BSONObjBuilder bob;
+        arrStruct.serialize(&bob);
+        return bob.obj();
+    }();
+
+    size_t totalBytes = 0;
+    for (auto _ : state) {
+        benchmark::DoNotOptimize(t::ArrayOfHasStringEnum10::parse(IDLParserContext("test"), doc));
+        totalBytes += doc.objsize();
+    }
+    state.SetBytesProcessed(totalBytes);
+}
+
+BENCHMARK(BM_ArrayOfStringEnum10)->Arg(10)->Arg(100)->Arg(1000);
 
 }  // namespace
 }  // namespace mongo

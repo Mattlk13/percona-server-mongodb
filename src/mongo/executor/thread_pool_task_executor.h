@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -77,7 +78,7 @@ public:
     /**
      * Destroys a ThreadPoolTaskExecutor.
      */
-    ~ThreadPoolTaskExecutor();
+    ~ThreadPoolTaskExecutor() override;
 
     void startup() override;
     void shutdown() override;
@@ -102,7 +103,7 @@ public:
     StatusWith<CallbackHandle> scheduleExhaustRemoteCommandOnAny(
         const RemoteCommandRequestOnAny& request,
         const RemoteCommandOnAnyCallbackFn& cb,
-        const BatonHandle& baton = nullptr);
+        const BatonHandle& baton = nullptr) override;
     void cancel(const CallbackHandle& cbHandle) override;
     void wait(const CallbackHandle& cbHandle,
               Interruptible* interruptible = Interruptible::notInterruptible()) override;
@@ -117,7 +118,7 @@ public:
      * Returns true if there are any tasks in any of _poolInProgressQueue, _networkInProgressQueue,
      * or _sleepersQueue.
      */
-    bool hasTasks();
+    bool hasTasks() override;
 
 private:
     class CallbackState;
@@ -182,7 +183,7 @@ private:
      * _poolInProgressQueue.
      */
     void scheduleIntoPool_inlock(WorkQueue* fromQueue,
-                                 const WorkQueue::iterator& iter,
+                                 boost::optional<WorkQueue::iterator> iter,
                                  stdx::unique_lock<Latch> lk);
 
     /**
@@ -190,8 +191,8 @@ private:
      * and moves them into _poolInProgressQueue.
      */
     void scheduleIntoPool_inlock(WorkQueue* fromQueue,
-                                 const WorkQueue::iterator& begin,
-                                 const WorkQueue::iterator& end,
+                                 boost::optional<WorkQueue::iterator>& begin,
+                                 boost::optional<WorkQueue::iterator>& end,
                                  stdx::unique_lock<Latch> lk);
 
     /**

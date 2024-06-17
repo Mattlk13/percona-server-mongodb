@@ -71,6 +71,12 @@ int32_t getStatementId(const BulkWriteCommandRequest& req, size_t currentOpIdx);
  */
 NamespaceInfoEntry getFLENamespaceInfoEntry(const BSONObj& bulkWrite);
 
+
+/**
+ * Return true when the operation uses unacknowledged writeConcern, i.e. {w: 0, j: false}.
+ */
+bool isUnacknowledgedBulkWrite(OperationContext* opCtx);
+
 /**
  * Helper for FLE support. Build a InsertCommandRequest from a BulkWriteCommandRequest.
  */
@@ -118,9 +124,18 @@ write_ops::DeleteCommandRequest makeDeleteCommandRequestForFLE(
     OperationContext* opCtx,
     const BulkWriteDeleteOp* op,
     const BulkWriteCommandRequest& req,
-    const mongo::NamespaceInfoEntry& nsInfoEntry);
+    const mongo::NamespaceInfoEntry& nsEntry);
 
 BulkWriteCommandRequest makeSingleOpBulkWriteCommandRequest(
     const BulkWriteCommandRequest& bulkWriteReq, size_t opIdx);
+
+/**
+ * Helper for bulkWrite use of incrementUpdateMetrics.
+ */
+void incrementBulkWriteUpdateMetrics(
+    ClusterRole role,
+    const write_ops::UpdateModification& updateMod,
+    const mongo::NamespaceString& ns,
+    const boost::optional<std::vector<mongo::BSONObj>>& arrayFilters);
 }  // namespace bulk_write_common
 }  // namespace mongo

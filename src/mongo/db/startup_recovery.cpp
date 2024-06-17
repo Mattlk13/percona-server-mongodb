@@ -68,7 +68,6 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/feature_compatibility_version_document_gen.h"
@@ -324,7 +323,7 @@ Status ensureCollectionProperties(OperationContext* opCtx,
  */
 template <typename Func>
 void openDatabases(OperationContext* opCtx, const StorageEngine* storageEngine, Func&& onDatabase) {
-    invariant(opCtx->lockState()->isW());
+    invariant(shard_role_details::getLocker(opCtx)->isW());
 
     auto databaseHolder = DatabaseHolder::get(opCtx);
     auto dbNames = storageEngine->listDatabases();
@@ -358,7 +357,7 @@ bool hasReplSetConfigDoc(OperationContext* opCtx) {
  */
 void assertCappedOplog(OperationContext* opCtx) {
     const NamespaceString oplogNss(NamespaceString::kRsOplogNamespace);
-    invariant(opCtx->lockState()->isDbLockedForMode(oplogNss.dbName(), MODE_IS));
+    invariant(shard_role_details::getLocker(opCtx)->isDbLockedForMode(oplogNss.dbName(), MODE_IS));
     const Collection* oplogCollection =
         CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, oplogNss);
     if (oplogCollection && !oplogCollection->isCapped()) {
@@ -401,7 +400,7 @@ void clearTempFilesExceptForResumableBuilds(const std::vector<ResumeIndexInfo>& 
 
 bool useUnreplicatedTruncatesForChangeStreamCollections() {
     bool res = mongo::feature_flags::gFeatureFlagUseUnreplicatedTruncatesForDeletions.isEnabled(
-        serverGlobalParams.featureCompatibility);
+        serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
     return res;
 }
 
@@ -457,8 +456,8 @@ void cleanupChangeCollectionAfterUncleanShutdown(OperationContext* opCtx,
                 "tenantId"_attr = tenantId);
 
             // Exclusively truncate based on the most recent WT snapshot.
-            opCtx->recoveryUnit()->abandonSnapshot();
-            opCtx->recoveryUnit()->allowOneUntimestampedWrite();
+            shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
+            shard_role_details::getRecoveryUnit(opCtx)->allowOneUntimestampedWrite();
 
             WriteUnitOfWork wuow(opCtx);
 
@@ -471,9 +470,11 @@ void cleanupChangeCollectionAfterUncleanShutdown(OperationContext* opCtx,
             wuow.commit();
         });
 }
-void cleanupPreImagesCollectionAfterUncleanShutdown(OperationContext* opCtx,
-                                                    boost::optional<TenantId> tenantId) {
-    auto currentTime = change_stream_pre_image_util::getCurrentTimeForPreImageRemoval(opCtx);
+
+// Returns the timestamp at which pre-images should be truncated for recovery.
+Timestamp getPreImageTruncateTimestampForRecovery(OperationContext* opCtx,
+                                                  boost::optional<TenantId> tenantId) {
+    const auto currentTime = change_stream_pre_image_util::getCurrentTimeForPreImageRemoval(opCtx);
     auto originalExpirationDate =
         change_stream_pre_image_util::getPreImageOpTimeExpirationDate(opCtx, tenantId, currentTime);
     boost::optional<Date_t> operationTimeExpirationDate = boost::none;
@@ -498,11 +499,40 @@ void cleanupPreImagesCollectionAfterUncleanShutdown(OperationContext* opCtx,
                               std::numeric_limits<unsigned>::max())}
         : Timestamp();
 
+    if (tenantId) {
+        // Multi-tenant environment, pre-images only expire by 'operationTime'.
+        invariant(operationTimeExpirationDate);
+        LOGV2_DEBUG(
+            7803701,
+            0,
+            "Computed timestamp to truncate pre-images at for tenant after unclean shutdown",
+            "truncateAtTimestamp"_attr = operationTimeExpirationTSEstimate,
+            "tenantId"_attr = tenantId);
+        return operationTimeExpirationTSEstimate;
+    }
+
+    // Pre-images expired when "_id.ts" < oldest oplog timestamp OR "_id.ts" <= the
+    // estimated timestamp for the 'operationTime' expiration date.
+    const auto oldestOplogTimestamp =
+        repl::StorageInterface::get(opCtx->getServiceContext())->getEarliestOplogTimestamp(opCtx);
+    const auto expirationTimestamp =
+        std::max(oldestOplogTimestamp, operationTimeExpirationTSEstimate);
+    LOGV2_DEBUG(7803703,
+                0,
+                "Computed timestamp to truncate pre-images at after unclean shutdown",
+                "truncateAtTimestamp"_attr = expirationTimestamp,
+                "oldestOplogEntryTimestamp"_attr = oldestOplogTimestamp);
+    return expirationTimestamp;
+}
+
+void cleanupPreImagesCollectionAfterUncleanShutdown(OperationContext* opCtx,
+                                                    boost::optional<TenantId> tenantId) {
     writeConflictRetry(
         opCtx,
         "cleanupPreImagesCollectionAfterUncleanShutdown",
         NamespaceString::makePreImageCollectionNSS(tenantId),
         [&] {
+            shard_role_details::getRecoveryUnit(opCtx)->allowAllUntimestampedWrites();
             const auto preImagesColl =
                 acquireCollection(opCtx,
                                   CollectionAcquisitionRequest(
@@ -520,44 +550,10 @@ void cleanupPreImagesCollectionAfterUncleanShutdown(OperationContext* opCtx,
                 return;
             }
 
-            if (originalExpirationDate) {
-                LOGV2_DEBUG(
-                    7803700,
-                    0,
-                    "Extending truncate range for pre-images expired by 'operationTime'",
-                    "originalExpirationDate"_attr = *originalExpirationDate,
-                    "newExpirationDate"_attr = *operationTimeExpirationDate,
-                    "expiryRangeExtensionSeconds"_attr =
-                        startup_recovery::kChangeStreamPostUncleanShutdownExpiryExtensionSeconds);
-            }
-
-            if (tenantId) {
-                // Multi-tenant environment, pre-images only expire by 'operationTime'.
-                invariant(operationTimeExpirationDate);
-                LOGV2_DEBUG(7803701,
-                            0,
-                            "About to truncate pre-images for tenant after unclean shutdown",
-                            "truncateAtTimestamp"_attr = operationTimeExpirationTSEstimate,
-                            "tenantId"_attr = tenantId);
-                change_stream_pre_image_util::truncatePreImagesByTimestampExpirationApproximation(
-                    opCtx, preImagesColl.getCollectionPtr(), operationTimeExpirationTSEstimate);
-                return;
-            }
-
-            // Pre-images expired when "_id.ts" < oldest oplog timestamp OR "_id.ts" <= the
-            // estimated timestamp for the 'operationTime' expiration date.
-            const auto oldestOplogTimestamp =
-                repl::StorageInterface::get(opCtx->getServiceContext())
-                    ->getEarliestOplogTimestamp(opCtx);
-            const auto expirationTimestamp =
-                std::max(oldestOplogTimestamp, operationTimeExpirationTSEstimate);
-            LOGV2_DEBUG(7803703,
-                        0,
-                        "About to truncate pre-images after unclean shutdown",
-                        "truncateAtTimestamp"_attr = expirationTimestamp,
-                        "oldestOplogEntryTimestamp"_attr = oldestOplogTimestamp);
+            const auto approximateExpirationTimestamp =
+                getPreImageTruncateTimestampForRecovery(opCtx, tenantId);
             change_stream_pre_image_util::truncatePreImagesByTimestampExpirationApproximation(
-                opCtx, preImagesColl.getCollectionPtr(), expirationTimestamp);
+                opCtx, preImagesColl, approximateExpirationTimestamp);
         });
 }
 
@@ -685,7 +681,7 @@ void setReplSetMemberInStandaloneMode(OperationContext* opCtx, StartupRecoveryMo
         return;
     }
 
-    invariant(opCtx->lockState()->isW());
+    invariant(shard_role_details::getLocker(opCtx)->isW());
     const Collection* collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
         opCtx, NamespaceString::kSystemReplSetNamespace);
     if (collection && !collection->isEmpty(opCtx)) {
@@ -871,7 +867,7 @@ void startupRecovery(OperationContext* opCtx,
 // Returns true if the oplog collection exists. Will always return false if the cached pointer to
 // the collection has not yet been initialized.
 bool oplogExists(OperationContext* opCtx) {
-    return static_cast<bool>(LocalOplogInfo::get(opCtx)->getCollection());
+    return static_cast<bool>(LocalOplogInfo::get(opCtx)->getRecordStore());
 }
 }  // namespace
 

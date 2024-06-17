@@ -45,6 +45,13 @@ namespace mongo {
 /**
  * Represents the role this node plays in a sharded cluster, based on its startup arguments. Roles
  * are not mutually exclusive since a node can play different roles at the same time.
+ *
+ * Every node in a sharded cluster will have by default the RouterServer role. As a consequence, the
+ * only possible combinations are:
+ *  - { ShardServer, RouterServer }
+ *  - { ShardServer, ConfigServer, RouterServer }
+ *  - { RouterServer }
+ * For a cluster that is not sharded, the cluster role of each node is { None }.
  */
 class ClusterRole {
 public:
@@ -67,29 +74,61 @@ public:
         ConfigServer = 0x02,
 
         /**
-         * The node acts as a router server (the process was started with --routerPort argument).
+         * By default, all shard and config server nodes act as router servers.
          */
         RouterServer = 0x04
     };
 
-    ClusterRole(Value role = ClusterRole::None);
-    ClusterRole(std::initializer_list<Value> roles);
-    ClusterRole& operator=(const ClusterRole& rhs);
-    ClusterRole& operator+=(Value role);
+    ClusterRole() = default;
+    ClusterRole(Value role) : _roleMask{role} {}
+    ClusterRole(std::initializer_list<Value> roles) {
+        for (auto&& role : roles)
+            _roleMask |= role;
+        _checkRole();
+    }
+
+    ClusterRole& operator=(const ClusterRole& rhs) {
+        if (this != &rhs) {
+            _roleMask = rhs._roleMask;
+            _checkRole();
+        }
+        return *this;
+    }
+
+    ClusterRole& operator+=(Value role) {
+        _roleMask |= role;
+        // TODO (SERVER-78810): Review these invariants as a node acting config and router roles (no
+        // shard role) would be allowed.
+        _checkRole();
+        return *this;
+    }
 
     /**
      * Returns `true` if this node plays the given role, `false` otherwise. Even if the node plays
      * the given role, it is not excluded that it also plays others.
      */
-    bool has(const ClusterRole& role) const;
+    bool has(const ClusterRole& role) const {
+        return role._roleMask == None ? _roleMask == None : _roleMask & role._roleMask;
+    }
 
     /**
      * Returns `true` if this node plays only the given role, `false` otherwise.
      */
-    bool hasExclusively(const ClusterRole& role) const;
+    bool hasExclusively(const ClusterRole& role) const {
+        return _roleMask == role._roleMask;
+    }
+
+    /**
+     * Returns `true` if this node has the shard role and not the config role.
+     */
+    bool isShardOnly() const {
+        return has(ShardServer) && !has(ConfigServer);
+    }
 
 private:
-    uint8_t _roleMask;
+    void _checkRole() const;
+
+    uint8_t _roleMask = 0;
 };
 
 /**
@@ -99,6 +138,8 @@ BSONArray toBSON(ClusterRole role);
 
 std::ostream& operator<<(std::ostream& os, ClusterRole r);
 
+StringBuilder& operator<<(StringBuilder& s, ClusterRole r);
+
 inline std::string toString(ClusterRole r) {
     std::ostringstream os;
     os << r;
@@ -106,9 +147,17 @@ inline std::string toString(ClusterRole r) {
 }
 
 /**
- * Returns the LogService corresponding to `role`. Requires ClusterRole::Shard,
- * ClusterRole::Router, or ClusterRole::None.
+ * Returns the LogService corresponding to `role`.
+ * `role` must be None, ShardService, or RouterService.
  */
-logv2::LogService toLogService(ClusterRole role);
+inline logv2::LogService toLogService(ClusterRole role) {
+    if (role.hasExclusively(ClusterRole::ShardServer))
+        return logv2::LogService::shard;
+    if (role.hasExclusively(ClusterRole::RouterServer))
+        return logv2::LogService::router;
+    if (role.hasExclusively(ClusterRole::None))
+        return logv2::LogService::none;
+    MONGO_UNREACHABLE;
+}
 
 }  // namespace mongo

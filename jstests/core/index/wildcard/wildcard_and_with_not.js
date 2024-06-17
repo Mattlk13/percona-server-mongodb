@@ -14,7 +14,6 @@
  *   references_foreign_collection,
  * ]
  */
-
 import {assertArrayEq} from "jstests/aggregation/extras/utils.js";
 import {getAggPlanStages} from "jstests/libs/analyze_plan.js";
 import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";

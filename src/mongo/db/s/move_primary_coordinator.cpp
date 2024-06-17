@@ -48,24 +48,25 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/client/read_preference.h"
+#include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/list_collections_filter.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/repl/change_stream_oplog_notification.h"
 #include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/forwardable_operation_metadata.h"
 #include "mongo/db/s/sharding_ddl_util.h"
 #include "mongo/db/s/sharding_logging.h"
 #include "mongo/db/s/sharding_recovery_service.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/session/logical_session_id_gen.h"
 #include "mongo/db/shard_id.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/vector_clock_mutable.h"
 #include "mongo/db/write_block_bypass.h"
 #include "mongo/idl/idl_parser.h"
@@ -81,6 +82,7 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/move_primary_gen.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/util/database_name_util.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/fail_point.h"
@@ -90,6 +92,7 @@
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 namespace mongo {
+using namespace fmt::literals;
 
 MONGO_FAIL_POINT_DEFINE(hangBeforeCloningData);
 
@@ -108,6 +111,11 @@ MovePrimaryCoordinator::MovePrimaryCoordinator(ShardingDDLCoordinatorService* se
 
 bool MovePrimaryCoordinator::canAlwaysStartWhenUserWritesAreDisabled() const {
     return true;
+}
+
+logv2::DynamicAttributes MovePrimaryCoordinator::getCoordinatorLogAttrs() const {
+    return logv2::DynamicAttributes{getBasicCoordinatorAttrs(),
+                                    "toShardId"_attr = _doc.getToShardId()};
 }
 
 StringData MovePrimaryCoordinator::serializePhase(const Phase& phase) const {
@@ -223,7 +231,8 @@ ExecutorFuture<void> MovePrimaryCoordinator::runMovePrimaryWorkflow(
 
                 ScopeGuard unblockWritesLegacyOnExit([&] {
                     // TODO (SERVER-71444): Fix to be interruptible or document exception.
-                    UninterruptibleLockGuard noInterrupt(opCtx->lockState());  // NOLINT
+                    UninterruptibleLockGuard noInterrupt(  // NOLINT
+                        shard_role_details::getLocker(opCtx));
                     unblockWritesLegacy(opCtx);
                 });
 
@@ -236,8 +245,9 @@ ExecutorFuture<void> MovePrimaryCoordinator::runMovePrimaryWorkflow(
 
                 cloneData(opCtx);
 
-                // TODO (SERVER-71566): Temporary solution to cover the case of stepping down before
-                // actually entering the `kCatchup` phase.
+                // Hack to cover the case of stepping down before actually entering the `kCatchup`
+                // phase. Once the time required by the `kClone` phase will be reduced, this
+                // synchronization mechanism can be replaced using a critical section.
                 blockWrites(opCtx);
             }))
         .then(_buildPhaseHandler(Phase::kCatchup,
@@ -370,6 +380,18 @@ ExecutorFuture<void> MovePrimaryCoordinator::_cleanupOnAbort(
             const auto& failedPhase = _doc.getPhase();
             const auto& toShardId = _doc.getToShardId();
 
+            unblockReadsAndWrites(opCtx);
+            try {
+                // Even if the error is `ShardNotFound`, the recipient may still be in draining
+                // mode, so try to exit the critical section anyway.
+                exitCriticalSectionOnRecipient(opCtx);
+            } catch (const ExceptionFor<ErrorCodes::ShardNotFound>&) {
+                LOGV2_INFO(7392902,
+                           "Failed to exit critical section on recipient as it has been removed",
+                           logAttrs(_dbName),
+                           "to"_attr = toShardId);
+            }
+
             if (failedPhase <= Phase::kCommit) {
                 // A non-retryable error occurred before the new primary shard was actually
                 // committed, so any cloned data on the recipient must be dropped.
@@ -384,18 +406,6 @@ ExecutorFuture<void> MovePrimaryCoordinator::_cleanupOnAbort(
                                logAttrs(_dbName),
                                "to"_attr = toShardId);
                 }
-            }
-
-            unblockReadsAndWrites(opCtx);
-            try {
-                // Even if the error is `ShardNotFound`, the recipient may still be in draining
-                // mode, so try to exit the critical section anyway.
-                exitCriticalSectionOnRecipient(opCtx);
-            } catch (const ExceptionFor<ErrorCodes::ShardNotFound>&) {
-                LOGV2_INFO(7392902,
-                           "Failed to exit critical section on recipient as it has been removed",
-                           logAttrs(_dbName),
-                           "to"_attr = toShardId);
             }
 
             LOGV2_ERROR(7392903,
@@ -435,8 +445,8 @@ std::vector<NamespaceString> MovePrimaryCoordinator::getCollectionsToClone(
             uassertStatusOK(bsonExtractStringField(collInfo, "name", &collName));
 
             const NamespaceString nss(NamespaceStringUtil::deserialize(_dbName, collName));
-            if (!nss.isSystem() ||
-                nss.isLegalClientSystemNS(serverGlobalParams.featureCompatibility)) {
+
+            if (!nss.isSystem() || nss.isLegalClientSystemNS()) {
                 colls.push_back(nss);
             }
         }
@@ -446,34 +456,28 @@ std::vector<NamespaceString> MovePrimaryCoordinator::getCollectionsToClone(
     }();
 
     const auto collectionsToIgnore = [&] {
-        auto colls = Grid::get(opCtx)->catalogClient()->getShardedCollectionNamespacesForDb(
+        auto catalogClient = Grid::get(opCtx)->catalogClient();
+        auto colls = catalogClient->getShardedCollectionNamespacesForDb(
             opCtx, _dbName, repl::ReadConcernLevel::kMajorityReadConcern, {});
-        auto unshardedCollsOutsideDbPrimary =
-            Grid::get(opCtx)
-                ->catalogClient()
-                ->getUnsplittableCollectionNamespacesForDbOutsideOfShards(
-                    opCtx,
-                    _dbName,
-                    {ShardingState::get(opCtx)->shardId().toString()},
-                    repl::ReadConcernLevel::kMajorityReadConcern);
+        auto unshardedTrackedColls = catalogClient->getUnsplittableCollectionNamespacesForDb(
+            opCtx, _dbName, repl::ReadConcernLevel::kMajorityReadConcern, {});
 
-        std::move(unshardedCollsOutsideDbPrimary.begin(),
-                  unshardedCollsOutsideDbPrimary.end(),
-                  std::back_inserter(colls));
+        std::move(
+            unshardedTrackedColls.begin(), unshardedTrackedColls.end(), std::back_inserter(colls));
 
         std::sort(colls.begin(), colls.end());
 
         return colls;
     }();
 
-    std::vector<NamespaceString> unshardedCollectionsOnDbPrimary;
+    std::vector<NamespaceString> collectionsToClone;
     std::set_difference(allCollections.cbegin(),
                         allCollections.cend(),
                         collectionsToIgnore.cbegin(),
                         collectionsToIgnore.cend(),
-                        std::back_inserter(unshardedCollectionsOnDbPrimary));
+                        std::back_inserter(collectionsToClone));
 
-    return unshardedCollectionsOnDbPrimary;
+    return collectionsToClone;
 }
 
 void MovePrimaryCoordinator::assertNoOrphanedDataOnRecipient(
@@ -517,8 +521,7 @@ void MovePrimaryCoordinator::assertNoOrphanedDataOnRecipient(
     };
 }
 
-std::vector<NamespaceString> MovePrimaryCoordinator::cloneDataToRecipient(
-    OperationContext* opCtx) const {
+std::vector<NamespaceString> MovePrimaryCoordinator::cloneDataToRecipient(OperationContext* opCtx) {
     // Enable write blocking bypass to allow cloning of catalog data even if writes are disallowed.
     WriteBlockBypass::get(opCtx).set(true);
 
@@ -529,28 +532,31 @@ std::vector<NamespaceString> MovePrimaryCoordinator::cloneDataToRecipient(
         uassertStatusOK(shardRegistry->getShard(opCtx, ShardingState::get(opCtx)->shardId()));
     const auto toShard = uassertStatusOK(shardRegistry->getShard(opCtx, toShardId));
 
-    const auto cloneCommand = [&] {
+    auto cloneCommand = [&](boost::optional<OperationSessionInfo> osi) {
         BSONObjBuilder commandBuilder;
         commandBuilder.append(
             "_shardsvrCloneCatalogData",
             DatabaseNameUtil::serialize(_dbName, SerializationContext::stateDefault()));
         commandBuilder.append("from", fromShard->getConnString().toString());
+        if (osi.is_initialized()) {
+            commandBuilder.appendElements(osi->toBSON());
+        }
         return CommandHelpers::appendMajorityWriteConcern(commandBuilder.obj());
-    }();
+    };
 
-    const auto cloneResponse =
-        toShard->runCommand(opCtx,
-                            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                            DatabaseName::kAdmin,
-                            cloneCommand,
-                            Shard::RetryPolicy::kNoRetry);
+    auto clonedCollections = [&](const BSONObj& command) {
+        const auto cloneResponse =
+            toShard->runCommand(opCtx,
+                                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                                DatabaseName::kAdmin,
+                                command,
+                                Shard::RetryPolicy::kNoRetry);
 
-    uassertStatusOKWithContext(
-        Shard::CommandResponse::getEffectiveStatus(cloneResponse),
-        "movePrimary operation on database {} failed to clone data to recipient {}"_format(
-            _dbName.toStringForErrorMsg(), toShardId.toString()));
+        uassertStatusOKWithContext(
+            Shard::CommandResponse::getEffectiveStatus(cloneResponse),
+            "movePrimary operation on database {} failed to clone data to recipient {}"_format(
+                _dbName.toStringForErrorMsg(), toShardId.toString()));
 
-    auto clonedCollections = [&] {
         std::vector<NamespaceString> colls;
         for (const auto& bsonElem : cloneResponse.getValue().response["clonedColls"].Obj()) {
             if (bsonElem.type() == String) {
@@ -561,8 +567,15 @@ std::vector<NamespaceString> MovePrimaryCoordinator::cloneDataToRecipient(
 
         std::sort(colls.begin(), colls.end());
         return colls;
-    }();
-    return clonedCollections;
+    };
+
+    try {
+        return clonedCollections(cloneCommand(getNewSession(opCtx)));
+    } catch (const ExceptionFor<ErrorCodes::NotARetryableWriteCommand>&) {
+        // TODO SERVER-83213: we're dealing with an older binary version, retry without the OSI
+        // protection. Remove once 8.0 is last-lts.
+        return clonedCollections(cloneCommand(boost::none));
+    }
 }
 
 void MovePrimaryCoordinator::assertClonedData(
@@ -643,34 +656,25 @@ void MovePrimaryCoordinator::dropStaleDataOnDonor(OperationContext* opCtx) const
 
     invariant(_doc.getCollectionsToClone());
 
-    auto trackedUnsplittableCollections =
-        Grid::get(opCtx)->catalogClient()->getUnsplittableCollectionNamespacesForDbOutsideOfShards(
-            opCtx,
-            _dbName,
-            {ShardingState::get(opCtx)->shardId().toString()},
-            repl::ReadConcernLevel::kMajorityReadConcern);
-
-    DBDirectClient dbClient(opCtx);
-
     const auto dropColl = [&](const NamespaceString& nssToDrop) {
-        const auto dropStatus = [&] {
-            BSONObj dropResult;
-            dbClient.runCommand(_dbName, BSON("drop" << nssToDrop.coll()), dropResult);
-            return getStatusFromCommandResult(dropResult);
-        }();
-
-        if (!dropStatus.isOK()) {
+        DropReply unusedDropReply;
+        try {
+            uassertStatusOK(
+                dropCollection(opCtx,
+                               nssToDrop,
+                               &unusedDropReply,
+                               DropCollectionSystemCollectionMode::kAllowSystemCollectionDrops,
+                               false /* fromMigrate */));
+        } catch (const DBException& e) {
             LOGV2_WARNING(7120210,
                           "Failed to drop stale collection on donor",
-                          logAttrs(nssToDrop),
-                          "error"_attr = redact(dropStatus));
+                          logv2::DynamicAttributes{getCoordinatorLogAttrs(),
+                                                   logAttrs(nssToDrop),
+                                                   "error"_attr = redact(e)});
         }
     };
 
     for (const auto& nss : *_doc.getCollectionsToClone()) {
-        dropColl(nss);
-    }
-    for (const auto& nss : trackedUnsplittableCollections) {
         dropColl(nss);
     }
 }
@@ -686,12 +690,14 @@ void MovePrimaryCoordinator::dropOrphanedDataOnRecipient(
     // Make a copy of this container since `getNewSession` changes the coordinator document.
     const auto collectionsToClone = *_doc.getCollectionsToClone();
     for (const auto& nss : collectionsToClone) {
-        sharding_ddl_util::sendDropCollectionParticipantCommandToShards(opCtx,
-                                                                        nss,
-                                                                        {_doc.getToShardId()},
-                                                                        **executor,
-                                                                        getNewSession(opCtx),
-                                                                        false /* fromMigrate */);
+        sharding_ddl_util::sendDropCollectionParticipantCommandToShards(
+            opCtx,
+            nss,
+            {_doc.getToShardId()},
+            **executor,
+            getNewSession(opCtx),
+            false /* fromMigrate */,
+            true /* dropSystemCollections */);
     }
 }
 

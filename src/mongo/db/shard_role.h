@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/inlined_vector.h>
 #include <boost/move/utility_core.hpp>
 #include <boost/none.hpp>
 #include <boost/optional/optional.hpp>
@@ -52,7 +54,6 @@
 #include "mongo/db/s/scoped_collection_metadata.h"
 #include "mongo/db/transaction_resources.h"
 #include "mongo/db/views/view.h"
-#include "mongo/stdx/unordered_map.h"
 #include "mongo/util/assert_util_core.h"
 #include "mongo/util/uuid.h"
 
@@ -72,12 +73,14 @@ struct CollectionOrViewAcquisitionRequest {
         PlacementConcern placementConcern,
         repl::ReadConcernArgs readConcern,
         AcquisitionPrerequisites::OperationType operationType,
-        AcquisitionPrerequisites::ViewMode viewMode = AcquisitionPrerequisites::kCanBeView)
+        AcquisitionPrerequisites::ViewMode viewMode = AcquisitionPrerequisites::kCanBeView,
+        Date_t lockAcquisitionDeadline = Date_t::max())
         : nssOrUUID(std::move(nssOrUUID)),
           placementConcern(std::move(placementConcern)),
           readConcern(readConcern),
           operationType(operationType),
-          viewMode(viewMode) {}
+          viewMode(viewMode),
+          lockAcquisitionDeadline(lockAcquisitionDeadline) {}
 
     /**
      * Overload, which acquires a collection by NSS/UUID combination, requiring that, if specified,
@@ -89,13 +92,15 @@ struct CollectionOrViewAcquisitionRequest {
         PlacementConcern placementConcern,
         repl::ReadConcernArgs readConcern,
         AcquisitionPrerequisites::OperationType operationType,
-        AcquisitionPrerequisites::ViewMode viewMode = AcquisitionPrerequisites::kCanBeView)
+        AcquisitionPrerequisites::ViewMode viewMode = AcquisitionPrerequisites::kCanBeView,
+        Date_t lockAcquisitionDeadline = Date_t::max())
         : nssOrUUID(std::move(nss)),
           expectedUUID(std::move(uuid)),
           placementConcern(placementConcern),
           readConcern(readConcern),
           operationType(operationType),
-          viewMode(viewMode) {}
+          viewMode(viewMode),
+          lockAcquisitionDeadline(lockAcquisitionDeadline) {}
 
     /**
      * Overload, which acquires a collection or view by NSS or DB/UUID and infers the placement and
@@ -118,6 +123,7 @@ struct CollectionOrViewAcquisitionRequest {
     repl::ReadConcernArgs readConcern;
     AcquisitionPrerequisites::OperationType operationType;
     AcquisitionPrerequisites::ViewMode viewMode;
+    Date_t lockAcquisitionDeadline;
 };
 
 struct CollectionAcquisitionRequest : public CollectionOrViewAcquisitionRequest {
@@ -128,12 +134,14 @@ struct CollectionAcquisitionRequest : public CollectionOrViewAcquisitionRequest 
     CollectionAcquisitionRequest(NamespaceStringOrUUID nssOrUUID,
                                  PlacementConcern placementConcern,
                                  repl::ReadConcernArgs readConcern,
-                                 AcquisitionPrerequisites::OperationType operationType)
+                                 AcquisitionPrerequisites::OperationType operationType,
+                                 Date_t lockAcquisitionDeadline = Date_t::max())
         : CollectionOrViewAcquisitionRequest(nssOrUUID,
                                              placementConcern,
                                              readConcern,
                                              operationType,
-                                             AcquisitionPrerequisites::kMustBeCollection) {}
+                                             AcquisitionPrerequisites::kMustBeCollection,
+                                             lockAcquisitionDeadline) {}
 
     /**
      * Overload, which acquires a collection by NSS/UUID combination, requiring that, if specified,
@@ -143,13 +151,15 @@ struct CollectionAcquisitionRequest : public CollectionOrViewAcquisitionRequest 
                                  boost::optional<UUID> uuid,
                                  PlacementConcern placementConcern,
                                  repl::ReadConcernArgs readConcern,
-                                 AcquisitionPrerequisites::OperationType operationType)
+                                 AcquisitionPrerequisites::OperationType operationType,
+                                 Date_t lockAcquisitionDeadline = Date_t::max())
         : CollectionOrViewAcquisitionRequest(nss,
                                              uuid,
                                              placementConcern,
                                              readConcern,
                                              operationType,
-                                             AcquisitionPrerequisites::kMustBeCollection) {}
+                                             AcquisitionPrerequisites::kMustBeCollection,
+                                             lockAcquisitionDeadline) {}
 
     /**
      * Infers the placement and read concerns from the OperationShardingState and ReadConcern values
@@ -159,12 +169,14 @@ struct CollectionAcquisitionRequest : public CollectionOrViewAcquisitionRequest 
         OperationContext* opCtx,
         NamespaceString nss,
         AcquisitionPrerequisites::OperationType operationType,
-        boost::optional<UUID> expectedUUID = boost::none);
+        boost::optional<UUID> expectedUUID = boost::none,
+        Date_t lockAcquisitionDeadline = Date_t::max());
 
     static CollectionAcquisitionRequest fromOpCtx(
         OperationContext* opCtx,
         NamespaceStringOrUUID nssOrUUID,
-        AcquisitionPrerequisites::OperationType operationType);
+        AcquisitionPrerequisites::OperationType operationType,
+        Date_t lockAcquisitionDeadline = Date_t::max());
 };
 
 class CollectionOrViewAcquisition;
@@ -275,16 +287,16 @@ public:
     }
 
     bool isCollection() const {
-        return std::holds_alternative<CollectionAcquisition>(_collectionOrViewAcquisition);
+        return holds_alternative<CollectionAcquisition>(_collectionOrViewAcquisition);
     }
 
     bool isView() const {
-        return std::holds_alternative<ViewAcquisition>(_collectionOrViewAcquisition);
+        return holds_alternative<ViewAcquisition>(_collectionOrViewAcquisition);
     }
 
     const CollectionAcquisition& getCollection() const {
         invariant(isCollection());
-        return std::get<CollectionAcquisition>(_collectionOrViewAcquisition);
+        return get<CollectionAcquisition>(_collectionOrViewAcquisition);
     }
 
     const CollectionPtr& getCollectionPtr() const {
@@ -297,7 +309,7 @@ public:
 
     const ViewAcquisition& getView() const {
         invariant(isView());
-        return std::get<ViewAcquisition>(_collectionOrViewAcquisition);
+        return get<ViewAcquisition>(_collectionOrViewAcquisition);
     }
 
     query_shape::CollectionType getCollectionType() const {
@@ -324,10 +336,28 @@ private:
         _collectionOrViewAcquisition;
 };
 
-using CollectionAcquisitions = stdx::unordered_map<NamespaceString, CollectionAcquisition>;
+// Most acquisitions are on a single collection and are only of size 1.
+static constexpr auto kDefaultAcquisitionContainerSize = 1;
 
+using NamespaceStringOrUUIDRequests =
+    absl::InlinedVector<NamespaceStringOrUUID, kDefaultAcquisitionContainerSize>;
+using CollectionOrViewAcquisitionRequests =
+    absl::InlinedVector<CollectionOrViewAcquisitionRequest, kDefaultAcquisitionContainerSize>;
+using CollectionAcquisitionRequests =
+    absl::InlinedVector<CollectionAcquisitionRequest, kDefaultAcquisitionContainerSize>;
+using CollectionAcquisitions =
+    absl::InlinedVector<CollectionAcquisition, kDefaultAcquisitionContainerSize>;
 using CollectionOrViewAcquisitions =
-    stdx::unordered_map<NamespaceString, CollectionOrViewAcquisition>;
+    absl::InlinedVector<CollectionOrViewAcquisition, kDefaultAcquisitionContainerSize>;
+using CollectionAcquisitionMap = absl::flat_hash_map<NamespaceString, CollectionAcquisition>;
+using CollectionOrViewAcquisitionMap =
+    absl::flat_hash_map<NamespaceString, CollectionOrViewAcquisition>;
+
+/**
+ * Helpers functions that convert a vector of acquisitions into a map.
+ */
+CollectionAcquisitionMap makeAcquisitionMap(CollectionAcquisitions acquisitions);
+CollectionOrViewAcquisitionMap makeAcquisitionMap(CollectionOrViewAcquisitions acquisitions);
 
 /**
  * Takes into account the specified namespace acquisition requests and if they can be satisfied,
@@ -340,18 +370,18 @@ CollectionAcquisition acquireCollection(OperationContext* opCtx,
                                         CollectionAcquisitionRequest acquisitionRequest,
                                         LockMode mode);
 
-CollectionAcquisitions acquireCollections(
-    OperationContext* opCtx,
-    std::vector<CollectionAcquisitionRequest> acquisitionRequests,
-    LockMode mode);
+CollectionAcquisitions acquireCollections(OperationContext* opCtx,
+                                          CollectionAcquisitionRequests acquisitionRequests,
+                                          LockMode mode);
 
 CollectionOrViewAcquisition acquireCollectionOrView(
     OperationContext* opCtx, CollectionOrViewAcquisitionRequest acquisitionRequest, LockMode mode);
 
 CollectionOrViewAcquisitions acquireCollectionsOrViews(
     OperationContext* opCtx,
-    std::vector<CollectionOrViewAcquisitionRequest> acquisitionRequests,
+    CollectionOrViewAcquisitionRequests acquisitionRequests,
     LockMode mode);
+
 
 /**
  * Same semantics as `acquireCollectionsOrViews` above, but will not acquire or hold any of the
@@ -365,13 +395,13 @@ CollectionAcquisition acquireCollectionMaybeLockFree(
     OperationContext* opCtx, CollectionAcquisitionRequest acquisitionRequest);
 
 CollectionAcquisitions acquireCollectionsMaybeLockFree(
-    OperationContext* opCtx, std::vector<CollectionAcquisitionRequest> acquisitionRequests);
+    OperationContext* opCtx, CollectionAcquisitionRequests acquisitionRequests);
 
 CollectionOrViewAcquisition acquireCollectionOrViewMaybeLockFree(
     OperationContext* opCtx, CollectionOrViewAcquisitionRequest acquisitionRequest);
 
 CollectionOrViewAcquisitions acquireCollectionsOrViewsMaybeLockFree(
-    OperationContext* opCtx, std::vector<CollectionOrViewAcquisitionRequest> acquisitionRequests);
+    OperationContext* opCtx, CollectionOrViewAcquisitionRequests acquisitionRequests);
 
 /**
  * Please read the comments on AcquisitionPrerequisites::kLocalCatalogOnlyWithPotentialDataLoss for
@@ -564,7 +594,7 @@ namespace shard_role_details {
 class SnapshotAttempt {
 public:
     SnapshotAttempt(OperationContext* opCtx,
-                    const std::vector<NamespaceStringOrUUID>& acquisitionRequests)
+                    const NamespaceStringOrUUIDRequests& acquisitionRequests)
         : _opCtx{opCtx}, _acquisitionRequests(acquisitionRequests) {}
 
     ~SnapshotAttempt();
@@ -579,12 +609,32 @@ public:
 
 private:
     OperationContext* _opCtx;
-    const std::vector<NamespaceStringOrUUID>& _acquisitionRequests;
+    const NamespaceStringOrUUIDRequests& _acquisitionRequests;
     bool _openedSnapshot = false;
     bool _successful = false;
     boost::optional<long long> _replTermBeforeSnapshot;
     boost::optional<std::shared_ptr<const CollectionCatalog>> _catalogBeforeSnapshot;
     boost::optional<bool> _shouldReadAtLastApplied;
 };
+
+/*
+ * Checks that, when in multi-document transaction, local catalog stashed by the transaction and the
+ * CollectionPtr it obtained are valid to be used for a request that attached
+ */
+void checkLocalCatalogIsValidForUnshardedShardVersion(OperationContext* opCtx,
+                                                      const CollectionCatalog& stashedCatalog,
+                                                      const CollectionPtr& collectionPtr,
+                                                      const NamespaceString& nss);
+
+/*
+ * Check that the collection uuid on the sharding catalog and the local catalog match.
+ */
+void checkShardingAndLocalCatalogCollectionUUIDMatch(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const ShardVersion& requestedShardVersion,
+    const ScopedCollectionDescription& shardingCollectionDescription,
+    const CollectionPtr& collectionPtr);
+
 }  // namespace shard_role_details
 }  // namespace mongo

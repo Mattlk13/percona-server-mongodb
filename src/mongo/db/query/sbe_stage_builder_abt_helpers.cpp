@@ -82,7 +82,7 @@ std::unique_ptr<sbe::EExpression> makeBalancedBooleanOpTree(
 SbExpr makeBalancedBooleanOpTree(sbe::EPrimBinary::Op logicOp,
                                  std::vector<SbExpr> leaves,
                                  StageBuilderState& state) {
-    if (std::all_of(leaves.begin(), leaves.end(), [](auto&& e) { return e.hasABT(); })) {
+    if (std::all_of(leaves.begin(), leaves.end(), [](auto&& e) { return e.canExtractABT(); })) {
         std::vector<optimizer::ABT> abtExprs;
         abtExprs.reserve(leaves.size());
         for (auto&& e : leaves) {
@@ -97,9 +97,14 @@ SbExpr makeBalancedBooleanOpTree(sbe::EPrimBinary::Op logicOp,
     std::vector<std::unique_ptr<sbe::EExpression>> exprs;
     exprs.reserve(leaves.size());
     for (auto&& e : leaves) {
-        exprs.emplace_back(e.extractExpr(state).expr);
+        exprs.emplace_back(e.extractExpr(state));
     }
     return SbExpr{makeBalancedBooleanOpTree(logicOp, std::move(exprs))};
+}
+
+optimizer::ABT makeFillEmpty(optimizer::ABT expr, optimizer::ABT altExpr) {
+    return optimizer::make<optimizer::BinaryOp>(
+        optimizer::Operations::FillEmpty, std::move(expr), std::move(altExpr));
 }
 
 optimizer::ABT makeFillEmptyFalse(optimizer::ABT e) {
@@ -142,12 +147,23 @@ optimizer::ABT generateABTNullOrMissing(optimizer::ABT var) {
     return makeFillEmptyTrue(
         makeABTFunction("typeMatch"_sd,
                         std::move(var),
-                        optimizer::Constant::int32(getBSONTypeMask(BSONType::jstNULL) |
-                                                   getBSONTypeMask(BSONType::Undefined))));
+                        optimizer::Constant::int32(getBSONTypeMask(BSONType::jstNULL))));
 }
 
 optimizer::ABT generateABTNullOrMissing(optimizer::ProjectionName var) {
     return generateABTNullOrMissing(makeVariable(std::move(var)));
+}
+
+optimizer::ABT generateABTNullMissingOrUndefined(optimizer::ABT var) {
+    return makeFillEmptyTrue(
+        makeABTFunction("typeMatch"_sd,
+                        std::move(var),
+                        optimizer::Constant::int32(getBSONTypeMask(BSONType::jstNULL) |
+                                                   getBSONTypeMask(BSONType::Undefined))));
+}
+
+optimizer::ABT generateABTNullMissingOrUndefined(optimizer::ProjectionName var) {
+    return generateABTNullMissingOrUndefined(makeVariable(std::move(var)));
 }
 
 optimizer::ABT generateABTNonStringCheck(optimizer::ABT var) {
@@ -207,7 +223,7 @@ optimizer::ABT generateABTNonObjectCheck(optimizer::ProjectionName var) {
 optimizer::ABT generateABTNullishOrNotRepresentableInt32Check(optimizer::ProjectionName var) {
     return optimizer::make<optimizer::BinaryOp>(
         optimizer::Operations::Or,
-        generateABTNullOrMissing(var),
+        generateABTNullMissingOrUndefined(var),
         makeNot(makeABTFunction("exists"_sd,
                                 makeABTFunction("convert"_sd,
                                                 makeVariable(var),
@@ -273,7 +289,7 @@ optimizer::ABT makeIfNullExpr(std::vector<optimizer::ABT> values,
             var,
             std::move(values[idx]),
             optimizer::make<optimizer::If>(
-                generateABTNullOrMissing(var), std::move(expr), makeVariable(var)));
+                generateABTNullMissingOrUndefined(var), std::move(expr), makeVariable(var)));
     }
 
     return expr;

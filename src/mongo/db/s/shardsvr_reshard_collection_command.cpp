@@ -43,12 +43,14 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/s/reshard_collection_coordinator.h"
 #include "mongo/db/s/reshard_collection_coordinator_document_gen.h"
+#include "mongo/db/s/sharding_cluster_parameters_gen.h"
 #include "mongo/db/s/sharding_ddl_coordinator_gen.h"
 #include "mongo/db/s/sharding_ddl_coordinator_service.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/rpc/op_msg.h"
+#include "mongo/s/cluster_ddl.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/future.h"
 
@@ -86,13 +88,42 @@ public:
 
         void typedRun(OperationContext* opCtx) {
             opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
-            uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
+            ShardingState::get(opCtx)->assertCanAcceptShardedCommands();
             uassert(ErrorCodes::IllegalOperation,
                     "Can't reshard a collection in the config database",
                     !ns().isConfigDB());
 
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
+
+            if (request().getProvenance() == ProvenanceEnum::kMoveCollection) {
+                bool clusterHasTwoOrMoreShards = [&]() {
+                    auto* clusterParameters = ServerParameterSet::getClusterParameterSet();
+                    auto* clusterCardinalityParam =
+                        clusterParameters
+                            ->get<ClusterParameterWithStorage<ShardedClusterCardinalityParam>>(
+                                "shardedClusterCardinalityForDirectConns");
+                    return clusterCardinalityParam->getValue(boost::none).getHasTwoOrMoreShards();
+                }();
+
+                uassert(ErrorCodes::IllegalOperation,
+                        "Cannot move a collection until a second shard has been successfully added",
+                        clusterHasTwoOrMoreShards);
+
+                // TODO (SERVER-88623): re-evalutate the need to track the collection before calling
+                // into moveCollection
+                ShardsvrCreateCollectionRequest trackCollectionRequest;
+                trackCollectionRequest.setUnsplittable(true);
+                trackCollectionRequest.setRegisterExistingCollectionInGlobalCatalog(true);
+                ShardsvrCreateCollection shardsvrCollCommand(ns());
+                shardsvrCollCommand.setShardsvrCreateCollectionRequest(trackCollectionRequest);
+                try {
+                    cluster::createCollectionWithRouterLoop(opCtx, shardsvrCollCommand);
+                } catch (const ExceptionFor<ErrorCodes::NamespaceExists>&) {
+                    // The registration may throw NamespaceExists when the namespace is a view.
+                    // Proceed and let resharding return the proper error in that case.
+                }
+            }
 
             const auto reshardCollectionCoordinatorCompletionFuture =
                 [&]() -> SharedSemiFuture<void> {

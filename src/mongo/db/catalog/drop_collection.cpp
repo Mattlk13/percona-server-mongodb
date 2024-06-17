@@ -60,7 +60,6 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/operation_context.h"
@@ -71,6 +70,7 @@
 #include "mongo/db/stats/top.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/views/view.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
@@ -238,7 +238,7 @@ Status _abortIndexBuildsAndDrop(OperationContext* opCtx,
 
     // Abandon the snapshot as the index catalog will compare the in-memory state to the disk state,
     // which may have changed when we released the collection lock temporarily.
-    opCtx->recoveryUnit()->abandonSnapshot();
+    shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
 
     CollectionPtr coll(
         CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, startingNss));
@@ -298,7 +298,7 @@ Status _abortIndexBuildsAndDrop(OperationContext* opCtx,
 
         // Abandon the snapshot as the index catalog will compare the in-memory state to the
         // disk state, which may have changed when we released the collection lock temporarily.
-        opCtx->recoveryUnit()->abandonSnapshot();
+        shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
 
         coll = CollectionPtr(
             CollectionCatalog::get(opCtx)->lookupCollectionByUUID(opCtx, collectionUUID));
@@ -646,7 +646,7 @@ Status dropCollectionForApplyOps(OperationContext* opCtx,
 
 void checkForIdIndexesAndDropPendingCollections(OperationContext* opCtx,
                                                 const DatabaseName& dbName) {
-    invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_IX));
+    invariant(shard_role_details::getLocker(opCtx)->isDbLockedForMode(dbName, MODE_IX));
 
     if (dbName == DatabaseName::kLocal) {
         // Collections in the local database are not replicated, so we do not need an _id index on
@@ -693,7 +693,7 @@ void checkForIdIndexesAndDropPendingCollections(OperationContext* opCtx,
 }
 
 void clearTempCollections(OperationContext* opCtx, const DatabaseName& dbName) {
-    invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_IX));
+    invariant(shard_role_details::getLocker(opCtx)->isDbLockedForMode(dbName, MODE_IX));
 
     auto db = DatabaseHolder::get(opCtx)->getDb(opCtx, dbName);
     invariant(db);
@@ -713,7 +713,7 @@ void clearTempCollections(OperationContext* opCtx, const DatabaseName& dbName) {
             LOGV2_WARNING(20328,
                           "could not drop temp collection due to WriteConflictException",
                           logAttrs(collection->ns()));
-            opCtx->recoveryUnit()->abandonSnapshot();
+            shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
         }
         return true;
     };
@@ -738,6 +738,7 @@ Status isDroppableCollection(OperationContext* opCtx, const NamespaceString& nss
             nss.isSystemDotJavascript() || nss.isSystemStatsCollection();
     };
 
+    using namespace fmt::literals;
     if (nss.isSystemDotProfile()) {
         if (CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(nss.dbName()) != 0)
             return Status(ErrorCodes::IllegalOperation,

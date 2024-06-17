@@ -98,7 +98,11 @@ public:
             CommandServiceTestFixtures::runWithServer(
                 serverStreamHandler,
                 [&](Server& server, unittest::ThreadAssertionMonitor& monitor) {
-                    callback(server, CommandServiceTestFixtures::makeStub(), factory, monitor);
+                    callback(
+                        server,
+                        CommandServiceTestFixtures::makeStub(server.getListeningAddresses().at(0)),
+                        factory,
+                        monitor);
                 });
         }
     }
@@ -228,29 +232,21 @@ private:
 };
 
 TEST_F(CommandServiceTest, Echo) {
-    CommandService::RPCHandler echoHandler = [](auto session) {
-        while (true) {
-            try {
-                auto msg = uassertStatusOK(session->sourceMessage());
-                ASSERT_OK(session->sinkMessage(std::move(msg)));
-            } catch (ExceptionFor<ErrorCodes::StreamTerminated>&) {
-                // Continues to serve the echo commands until the stream is terminated.
-                return;
-            }
-        }
-    };
+    runTestWithBothMethods(CommandServiceTestFixtures::makeEchoHandler(),
+                           [&](auto&, auto stub, auto streamFactory, auto&) {
+                               ::grpc::ClientContext ctx;
+                               CommandServiceTestFixtures::addAllClientMetadata(ctx);
 
-    runTestWithBothMethods(echoHandler, [&](auto&, auto stub, auto streamFactory, auto&) {
-        ::grpc::ClientContext ctx;
-        CommandServiceTestFixtures::addAllClientMetadata(ctx);
-
-        auto stream = streamFactory(ctx, stub);
-        auto toWrite = makeUniqueMessage();
-        ASSERT_TRUE(stream->Write(toWrite.sharedBuffer()));
-        SharedBuffer toRead;
-        ASSERT_TRUE(stream->Read(&toRead)) << stream->Finish().error_message();
-        ASSERT_EQ_MSG(Message{toRead}, toWrite);
-    });
+                               auto stream = streamFactory(ctx, stub);
+                               auto toWrite = makeUniqueMessage();
+                               ASSERT_TRUE(stream->Write(toWrite.sharedBuffer()));
+                               SharedBuffer toRead;
+                               ASSERT_TRUE(stream->Read(&toRead))
+                                   << stream->Finish().error_message();
+                               ASSERT_EQ_MSG(Message{toRead}, toWrite);
+                               ASSERT_TRUE(stream->WritesDone());
+                               ASSERT_EQ(stream->Finish().error_code(), ::grpc::OK);
+                           });
 }
 
 TEST_F(CommandServiceTest, CancelSession) {
@@ -263,20 +259,59 @@ TEST_F(CommandServiceTest, CancelSession) {
 
 TEST_F(CommandServiceTest, TerminateSessionWithShutdownError) {
     Status shutdownError(ErrorCodes::ShutdownInProgress, "shutdown error");
-    runTerminationTest([&](auto& session) { session.terminate(shutdownError); },
+    runTerminationTest([&](auto& session) { session.setTerminationStatus(shutdownError); },
                        util::errorToStatusCode(shutdownError.code()),
                        shutdownError.reason());
 }
 
 TEST_F(CommandServiceTest, TerminateSessionWithCancellationError) {
     Status cancellationError(ErrorCodes::CallbackCanceled, "cancelled");
-    runTerminationTest([&](auto& session) { session.terminate(cancellationError); },
+    runTerminationTest([&](auto& session) { session.setTerminationStatus(cancellationError); },
                        util::errorToStatusCode(cancellationError.code()),
                        cancellationError.reason());
 }
 
 TEST_F(CommandServiceTest, EndSession) {
-    runTerminationTest([](auto& session) { session.end(); }, ::grpc::OK);
+    runTerminationTest([](auto& session) { session.end(); }, ::grpc::CANCELLED);
+}
+
+TEST_F(CommandServiceTest, TerminateSession) {
+    runTerminationTest([](auto& session) { session.setTerminationStatus(Status::OK()); },
+                       ::grpc::OK);
+}
+
+TEST_F(CommandServiceTest, ClientCancellation) {
+    std::unique_ptr<Notification<void>> serverCbDone;
+
+    auto serverCb = [&serverCbDone](auto session) {
+        ON_BLOCK_EXIT([&] { serverCbDone->set(); });
+        ASSERT_OK(session->sourceMessage());
+        ASSERT_OK(session->sinkMessage(makeUniqueMessage()));
+
+        auto swMsg = session->sourceMessage();
+        ASSERT_EQ(swMsg.getStatus().code(), ErrorCodes::CallbackCanceled);
+        ASSERT_TRUE(session->terminationStatus().has_value());
+        ASSERT_EQ(session->terminationStatus()->code(), ErrorCodes::CallbackCanceled);
+    };
+
+    runTestWithBothMethods(serverCb, [&](auto&, auto stub, auto streamFactory, auto&) {
+        serverCbDone = std::make_unique<Notification<void>>();
+
+        ::grpc::ClientContext ctx;
+        CommandServiceTestFixtures::addAllClientMetadata(ctx);
+
+        auto stream = streamFactory(ctx, stub);
+        auto toWrite = makeUniqueMessage();
+        ASSERT_TRUE(stream->Write(toWrite.sharedBuffer()));
+        SharedBuffer toRead;
+        ASSERT_TRUE(stream->Read(&toRead)) << stream->Finish().error_message();
+
+        ctx.TryCancel();
+        ASSERT_EQ(stream->Finish().error_code(), ::grpc::CANCELLED);
+
+        // Wait for server to receive cancellation before exiting.
+        serverCbDone->get();
+    });
 }
 
 TEST_F(CommandServiceTest, TooLowWireVersionIsRejected) {
@@ -391,15 +426,13 @@ TEST_F(CommandServiceTest, NoLogsForMissingMetadataDocument) {
 TEST_F(CommandServiceTest, ClientSendsMultipleMessages) {
     CommandService::RPCHandler serverHandler = [](auto session) {
         int nReceived = 0;
-        try {
-            while (true) {
-                uassertStatusOK(session->sourceMessage());
-                nReceived++;
+        while (true) {
+            auto msg = uassertStatusOK(session->sourceMessage());
+            nReceived++;
+            if (!OpMsg::isFlagSet(msg, OpMsg::kMoreToCome)) {
+                break;
             }
-        } catch (ExceptionFor<ErrorCodes::StreamTerminated>&) {
-            // Continue to receive client messages until the stream is terminated.
         }
-
         OpMsg response;
         response.body = BSON("nReceived" << nReceived);
         ASSERT_OK(session->sinkMessage(response.serialize()));
@@ -413,9 +446,11 @@ TEST_F(CommandServiceTest, ClientSendsMultipleMessages) {
         const int kMessages = 13;
         for (auto i = 0; i < kMessages; i++) {
             auto msg = makeUniqueMessage();
+            if (i < kMessages - 1) {
+                OpMsg::setFlag(&msg, OpMsg::kMoreToCome);
+            }
             ASSERT_TRUE(stream->Write(msg.sharedBuffer()));
         }
-        ASSERT_TRUE(stream->WritesDone());
 
         SharedBuffer serverResponse;
         ASSERT_TRUE(stream->Read(&serverResponse));
@@ -423,6 +458,8 @@ TEST_F(CommandServiceTest, ClientSendsMultipleMessages) {
         auto responseMsg = OpMsg::parse(Message{serverResponse});
         int32_t nReceived = responseMsg.body.getIntField("nReceived");
         ASSERT_EQ(nReceived, kMessages);
+
+        ASSERT_EQ(stream->Finish().error_code(), ::grpc::OK);
     };
 
     runTestWithBothMethods(serverHandler, clientCallback);
@@ -463,47 +500,59 @@ TEST_F(CommandServiceTest, ServerSendsMultipleMessages) {
         OpMsg response;
         response.body = BSON("nReceived" << nReceived);
         ASSERT_TRUE(stream->Write(response.serialize().sharedBuffer()));
+        ASSERT_EQ(stream->Finish().error_code(), ::grpc::OK);
     };
 
     runTestWithBothMethods(serverHandler, clientCallback);
 }
 
 TEST_F(CommandServiceTest, AuthTokenHandling) {
-    auto makeStream = [&](bool useAuth, boost::optional<std::string> authToken) {
-        ::grpc::ClientContext ctx;
-        auto stub = CommandServiceTestFixtures::makeStub();
-        ctx.AddMetadata(util::constants::kWireVersionKey.toString(),
-                        std::to_string(wireVersionProvider().getClusterMaxWireVersion()));
-        if (authToken) {
-            ctx.AddMetadata(util::constants::kAuthenticationTokenKey.toString(), *authToken);
-        }
-        auto stream = useAuth ? stub.authenticatedCommandStream(&ctx)
-                              : stub.unauthenticatedCommandStream(&ctx);
-        return stream->Finish();
-    };
+    auto makeStream =
+        [&](const HostAndPort& addr, bool useAuth, boost::optional<std::string> authToken) {
+            ::grpc::ClientContext ctx;
+            auto stub = CommandServiceTestFixtures::makeStub(addr);
+            ctx.AddMetadata(util::constants::kWireVersionKey.toString(),
+                            std::to_string(wireVersionProvider().getClusterMaxWireVersion()));
+            if (authToken) {
+                ctx.AddMetadata(util::constants::kAuthenticationTokenKey.toString(), *authToken);
+            }
+            auto stream = useAuth ? stub.authenticatedCommandStream(&ctx)
+                                  : stub.unauthenticatedCommandStream(&ctx);
+            return stream->Finish();
+        };
 
     CommandServiceTestFixtures::runWithServer(
         [](auto session) { ASSERT_FALSE(session->authToken()); },
-        [&](auto&, auto&) {
-            ASSERT_TRUE(makeStream(false /* Don't use Auth */, boost::none).ok());
+        [&](auto& server, auto&) {
+            ASSERT_TRUE(makeStream(server.getListeningAddresses().at(0),
+                                   false /* Don't use Auth */,
+                                   boost::none)
+                            .ok());
         });
     CommandServiceTestFixtures::runWithServer(
         [](auto) { FAIL("RPC should fail before invoking handler"); },
-        [&](auto&, auto&) {
-            ASSERT_EQ(makeStream(true /* Use Auth */, boost::none).error_code(),
-                      ::grpc::StatusCode::UNAUTHENTICATED);
+        [&](auto& server, auto&) {
+            ASSERT_EQ(
+                makeStream(server.getListeningAddresses().at(0), true /* Use Auth */, boost::none)
+                    .error_code(),
+                ::grpc::StatusCode::UNAUTHENTICATED);
         });
     const std::string kAuthToken = "my-auth-token";
     CommandServiceTestFixtures::runWithServer(
         [&](auto session) { ASSERT_EQ(session->authToken(), kAuthToken); },
-        [&](auto&, auto&) {
-            ASSERT_EQ(makeStream(true /* Use Auth */, kAuthToken).error_code(),
-                      ::grpc::StatusCode::OK);
+        [&](auto& server, auto&) {
+            ASSERT_EQ(
+                makeStream(server.getListeningAddresses().at(0), true /* Use Auth */, kAuthToken)
+                    .error_code(),
+                ::grpc::StatusCode::OK);
         });
     CommandServiceTestFixtures::runWithServer(
         [](auto session) { ASSERT_FALSE(session->authToken()); },
-        [&](auto&, auto&) {
-            ASSERT_EQ(makeStream(false /* Don't use Auth */, kAuthToken).error_code(),
+        [&](auto& server, auto&) {
+            ASSERT_EQ(makeStream(server.getListeningAddresses().at(0),
+                                 false /* Don't use Auth */,
+                                 kAuthToken)
+                          .error_code(),
                       ::grpc::StatusCode::OK);
         });
 }
@@ -525,6 +574,9 @@ TEST_F(CommandServiceTest, ServerProvidesClusterMaxWireVersion) {
         auto it = serverMetadata.find(util::constants::kClusterMaxWireVersionKey);
         ASSERT_NE(it, serverMetadata.end());
         ASSERT_EQ(it->second, std::to_string(wireVersionProvider().getClusterMaxWireVersion()));
+
+        ASSERT_TRUE(stream->WritesDone());
+        ASSERT_EQ(stream->Finish().error_code(), ::grpc::OK);
     };
 
     runTestWithBothMethods(CommandServiceTestFixtures::makeEchoHandler(), clientCallback);
@@ -536,8 +588,8 @@ TEST_F(CommandServiceTest, ServerHandlesMultipleClients) {
             try {
                 auto msg = uassertStatusOK(session->sourceMessage());
                 auto response = OpMsg::parseOwned(msg);
-                response.body = response.body.addFields(
-                    BSON(util::constants::kClientIdKey << session->clientId()->toString()));
+                response.body = response.body.addFields(BSON(
+                    util::constants::kClientIdKey << session->getRemoteClientId()->toString()));
                 ASSERT_OK(session->sinkMessage(response.serialize()));
             } catch (ExceptionFor<ErrorCodes::StreamTerminated>&) {
                 // Continues to serve the echo commands until the stream is terminated.
@@ -570,6 +622,9 @@ TEST_F(CommandServiceTest, ServerHandlesMultipleClients) {
                 auto response = OpMsg::parse(Message{receivedMsg});
                 ASSERT_EQ(response.body.getIntField("thread"), i);
                 ASSERT_EQ(response.body.getStringField(util::constants::kClientIdKey), clientId);
+
+                ASSERT_TRUE(stream->WritesDone());
+                ASSERT_EQ(stream->Finish().error_code(), ::grpc::OK);
             }));
         }
 
@@ -595,7 +650,7 @@ TEST_F(CommandServiceTest, ServerHandlerThrows) {
         }
     });
 
-    auto stub = CommandServiceTestFixtures::makeStub();
+    auto stub = CommandServiceTestFixtures::makeStub(server->getListeningAddresses().at(0));
     ::grpc::ClientContext ctx;
     CommandServiceTestFixtures::addRequiredClientMetadata(ctx);
     ASSERT_NE(stub.connect().error_code(), ::grpc::StatusCode::OK);
@@ -670,27 +725,52 @@ TEST(GRPCInteropTest, SerializationRoundTrip) {
 
 TEST(GRPCInteropTest, URIParsing) {
     {
-        HostAndPort hp = GRPCServerContext::parseURI("ipv4:127.0.0.1");
+        HostAndPort hp = grpc::util::parseGRPCFormattedURI("127.0.0.1");
         ASSERT_TRUE(hp.isLocalHost());
     }
     {
-        HostAndPort hp = GRPCServerContext::parseURI("ipv4:192.168.0.1:123");
+        HostAndPort hp = grpc::util::parseGRPCFormattedURI("ipv4:127.0.0.1");
+        ASSERT_TRUE(hp.isLocalHost());
+    }
+    {
+        HostAndPort hp = grpc::util::parseGRPCFormattedURI("ipv4:192.168.0.1:123");
         ASSERT_EQ(hp.host(), "192.168.0.1");
         ASSERT_EQ(hp.port(), 123);
     }
     {
-        HostAndPort hp = GRPCServerContext::parseURI("ipv6:[::1]");
+        HostAndPort hp = grpc::util::parseGRPCFormattedURI("[::1]");
+        ASSERT_TRUE(hp.isLocalHost());
+    }
+    {
+        HostAndPort hp = grpc::util::parseGRPCFormattedURI("ipv6:[::1]");
+        ASSERT_TRUE(hp.isLocalHost());
+    }
+    {
+        HostAndPort hp = grpc::util::parseGRPCFormattedURI("ipv6:%5B%3A%3A1%5D");
         ASSERT_TRUE(hp.isLocalHost());
     }
     {
         HostAndPort hp =
-            GRPCServerContext::parseURI("ipv6:[2001:db8:3333:4444:5555:6666:7777:8888]:123");
+            grpc::util::parseGRPCFormattedURI("ipv6:[2001:db8:3333:4444:5555:6666:7777:8888]:123");
         ASSERT_EQ(hp.host(), "2001:db8:3333:4444:5555:6666:7777:8888");
         ASSERT_EQ(hp.port(), 123);
     }
+
     {
-        HostAndPort hp = GRPCServerContext::parseURI("unix://path/to/socket.sock");
-        ASSERT_EQ(hp.host(), "//path/to/socket.sock");
+        HostAndPort hp = grpc::util::parseGRPCFormattedURI(
+            "ipv6:%5B2001%3Adb8%3A3333%3A4444%3A5555%3A6666%3A7777%3A8888%5D%3A123");
+        ASSERT_EQ(hp.host(), "2001:db8:3333:4444:5555:6666:7777:8888");
+        ASSERT_EQ(hp.port(), 123);
+    }
+
+    {
+        HostAndPort hp = grpc::util::parseGRPCFormattedURI("unix:///path/to/socket.sock");
+        ASSERT_EQ(hp.host(), "///path/to/socket.sock");
+    }
+
+    {
+        HostAndPort hp = grpc::util::parseGRPCFormattedURI("unix:%2F%2F%2Fpath%2Fto%2Fsocket.sock");
+        ASSERT_EQ(hp.host(), "///path/to/socket.sock");
     }
 }
 

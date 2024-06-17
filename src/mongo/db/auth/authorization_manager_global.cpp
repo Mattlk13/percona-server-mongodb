@@ -41,6 +41,7 @@
 #include "mongo/client/internal_auth.h"
 #include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_manager_factory.h"
 #include "mongo/db/auth/authorization_manager_global_parameters_gen.h"
 #include "mongo/db/auth/cluster_auth_mode.h"
 #include "mongo/db/auth/security_key.h"
@@ -55,18 +56,31 @@
 namespace mongo {
 namespace {
 
-ServiceContext::ConstructorActionRegisterer createAuthorizationManager(
+ServiceContext::ConstructorActionRegisterer setClusterAuthMode(
+    "SetClusterAuthMode", [](ServiceContext* serviceContext) {
+        // Officially set the ClusterAuthMode for this ServiceContext
+        if (!ClusterAuthMode::get(serviceContext)
+                 .equals(serverGlobalParams.startupClusterAuthMode)) {
+            ClusterAuthMode::set(serviceContext, serverGlobalParams.startupClusterAuthMode);
+        }
+    });
+
+Service::ConstructorActionRegisterer createAuthorizationManager(
     "CreateAuthorizationManager",
     {"OIDGeneration", "EndStartupOptionStorage", "CreateLDAPManager"},
-    [](ServiceContext* service) {
-        // Officially set the ClusterAuthMode for this ServiceContext
-        ClusterAuthMode::set(service, serverGlobalParams.startupClusterAuthMode);
-
+    [](Service* service) {
         const auto clusterAuthMode = serverGlobalParams.startupClusterAuthMode;
         const auto authIsEnabled =
             serverGlobalParams.authState == ServerGlobalParams::AuthState::kEnabled;
 
-        auto authzManager = AuthorizationManager::create(service);
+        std::unique_ptr<AuthorizationManager> authzManager;
+
+        if (service->role().hasExclusively(ClusterRole::RouterServer)) {
+            authzManager = globalAuthzManagerFactory->createRouter(service);
+        } else {
+            authzManager = globalAuthzManagerFactory->createShard(service);
+        }
+
         authzManager->setAuthEnabled(authIsEnabled);
         authzManager->setShouldValidateAuthSchemaOnStartup(gStartupAuthSchemaValidation);
 
@@ -93,7 +107,8 @@ ServiceContext::ConstructorActionRegisterer createAuthorizationManager(
                                                 .clientSubjectName.toString()}));
 #endif
         }
-    });
+    },
+    [](Service* service) { AuthorizationManager::set(service, nullptr); });
 
 }  // namespace
 
@@ -102,7 +117,7 @@ void AuthzVersionParameter::append(OperationContext* opCtx,
                                    StringData name,
                                    const boost::optional<TenantId>&) {
     int authzVersion;
-    uassertStatusOK(AuthorizationManager::get(opCtx->getServiceContext())
+    uassertStatusOK(AuthorizationManager::get(opCtx->getService())
                         ->getAuthorizationVersion(opCtx, &authzVersion));
     b->append(name, authzVersion);
 }

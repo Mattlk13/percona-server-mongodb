@@ -26,9 +26,10 @@ TestData.skipCheckShardFilteringMetadata = true;
 // is expected to throw before it calls stopMongod.
 TestData.failIfUnterminatedProcesses = false;
 
-// Do not check metadata consistency as it would require a connection to the mongos and this is
-// bound to a specific socket for testing purposes.
+// Do not check metadata or UUID consistency as it would require a connection to the mongos and this
+// is bound to a specific socket for testing purposes.
 TestData.skipCheckMetadataConsistency = true;
+TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 
 var doesLogMatchRegex = function(logArray, regex) {
     for (let i = (logArray.length - 1); i >= 0; i--) {
@@ -91,6 +92,11 @@ var testSockOptions = function(bindPath, expectSockPath, optDict, bindSep = ',',
 // Check that the default unix sockets work
 testSockOptions();
 testSockOptions(undefined, undefined, undefined, ',', true);
+
+// TODO: SERVER-84437 Unskip the remainder of this test when using TLS.
+if (jsTestOptions().tlsMode && jsTestOptions().tlsMode != "disabled") {
+    quit();
+}
 
 // Check that a custom unix socket path works
 testSockOptions("testsock.socket", "testsock.socket");

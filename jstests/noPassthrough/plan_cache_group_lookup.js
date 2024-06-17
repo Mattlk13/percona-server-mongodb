@@ -1,27 +1,21 @@
 /**
  * Test that plans with $group and $lookup lowered to SBE are cached and invalidated correctly.
  * @tags: [
- *   # TODO SERVER-67607: Test plan cache with CQF enabled.
- *   cqf_experimental_incompatible,
+ *   featureFlagSbeFull
  * ]
  */
+import {checkCascadesOptimizerEnabled} from "jstests/libs/optimizer_utils.js";
 import {getLatestProfilerEntry} from "jstests/libs/profiler.js";
-import {checkSBEEnabled} from "jstests/libs/sbe_util.js";
 
 const conn = MongoRunner.runMongod();
-const db = conn.getDB("test");
-const coll = db.plan_cache_pipeline;
-const foreignColl = db.plan_cache_pipeline_foreign;
-
-if (!checkSBEEnabled(db)) {
-    jsTest.log("Skipping test because SBE is not enabled");
-    MongoRunner.stopMongod(conn);
-    quit();
-}
+const db = conn.getDB(jsTestName());
+const colName = jsTestName();
+const coll = db.getCollection(colName);
+const foreignColl = db.getCollection(colName + "_foreign");
 
 assert.commandWorked(coll.insert({a: 1}));
 assert.commandWorked(coll.createIndex({a: 1, a1: 1}));
-assert.commandWorked(coll.createIndex({a: 1, a2: 1}));
+assert.commandWorked(coll.createIndex({a: -1, a2: 1}));
 function setupForeignColl(index) {
     foreignColl.drop();
     assert.commandWorked(foreignColl.insert({b: 1}));
@@ -32,17 +26,19 @@ function setupForeignColl(index) {
 assert.commandWorked(db.setProfilingLevel(2));
 
 /**
- * Assert that the last aggregation command has a corresponding plan cache entry with the desired
- * properties. 'version' is 1 if it's classic cache, 2 if it's SBE cache. 'isActive' is true if the
- * cache entry is active. 'fromMultiPlanner' is true if the query part of aggregation has been
- * multi-planned. 'fromPlanCache' is true if the winning plan was retrieved from the plan cache.
- * 'forcesClassicEngine' is true if the query is forced to use classic engine.
+ * Assert that the last aggregation command has a corresponding plan cache entry with the
+ * desired properties. 'version' is 1 if it's classic cache, 2 if it's SBE cache. 'isActive' is
+ * true if the cache entry is active. 'fromMultiPlanner' is true if the query part of
+ * aggregation has been multi-planned. 'fromPlanCache' is true if the winning plan was retrieved
+ * from the plan cache. 'forcesClassicEngine' is true if the query is forced to use classic
+ * engine.
  */
 function assertCacheUsage(
-    {version, fromMultiPlanner, fromPlanCache, isActive, forcesClassicEngine = false}) {
+    {version, fromMultiPlanner, fromPlanCache, isActive, forcesClassicEngine}) {
     const profileObj = getLatestProfilerEntry(
         db, {op: "command", "command.pipeline": {$exists: true}, ns: coll.getFullName()});
     assert.eq(fromMultiPlanner, !!profileObj.fromMultiPlanner, profileObj);
+
     assert.eq(fromPlanCache, !!profileObj.fromPlanCache, profileObj);
 
     const entries = coll.getPlanCache().list();
@@ -65,7 +61,8 @@ function assertCacheUsage(
 }
 
 /**
- * Run the pipeline three times, assert that we have the following plan cache entries of "version".
+ * Run the pipeline three times, assert that we have the following plan cache entries of
+ * "version".
  *      1. The pipeline runs from the multi-planner, saving an inactive cache entry.
  *      2. The pipeline runs from the multi-planner, activating the cache entry.
  *      3. The pipeline runs from cached solution planner, using the active cache entry.
@@ -106,7 +103,7 @@ function testLoweredPipeline({pipeline, version, forcesClassicEngine = false}) {
     return nextEntry;
 }
 
-const multiPlanningQueryStage = {
+const matchStage = {
     $match: {a: 1}
 };
 const lookupStage = {
@@ -121,41 +118,37 @@ const groupStage = {
     const expectedVersion = 2;
 
     coll.getPlanCache().clear();
-    testLoweredPipeline(
-        {pipeline: [multiPlanningQueryStage, lookupStage], version: expectedVersion});
+    testLoweredPipeline({pipeline: [matchStage, lookupStage], version: expectedVersion});
+
+    coll.getPlanCache().clear();
+    testLoweredPipeline({pipeline: [matchStage, groupStage], version: expectedVersion});
 
     coll.getPlanCache().clear();
     testLoweredPipeline(
-        {pipeline: [multiPlanningQueryStage, groupStage], version: expectedVersion});
+        {pipeline: [matchStage, lookupStage, groupStage], version: expectedVersion});
 
     coll.getPlanCache().clear();
     testLoweredPipeline(
-        {pipeline: [multiPlanningQueryStage, lookupStage, groupStage], version: expectedVersion});
-
-    coll.getPlanCache().clear();
-    testLoweredPipeline(
-        {pipeline: [multiPlanningQueryStage, groupStage, lookupStage], version: expectedVersion});
+        {pipeline: [matchStage, groupStage, lookupStage], version: expectedVersion});
 })();
 
 (function testPartiallyLoweredPipeline() {
     coll.getPlanCache().clear();
     setupForeignColl();
-    testLoweredPipeline({
-        pipeline: [multiPlanningQueryStage, lookupStage, {$_internalInhibitOptimization: {}}],
-        version: 2
-    });
+    testLoweredPipeline(
+        {pipeline: [matchStage, lookupStage, {$_internalInhibitOptimization: {}}], version: 2});
 })();
 
 (function testNonExistentForeignCollectionCache() {
     coll.getPlanCache().clear();
     foreignColl.drop();
     const entryWithoutForeignColl =
-        testLoweredPipeline({pipeline: [multiPlanningQueryStage, lookupStage], version: 2});
+        testLoweredPipeline({pipeline: [matchStage, lookupStage], version: 2});
 
     coll.getPlanCache().clear();
     setupForeignColl();
     const entryWithForeignColl =
-        testLoweredPipeline({pipeline: [multiPlanningQueryStage, lookupStage], version: 2});
+        testLoweredPipeline({pipeline: [matchStage, lookupStage], version: 2});
 
     assert.neq(entryWithoutForeignColl.planCacheKey,
                entryWithForeignColl.planCacheKey,
@@ -168,54 +161,54 @@ const groupStage = {
 (function testForeignCollectionDropCacheInvalidation() {
     coll.getPlanCache().clear();
     setupForeignColl();
-    testLoweredPipeline({pipeline: [multiPlanningQueryStage, lookupStage], version: 2});
+    testLoweredPipeline({pipeline: [matchStage, lookupStage], version: 2});
 
     foreignColl.drop();
-    testLoweredPipeline({pipeline: [multiPlanningQueryStage, lookupStage], version: 2});
+    testLoweredPipeline({pipeline: [matchStage, lookupStage], version: 2});
 })();
 
 (function testForeignIndexDropCacheInvalidation() {
     coll.getPlanCache().clear();
     setupForeignColl({b: 1} /* index */);
-    testLoweredPipeline({pipeline: [multiPlanningQueryStage, lookupStage], version: 2});
+    testLoweredPipeline({pipeline: [matchStage, lookupStage], version: 2});
 
     assert.commandWorked(foreignColl.dropIndex({b: 1}));
-    testLoweredPipeline({pipeline: [multiPlanningQueryStage, lookupStage], version: 2});
+    testLoweredPipeline({pipeline: [matchStage, lookupStage], version: 2});
 })();
 
 (function testForeignIndexBuildCacheInvalidation() {
     coll.getPlanCache().clear();
     setupForeignColl({b: 1} /* index */);
-    testLoweredPipeline({pipeline: [multiPlanningQueryStage, lookupStage], version: 2});
+    testLoweredPipeline({pipeline: [matchStage, lookupStage], version: 2});
 
     assert.commandWorked(foreignColl.createIndex({c: 1}));
-    testLoweredPipeline({pipeline: [multiPlanningQueryStage, lookupStage], version: 2});
+    testLoweredPipeline({pipeline: [matchStage, lookupStage], version: 2});
 })();
 
 (function testLookupSbeAndClassicPlanCacheKey() {
     setupForeignColl({b: 1} /* index */);
 
-    // When using SBE engine, the plan cache key of $match vs. $match + $lookup should be different.
+    // When using SBE engine, the plan cache key of $match vs. $match + $lookup should be
+    // different.
     coll.getPlanCache().clear();
-    let matchEntry = testLoweredPipeline({pipeline: [multiPlanningQueryStage], version: 2});
+    let matchEntry = testLoweredPipeline({pipeline: [matchStage], version: 2});
 
     coll.getPlanCache().clear();
-    let lookupEntry =
-        testLoweredPipeline({pipeline: [multiPlanningQueryStage, lookupStage], version: 2});
+    let lookupEntry = testLoweredPipeline({pipeline: [matchStage, lookupStage], version: 2});
     assert.neq(matchEntry.planCacheKey, lookupEntry.planCacheKey, {matchEntry, lookupEntry});
 
-    // When using classic engine, the plan cache key of $match vs. $match + $lookup should be the
-    // same.
+    // When using classic engine, the plan cache key of $match vs. $match + $lookup should be
+    // the same.
     assert.commandWorked(
         db.adminCommand({setParameter: 1, internalQueryFrameworkControl: "forceClassicEngine"}));
 
     coll.getPlanCache().clear();
-    matchEntry = testLoweredPipeline(
-        {pipeline: [multiPlanningQueryStage], version: 1, forcesClassicEngine: true});
+    matchEntry =
+        testLoweredPipeline({pipeline: [matchStage], version: 1, forcesClassicEngine: true});
 
     coll.getPlanCache().clear();
     lookupEntry = testLoweredPipeline(
-        {pipeline: [multiPlanningQueryStage, lookupStage], version: 1, forcesClassicEngine: true});
+        {pipeline: [matchStage, lookupStage], version: 1, forcesClassicEngine: true});
     assert.eq(matchEntry.planCacheKey, lookupEntry.planCacheKey, {matchEntry, lookupEntry});
 
     assert.commandWorked(

@@ -3,13 +3,15 @@
 //
 // @tags: [
 //   # The test runs commands that are not allowed with security token: connectionStatus.
-//   not_allowed_with_security_token,
+//   not_allowed_with_signed_security_token,
 //   does_not_support_stepdowns,
 //   uses_testing_only_commands,
 //   no_selinux,
 //   # The config fuzzer may run logical session cache refreshes in the background, which interferes
 //   # with this test.
 //   does_not_support_config_fuzzer,
+//   # $listSession is not supported in serverless.
+//   command_not_supported_in_serverless,
 // ]
 
 // Basic tests for the $listSessions aggregation stage.

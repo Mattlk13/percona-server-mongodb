@@ -828,9 +828,9 @@ protected:
     void setUp() final {
         auto authzManagerState = std::make_unique<AuthzManagerExternalStateMock>();
         auto authzManager = std::make_unique<AuthorizationManagerImpl>(
-            getServiceContext(), std::move(authzManagerState));
+            getServiceContext()->getService(), std::move(authzManagerState));
         authzManager->setAuthEnabled(true);
-        AuthorizationManager::set(getServiceContext(), std::move(authzManager));
+        AuthorizationManager::set(getService(), std::move(authzManager));
 
         client = getServiceContext()->getService()->makeClient("test");
     }
@@ -844,12 +844,12 @@ TEST_F(OpMsgWithAuth, ParseValidatedTenancyScopeFromSecurityToken) {
     RAIIServerParameterControllerForTest secretController("testOnlyValidatedTenancyScopeKey",
                                                           "secret");
 
-    using VTS = auth::ValidatedTenancyScope;
     const auto kTenantId = TenantId(OID::gen());
-    const auto token = VTS(UserName("user", "admin", kTenantId),
+    const auto token = auth::ValidatedTenancyScopeFactory::create(
+                           UserName("user", "admin", kTenantId),
                            "secret"_sd,
-                           VTS::TenantProtocol::kDefault,
-                           VTS::TokenForTestingTag{})
+                           auth::ValidatedTenancyScope::TenantProtocol::kDefault,
+                           auth::ValidatedTenancyScopeFactory::TokenForTestingTag{})
                            .getOriginalToken()
                            .toString();
     auto msg =
@@ -876,41 +876,25 @@ TEST_F(OpMsgWithAuth, ParseValidatedTenancyScopeFromSecurityToken) {
     ASSERT_EQ(msg.validatedTenancyScope->tenantId(), kTenantId);
 }
 
-TEST_F(OpMsgWithAuth, ParseValidatedTenancyScopeFromDollarTenant) {
-    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
-    AuthorizationSessionImplTestHelper::grantUseTenant(*(client.get()));
-
-    const auto kTenantId = TenantId(OID::gen());
-    const auto body = BSON("ping" << 1 << "$tenant" << kTenantId);
-    auto msg =
-        OpMsgBytes{
-            kNoFlags,  //
-            kBodySection,
-            body,
-
-            kDocSequenceSection,
-            Sized{
-                "docs",  //
-                fromjson("{a: 1}"),
-                fromjson("{a: 2}"),
-            },
-        }
-            .parse(client.get());
-
-    ASSERT(msg.validatedTenancyScope);
-    ASSERT_EQ(msg.validatedTenancyScope->tenantId(), kTenantId);
-}
-
 TEST_F(OpMsgWithAuth, ValidatedTenancyScopeShouldNotBeSerialized) {
     RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    RAIIServerParameterControllerForTest securityTokenController("featureFlagSecurityToken", true);
     AuthorizationSessionImplTestHelper::grantUseTenant(*(client.get()));
 
     const auto kTenantId = TenantId(OID::gen());
-    const auto body = BSON("ping" << 1 << "$tenant" << kTenantId);
+
+    const auto token = auth::ValidatedTenancyScopeFactory::create(
+                           kTenantId,
+                           auth::ValidatedTenancyScope::TenantProtocol::kAtlasProxy,
+                           auth::ValidatedTenancyScopeFactory::TenantForTestingTag{})
+                           .getOriginalToken()
+                           .toString();
+
+    const auto body = BSON("ping" << 1);
     auto msgBytes = OpMsgBytes{
         kNoFlags,  //
-        kBodySection,
-        body,
+        kSecurityTokenSection,
+        token,
 
         kDocSequenceSection,
         Sized{
@@ -918,6 +902,8 @@ TEST_F(OpMsgWithAuth, ValidatedTenancyScopeShouldNotBeSerialized) {
             fromjson("{a: 1}"),
             fromjson("{a: 2}"),
         },
+        kBodySection,
+        body,
     };
     auto msg = msgBytes.parse(client.get());
     ASSERT(msg.validatedTenancyScope);
@@ -926,6 +912,8 @@ TEST_F(OpMsgWithAuth, ValidatedTenancyScopeShouldNotBeSerialized) {
     testSerializer(serializedMsg,
                    OpMsgBytes{
                        kNoFlags,  //
+                       kSecurityTokenSection,
+                       token,
 
                        kDocSequenceSection,
                        Sized{
@@ -933,7 +921,6 @@ TEST_F(OpMsgWithAuth, ValidatedTenancyScopeShouldNotBeSerialized) {
                            fromjson("{a: 1}"),
                            fromjson("{a: 2}"),
                        },
-
                        kBodySection,
                        body,
                    });
@@ -942,116 +929,91 @@ TEST_F(OpMsgWithAuth, ValidatedTenancyScopeShouldNotBeSerialized) {
 TEST(OpMsgRequest, GetDatabaseWorks) {
     OpMsgRequest msg;
     msg.body = fromjson("{$db: 'foo'}");
-    ASSERT_EQ(msg.getDatabase(), "foo");
+    ASSERT_EQ(msg.parseDbName().toString_forTest(), "foo");
 
     msg.body = fromjson("{before: 1, $db: 'foo'}");
-    ASSERT_EQ(msg.getDatabase(), "foo");
+    ASSERT_EQ(msg.parseDbName().toString_forTest(), "foo");
 
     msg.body = fromjson("{before: 1, $db: 'foo', after: 1}");
-    ASSERT_EQ(msg.getDatabase(), "foo");
+    ASSERT_EQ(msg.parseDbName().toString_forTest(), "foo");
 }
 
 TEST(OpMsgRequest, GetDatabaseThrowsWrongType) {
     OpMsgRequest msg;
     msg.body = fromjson("{$db: 1}");
-    ASSERT_THROWS(msg.getDatabase(), DBException);
+    ASSERT_THROWS(msg.parseDbName().toString_forTest(), DBException);
 }
 
 TEST(OpMsgRequest, GetDatabaseThrowsMissing) {
     OpMsgRequest msg;
     msg.body = fromjson("{}");
-    ASSERT_THROWS(msg.getDatabase(), AssertionException);
+    ASSERT_THROWS(msg.parseDbName().toString_forTest(), AssertionException);
 
     msg.body = fromjson("{$notdb: 'foo'}");
-    ASSERT_THROWS(msg.getDatabase(), AssertionException);
-}
-
-TEST(OpMsgRequestBuilder, WithTenantInDatabaseName) {
-    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
-    RAIIServerParameterControllerForTest requireTenantIdController("featureFlagRequireTenantID",
-                                                                   true);
-    const TenantId tenantId(OID::gen());
-    auto const body = fromjson("{ping: 1}");
-    OpMsgRequest msg = OpMsgRequestBuilder::create(
-        DatabaseName::createDatabaseName_forTest(tenantId, "testDb"), body);
-    ASSERT_EQ(msg.body.getField("$tenant").eoo(), false);
-    ASSERT_EQ(TenantId::parseFromBSON(msg.body.getField("$tenant")), tenantId);
-    ASSERT_EQ(msg.getDatabase(), "testDb");
-}
-
-TEST(OpMsgRequestBuilder, WithSameTenantInBody) {
-    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
-    RAIIServerParameterControllerForTest requireTenantIdController("featureFlagRequireTenantID",
-                                                                   true);
-    const TenantId tenantId(OID::gen());
-    auto const body = BSON("ping" << 1 << "$tenant" << tenantId);
-    OpMsgRequest msg = OpMsgRequestBuilder::create(
-        DatabaseName::createDatabaseName_forTest(tenantId, "testDb"), body);
-    ASSERT_EQ(msg.body.getField("$tenant").eoo(), false);
-    ASSERT_EQ(TenantId::parseFromBSON(msg.body.getField("$tenant")), tenantId);
+    ASSERT_THROWS(msg.parseDbName().toString_forTest(), AssertionException);
 }
 
 TEST(OpMsgRequestBuilder, WithVTS) {
     RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    RAIIServerParameterControllerForTest securityTokenController("featureFlagSecurityToken", true);
+    RAIIServerParameterControllerForTest secretController("testOnlyValidatedTenancyScopeKey",
+                                                          "secret");
 
     const TenantId tenantId(OID::gen());
+    const auto vts = auth::ValidatedTenancyScopeFactory::create(
+        UserName("user", "admin", tenantId),
+        "secret"_sd,
+        auth::ValidatedTenancyScope::TenantProtocol::kDefault,
+        auth::ValidatedTenancyScopeFactory::TokenForTestingTag{});
+
     const StringData dbString = "testDb";
     auto const body = fromjson("{ping: 1}");
 
-    using VTS = auth::ValidatedTenancyScope;
-    VTS vts = VTS(tenantId, VTS::TenantProtocol::kDefault, VTS::TenantForTestingTag{});
-    OpMsgRequest msg = OpMsgRequestBuilder::createWithValidatedTenancyScope(
-        DatabaseName::createDatabaseName_forTest(tenantId, dbString), vts, body);
+    OpMsgRequest msg = OpMsgRequestBuilder::create(
+        vts, DatabaseName::createDatabaseName_forTest(tenantId, dbString), body);
     ASSERT(msg.validatedTenancyScope);
     ASSERT_EQ(msg.validatedTenancyScope->tenantId(), tenantId);
-    // Verify $tenant is added to the msg body, as the vts does not come from security token.
-    ASSERT_EQ(msg.body.getField("$tenant").eoo(), false);
-    ASSERT_EQ(TenantId::parseFromBSON(msg.body.getField("$tenant")), tenantId);
-    ASSERT_EQ(msg.getDatabase(), dbString);
+    ASSERT_EQ(msg.parseDbName().toString_forTest(), dbString);
 }
 
 TEST(OpMsgRequestBuilder, WithVTSAndSerializationContextExpPrefixDefault) {
     RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    RAIIServerParameterControllerForTest securityTokenController("featureFlagSecurityToken", true);
+    RAIIServerParameterControllerForTest secretController("testOnlyValidatedTenancyScopeKey",
+                                                          "secret");
 
     const TenantId tenantId(OID::gen());
     const StringData dbString = "testDb";
     const std::string dbStringWithTid = str::stream() << tenantId.toString() << "_" << dbString;
     auto const body = fromjson("{ping: 1}");
 
-    using VTS = auth::ValidatedTenancyScope;
     using Prefix = SerializationContext::Prefix;
 
-    for (auto nonPrefixedTenantId :
-         {false, true}) {  // tenantId supplied in the security token or $tenant.
-        VTS vts = VTS(tenantId, VTS::TenantProtocol::kDefault, VTS::TenantForTestingTag{});
+    auth::ValidatedTenancyScope vts = auth::ValidatedTenancyScopeFactory::create(
+        UserName("user", "admin", tenantId),
+        "secret"_sd,
+        auth::ValidatedTenancyScope::TenantProtocol::kDefault,
+        auth::ValidatedTenancyScopeFactory::TokenForTestingTag{});
 
-        auto sc = SerializationContext::stateCommandRequest();
-        sc.setTenantIdSource(nonPrefixedTenantId);
+    OpMsgRequest msg = OpMsgRequestBuilder::create(
+        vts, DatabaseName::createDatabaseName_forTest(tenantId, dbString), body);
+    ASSERT(msg.validatedTenancyScope);
+    ASSERT_EQ(msg.validatedTenancyScope->tenantId(), tenantId);
 
-        OpMsgRequest msg = OpMsgRequestBuilder::createWithValidatedTenancyScope(
-            DatabaseName::createDatabaseName_forTest(tenantId, dbString), vts, body, sc);
-        ASSERT(msg.validatedTenancyScope);
-        ASSERT_EQ(msg.validatedTenancyScope->tenantId(), tenantId);
-        // Verify $tenant is added to the msg body, as the vts does not come from security token.
-        ASSERT_EQ(msg.body.getField("$tenant").eoo(), !nonPrefixedTenantId);
-        if (nonPrefixedTenantId) {
-            ASSERT_EQ(TenantId::parseFromBSON(msg.body.getField("$tenant")), tenantId);
-        }
-
-        // Missing expectPrefix in the request body.
-        ASSERT_EQ(msg.body.getField("expectPrefix").eoo(), true);
-        ASSERT_EQ(msg.getDatabase(), nonPrefixedTenantId ? dbString : dbStringWithTid);
-    }
+    // Missing expectPrefix in the request body.
+    ASSERT_EQ(msg.body.getField("expectPrefix").eoo(), true);
+    ASSERT_EQ(msg.parseDbName().toString_forTest(), dbString);
 }
 
 void CheckVtsSetsPrefix(Client* client, bool simulateAtlasProxyTenantProtocol) {
-    using VTS = auth::ValidatedTenancyScope;
     const auto kTenantId = TenantId(OID::gen());
-    const auto token = VTS(UserName("user", "admin", kTenantId),
+    const auto token = auth::ValidatedTenancyScopeFactory::create(
+                           UserName("user", "admin", kTenantId),
                            "secret"_sd,
-                           simulateAtlasProxyTenantProtocol ? VTS::TenantProtocol::kAtlasProxy
-                                                            : VTS::TenantProtocol::kDefault,
-                           VTS::TokenForTestingTag{})
+                           simulateAtlasProxyTenantProtocol
+                               ? auth::ValidatedTenancyScope::TenantProtocol::kAtlasProxy
+                               : auth::ValidatedTenancyScope::TenantProtocol::kDefault,
+                           auth::ValidatedTenancyScopeFactory::TokenForTestingTag{})
                            .getOriginalToken()
                            .toString();
     auto msg =
@@ -1071,7 +1033,7 @@ void CheckVtsSetsPrefix(Client* client, bool simulateAtlasProxyTenantProtocol) {
             token,
         }
             .parse(client);
-    VTS vts = msg.validatedTenancyScope.value();
+    auth::ValidatedTenancyScope vts = msg.validatedTenancyScope.value();
     ASSERT_TRUE(vts.isFromAtlasProxy() == simulateAtlasProxyTenantProtocol);
 
     auto serializedMsg = msg.serialize();
@@ -1103,175 +1065,123 @@ TEST_F(OpMsgWithAuth, TestVTSSetsPrefixStateTrue) {
     CheckVtsSetsPrefix(client.get(), true);
 }
 
+void CheckCommandMsgIdlParsingForOpMsgRequest(bool simulateAtlasProxyTenantProtocol) {
+    const TenantId tenantId(OID::gen());
+    const std::string dbString =
+        simulateAtlasProxyTenantProtocol ? (tenantId.toString() + "_testDb") : "testDb";
+    auto cmd = BSON("insert"
+                    << "bar"
+                    << "$db" << dbString << "documents" << BSON_ARRAY(BSONObj()));
+    OpMsgRequest msg;
+    msg.body = cmd;
+    auth::ValidatedTenancyScope vts = auth::ValidatedTenancyScopeFactory::create(
+        tenantId,
+        simulateAtlasProxyTenantProtocol ? auth::ValidatedTenancyScope::TenantProtocol::kAtlasProxy
+                                         : auth::ValidatedTenancyScope::TenantProtocol::kDefault,
+        auth::ValidatedTenancyScopeFactory::TenantForTestingTag{});
+    msg.validatedTenancyScope = vts;
+    auto op = InsertOp::parse(msg);
+    ASSERT_EQ(op.getSerializationContext().getPrefix(),
+              simulateAtlasProxyTenantProtocol ? SerializationContext::Prefix::IncludePrefix
+                                               : SerializationContext::Prefix::ExcludePrefix);
+}
+
+TEST_F(OpMsgWithAuth, TestExpectPrefixTrueParsedInMsg) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    RAIIServerParameterControllerForTest securityTokenController("featureFlagSecurityToken", true);
+    RAIIServerParameterControllerForTest secretController("testOnlyValidatedTenancyScopeKey",
+                                                          "secret");
+
+    CheckCommandMsgIdlParsingForOpMsgRequest(true);
+}
+
+TEST_F(OpMsgWithAuth, TestExpectPrefixFalseParsedInMsg) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    RAIIServerParameterControllerForTest securityTokenController("featureFlagSecurityToken", true);
+    RAIIServerParameterControllerForTest secretController("testOnlyValidatedTenancyScopeKey",
+                                                          "secret");
+
+    CheckCommandMsgIdlParsingForOpMsgRequest(false);
+}
+
 TEST(OpMsgRequestBuilder, WithVTSAndSerializationContextExpPrefixFalse) {
     RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    RAIIServerParameterControllerForTest securityTokenController("featureFlagSecurityToken", true);
+    RAIIServerParameterControllerForTest secretController("testOnlyValidatedTenancyScopeKey",
+                                                          "secret");
 
     const TenantId tenantId(OID::gen());
     const StringData dbString = "testDb";
     const std::string dbStringWithTid = str::stream() << tenantId.toString() << "_" << dbString;
     auto const body = fromjson("{ping: 1}");
 
-    using VTS = auth::ValidatedTenancyScope;
     using Prefix = SerializationContext::Prefix;
 
-    for (auto nonPrefixedTenantId :
-         {false, true}) {  // tenantId supplied in the security token or $tenant.
-        VTS vts = VTS(tenantId, VTS::TenantProtocol::kDefault, VTS::TenantForTestingTag{});
+    auth::ValidatedTenancyScope vts = auth::ValidatedTenancyScopeFactory::create(
+        UserName("user", "admin", tenantId),
+        "secret"_sd,
+        auth::ValidatedTenancyScope::TenantProtocol::kDefault,
+        auth::ValidatedTenancyScopeFactory::TokenForTestingTag{});
 
-        auto sc = SerializationContext::stateCommandRequest();
-        sc.setPrefixState(false);
-        sc.setTenantIdSource(nonPrefixedTenantId);
-
-        OpMsgRequest msg = OpMsgRequestBuilder::createWithValidatedTenancyScope(
-            DatabaseName::createDatabaseName_forTest(tenantId, dbString), vts, body, sc);
-        ASSERT(msg.validatedTenancyScope);
-        ASSERT_EQ(msg.validatedTenancyScope->tenantId(), tenantId);
-        // Verify $tenant is added to the msg body, as the vts does not come from security token.
-        ASSERT_EQ(msg.body.getField("$tenant").eoo(), !nonPrefixedTenantId);
-        if (nonPrefixedTenantId) {
-            ASSERT_EQ(TenantId::parseFromBSON(msg.body.getField("$tenant")), tenantId);
-        }
-
-        // Received an expectPrefix=false in the request body.
-        ASSERT_EQ(msg.body.getField("expectPrefix").eoo(), false);
-        ASSERT_TRUE(msg.body.getField("expectPrefix").isBoolean());
-        ASSERT_EQ(msg.body.getField("expectPrefix").boolean(), false);
-        ASSERT_EQ(msg.getDatabase(), dbString);
-    }
+    OpMsgRequest msg = OpMsgRequestBuilder::create(
+        vts, DatabaseName::createDatabaseName_forTest(tenantId, dbString), body);
+    ASSERT(msg.validatedTenancyScope);
+    ASSERT_EQ(msg.validatedTenancyScope->tenantId(), tenantId);
+    ASSERT_EQ(msg.parseDbName().toString_forTest(), dbString);
 }
 
 TEST(OpMsgRequestBuilder, WithVTSAndSerializationContextExpPrefixTrue) {
     RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    RAIIServerParameterControllerForTest securityTokenController("featureFlagSecurityToken", true);
+    RAIIServerParameterControllerForTest secretController("testOnlyValidatedTenancyScopeKey",
+                                                          "secret");
 
     const TenantId tenantId(OID::gen());
     const StringData dbString = "testDb";
     const std::string dbStringWithTid = str::stream() << tenantId.toString() << "_" << dbString;
     auto const body = fromjson("{ping: 1}");
 
-    using VTS = auth::ValidatedTenancyScope;
     using Prefix = SerializationContext::Prefix;
 
-    for (auto nonPrefixedTenantId :
-         {false, true}) {  // tenantId supplied in the security token or $tenant.
-        VTS vts = VTS(tenantId, VTS::TenantProtocol::kDefault, VTS::TenantForTestingTag{});
+    auth::ValidatedTenancyScope vts = auth::ValidatedTenancyScopeFactory::create(
+        UserName("user", "admin", tenantId),
+        "secret"_sd,
+        auth::ValidatedTenancyScope::TenantProtocol::kAtlasProxy,
+        auth::ValidatedTenancyScopeFactory::TokenForTestingTag{});
 
-        auto sc = SerializationContext::stateCommandRequest();
-        sc.setPrefixState(true);
-        sc.setTenantIdSource(nonPrefixedTenantId);
-
-        OpMsgRequest msg = OpMsgRequestBuilder::createWithValidatedTenancyScope(
-            DatabaseName::createDatabaseName_forTest(tenantId, dbString), vts, body, sc);
-        ASSERT(msg.validatedTenancyScope);
-        ASSERT_EQ(msg.validatedTenancyScope->tenantId(), tenantId);
-        // Verify $tenant is added to the msg body, as the vts does not come from security token.
-        ASSERT_EQ(msg.body.getField("$tenant").eoo(), !nonPrefixedTenantId);
-        if (nonPrefixedTenantId) {
-            ASSERT_EQ(TenantId::parseFromBSON(msg.body.getField("$tenant")), tenantId);
-        }
-
-        // Received an expectPrefix=true in the request body.
-        ASSERT_EQ(msg.body.getField("expectPrefix").eoo(), false);
-        ASSERT_TRUE(msg.body.getField("expectPrefix").isBoolean());
-        ASSERT_EQ(msg.body.getField("expectPrefix").boolean(), true);
-        ASSERT_EQ(msg.getDatabase(), dbStringWithTid);
-    }
-}
-
-TEST(OpMsgRequestBuilder, FailWithDiffTenantInBody) {
-    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
-    RAIIServerParameterControllerForTest requireTenantIdController("featureFlagRequireTenantID",
-                                                                   true);
-    const TenantId tenantId(OID::gen());
-    const TenantId otherTenantId(OID::gen());
-
-    auto const body = BSON("ping" << 1 << "$tenant" << tenantId);
-    ASSERT_THROWS_CODE(OpMsgRequestBuilder::create(
-                           DatabaseName::createDatabaseName_forTest(otherTenantId, "testDb"), body),
-                       DBException,
-                       8423373);
+    OpMsgRequest msg = OpMsgRequestBuilder::create(
+        vts, DatabaseName::createDatabaseName_forTest(tenantId, dbString), body);
+    ASSERT(msg.validatedTenancyScope);
+    ASSERT_EQ(msg.validatedTenancyScope->tenantId(), tenantId);
+    ASSERT_EQ(msg.parseDbName().toStringWithTenantId_forTest(), dbStringWithTid);
 }
 
 TEST(OpMsgRequestBuilder, CreateDoesNotCopy) {
     RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
     RAIIServerParameterControllerForTest requireTenantIdController("featureFlagRequireTenantID",
                                                                    true);
+    RAIIServerParameterControllerForTest securityTokenController("featureFlagSecurityToken", true);
+    RAIIServerParameterControllerForTest secretController("testOnlyValidatedTenancyScopeKey",
+                                                          "secret");
+
+
     const TenantId tenantId(OID::gen());
+
+    auth::ValidatedTenancyScope vts = auth::ValidatedTenancyScopeFactory::create(
+        UserName("user", "admin", tenantId),
+        "secret"_sd,
+        auth::ValidatedTenancyScope::TenantProtocol::kDefault,
+        auth::ValidatedTenancyScopeFactory::TokenForTestingTag{});
+
     auto body = fromjson("{ping: 1}");
     const void* const bodyPtr = body.objdata();
-    auto msg = OpMsgRequestBuilder::create(DatabaseName::createDatabaseName_forTest(tenantId, "db"),
-                                           std::move(body));
+    auto msg = OpMsgRequestBuilder::create(
+        vts, DatabaseName::createDatabaseName_forTest(tenantId, "db"), std::move(body));
 
-    auto const newBody = BSON("ping" << 1 << "$tenant" << tenantId << "$db"
+    auto const newBody = BSON("ping" << 1 << "$db"
                                      << "db");
     ASSERT_BSONOBJ_EQ(msg.body, newBody);
     ASSERT_EQ(static_cast<const void*>(msg.body.objdata()), bodyPtr);
-}
-
-TEST(OpMsgRequest, FromDbAndBodyDoesNotCopy) {
-    auto body = fromjson("{ping: 1}");
-    const void* const bodyPtr = body.objdata();
-    auto msg = OpMsgRequest::fromDBAndBody(
-        DatabaseName::createDatabaseName_forTest(boost::none, "db"), std::move(body));
-
-    ASSERT_BSONOBJ_EQ(msg.body, fromjson("{ping: 1, $db: 'db'}"));
-    ASSERT_EQ(static_cast<const void*>(msg.body.objdata()), bodyPtr);
-}
-
-TEST(OpMsgRequest, SetDollarTenantHasSameTenant) {
-    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
-    RAIIServerParameterControllerForTest requireTenantIdController("featureFlagRequireTenantID",
-                                                                   true);
-    const TenantId tenantId(OID::gen());
-    // Set $tenant on a OpMsgRequest which already has the same $tenant.
-    OpMsgRequest request;
-    request.body = BSON("ping" << 1 << "$tenant" << tenantId << "$db"
-                               << "testDb");
-    request.setDollarTenant(tenantId);
-
-    auto dollarTenant = request.body.getField("$tenant");
-    ASSERT(!dollarTenant.eoo());
-    ASSERT_EQ(TenantId::parseFromBSON(dollarTenant), tenantId);
-}
-
-TEST(OpMsgRequest, SetDollarTenantHasNoTenant) {
-    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
-    RAIIServerParameterControllerForTest requireTenantIdController("featureFlagRequireTenantID",
-                                                                   true);
-    const TenantId tenantId(OID::gen());
-    // Set $tenant on a OpMsgRequest which has no $tenant.
-    OpMsgRequest request;
-    request.body = BSON("ping" << 1 << "$db"
-                               << "testDb");
-    request.setDollarTenant(tenantId);
-
-    auto dollarTenant = request.body.getField("$tenant");
-    ASSERT(!dollarTenant.eoo());
-    ASSERT_EQ(TenantId::parseFromBSON(dollarTenant), tenantId);
-}
-
-TEST(OpMsgRequest, SetDollarTenantFailWithDiffTenant) {
-    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
-    RAIIServerParameterControllerForTest requireTenantIdController("featureFlagRequireTenantID",
-                                                                   true);
-    const TenantId tenantId(OID::gen());
-    auto dbName =
-        DatabaseNameUtil::deserialize(tenantId, "testDb", SerializationContext::stateDefault());
-    auto const body = BSON("ping" << 1 << "$tenant" << tenantId);
-    auto request = OpMsgRequest::fromDBAndBody(dbName, body);
-    ASSERT_THROWS_CODE(request.setDollarTenant(TenantId(OID::gen())), DBException, 8423373);
-}
-
-TEST_F(OpMsgWithAuth, SetDollarTenantFailWithVTS) {
-    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
-    AuthorizationSessionImplTestHelper::grantUseTenant(*(client.get()));
-
-    const auto kTenantId = TenantId(OID::gen());
-    const auto body = BSON("ping" << 1 << "$tenant" << kTenantId);
-    auto msg = OpMsgBytes{kNoFlags, kBodySection, body}.parse(client.get());
-    OpMsgRequest request(std::move(msg));
-
-    ASSERT(request.validatedTenancyScope);
-    ASSERT_THROWS_CODE(request.setDollarTenant(TenantId(OID::gen())), DBException, 8423372);
 }
 
 TEST(OpMsgTest, ChecksumResizesMessage) {
@@ -1301,67 +1211,91 @@ TEST_F(OpMsgWithAuth, GetDbNameWithVTS) {
     AuthorizationSessionImplTestHelper::grantUseTenant(*(client.get()));
 
     const auto kTenantId = TenantId(OID::gen());
-    auto createMsg = [&](bool prefixed, bool hasDollarTenant) {
-        std::string db = prefixed ? kTenantId.toString() + "_myDb" : "myDb";
-        BSONObjBuilder builder;
-        builder.append("ping", 1).append("$db", db);
+    std::string db = "myDb";
+    BSONObjBuilder builder;
+    builder.append("ping", 1).append("$db", db);
 
-        if (hasDollarTenant) {
-            if (prefixed) {
-                builder.append("expectPrefix", true);
-            }
-            kTenantId.serializeToBSON("$tenant", &builder);
+    const auto token = auth::ValidatedTenancyScopeFactory::create(
+                           kTenantId,
+                           auth::ValidatedTenancyScope::TenantProtocol::kDefault,
+                           auth::ValidatedTenancyScopeFactory::TenantForTestingTag{})
+                           .getOriginalToken()
+                           .toString();
+
+    const auto body = builder.obj();
+    OpMsg msg =
+        OpMsgBytes{
+            kNoFlags,
+            kBodySection,
+            body,
+            kDocSequenceSection,
+            Sized{
+                "docs",
+                fromjson("{a: 1}"),
+                fromjson("{a: 2}"),
+            },
+            kSecurityTokenSection,
+            token,
         }
-        const auto body = builder.obj();
-        OpMsg msg =
-            OpMsgBytes{
-                kNoFlags,  //
-                kBodySection,
-                body,
-                kDocSequenceSection,
-                Sized{
-                    "docs",  //
-                    fromjson("{a: 1}"),
-                    fromjson("{a: 2}"),
-                },
-            }
-                .parse(client.get());
-        return msg;
-    };
+            .parse(client.get());
+
 
     const DatabaseName expectedTenantDbName =
         DatabaseName::createDatabaseName_forTest(kTenantId, "myDb");
-    // Test the request which has tenant prefix and $tenant.
     using SC = SerializationContext;
-    OpMsgRequest request = OpMsgRequest(createMsg(true, true));
 
+    // Test the request which has tenant prefix.
+    OpMsgRequest request = OpMsgRequest(std::move(msg));
     ASSERT_EQ(request.getSerializationContext(),
               SerializationContext(
-                  SC::Source::Command, SC::CallerType::Request, SC::Prefix::IncludePrefix, true));
-    ASSERT_EQ(request.getDbName(), expectedTenantDbName);
+                  SC::Source::Command, SC::CallerType::Request, SC::Prefix::ExcludePrefix));
+    ASSERT_EQ(request.parseDbName(), expectedTenantDbName);
+}
 
-    // Test the request which has tenant prefix alone.
-    request = OpMsgRequest(createMsg(true, false));
+TEST_F(OpMsgWithAuth, GetDbNameWithVTSIncludePrefix) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    AuthorizationSessionImplTestHelper::grantUseTenant(*(client.get()));
+
+    const auto kTenantId = TenantId(OID::gen());
+    std::string db = kTenantId.toString() + "_myDb";
+    BSONObjBuilder builder;
+    builder.append("ping", 1).append("$db", db);
+
+    const auto token = auth::ValidatedTenancyScopeFactory::create(
+                           kTenantId,
+                           auth::ValidatedTenancyScope::TenantProtocol::kAtlasProxy,
+                           auth::ValidatedTenancyScopeFactory::TenantForTestingTag{})
+                           .getOriginalToken()
+                           .toString();
+
+    const auto body = builder.obj();
+    OpMsg msg =
+        OpMsgBytes{
+            kNoFlags,  //
+            kBodySection,
+            body,
+            kDocSequenceSection,
+            Sized{
+                "docs",  //
+                fromjson("{a: 1}"),
+                fromjson("{a: 2}"),
+            },
+            kSecurityTokenSection,
+            token,
+        }
+            .parse(client.get());
+
+    const DatabaseName expectedTenantDbName =
+        DatabaseName::createDatabaseName_forTest(kTenantId, "myDb");
+    using SC = SerializationContext;
+
+    // Test the request which does not have tenant prefix.
+    const DatabaseName expectedDbName = DatabaseName::createDatabaseName_forTest(kTenantId, "myDb");
+    OpMsgRequest request{std::move(msg)};
     ASSERT_EQ(request.getSerializationContext(),
               SerializationContext(
-                  SC::Source::Command, SC::CallerType::Request, SC::Prefix::Default, false));
-    ASSERT_EQ(request.getDbName(), expectedTenantDbName);
-
-    // Test the request which has $tenant alone.
-    request = OpMsgRequest(createMsg(false, true));
-    ASSERT_EQ(request.getSerializationContext(),
-              SerializationContext(
-                  SC::Source::Command, SC::CallerType::Request, SC::Prefix::ExcludePrefix, true));
-    ASSERT_EQ(request.getDbName(), expectedTenantDbName);
-
-    // Test the request which has neither tenant prefix nor $tenant.
-    const DatabaseName expectedDbName =
-        DatabaseName::createDatabaseName_forTest(boost::none, "myDb");
-    request = OpMsgRequest(createMsg(false, false));
-    ASSERT_EQ(request.getSerializationContext(),
-              SerializationContext(
-                  SC::Source::Command, SC::CallerType::Request, SC::Prefix::Default, false));
-    ASSERT_THROWS_CODE(request.getDbName(), AssertionException, 8423388 /*"TenantId must be set"*/);
+                  SC::Source::Command, SC::CallerType::Request, SC::Prefix::IncludePrefix));
+    ASSERT_EQ(request.parseDbName(), expectedDbName);
 }
 
 }  // namespace

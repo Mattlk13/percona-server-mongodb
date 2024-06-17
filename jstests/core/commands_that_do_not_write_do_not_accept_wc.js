@@ -5,7 +5,7 @@
  *
  * @tags: [
  *   # The test runs commands that are not allowed with security token: mapReduce.
- *   not_allowed_with_security_token,
+ *   not_allowed_with_signed_security_token,
  *   assumes_write_concern_unchanged,
  *   does_not_support_stepdowns,
  * ]
@@ -15,7 +15,7 @@ var collName = 'leaves';
 
 var commands = [];
 
-commands.push({find: collName, query: {_id: 1}});
+commands.push({find: collName, filter: {_id: 1}});
 
 commands.push({distinct: collName, key: "_id"});
 

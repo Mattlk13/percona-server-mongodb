@@ -44,11 +44,11 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/storage/ident.h"
 #include "mongo/db/storage/kv/kv_drop_pending_ident_reaper.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -62,28 +62,27 @@ namespace mongo {
 bool KVDropPendingIdentReaper::IdentInfo::isExpired(const KVEngine* engine,
                                                     const Timestamp& ts) const {
     return identState == IdentInfo::State::kNotDropped && dropToken.expired() &&
-        stdx::visit(OverloadedVisitor{[&](const Timestamp& dropTs) {
-                                          return dropTs < ts || dropTs == Timestamp::min();
-                                      },
-                                      [&](const StorageEngine::CheckpointIteration& iteration) {
-                                          return engine->hasDataBeenCheckpointed(iteration);
-                                      }},
-                    dropTime);
+        visit(OverloadedVisitor{[&](const Timestamp& dropTs) {
+                                    return dropTs < ts || dropTs == Timestamp::min();
+                                },
+                                [&](const StorageEngine::CheckpointIteration& iteration) {
+                                    return engine->hasDataBeenCheckpointed(iteration);
+                                }},
+              dropTime);
 }
 
 KVDropPendingIdentReaper::KVDropPendingIdentReaper(KVEngine* engine) : _engine(engine) {}
 
 void KVDropPendingIdentReaper::addDropPendingIdent(
-    const stdx::variant<Timestamp, StorageEngine::CheckpointIteration>& dropTime,
+    const std::variant<Timestamp, StorageEngine::CheckpointIteration>& dropTime,
     std::shared_ptr<Ident> ident,
     StorageEngine::DropIdentCallback&& onDrop) {
     stdx::lock_guard<Latch> lock(_mutex);
-    auto dropTimestamp =
-        stdx::visit(OverloadedVisitor{[](const Timestamp& ts) { return ts; },
-                                      [](const StorageEngine::CheckpointIteration&) {
-                                          return Timestamp::min();
-                                      }},
-                    dropTime);
+    auto dropTimestamp = visit(OverloadedVisitor{[](const Timestamp& ts) { return ts; },
+                                                 [](const StorageEngine::CheckpointIteration&) {
+                                                     return Timestamp::min();
+                                                 }},
+                               dropTime);
     const auto equalRange = _dropPendingIdents.equal_range(dropTimestamp);
     const auto& lowerBound = equalRange.first;
     const auto& upperBound = equalRange.second;
@@ -223,7 +222,8 @@ void KVDropPendingIdentReaper::dropIdentsOlderThan(OperationContext* opCtx, cons
                   "ident"_attr = identName,
                   "dropTimestamp"_attr = dropTimestamp);
             WriteUnitOfWork wuow(opCtx);
-            auto status = _engine->dropIdent(opCtx->recoveryUnit(), identName, identInfo->onDrop);
+            auto status = _engine->dropIdent(
+                shard_role_details::getRecoveryUnit(opCtx), identName, identInfo->onDrop);
             if (!status.isOK()) {
                 if (status == ErrorCodes::ObjectIsBusy) {
                     LOGV2(6936300,
@@ -291,7 +291,7 @@ void KVDropPendingIdentReaper::dropIdentsOlderThan(OperationContext* opCtx, cons
 }
 
 void KVDropPendingIdentReaper::clearDropPendingState(OperationContext* opCtx) {
-    invariant(opCtx->lockState()->isW());
+    invariant(shard_role_details::getLocker(opCtx)->isW());
 
     stdx::lock_guard<Latch> lock(_mutex);
     // We only delete the timestamped drops. Non-timestamped drops cannot be rolled back, and the

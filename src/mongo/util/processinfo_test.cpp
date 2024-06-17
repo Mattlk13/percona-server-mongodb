@@ -28,6 +28,7 @@
  */
 
 #include <cstdint>
+#include <fstream>
 #include <map>
 
 #include <boost/optional/optional.hpp>
@@ -38,9 +39,11 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/unittest/framework.h"
+#include "mongo/unittest/temp_dir.h"
 #include "mongo/util/processinfo.h"
 
 using boost::optional;
+using mongo::unittest::TempDir;
 
 namespace mongo {
 
@@ -83,6 +86,7 @@ TEST(ProcessInfo, TestSysInfo) {
     ASSERT_KEY("cpuVariant");
     ASSERT_KEY("cpuPart");
     ASSERT_KEY("cpuRevision");
+    ASSERT_KEY("glibc_rseq_present");
 #endif
 
     ASSERT_KEY("mountInfo");
@@ -108,12 +112,135 @@ TEST(ProcessInfo, GetNumAvailableCores) {
     defined(_WIN32)
     unsigned long numAvailCores = ProcessInfo::getNumAvailableCores();
     ASSERT_GREATER_THAN(numAvailCores, 0u);
-    ASSERT_LESS_THAN_OR_EQUALS(numAvailCores, ProcessInfo::getNumCores());
+    ASSERT_LESS_THAN_OR_EQUALS(numAvailCores, ProcessInfo::getNumLogicalCores());
 #endif
 }
 
 TEST(ProcessInfo, GetNumCoresReturnsNonZeroNumberOfProcessors) {
-    ASSERT_GREATER_THAN(ProcessInfo::getNumCores(), 0u);
+    ASSERT_GREATER_THAN(ProcessInfo::getNumLogicalCores(), 0u);
 }
+
+#if defined(__linux__)
+TEST(ProcessInfo, ReadTransparentHugePagesParameterInvalidDirectory) {
+    StatusWith<std::string> result =
+        ProcessInfo::readTransparentHugePagesParameter("no_such_directory", "param");
+    ASSERT_NOT_OK(result.getStatus());
+    ASSERT_EQUALS(ErrorCodes::NonExistentPath, result.getStatus().code());
+}
+
+TEST(ProcessInfo, ReadTransparentHugePagesParameterInvalidFile) {
+    TempDir tempDir("ProcessInfo_ReadTransparentHugePagesParameterInvalidFile");
+    StatusWith<std::string> result =
+        ProcessInfo::readTransparentHugePagesParameter("param", tempDir.path());
+    ASSERT_NOT_OK(result.getStatus());
+    ASSERT_EQUALS(ErrorCodes::NonExistentPath, result.getStatus().code());
+}
+
+TEST(ProcessInfo, ReadTransparentHugePagesParameterEmptyFile) {
+    TempDir tempDir("ProcessInfo_ReadTransparentHugePagesParameterInvalidFile");
+    {
+        std::string filename(tempDir.path() + "/param");
+        std::ofstream(filename.c_str());
+    }
+    StatusWith<std::string> result =
+        ProcessInfo::readTransparentHugePagesParameter("param", tempDir.path());
+    ASSERT_NOT_OK(result.getStatus());
+    ASSERT_EQUALS(ErrorCodes::NonExistentPath, result.getStatus().code());
+}
+
+TEST(ProcessInfo, ReadTransparentHugePagesParameterBlankLine) {
+    TempDir tempDir("ProcessInfo_ReadTransparentHugePagesParameterBlankLine");
+    {
+        std::string filename(tempDir.path() + "/param");
+        std::ofstream ofs(filename.c_str());
+        ofs << std::endl;
+    }
+    StatusWith<std::string> result =
+        ProcessInfo::readTransparentHugePagesParameter("param", tempDir.path());
+    ASSERT_NOT_OK(result.getStatus());
+    ASSERT_EQUALS(ErrorCodes::NonExistentPath, result.getStatus().code());
+}
+
+TEST(ProcessInfo, ReadTransparentHugePagesParameterInvalidFormat) {
+    TempDir tempDir("ProcessInfo_ReadTransparentHugePagesParameterBlankLine");
+    {
+        std::string filename(tempDir.path() + "/param");
+        std::ofstream ofs(filename.c_str());
+        ofs << "always madvise never" << std::endl;
+    }
+    StatusWith<std::string> result =
+        ProcessInfo::readTransparentHugePagesParameter("param", tempDir.path());
+    ASSERT_NOT_OK(result.getStatus());
+    ASSERT_EQUALS(ErrorCodes::FailedToParse, result.getStatus().code());
+}
+
+TEST(ProcessInfo, ReadTransparentHugePagesParameterEmptyOpMode) {
+    TempDir tempDir("ProcessInfo_ReadTransparentHugePagesParameterEmptyOpMode");
+    {
+        std::string filename(tempDir.path() + "/param");
+        std::ofstream ofs(filename.c_str());
+        ofs << "always madvise [] never" << std::endl;
+    }
+    StatusWith<std::string> result =
+        ProcessInfo::readTransparentHugePagesParameter("param", tempDir.path());
+    ASSERT_NOT_OK(result.getStatus());
+    ASSERT_EQUALS(ErrorCodes::BadValue, result.getStatus().code());
+}
+
+TEST(ProcessInfo, ReadTransparentHugePagesParameterUnrecognizedOpMode) {
+    TempDir tempDir("ProcessInfo_ReadTransparentHugePagesParameterUnrecognizedOpMode");
+    {
+        std::string filename(tempDir.path() + "/param");
+        std::ofstream ofs(filename.c_str());
+        ofs << "always madvise never [unknown]" << std::endl;
+    }
+    StatusWith<std::string> result =
+        ProcessInfo::readTransparentHugePagesParameter("param", tempDir.path());
+    ASSERT_NOT_OK(result.getStatus());
+    ASSERT_EQUALS(ErrorCodes::BadValue, result.getStatus().code());
+}
+
+TEST(ProcessInfo, ReadTransparentHugePagesParameterValidFormat) {
+    TempDir tempDir("ProcessInfo_ReadTransparentHugePagesParameterBlankLine");
+    {
+        std::string filename(tempDir.path() + "/param");
+        std::ofstream ofs(filename.c_str());
+        ofs << "always madvise [never]" << std::endl;
+    }
+    StatusWith<std::string> result =
+        ProcessInfo::readTransparentHugePagesParameter("param", tempDir.path());
+    ASSERT_OK(result.getStatus());
+    ASSERT_EQUALS("never", result.getValue());
+}
+#endif  // __linux__
+
+#if defined(__linux__) && defined(MONGO_CONFIG_GLIBC_RSEQ)
+TEST(ProcessInfo, GLIBCRseqTunable) {
+    using namespace fmt::literals;
+
+    std::string glibcOriginalEnv("");
+    if (auto res = getenv(ProcessInfo::kGlibcTunableEnvVar); res != nullptr) {
+        glibcOriginalEnv = std::string(res);
+    }
+
+    ON_BLOCK_EXIT([&]() { setenv(ProcessInfo::kGlibcTunableEnvVar, glibcOriginalEnv.c_str(), 1); });
+
+    auto checkRseqSetting = [&](const char* settingName, const char* setting, bool expectOK) {
+        auto setting1 = "{}={}"_format(settingName, setting);
+        setenv(ProcessInfo::kGlibcTunableEnvVar, setting1.c_str(), 1);
+        auto res = ProcessInfo::checkGlibcRseqTunable();
+        if (expectOK) {
+            ASSERT(res);
+        } else {
+            ASSERT_FALSE(res);
+        }
+    };
+
+    checkRseqSetting(ProcessInfo::kRseqKey, "0", true);
+    checkRseqSetting(ProcessInfo::kRseqKey, "1", false);
+    checkRseqSetting("", "", false);
+    checkRseqSetting(ProcessInfo::kRseqKey, "a", false);
+}
+#endif
 }  // namespace
 }  // namespace mongo

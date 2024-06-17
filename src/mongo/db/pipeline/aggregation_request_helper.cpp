@@ -102,7 +102,6 @@ StatusWith<AggregateCommandRequest> parseFromBSONForTests(
     bool apiStrict,
     const SerializationContext& serializationContext) {
     try {
-        // TODO SERVER-75930: pass serializationContext in
         return parseFromBSON(
             /*opCtx=*/nullptr, dbName, cmdObj, explainVerbosity, apiStrict, serializationContext);
     } catch (const AssertionException&) {
@@ -128,10 +127,13 @@ AggregateCommandRequest parseFromBSON(OperationContext* opCtx,
     }
 
     AggregateCommandRequest request(nss);
-    // TODO SERVER-75930: tenantId in VTS isn't properly detected by call to parse(IDLParseContext&,
-    // BSONObj&)
+    const auto tenantId = nss.tenantId();
+    const auto vts = tenantId
+        ? boost::make_optional(auth::ValidatedTenancyScopeFactory::create(
+              *tenantId, auth::ValidatedTenancyScopeFactory::TrustedForInnerOpMsgRequestTag{}))
+        : boost::none;
     request = AggregateCommandRequest::parse(
-        IDLParserContext("aggregate", apiStrict, nss.tenantId(), serializationContext),
+        IDLParserContext("aggregate", apiStrict, vts, tenantId, serializationContext),
         cmdObjChanged ? cmdObjBob.obj() : cmdObj);
 
     if (explainVerbosity) {
@@ -225,11 +227,16 @@ void validate(OperationContext* opCtx,
             !hasRequestReshardingResumeToken || nss.isOplog());
 
     auto requestResumeTokenElem = cmdObj[AggregateCommandRequest::kRequestResumeTokenFieldName];
-    uassert(ErrorCodes::InvalidOptions,
-            "$_requestResumeToken is not supported without Resharding Improvements",
-            !requestResumeTokenElem ||
-                resharding::gFeatureFlagReshardingImprovements.isEnabled(
-                    serverGlobalParams.featureCompatibility));
+    // We need to use isEnabledUseLastLTSFCVWhenUninitialized here because an aggregate
+    // command with $_requestResumeToken could be sent directly to an initial sync node with
+    // uninitialized FCV, and creating/parsing/validating this command invocation happens before
+    // any check that the node is a primary.
+    uassert(
+        ErrorCodes::InvalidOptions,
+        "$_requestResumeToken is not supported without Resharding Improvements",
+        !requestResumeTokenElem ||
+            resharding::gFeatureFlagReshardingImprovements.isEnabledUseLastLTSFCVWhenUninitialized(
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot()));
     uassert(ErrorCodes::FailedToParse,
             str::stream() << AggregateCommandRequest::kRequestResumeTokenFieldName
                           << " must be a boolean type",

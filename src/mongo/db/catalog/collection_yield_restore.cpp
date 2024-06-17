@@ -34,9 +34,10 @@
 
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
+#include "mongo/db/direct_connection_util.h"
 #include "mongo/db/storage/capped_snapshots.h"
 #include "mongo/db/storage/snapshot_helper.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/util/assert_util_core.h"
 
 namespace mongo {
@@ -48,15 +49,15 @@ bool locked(OperationContext* opCtx, const NamespaceString& ns) {
     }
 
     if (ns.isOplog()) {
-        return opCtx->lockState()->isReadLocked();
+        return shard_role_details::getLocker(opCtx)->isReadLocked();
     }
 
     if (ns.isChangeCollection() && ns.tenantId()) {
-        return opCtx->lockState()->isLockHeldForMode(
+        return shard_role_details::getLocker(opCtx)->isLockHeldForMode(
             {ResourceType::RESOURCE_TENANT, *ns.tenantId()}, MODE_IS);
     }
 
-    return opCtx->lockState()->isCollectionLockedForMode(ns, MODE_IS);
+    return shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(ns, MODE_IS);
 }
 
 }  // namespace
@@ -74,6 +75,9 @@ const Collection* LockedCollectionYieldRestore::operator()(OperationContext* opC
     invariant(!_nss.isEmpty());
     // Confirm that we are holding the necessary collection level lock.
     invariant(locked(opCtx, _nss));
+
+    // Check if this operation is a direct connection and if it is authorized to be one.
+    direct_connection_util::checkDirectShardOperationAllowed(opCtx, _nss.dbName());
 
     // Hold reference to the catalog for collection lookup without locks to be safe.
     auto catalog = CollectionCatalog::get(opCtx);

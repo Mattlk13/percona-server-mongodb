@@ -467,7 +467,7 @@ public:
 
     SSLConnectionOpenSSL(SSL_CTX* ctx, Socket* sock, const char* initialBytes, int len);
 
-    ~SSLConnectionOpenSSL();
+    ~SSLConnectionOpenSSL() override;
 };
 
 ////////////////////////////////////////////////////////////////
@@ -760,10 +760,6 @@ Future<UniqueOCSPResponse> retrieveOCSPResponse(const std::string& host,
         return getSSLFailure("Could not convert type OCSP Response to DER encoded object.");
     }
 
-    if (!OCSPManager::get(getGlobalServiceContext())) {
-        return getSSLFailure("OCSP fetch could not complete, server is in shutdown mode.");
-    }
-
     // Query the OCSP responder
     return OCSPManager::get(getGlobalServiceContext())
         ->requestStatus(buffer, host, purpose)
@@ -1013,7 +1009,7 @@ Future<OCSPFetchResponse> dispatchOCSPRequests(SSL_CTX* context,
                 //    unknown.
                 ScopeGuard logLatencyGuard([requestLatency, purpose]() {
                     if (purpose != OCSPPurpose::kClientVerify ||
-                        !gEnableDetailedConnectionHealthMetricLogLines) {
+                        !gEnableDetailedConnectionHealthMetricLogLines.load()) {
                         return;
                     }
                     LOGV2_INFO(6840101,
@@ -1112,7 +1108,7 @@ StatusWith<OCSPValidationContext> extractOcspUris(SSL_CTX* context,
 class OCSPCache : public ReadThroughCache<OCSPCacheKey, OCSPFetchResponse> {
 public:
     OCSPCache(ServiceContext* service)
-        : ReadThroughCache(_mutex, service, _threadPool, _lookup, tlsOCSPCacheSize) {
+        : ReadThroughCache(_mutex, service->getService(), _threadPool, _lookup, tlsOCSPCacheSize) {
         _threadPool.startup();
     }
 
@@ -1272,7 +1268,7 @@ public:
     explicit SSLManagerOpenSSL(const SSLParams& params,
                                const boost::optional<TransientSSLParams>& transientSSLParams,
                                bool isServer);
-    ~SSLManagerOpenSSL() {
+    ~SSLManagerOpenSSL() override {
         stopJobs();
     }
 
@@ -2583,6 +2579,8 @@ Status SSLManagerOpenSSL::initSSLContext(SSL_CTX* context,
         }
     }
 
+    // If the user has specified --setParameter tlsUseSystemCA=true, then no params.sslCAFile nor
+    // params.sslClusterCAFile will be defined, and the SSL Manager will fall back to the System CA.
     std::string cafile = params.sslCAFile;
     if (direction == ConnectionDirection::kIncoming && !params.sslClusterCAFile.empty()) {
         cafile = params.sslClusterCAFile;
@@ -3304,7 +3302,7 @@ Future<SSLPeerInfo> SSLManagerOpenSSL::parseAndValidatePeerCertificate(
     // TODO: check optional cipher restriction, using cert.
     auto peerSubject = getCertificateSubjectX509Name(peerCert.get());
     const auto cipher = SSL_get_current_cipher(conn);
-    if (!serverGlobalParams.quiet.load() && gEnableDetailedConnectionHealthMetricLogLines) {
+    if (!serverGlobalParams.quiet.load() && gEnableDetailedConnectionHealthMetricLogLines.load()) {
         LOGV2_INFO(6723801,
                    "Accepted TLS connection from peer",
                    "peerSubject"_attr = peerSubject,

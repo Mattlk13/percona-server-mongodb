@@ -1,11 +1,10 @@
 /*
  * Tests resharding and moveCollection behaviour on unsplittable collections.
  * @tags: [
- *   featureFlagTrackUnshardedCollectionsOnShardingCatalog,
  *   featureFlagReshardingImprovements,
  *   featureFlagMoveCollection,
- *   multiversion_incompatible,
  *   assumes_balancer_off,
+ *   requires_fcv_80
  * ]
  */
 
@@ -21,6 +20,7 @@ const kDataCollNss = kDbName + '.' + kDataColl;
 const kNumObjs = 3;
 
 assert.commandWorked(st.s.adminCommand({enableSharding: kDbName, primaryShard: shard0}));
+
 assert.commandWorked(st.s.getDB(kDbName).runCommand({createUnsplittableCollection: kDataColl}));
 
 for (let i = 0; i < kNumObjs; ++i) {

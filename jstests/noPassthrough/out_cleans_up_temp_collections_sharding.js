@@ -51,13 +51,31 @@ function failFn_sigkill() {
 
 function failFn_killOp() {
     let adminDB = st.rs0.getPrimary().getDB("admin");
-    const curOps =
-        adminDB
-            .aggregate(
-                [{$currentOp: {allUsers: true}}, {$match: {"command.comment": "testComment"}}])
-            .toArray();
+    // The create coordinator issues fire and forget refreshes after creating a collection. We
+    // filter these out to ensure we are killing the correct operation.
+    const curOps = adminDB
+                       .aggregate([
+                           {$currentOp: {allUsers: true}},
+                           {
+                               $match: {
+                                   "command.comment": "testComment",
+                                   "command._flushRoutingTableCacheUpdates": {$exists: false}
+                               }
+                           }
+                       ])
+                       .toArray();
     assert.eq(1, curOps.length, curOps);
     adminDB.killOp(curOps[0].opid);
+}
+
+function failFn_dropDbAndSigKill() {
+    testDB.dropDatabase();
+    failFn_sigkill();
+}
+
+function failFn_dropDbAndKillOp() {
+    testDB.dropDatabase();
+    failFn_killOp();
 }
 
 function testFn(timeseries, failFn) {
@@ -99,14 +117,22 @@ function testFn(timeseries, failFn) {
             st.rs0.getPrimary().getDB('config')['agg_temp_collections'].count();
 
         return tempCollections.length === 0 && garbageCollectionEntries === 0;
-    });
+    }, "Timeout hit while waiting for temporary collections to be garbage collected", 60000);
 }
 
 jsTest.log("Running test with normal collection and SIGKILL");
 testFn(false, failFn_sigkill);
 
+jsTest.log("Running test with normal collection and dropDbAndSigKill");
+testFn(false, failFn_dropDbAndSigKill);
+assert.commandWorked(sourceColl.insert({x: 1}));
+
 jsTest.log("Running test with normal collection and killOp");
 testFn(false, failFn_killOp);
+
+jsTest.log("Running test with normal collection and dropDbAndkillOp");
+testFn(false, failFn_dropDbAndKillOp);
+assert.commandWorked(sourceColl.insert({x: 1}));
 
 jsTest.log("Running test with timeseries collection and SIGKILL");
 testFn(true, failFn_sigkill);

@@ -41,8 +41,8 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/admission/execution_admission_context.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/last_vote.h"
 #include "mongo/db/repl/member_config.h"
@@ -56,6 +56,7 @@
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/vote_requester.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
@@ -134,14 +135,19 @@ void ReplicationCoordinatorImpl::cancelElection_forTest() {
 }
 
 StatusWith<executor::TaskExecutor::EventHandle>
-ReplicationCoordinatorImpl::ElectionState::_startVoteRequester(
-    WithLock lk, long long term, bool dryRun, OpTime lastAppliedOpTime, int primaryIndex) {
+ReplicationCoordinatorImpl::ElectionState::_startVoteRequester(WithLock lk,
+                                                               long long term,
+                                                               bool dryRun,
+                                                               OpTime lastWrittenOpTime,
+                                                               OpTime lastAppliedOpTime,
+                                                               int primaryIndex) {
     _voteRequester.reset(new VoteRequester);
     return _voteRequester->start(_replExecutor,
                                  _repl->_rsConfig,
                                  _repl->_selfIndex,
                                  term,
                                  dryRun,
+                                 lastWrittenOpTime,
                                  lastAppliedOpTime,
                                  primaryIndex);
 }
@@ -202,9 +208,10 @@ void ReplicationCoordinatorImpl::ElectionState::start(WithLock lk, StartElection
     _electionDryRunFinishedEvent = dryRunFinishedEvent;
 
     invariant(_repl->_rsConfig.getMemberAt(_repl->_selfIndex).isElectable());
+    const auto lastWrittenOpTime = _repl->_getMyLastWrittenOpTime_inlock();
     const auto lastAppliedOpTime = _repl->_getMyLastAppliedOpTime_inlock();
 
-    if (lastAppliedOpTime == OpTime()) {
+    if (lastWrittenOpTime == OpTime() || lastAppliedOpTime == OpTime()) {
         LOGV2(21436,
               "Not trying to elect self, "
               "do not yet have a complete set of data from any point in time");
@@ -234,6 +241,7 @@ void ReplicationCoordinatorImpl::ElectionState::start(WithLock lk, StartElection
         _startVoteRequester(lk,
                             term,
                             true,  // dry run
+                            lastWrittenOpTime,
                             lastAppliedOpTime,
                             primaryIndex);
     if (nextPhaseEvh.getStatus() == ErrorCodes::ShutdownInProgress) {
@@ -297,7 +305,8 @@ void ReplicationCoordinatorImpl::ElectionState::_startRealElection(WithLock lk,
 
     const Date_t now = _replExecutor->now();
     const OpTime lastCommittedOpTime = _topCoord->getLastCommittedOpTime();
-    const OpTime lastSeenOpTime = _topCoord->latestKnownOpTime();
+    const OpTime latestWrittenOpTime = _topCoord->latestKnownWrittenOpTime();
+    const OpTime latestAppliedOpTime = _topCoord->latestKnownAppliedOpTime();
     const int numVotesNeeded = rsConfig.getMajorityVoteCount();
     const double priorityAtElection = rsConfig.getMemberAt(selfIndex).getPriority();
     const Milliseconds electionTimeoutMillis = rsConfig.getElectionTimeoutPeriod();
@@ -311,7 +320,8 @@ void ReplicationCoordinatorImpl::ElectionState::_startRealElection(WithLock lk,
                                      now,
                                      newTerm,
                                      lastCommittedOpTime,
-                                     lastSeenOpTime,
+                                     latestWrittenOpTime,
+                                     latestAppliedOpTime,
                                      numVotesNeeded,
                                      priorityAtElection,
                                      electionTimeoutMillis,
@@ -361,8 +371,8 @@ void ReplicationCoordinatorImpl::ElectionState::_writeLastVoteForMyElection(
         // Any operation that occurs as part of an election process is critical to the operation of
         // the cluster. We mark the operation as having Immediate priority to skip ticket
         // acquisition and flow control.
-        ScopedAdmissionPriorityForLock priority(opCtx->lockState(),
-                                                AdmissionContext::Priority::kImmediate);
+        ScopedAdmissionPriority<ExecutionAdmissionContext> priority(
+            opCtx.get(), AdmissionContext::Priority::kExempt);
 
         LOGV2(6015300,
               "Storing last vote document in local storage for my election",
@@ -405,10 +415,11 @@ void ReplicationCoordinatorImpl::ElectionState::_writeLastVoteForMyElection(
 
 void ReplicationCoordinatorImpl::ElectionState::_requestVotesForRealElection(
     WithLock lk, long long newTerm, StartElectionReasonEnum reason) {
+    const auto lastWrittenOpTime = _repl->_getMyLastWrittenOpTime_inlock();
     const auto lastAppliedOpTime = _repl->_getMyLastAppliedOpTime_inlock();
 
     StatusWith<executor::TaskExecutor::EventHandle> nextPhaseEvh =
-        _startVoteRequester(lk, newTerm, false, lastAppliedOpTime, -1);
+        _startVoteRequester(lk, newTerm, false, lastWrittenOpTime, lastAppliedOpTime, -1);
     if (nextPhaseEvh.getStatus() == ErrorCodes::ShutdownInProgress) {
         return;
     }

@@ -324,7 +324,8 @@ void logShutdown(Client* client);
 void logLogout(Client* client,
                StringData reason,
                const BSONArray& initialUsers,
-               const BSONArray& updatedUsers);
+               const BSONArray& updatedUsers,
+               const boost::optional<Date_t>& loginTime);
 
 /**
  * Logs the result of a createIndex command.
@@ -441,8 +442,7 @@ void logRemoveOperation(Client* client, const NamespaceString& nss, const BSONOb
  * Logs values of cluster server parameters requested via getClusterParameter.
  */
 void logGetClusterParameter(
-    Client* client,
-    const stdx::variant<std::string, std::vector<std::string>>& requestedParameters);
+    Client* client, const std::variant<std::string, std::vector<std::string>>& requestedParameters);
 
 /**
  * Logs old and new value of given tenant's cluster server parameter when it is updated via

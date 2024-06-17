@@ -41,10 +41,8 @@ namespace mongo {
 
 namespace {
 class TenantMigrationAccessBlockerServerStatus final : public ServerStatusSection {
-
 public:
-    TenantMigrationAccessBlockerServerStatus()
-        : ServerStatusSection("tenantMigrationAccessBlocker") {}
+    using ServerStatusSection::ServerStatusSection;
 
     bool includeByDefault() const override {
         return true;
@@ -56,6 +54,10 @@ public:
             .appendInfoForServerStatus(&result);
         return result.obj();
     }
-} tenantMigrationAccessBlockerServerStatus;
+};
+auto& tenantMigrationAccessBlockerServerStatus =
+    *ServerStatusSectionBuilder<TenantMigrationAccessBlockerServerStatus>(
+         "tenantMigrationAccessBlocker")
+         .forShard();
 }  // namespace
 }  // namespace mongo

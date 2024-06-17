@@ -169,7 +169,7 @@ class CatalogCache {
     CatalogCache& operator=(const CatalogCache&) = delete;
 
 public:
-    CatalogCache(ServiceContext* service, CatalogCacheLoader& cacheLoader);
+    CatalogCache(ServiceContext* service, CatalogCacheLoader& cacheLoader, StringData kind = ""_sd);
     virtual ~CatalogCache();
 
     /**
@@ -200,7 +200,8 @@ public:
      */
     StatusWith<CollectionRoutingInfo> getCollectionRoutingInfoAt(OperationContext* opCtx,
                                                                  const NamespaceString& nss,
-                                                                 Timestamp atClusterTime);
+                                                                 Timestamp atClusterTime,
+                                                                 bool allowLocks = false);
 
     /**
      * Same as the getCollectionRoutingInfoAt call above, but returns the latest known routing
@@ -299,12 +300,6 @@ public:
                                 const boost::optional<DatabaseVersion>& wantedVersion);
 
     /**
-     * Sets whether this operation should block behind a catalog cache refresh.
-     */
-    static void setOperationShouldBlockBehindCatalogCacheRefresh(OperationContext* opCtx,
-                                                                 bool shouldBlock);
-
-    /**
      * Invalidates a single shard for the current collection if the epochs given in the chunk
      * versions match. Otherwise, invalidates the entire collection, causing any future targetting
      * requests to block on an upcoming catalog cache refresh.
@@ -313,6 +308,12 @@ public:
         const NamespaceString& nss,
         const boost::optional<ShardVersion>& wantedVersion,
         const ShardId& shardId);
+
+    /**
+     * Notifies the cache that there is a (possibly) newer collection version on the backing store.
+     */
+    virtual void advanceCollectionTimeInStore(const NamespaceString& nss,
+                                              const ChunkVersion& newVersionInStore);
 
     /**
      * Non-blocking method, which invalidates all namespaces which contain data on the specified
@@ -352,6 +353,12 @@ public:
     void invalidateCollectionEntry_LINEARIZABLE(const NamespaceString& nss);
 
     void invalidateIndexEntry_LINEARIZABLE(const NamespaceString& nss);
+
+    /**
+     * Peeks at the collection routing cache and returns the currently cached collection version.
+     * Returns boost::none if none is cached. Never blocks waiting for a refresh.
+     */
+    boost::optional<ChunkVersion> peekCollectionCacheVersion(const NamespaceString& nss);
 
 private:
     class DatabaseCache : public DatabaseTypeCache {
@@ -442,15 +449,24 @@ private:
     boost::optional<ShardingIndexesCatalogCache> _getCollectionIndexInfoAt(
         OperationContext* opCtx, const NamespaceString& nss, bool allowLocks = false);
 
-    void _triggerPlacementVersionRefresh(OperationContext* opCtx, const NamespaceString& nss);
+    void _triggerPlacementVersionRefresh(const NamespaceString& nss);
 
-    void _triggerIndexVersionRefresh(OperationContext* opCtx, const NamespaceString& nss);
+    void _triggerIndexVersionRefresh(const NamespaceString& nss);
 
     // Same as getCollectionRoutingInfo but will fetch the index information from the cache even if
     // the placement information is not sharded. Used internally when the a refresh is requested for
     // the index component.
     StatusWith<CollectionRoutingInfo> _getCollectionRoutingInfoWithoutOptimization(
         OperationContext* opCtx, const NamespaceString& nss);
+
+    StatusWith<CollectionRoutingInfo> _retryUntilConsistentRoutingInfo(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        ChunkManager&& cm,
+        boost::optional<ShardingIndexesCatalogCache>&& sii);
+
+    // (Optional) the kind of catalog cache instantiated. Used for logging and reporting purposes.
+    std::string _kind;
 
     // Interface from which chunks will be retrieved
     CatalogCacheLoader& _cacheLoader;

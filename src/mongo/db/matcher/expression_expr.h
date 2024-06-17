@@ -92,7 +92,7 @@ public:
 
     void debugString(StringBuilder& debug, int indentationLevel = 0) const final {
         _debugAddSpace(debug, indentationLevel);
-        debug << "$expr " << _expression->serialize(SerializationOptions{}).toString();
+        debug << "$expr " << _expression->serialize().toString();
         _debugStringAttachTagInfo(&debug);
     }
 
@@ -116,7 +116,7 @@ public:
         MONGO_UNREACHABLE_TASSERT(6400207);
     }
 
-    void resetChild(size_t, MatchExpression*) {
+    void resetChild(size_t, MatchExpression*) override {
         MONGO_UNREACHABLE;
     };
 

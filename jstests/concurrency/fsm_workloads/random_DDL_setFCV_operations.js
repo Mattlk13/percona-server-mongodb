@@ -8,6 +8,8 @@
  *   does_not_support_add_remove_shards,
  *   # Requires all nodes to be running the latest binary.
  *   multiversion_incompatible,
+ *   # TODO (SERVER-88539) Remove the 'assumes_balancer_off' tag
+ *   assumes_balancer_off,
  *  ]
  */
 
@@ -60,6 +62,11 @@ export const $config = extendWorkload($baseConfig, function($config, $super) {
         assert.commandWorked(
             db.adminCommand({setFeatureCompatibilityVersion: latestFCV, confirm: true}));
     };
+
+    // TODO SERVER-84271: The downgrade for featureFlagReplicateVectoredInsertsTransactionally is
+    // what causes the Interrupted error, so this can be removed when that feature flag is removed.
+    $config.data.movePrimaryAllowedErrorCodes =
+        [...$super.data.movePrimaryAllowedErrorCodes, ErrorCodes.Interrupted];
 
     return $config;
 });

@@ -176,6 +176,12 @@ public:
         _makeSessionWorkerFnForEagerReap = std::move(makeWorkerFnForEagerReap);
     }
 
+    /**
+     * Called on shutdown to prevent the TransactionRouter from starting a new transaction.
+     */
+    void setDisallowNewTransactions();
+    bool getDisallowNewTransactions();
+
 private:
     /**
      * Tracks the runtime info for transaction sessions that corresponds to the same logical
@@ -276,6 +282,8 @@ private:
 
     // Owns the Session objects for all current Sessions.
     SessionRuntimeInfoMap _sessions;
+
+    AtomicWord<bool> _disallowNewTransactions{false};
 };
 
 /**
@@ -478,10 +486,9 @@ public:
 private:
     friend class SessionCatalog;
 
-    static stdx::unique_lock<Client> _lockClientForSession(
-        WithLock, SessionCatalog::SessionRuntimeInfo* sri) {
+    static ClientLock _lockClientForSession(WithLock, SessionCatalog::SessionRuntimeInfo* sri) {
         if (const auto opCtx = sri->checkoutOpCtx) {
-            return stdx::unique_lock<Client>{*opCtx->getClient()};
+            return ClientLock{opCtx->getClient()};
         }
         return {};
     }
@@ -512,7 +519,7 @@ private:
 
     SessionCatalog::SessionRuntimeInfo* _sri;
     Session* _session;
-    stdx::unique_lock<Client> _clientLock;
+    mutable ClientLock _clientLock;
 
     bool _markedForReap{false};
     boost::optional<ReapMode> _reapMode;

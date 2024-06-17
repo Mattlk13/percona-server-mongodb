@@ -48,7 +48,6 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
@@ -72,6 +71,7 @@
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/db/tenant_id.h"
 #include "mongo/db/transaction/session_catalog_mongod_transaction_interface_impl.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/vector_clock_mutable.h"
 #include "mongo/idl/idl_parser.h"
 #include "mongo/unittest/assert.h"
@@ -88,6 +88,7 @@ void OplogApplierImplOpObserver::onInserts(OperationContext* opCtx,
                                            const CollectionPtr& coll,
                                            std::vector<InsertStatement>::const_iterator begin,
                                            std::vector<InsertStatement>::const_iterator end,
+                                           const std::vector<RecordId>& recordIds,
                                            std::vector<bool> fromMigrate,
                                            bool defaultFromMigrate,
                                            OpStateAccumulator* opAccumulator) {
@@ -224,7 +225,7 @@ void OplogApplierImplTest::setUp() {
     // test fixture does not create a featureCompatibilityVersion document from which to initialize
     // the server parameter.
     // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
-    serverGlobalParams.mutableFeatureCompatibility.setVersion(multiversion::GenericFCV::kLatest);
+    serverGlobalParams.mutableFCV.setVersion(multiversion::GenericFCV::kLatest);
 
     // This is necessary to generate ghost timestamps for index builds that are not 0, since 0 is an
     // invalid timestamp.
@@ -276,9 +277,12 @@ void OplogApplierImplTest::_testApplyOplogEntryOrGroupedInsertsCrudOperation(
 
     auto checkOpCtx = [&targetNss](OperationContext* opCtx) {
         ASSERT_TRUE(opCtx);
-        ASSERT_TRUE(opCtx->lockState()->isDbLockedForMode(targetNss.dbName(), MODE_IX));
-        ASSERT_FALSE(opCtx->lockState()->isDbLockedForMode(targetNss.dbName(), MODE_X));
-        ASSERT_TRUE(opCtx->lockState()->isCollectionLockedForMode(targetNss, MODE_IX));
+        ASSERT_TRUE(
+            shard_role_details::getLocker(opCtx)->isDbLockedForMode(targetNss.dbName(), MODE_IX));
+        ASSERT_FALSE(
+            shard_role_details::getLocker(opCtx)->isDbLockedForMode(targetNss.dbName(), MODE_X));
+        ASSERT_TRUE(
+            shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(targetNss, MODE_IX));
         ASSERT_FALSE(opCtx->writesAreReplicated());
         ASSERT_TRUE(DocumentValidationSettings::get(opCtx).isSchemaValidationDisabled());
     };

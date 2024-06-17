@@ -10,7 +10,6 @@ import {
     createCmdObjWithTenantId,
     getTenantIdForDatabase,
     isCmdObjWithTenantId,
-    isDenylistedDb,
     prependTenantIdToDbNameIfApplicable,
     removeTenantIdAndMaybeCheckPrefixes,
     usingMultipleTenants
@@ -26,8 +25,9 @@ const originalRunCommand = Mongo.prototype.runCommand;
 const originalCloseMethod = Mongo.prototype.close;
 
 // Save a reference to the connection created at shell startup. This will be used as a proxy for
-// multiple internal routing connections for the lifetime of the test execution.
-const initialConn = db.getMongo();
+// multiple internal routing connections for the lifetime of the test execution. If there is no
+// initial connection, then we will not perform connection routing when using this override.
+const initialConn = (typeof db !== 'undefined') ? db.getMongo() : undefined;
 
 const testTenantMigrationDB = "testTenantMigration";
 // For shard merge we need to use the local DB that is not blocked by tenant access blockers.
@@ -406,11 +406,10 @@ function runCommandRetryOnTenantMigrationErrors(
                 } else {
                     // The last item from the previous response is guaranteed to be a
                     // tenant migration error. Remove it to append the retried response.
-                    let newIdx = bulkWriteResponse.cursor.firstBatch.pop().idx;
+                    let newIdxBase = bulkWriteResponse.cursor.firstBatch.pop().idx;
                     // Iterate over new response and change the indexes to start with newIdx.
                     for (let opRes of resObj.cursor.firstBatch) {
-                        opRes.idx = newIdx;
-                        newIdx += 1;
+                        opRes.idx += newIdxBase;
                     }
 
                     // Add the new responses (with modified indexes) onto the original responses.
@@ -419,7 +418,12 @@ function runCommandRetryOnTenantMigrationErrors(
 
                     // Add new numErrors onto old numErrors. Subtract one to account for the
                     // tenant migration error that was popped off.
-                    bulkWriteResponse.numErrors += resObj.numErrors - 1;
+                    bulkWriteResponse.nErrors += resObj.nErrors - 1;
+                    bulkWriteResponse.nInserted += resObj.nInserted;
+                    bulkWriteResponse.nDeleted += resObj.nDeleted;
+                    bulkWriteResponse.nMatched += resObj.nMatched;
+                    bulkWriteResponse.nModified += resObj.nModified;
+                    bulkWriteResponse.nUpserted += resObj.nUpserted;
                 }
             }
 
@@ -571,15 +575,14 @@ function runCommandRetryOnTenantMigrationErrors(
 }
 
 Mongo.prototype.runCommand = function(dbName, cmdObj, options) {
-    const useDollarTenant = !!TestData.useDollarTenant;
     const useSecurityToken = !!TestData.useSecurityToken;
-    const useExpectPrefix = !!TestData.useExpectPrefix;
     const useResponsePrefixChecking = !!TestData.useResponsePrefixChecking;
 
     const tenantId = getTenantIdForDatabase(dbName);
     const dbNameWithTenantId = prependTenantIdToDbNameIfApplicable(dbName, tenantId);
-    const securityToken =
-        useSecurityToken ? _createTenantToken({tenant: ObjectId(tenantId)}) : undefined;
+    const securityToken = useSecurityToken
+        ? _createTenantToken({tenant: ObjectId(tenantId), expectPrefix: true})
+        : undefined;
 
     // If the command is already prefixed, just run it
     if (isCmdObjWithTenantId(cmdObj)) {
@@ -588,21 +591,7 @@ Mongo.prototype.runCommand = function(dbName, cmdObj, options) {
     }
 
     // Prepend a tenant prefix to all database names and namespaces, where applicable.
-    const cmdObjWithTenantId = (function() {
-        const cmdWithTenantPrefix = createCmdObjWithTenantId(cmdObj, tenantId);
-        if (!useDollarTenant && !useSecurityToken) {
-            return cmdWithTenantPrefix;
-        }
-
-        if (useDollarTenant) {
-            Object.assign(cmdWithTenantPrefix, {$tenant: ObjectId(tenantId)});
-        }
-        if (useExpectPrefix) {
-            Object.assign(cmdWithTenantPrefix, {expectPrefix: true});
-        }
-
-        return cmdWithTenantPrefix;
-    })();
+    const cmdObjWithTenantId = createCmdObjWithTenantId(cmdObj, tenantId);
 
     const resObj = runCommandRetryOnTenantMigrationErrors(
         this, securityToken, dbNameWithTenantId, cmdObjWithTenantId, options);
@@ -610,17 +599,15 @@ Mongo.prototype.runCommand = function(dbName, cmdObj, options) {
     // Remove the tenant prefix from all database names and namespaces in the result since tests
     // assume the command was run against the original database.
     const cmdName = Object.keys(cmdObj)[0];
-    let checkPrefixOptions = {};
-    if (useExpectPrefix || useResponsePrefixChecking) {
-        checkPrefixOptions = {
-            checkPrefix: true,
-            tenantId,
-            dbName,
-            cmdName,
-            debugLog: "Failed to check tenant prefix in response : " + tojsononeline(resObj) +
-                ". The request command obj is " + tojsononeline(cmdObjWithTenantId)
-        };
-    }
+    let checkPrefixOptions = !useResponsePrefixChecking ? {} : {
+        checkPrefix: true,
+        expectPrefix: true,
+        tenantId,
+        dbName,
+        cmdName,
+        debugLog: "Failed to check tenant prefix in response : " + tojsononeline(resObj) +
+            ". The request command obj is " + tojsononeline(cmdObjWithTenantId)
+    };
 
     removeTenantIdAndMaybeCheckPrefixes(resObj, checkPrefixOptions);
 

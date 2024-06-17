@@ -37,6 +37,7 @@
 
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/basic_types.h"
+#include "mongo/db/feature_compatibility_version_documentation.h"
 #include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/process_interface/stub_mongo_process_interface.h"
@@ -84,7 +85,7 @@ ExpressionContext::ExpressionContext(OperationContext* opCtx,
           std::move(collator),
           nullptr,  // mongoProcessInterface
           {},       // resolvedNamespaces
-          [findCmd]() -> boost::optional<UUID> {
+          [&findCmd]() -> boost::optional<UUID> {
               if (findCmd.getNamespaceOrUUID().isUUID()) {
                   return findCmd.getNamespaceOrUUID().uuid();
               }
@@ -93,6 +94,36 @@ ExpressionContext::ExpressionContext(OperationContext* opCtx,
           findCmd.getLet(),
           mayDbProfile,
           findCmd.getSerializationContext()) {}
+
+
+ExpressionContext::ExpressionContext(OperationContext* opCtx,
+                                     const DistinctCommandRequest& distinctCmd,
+                                     const NamespaceString& nss,
+                                     std::unique_ptr<CollatorInterface> collator,
+                                     bool mayDbProfile,
+                                     boost::optional<ExplainOptions::Verbosity> verbosity)
+    : ExpressionContext(
+          opCtx,
+          verbosity,
+          false,  // fromMongos
+          false,  // needsMerge
+          false,  // allowDiskUse
+          false,  // bypassDocumentValidation
+          false,  // isMapReduceCommand
+          nss,
+          boost::none,  // legacyRuntimeConstraints
+          std::move(collator),
+          nullptr,  // mongoProcessInterface
+          {},       // resolvedNamespaces
+          [&distinctCmd]() -> boost::optional<UUID> {
+              if (distinctCmd.getNamespaceOrUUID().isUUID()) {
+                  return distinctCmd.getNamespaceOrUUID().uuid();
+              }
+              return boost::none;
+          }(),
+          boost::none,  // letParameters
+          mayDbProfile,
+          distinctCmd.getSerializationContext()) {}
 
 ExpressionContext::ExpressionContext(OperationContext* opCtx,
                                      const AggregateCommandRequest& request,
@@ -165,6 +196,9 @@ ExpressionContext::ExpressionContext(
       _valueComparator(_collator.getCollator()),
       _resolvedNamespaces(std::move(resolvedNamespaces)) {
 
+    // Only initialize 'variables' if we are given a runtimeConstants object. We delay initializing
+    // variables and expect callers to invoke 'initializeReferencedSystemVariables()' after query
+    // parsing. This allows us to only initialize variables which are used in the query.
     if (runtimeConstants && runtimeConstants->getClusterTime().isNull()) {
         // Try to get a default value for clusterTime if a logical clock exists.
         auto genConsts = variables.generateRuntimeConstants(opCtx);
@@ -174,8 +208,6 @@ ExpressionContext::ExpressionContext(
         variables.setLegacyRuntimeConstants(genConsts);
     } else if (runtimeConstants) {
         variables.setLegacyRuntimeConstants(*runtimeConstants);
-    } else {
-        variables.setDefaultRuntimeConstants(opCtx);
     }
 
     if (!isMapReduce) {
@@ -231,11 +263,12 @@ ExpressionContext::ExpressionContext(OperationContext* opCtx,
       variablesParseState(variables.useIdGenerator()),
       maxFeatureCompatibilityVersion(boost::none),  // Ensure all features are allowed.
       mayDbProfile(true),
-      _collator(
-          nullptr),  // TODO SERVER-81604 Instantiate collator for makeBlankExpressionContext()
+      _collator(nullptr),
       _documentComparator(_collator.getCollator()),
       _valueComparator(_collator.getCollator()) {
-    variables.setDefaultRuntimeConstants(opCtx);
+    // This is a shortcut to avoid reading the clock and the vector clock, since we don't actually
+    // care about their values for this 'blank' ExpressionContext codepath.
+    variables.setLegacyRuntimeConstants({Date_t::min(), Timestamp()});
     // Expression counters are reported in serverStatus to indicate how often clients use certain
     // expressions/stages, so it's a side effect tied to parsing. We must stop expression counters
     // before re-parsing to avoid adding to the counters more than once per a given query.
@@ -248,11 +281,9 @@ boost::intrusive_ptr<ExpressionContext> ExpressionContext::makeBlankExpressionCo
     OperationContext* opCtx,
     const NamespaceStringOrUUID& nssOrUUID,
     boost::optional<BSONObj> shapifiedLet) {
-    // TODO SERVER-76087 We will likely want to set a flag here to stop $search from calling out
-    // to mongot.
     const auto nss = nssOrUUID.isNamespaceString() ? nssOrUUID.nss() : NamespaceString{};
     // This constructor is private, so we can't use `boost::make_instrusive()`.
-    return boost::intrusive_ptr<ExpressionContext>{new ExpressionContext(opCtx, nss, shapifiedLet)};
+    return new ExpressionContext(opCtx, nss, shapifiedLet);
 }
 
 void ExpressionContext::checkForInterruptSlow() {
@@ -334,6 +365,8 @@ boost::intrusive_ptr<ExpressionContext> ExpressionContext::copyWith(
     expCtx->inLookup = inLookup;
     expCtx->serializationCtxt = serializationCtxt;
 
+    expCtx->setQuerySettings(getQuerySettings());
+
     // Note that we intentionally skip copying the value of '_interruptCounter' because 'expCtx' is
     // intended to be used for executing a separate aggregation pipeline.
 
@@ -382,11 +415,51 @@ void ExpressionContext::stopExpressionCounters() {
     _expressionCounters.reset();
 }
 
-void ExpressionContext::setUserRoles() {
-    // Only set the value of $$USER_ROLES if it is referenced in the query.
-    if (isSystemVarReferencedInQuery(Variables::kUserRolesId) && enableAccessToUserRoles.load()) {
+void ExpressionContext::initializeReferencedSystemVariables() {
+    if (_systemVarsReferencedInQuery.contains(Variables::kNowId) &&
+        !variables.hasValue(Variables::kNowId)) {
+        variables.defineLocalNow();
+    }
+    if (_systemVarsReferencedInQuery.contains(Variables::kClusterTimeId) &&
+        !variables.hasValue(Variables::kClusterTimeId)) {
+        variables.defineClusterTime(opCtx);
+    }
+    if (_systemVarsReferencedInQuery.contains(Variables::kUserRolesId) &&
+        !variables.hasValue(Variables::kUserRolesId) && enableAccessToUserRoles.load()) {
         variables.defineUserRoles(opCtx);
     }
+}
+
+void ExpressionContext::throwIfFeatureFlagIsNotEnabledOnFCV(
+    StringData name, const boost::optional<FeatureFlag>& flag) {
+    if (!flag) {
+        return;
+    }
+
+    // If the FCV is not initialized yet, we check whether the feature flag is enabled on the last
+    // LTS FCV, which is the lowest FCV we can have on this server. If the FCV is set, then we
+    // should check if the flag is enabled on maxFeatureCompatibilityVersion or the current FCV. If
+    // both the FCV is uninitialized and maxFeatureCompatibilityVersion is set, to be safe, we
+    // should check the lowest FCV. We are guaranteed that maxFeatureCompatibilityVersion will
+    // always be greater than or equal to the last LTS. So we will check the last LTS.
+    const auto fcv = serverGlobalParams.featureCompatibility.acquireFCVSnapshot();
+    mongo::multiversion::FeatureCompatibilityVersion versionToCheck = fcv.getVersion();
+    if (!fcv.isVersionInitialized()) {
+        // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
+        versionToCheck = multiversion::GenericFCV::kLastLTS;
+    } else if (maxFeatureCompatibilityVersion) {
+        versionToCheck = *maxFeatureCompatibilityVersion;
+    }
+
+    uassert(ErrorCodes::QueryFeatureNotAllowed,
+            // We would like to include the current version and the required minimum version in this
+            // error message, but using FeatureCompatibilityVersion::toString() would introduce a
+            // dependency cycle (see SERVER-31968).
+            str::stream() << name
+                          << " is not allowed in the current feature compatibility version. See "
+                          << feature_compatibility_version_documentation::kCompatibilityLink
+                          << " for more information.",
+            flag->isEnabledOnVersion(versionToCheck));
 }
 
 }  // namespace mongo

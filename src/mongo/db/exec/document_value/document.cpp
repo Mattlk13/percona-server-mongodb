@@ -44,7 +44,6 @@
 #include "mongo/bson/bson_depth.h"
 #include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/pipeline/field_path.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -67,25 +66,28 @@ void assertFieldPathLengthOK(const std::vector<Position>& path) {
             path.size() < BSONDepth::getMaxAllowableDepth());
 }
 
-stdx::variant<BSONElement, Value, Document::TraversesArrayTag, stdx::monostate>
-getNestedFieldHelperBSON(BSONElement elt, const FieldPath& fp, size_t level) {
+/**
+ * Returns the BSONElement for path 'fp' and current nesting level.
+ *
+ * Returns EOO if the path does not exist or boost::none if an array is encountered along the path
+ * (but not at the end of the path).
+ */
+boost::optional<BSONElement> getNestedFieldHelperBSON(BSONElement elt,
+                                                      const FieldPath& fp,
+                                                      size_t level) {
     if (level == fp.getPathLength()) {
-        if (elt.ok()) {
-            return elt;
-        } else {
-            return stdx::monostate{};
-        }
+        return elt;
     }
 
     if (elt.type() == BSONType::Array) {
-        return Document::TraversesArrayTag{};
+        return boost::none;
     } else if (elt.type() == BSONType::Object) {
         auto subFieldElt = elt.embeddedObject()[fp.getFieldName(level)];
         return getNestedFieldHelperBSON(subFieldElt, fp, level + 1);
     }
 
     // The path continues "past" a scalar, and therefore does not exist.
-    return stdx::monostate{};
+    return BSONElement();
 }
 }  // namespace
 
@@ -143,7 +145,7 @@ bool DocumentStorageIterator::shouldSkipDeleted() {
 
         // If we strip the metadata see if a field name matches the known list. All metadata fields
         // start with '$' so optimize for a quick bailout.
-        if (_storage->bsonHasMetadata() && fieldName[0] == '$' &&
+        if (_storage->bsonHasMetadata() && fieldName.starts_with('$') &&
             Document::allMetadataFieldNames.contains(fieldName)) {
             return true;
         }
@@ -439,6 +441,7 @@ Document DocumentStorage::shred() const {
             md[it.fieldName()] = valueElem.val.shred();
         }
     }
+    md.setMetadata(DocumentMetadataFields(metadata()));
     return md.freeze();
 }
 
@@ -453,7 +456,7 @@ void DocumentStorage::loadLazyMetadata() const {
     while (it.more()) {
         BSONElement elem(it.next());
         auto fieldName = elem.fieldNameStringData();
-        if (fieldName[0] == '$') {
+        if (fieldName.starts_with('$')) {
             if (fieldName == Document::metaFieldTextScore) {
                 _metadataFields.setTextScore(elem.Double());
             } else if (fieldName == Document::metaFieldSearchScore) {
@@ -670,43 +673,56 @@ MutableValue MutableDocument::getNestedField(const vector<Position>& positions) 
 }
 
 
-stdx::variant<BSONElement, Value, Document::TraversesArrayTag, stdx::monostate>
-Document::getNestedFieldNonCachingHelper(const FieldPath& dottedField, size_t level) const {
+boost::optional<Value> Document::getNestedScalarFieldNonCachingHelper(const FieldPath& dottedField,
+                                                                      size_t level) const {
     if (!_storage) {
-        return stdx::monostate{};
+        return Value();
     }
 
     StringData fieldName = dottedField.getFieldName(level);
-    auto bsonEltOrValue = _storage->getFieldNonCaching(fieldName);
 
-    if (stdx::holds_alternative<BSONElement>(bsonEltOrValue)) {
-        return getNestedFieldHelperBSON(
-            stdx::get<BSONElement>(bsonEltOrValue), dottedField, level + 1);
-    }
+    // In many cases, the cache is empty and we can skip straight to reading from the backing BSON.
+    if (isModified()) {
+        if (auto val = _storage->getFieldCacheOnly(fieldName); !val.missing()) {
+            // Whether landing on an array (level + 1 == dottedField.getPathLength) or traversing an
+            // array, return boost::none.
+            if (val.getType() == BSONType::Array)
+                return boost::none;
 
-    const Value& val = stdx::get<Value>(bsonEltOrValue);
+            if (level + 1 == dottedField.getPathLength()) {
+                return val;
+            }
 
-    if (level + 1 == dottedField.getPathLength()) {
-        if (val.missing()) {
-            return stdx::monostate{};
-        } else {
-            return val;
+            if (val.getType() == BSONType::Object) {
+                return val.getDocument().getNestedScalarFieldNonCachingHelper(dottedField,
+                                                                              level + 1);
+            }
         }
     }
 
-    if (val.getType() == BSONType::Array) {
-        return Document::TraversesArrayTag{};
-    } else if (val.getType() == BSONType::Object) {
-        return val.getDocument().getNestedFieldNonCachingHelper(dottedField, level + 1);
+    // Either the value does not exist in the cache or the cache is empty so the above block is
+    // skipped, now check the backing BSON.
+    if (auto bsonElt = _storage->getFieldBsonOnly(fieldName); !bsonElt.eoo()) {
+        auto maybeBsonElt = getNestedFieldHelperBSON(bsonElt, dottedField, level + 1);
+        // Take care to avoid needlessly constructing a Value. There are 4 possible states for
+        // 'maybeBsonElt':
+        // 1. Scalar BSONElement --> coerce to Value and return it.
+        // 2. Array BSONElement --> return boost::none per this function's contract.
+        // 3. BSONElement::eoo --> path does not exist, so return an empty Value via
+        // Value(BSONElement::eoo).
+        // 4. boost::none --> encountered an array along the path, return boost::none.
+        if (maybeBsonElt && maybeBsonElt->type() != BSONType::Array)
+            return Value(*maybeBsonElt);
+        return boost::none;
     }
 
-    // The path extends beyond a scalar, so it does not exist.
-    return stdx::monostate{};
+    // Path does not exist.
+    return Value();
 }
 
-stdx::variant<BSONElement, Value, Document::TraversesArrayTag, stdx::monostate>
-Document::getNestedFieldNonCaching(const FieldPath& dottedField) const {
-    return getNestedFieldNonCachingHelper(dottedField, 0);
+boost::optional<Value> Document::getNestedScalarFieldNonCaching(
+    const FieldPath& dottedField) const {
+    return getNestedScalarFieldNonCachingHelper(dottedField, 0);
 }
 
 static Value getNestedFieldHelper(const Document& doc,

@@ -97,8 +97,6 @@ auto shardVersionRetry(OperationContext* opCtx,
     size_t numAttempts = 0;
 
     while (true) {
-        catalogCache->setOperationShouldBlockBehindCatalogCacheRefresh(opCtx, numAttempts);
-
         try {
             return callbackFn();
         } catch (const DBException& ex) {
@@ -106,58 +104,6 @@ auto shardVersionRetry(OperationContext* opCtx,
                 ex.toStatus(), nss, catalogCache, taskDescription, ++numAttempts);
         }
     }
-}
-
-/**
- * Async loop for retrying stale database/shard version a finite number of times. callbackFn should
- * accept OperationContext* as an argument.
- *
- * Note: Currently only supports void return type for callbackFn.
- */
-template <typename Callable>
-auto shardVersionRetry(ServiceContext* service,
-                       NamespaceString nss,
-                       CatalogCache* catalogCache,
-                       StringData taskDescription,
-                       ExecutorPtr executor,
-                       CancellationToken cancelToken,
-                       Callable callbackFn) {
-    auto numAttempts = std::make_shared<size_t>(0);
-
-    auto body = [service,
-                 catalogCache,
-                 taskDescription,
-                 numAttempts,
-                 _callbackFn = std::move(callbackFn),
-                 executor,
-                 cancelToken] {
-        boost::optional<ThreadClient> threadClient;
-        if (!haveClient()) {
-            threadClient.emplace(taskDescription, service->getService());
-        }
-
-        CancelableOperationContextFactory opCtxFactory(cancelToken, executor);
-        auto cancelableOpCtx = opCtxFactory.makeOperationContext(&cc());
-        auto opCtx = cancelableOpCtx.get();
-
-        catalogCache->setOperationShouldBlockBehindCatalogCacheRefresh(opCtx, *numAttempts);
-        return _callbackFn(opCtx);
-    };
-
-    using ResultType = std::invoke_result_t<Callable, OperationContext*>;
-
-    return AsyncTry<decltype(body)>(std::move(body))
-        .until([numAttempts, _nss = std::move(nss), catalogCache, taskDescription](
-                   const StatusOrStatusWith<ResultType>& statusOrStatusWith) {
-            if (statusOrStatusWith.isOK()) {
-                return true;
-            }
-
-            shard_version_retry::checkErrorStatusAndMaxRetries(
-                statusOrStatusWith, _nss, catalogCache, taskDescription, ++(*numAttempts));
-            return false;
-        })
-        .on(std::move(executor), cancelToken);
 }
 
 }  // namespace mongo

@@ -46,7 +46,7 @@ class StubMongoProcessInterface : public MongoProcessInterface {
 public:
     StubMongoProcessInterface() : MongoProcessInterface(nullptr) {}
     using MongoProcessInterface::MongoProcessInterface;
-    virtual ~StubMongoProcessInterface() = default;
+    ~StubMongoProcessInterface() override = default;
 
     std::unique_ptr<TransactionHistoryIteratorBase> createTransactionHistoryIterator(
         repl::OpTime time) const override {
@@ -80,9 +80,18 @@ public:
         return std::make_unique<StubWriteSizeEstimator>();
     }
 
+    bool isExpectedToExecuteQueries() override {
+        return false;
+    }
+
     bool isSharded(OperationContext* opCtx, const NamespaceString& ns) override {
         return false;
     }
+
+    boost::optional<ShardId> determineSpecificMergeShard(
+        OperationContext* opCtx, const NamespaceString& nss) const override {
+        return boost::none;
+    };
 
     void updateClientOperationTime(OperationContext* opCtx) const override {}
 
@@ -192,7 +201,8 @@ public:
 
     void createTempCollection(OperationContext* opCtx,
                               const NamespaceString& nss,
-                              const BSONObj& collectionOptions) override {
+                              const BSONObj& collectionOptions,
+                              boost::optional<ShardId> dataShard) override {
         MONGO_UNREACHABLE;
     }
 
@@ -210,14 +220,14 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+    std::unique_ptr<Pipeline, PipelineDeleter> preparePipelineForExecution(
         Pipeline* pipeline,
         ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
         boost::optional<BSONObj> readConcern = boost::none) override {
         MONGO_UNREACHABLE;
     }
 
-    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+    std::unique_ptr<Pipeline, PipelineDeleter> preparePipelineForExecution(
         const AggregateCommandRequest& aggRequest,
         Pipeline* pipeline,
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -252,6 +262,10 @@ public:
         MONGO_UNREACHABLE;
     }
 
+    boost::optional<ShardId> getShardId(OperationContext* opCtx) const override {
+        return boost::none;
+    }
+
     bool inShardedEnvironment(OperationContext* opCtx) const override {
         MONGO_UNREACHABLE;
     }
@@ -270,19 +284,19 @@ public:
         const NamespaceString& nss,
         UUID collectionUUID,
         const Document& documentKey,
-        boost::optional<BSONObj> readConcern) {
+        boost::optional<BSONObj> readConcern) override {
         MONGO_UNREACHABLE;
     }
 
     boost::optional<Document> lookupSingleDocumentLocally(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const NamespaceString& nss,
-        const Document& documentKey) {
+        const Document& documentKey) override {
         MONGO_UNREACHABLE_TASSERT(6148002);
     }
 
     std::vector<GenericCursor> getIdleCursors(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                              CurrentOpUserMode userMode) const {
+                                              CurrentOpUserMode userMode) const override {
         MONGO_UNREACHABLE;
     }
 
@@ -323,10 +337,6 @@ public:
         uasserted(51019, "Unexpected check of routing table");
     }
 
-    std::unique_ptr<ResourceYielder> getResourceYielder(StringData cmdName) const override {
-        return nullptr;
-    }
-
     std::pair<std::set<FieldPath>, boost::optional<ChunkVersion>>
     ensureFieldsUniqueOrResolveDocumentKey(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -353,31 +363,31 @@ public:
     }
 
     std::unique_ptr<TemporaryRecordStore> createTemporaryRecordStore(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx, KeyFormat keyFormat) const {
+        const boost::intrusive_ptr<ExpressionContext>& expCtx, KeyFormat keyFormat) const override {
         MONGO_UNREACHABLE;
     }
 
     void writeRecordsToRecordStore(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                    RecordStore* rs,
                                    std::vector<Record>* records,
-                                   const std::vector<Timestamp>& ts) const {
+                                   const std::vector<Timestamp>& ts) const override {
         MONGO_UNREACHABLE;
     }
 
     Document readRecordFromRecordStore(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                        RecordStore* rs,
-                                       RecordId rID) const {
+                                       RecordId rID) const override {
         MONGO_UNREACHABLE;
     }
 
     void deleteRecordFromRecordStore(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                      RecordStore* rs,
-                                     RecordId rID) const {
+                                     RecordId rID) const override {
         MONGO_UNREACHABLE;
     }
 
     void truncateRecordStore(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                             RecordStore* rs) const {
+                             RecordStore* rs) const override {
         MONGO_UNREACHABLE;
     }
 };

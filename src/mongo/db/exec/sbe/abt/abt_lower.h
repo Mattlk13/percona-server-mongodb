@@ -75,22 +75,41 @@ private:
     LowerFuncT _lowerFn;
 };
 
+/*
+ * Represent how ABT expression to SBE EExpression lowering should treat the meaning of
+ * BinaryOp<Gt/Gte/Lt/Lte/Eq>.
+ */
+enum class ComparisonOpSemantics {
+    // Translate comparisons as full BSON order comparisons. For example, 5 < "str" evaluates to
+    // true because numbers are less than strings on the BSON numberline. BinaryOp<Eq> will return
+    // false for operands of different types.
+    kTotalOrder,
+    // Translate comparisons as type-bracketed comparisons. This causes comparisons with operands of
+    // different types to evaluate to Nothing. This option will means the ABT BinaryOp operators
+    // have the same semantics as 'sbe::EPrimBinary'; for example, numbers have IEEE semantics,
+    // where NaN == NaN evaluates to false.
+    kTypeBracketing
+};
+
 class SBEExpressionLowering {
 public:
-    SBEExpressionLowering(const VariableEnvironment& env,
-                          VarResolver vr,
-                          SlotsProvider& providedSlots,
-                          sbe::value::SlotIdGenerator& ids,
-                          sbe::InputParamToSlotMap& inputParamToSlotMap,
-                          const Metadata* metadata = nullptr,
-                          const NodeProps* np = nullptr)
+    SBEExpressionLowering(
+        const VariableEnvironment& env,
+        VarResolver vr,
+        SlotsProvider& providedSlots,
+        sbe::value::SlotIdGenerator& ids,
+        sbe::InputParamToSlotMap& inputParamToSlotMap,
+        const Metadata* metadata = nullptr,
+        const NodeProps* np = nullptr,
+        ComparisonOpSemantics compOpSemantics = ComparisonOpSemantics::kTotalOrder)
         : _env(env),
           _varResolver(vr),
           _providedSlots(providedSlots),
           _slotIdGenerator(ids),
           _inputParamToSlotMap(inputParamToSlotMap),
           _metadata(metadata),
-          _np(np) {}
+          _np(np),
+          _comparisonOpSemantics(compOpSemantics) {}
 
     // The default noop transport.
     template <typename T, typename... Ts>
@@ -149,12 +168,11 @@ private:
     sbe::FrameId _frameCounter{100};
     stdx::unordered_map<const Let*, sbe::FrameId> _letMap;
     stdx::unordered_map<const LambdaAbstraction*, sbe::FrameId> _lambdaMap;
-};
-
-enum class ScanOrder {
-    Forward,
-    Reverse,
-    Random  // Uses a random cursor.
+    // Allow SBE stage builders to specify a different meaning for comparison operations. This is
+    // mainly offered as a crutch to allow SBE stage builders to continue using this class. The
+    // default for Bonsai is that comparison operators form a total order; many rewrites make this
+    // assumption.
+    ComparisonOpSemantics _comparisonOpSemantics{ComparisonOpSemantics::kTotalOrder};
 };
 
 class SBENodeLowering {
@@ -165,7 +183,6 @@ public:
                     sbe::InputParamToSlotMap& inputParamToSlotMap,
                     const Metadata& metadata,
                     const NodeToGroupPropsMap& nodeToGroupPropsMap,
-                    const ScanOrder scanOrder,
                     PlanYieldPolicy* yieldPolicy = nullptr)
         : _env(env),
           _providedSlots(providedSlots),
@@ -173,12 +190,12 @@ public:
           _inputParamToSlotMap(inputParamToSlotMap),
           _metadata(metadata),
           _nodeToGroupPropsMap(nodeToGroupPropsMap),
-          _scanOrder(scanOrder),
           _yieldPolicy(yieldPolicy) {}
 
     // The default noop transport.
     template <typename T, typename... Ts>
-    std::unique_ptr<sbe::PlanStage> walk(const T&,
+    std::unique_ptr<sbe::PlanStage> walk(const ABT& abtn,
+                                         const T&,
                                          SlotVarMap& slotMap,
                                          boost::optional<sbe::value::SlotId>& ridSlot,
                                          Ts&&...) {
@@ -190,57 +207,67 @@ public:
         return nullptr;
     }
 
-    std::unique_ptr<sbe::PlanStage> walk(const RootNode& n,
+    std::unique_ptr<sbe::PlanStage> walk(const ABT& abtn,
+                                         const RootNode& n,
                                          SlotVarMap& slotMap,
                                          boost::optional<sbe::value::SlotId>& ridSlot,
                                          const ABT& child,
                                          const ABT& refs);
-    std::unique_ptr<sbe::PlanStage> walk(const EvaluationNode& n,
+    std::unique_ptr<sbe::PlanStage> walk(const ABT& abtn,
+                                         const EvaluationNode& n,
                                          SlotVarMap& slotMap,
                                          boost::optional<sbe::value::SlotId>& ridSlot,
                                          const ABT& child,
                                          const ABT& binds);
 
-    std::unique_ptr<sbe::PlanStage> walk(const FilterNode& n,
+    std::unique_ptr<sbe::PlanStage> walk(const ABT& abtn,
+                                         const FilterNode& n,
                                          SlotVarMap& slotMap,
                                          boost::optional<sbe::value::SlotId>& ridSlot,
                                          const ABT& child,
                                          const ABT& filter);
 
-    std::unique_ptr<sbe::PlanStage> walk(const LimitSkipNode& n,
+    std::unique_ptr<sbe::PlanStage> walk(const ABT& abtn,
+                                         const LimitSkipNode& n,
                                          SlotVarMap& slotMap,
                                          boost::optional<sbe::value::SlotId>& ridSlot,
                                          const ABT& child);
-    std::unique_ptr<sbe::PlanStage> walk(const ExchangeNode& n,
+    std::unique_ptr<sbe::PlanStage> walk(const ABT& abtn,
+                                         const ExchangeNode& n,
                                          SlotVarMap& slotMap,
                                          boost::optional<sbe::value::SlotId>& ridSlot,
                                          const ABT& child,
                                          const ABT& refs);
-    std::unique_ptr<sbe::PlanStage> walk(const CollationNode& n,
+    std::unique_ptr<sbe::PlanStage> walk(const ABT& abtn,
+                                         const CollationNode& n,
                                          SlotVarMap& slotMap,
                                          boost::optional<sbe::value::SlotId>& ridSlot,
                                          const ABT& child,
                                          const ABT& refs);
 
-    std::unique_ptr<sbe::PlanStage> walk(const UniqueNode& n,
+    std::unique_ptr<sbe::PlanStage> walk(const ABT& abtn,
+                                         const UniqueNode& n,
                                          SlotVarMap& slotMap,
                                          boost::optional<sbe::value::SlotId>& ridSlot,
                                          const ABT& child,
                                          const ABT& refs);
 
-    std::unique_ptr<sbe::PlanStage> walk(const SpoolProducerNode& n,
+    std::unique_ptr<sbe::PlanStage> walk(const ABT& abtn,
+                                         const SpoolProducerNode& n,
                                          SlotVarMap& slotMap,
                                          boost::optional<sbe::value::SlotId>& ridSlot,
                                          const ABT& child,
                                          const ABT& filter,
                                          const ABT& binder,
                                          const ABT& refs);
-    std::unique_ptr<sbe::PlanStage> walk(const SpoolConsumerNode& n,
+    std::unique_ptr<sbe::PlanStage> walk(const ABT& abtn,
+                                         const SpoolConsumerNode& n,
                                          SlotVarMap& slotMap,
                                          boost::optional<sbe::value::SlotId>& ridSlot,
                                          const ABT& binder);
 
-    std::unique_ptr<sbe::PlanStage> walk(const GroupByNode& n,
+    std::unique_ptr<sbe::PlanStage> walk(const ABT& abtn,
+                                         const GroupByNode& n,
                                          SlotVarMap& slotMap,
                                          boost::optional<sbe::value::SlotId>& ridSlot,
                                          const ABT& child,
@@ -249,59 +276,69 @@ public:
                                          const ABT& gbBind,
                                          const ABT& gbRefs);
 
-    std::unique_ptr<sbe::PlanStage> walk(const NestedLoopJoinNode& n,
+    std::unique_ptr<sbe::PlanStage> walk(const ABT& abtn,
+                                         const NestedLoopJoinNode& n,
                                          SlotVarMap& slotMap,
                                          boost::optional<sbe::value::SlotId>& ridSlot,
                                          const ABT& leftChild,
                                          const ABT& rightChild,
                                          const ABT& filter);
-    std::unique_ptr<sbe::PlanStage> walk(const HashJoinNode& n,
+    std::unique_ptr<sbe::PlanStage> walk(const ABT& abtn,
+                                         const HashJoinNode& n,
                                          SlotVarMap& slotMap,
                                          boost::optional<sbe::value::SlotId>& ridSlot,
                                          const ABT& leftChild,
                                          const ABT& rightChild,
                                          const ABT& refs);
-    std::unique_ptr<sbe::PlanStage> walk(const MergeJoinNode& n,
+    std::unique_ptr<sbe::PlanStage> walk(const ABT& abtn,
+                                         const MergeJoinNode& n,
                                          SlotVarMap& slotMap,
                                          boost::optional<sbe::value::SlotId>& ridSlot,
                                          const ABT& leftChild,
                                          const ABT& rightChild,
                                          const ABT& refs);
 
-    std::unique_ptr<sbe::PlanStage> walk(const SortedMergeNode& n,
+    std::unique_ptr<sbe::PlanStage> walk(const ABT& abtn,
+                                         const SortedMergeNode& n,
                                          SlotVarMap& slotMap,
                                          boost::optional<sbe::value::SlotId>& ridSlot,
                                          const ABTVector& children,
                                          const ABT& binder,
                                          const ABT& refs);
 
-    std::unique_ptr<sbe::PlanStage> walk(const UnionNode& n,
+    std::unique_ptr<sbe::PlanStage> walk(const ABT& abtn,
+                                         const UnionNode& n,
                                          SlotVarMap& slotMap,
                                          boost::optional<sbe::value::SlotId>& ridSlot,
                                          const ABTVector& children,
                                          const ABT& binder,
                                          const ABT& refs);
 
-    std::unique_ptr<sbe::PlanStage> walk(const UnwindNode& n,
+    std::unique_ptr<sbe::PlanStage> walk(const ABT& abtn,
+                                         const UnwindNode& n,
                                          SlotVarMap& slotMap,
                                          boost::optional<sbe::value::SlotId>& ridSlot,
                                          const ABT& child,
                                          const ABT& pidBind,
                                          const ABT& refs);
 
-    std::unique_ptr<sbe::PlanStage> walk(const PhysicalScanNode& n,
+    std::unique_ptr<sbe::PlanStage> walk(const ABT& abtn,
+                                         const PhysicalScanNode& n,
                                          SlotVarMap& slotMap,
                                          boost::optional<sbe::value::SlotId>& ridSlot,
                                          const ABT& /*binds*/);
-    std::unique_ptr<sbe::PlanStage> walk(const CoScanNode& n,
+    std::unique_ptr<sbe::PlanStage> walk(const ABT& abtn,
+                                         const CoScanNode& n,
                                          SlotVarMap& slotMap,
                                          boost::optional<sbe::value::SlotId>& ridSlot);
 
-    std::unique_ptr<sbe::PlanStage> walk(const IndexScanNode& n,
+    std::unique_ptr<sbe::PlanStage> walk(const ABT& abtn,
+                                         const IndexScanNode& n,
                                          SlotVarMap& slotMap,
                                          boost::optional<sbe::value::SlotId>& ridSlot,
                                          const ABT& /*binds*/);
-    std::unique_ptr<sbe::PlanStage> walk(const SeekNode& n,
+    std::unique_ptr<sbe::PlanStage> walk(const ABT& abtn,
+                                         const SeekNode& n,
                                          SlotVarMap& slotMap,
                                          boost::optional<sbe::value::SlotId>& ridSlot,
                                          const ABT& /*binds*/,
@@ -392,6 +429,11 @@ private:
                                                       const NodeProps* np = nullptr) {
         return getExpressionLowering(slotMap, np).optimize(e);
     }
+
+    void extractAndLowerExpressions(const EvaluationNode& n,
+                                    SlotVarMap& slotMap,
+                                    sbe::SlotExprPairVector& projectsOut);
+
     const VariableEnvironment& _env;
     SlotsProvider& _providedSlots;
 
@@ -402,13 +444,12 @@ private:
     const Metadata& _metadata;
     const NodeToGroupPropsMap& _nodeToGroupPropsMap;
 
-    // Specifies the order for any ScanStages. Currently only supported for single-threaded
-    // (non parallel-scanned) mongod collections.
-    // TODO SERVER-73010: handle cases where we have more than one collection scan.
-    const ScanOrder _scanOrder;
-
     // Specifies the yielding policy to initialize the corresponding PlanStages with.
     PlanYieldPolicy* _yieldPolicy;
+
+    // Map of <child, parent> evaluation nodes, such that the parent projections can be merged in
+    // the same sbe project stage as the child's.
+    std::map<const EvaluationNode*, const EvaluationNode*> _evalMap;
 };
 
 inline sbe::EPrimUnary::Op getEPrimUnaryOp(optimizer::Operations op) {

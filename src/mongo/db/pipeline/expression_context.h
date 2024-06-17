@@ -63,13 +63,15 @@
 #include "mongo/db/query/collation/collation_spec.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/datetime/date_time_support.h"
+#include "mongo/db/query/distinct_command_gen.h"
 #include "mongo/db/query/explain_options.h"
 #include "mongo/db/query/find_command.h"
+#include "mongo/db/query/query_knob_configuration.h"
 #include "mongo/db/query/query_knobs_gen.h"
-#include "mongo/db/query/query_settings_gen.h"
+#include "mongo/db/query/query_settings/query_settings_gen.h"
 #include "mongo/db/query/tailable_mode.h"
 #include "mongo/db/query/tailable_mode_gen.h"
-#include "mongo/db/server_options.h"
+#include "mongo/db/query/util/deferred.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/stdx/unordered_set.h"
@@ -88,10 +90,15 @@ class AggregateCommandRequest;
 enum struct SbeCompatibility {
     // Not implemented in SBE.
     notCompatible,
-    // Implemented in SBE but behind the featureFlagSbeFull flag.
-    flagGuarded,
-    // Implemented in SBE and enabled by default.
-    fullyCompatible,
+    // Requires "featureFlagSbeFull" to be set. New SBE features which are under
+    // development can live under this feature flag until they are ready to be shipped.
+    requiresSbeFull,
+    // Requires the framework control knob to be "trySbeEngine". Fully tested, complete
+    // SBE features belong here.
+    requiresTrySbe,
+    // Used for the narrow feature set that we expose when "trySbeRestricted" is on. These features
+    // are always SBE compatible unless SBE is completely disabled with "forceClassicEngine".
+    noRequirements,
 };
 
 class ExpressionContext : public RefCountable {
@@ -157,6 +164,12 @@ public:
                       boost::optional<ExplainOptions::Verbosity> verbosity = boost::none,
                       bool allowDiskUseByDefault = false);
 
+    ExpressionContext(OperationContext* opCtx,
+                      const DistinctCommandRequest& distinctCmd,
+                      const NamespaceString& nss,
+                      std::unique_ptr<CollatorInterface> collator,
+                      bool mayDbProfile,
+                      boost::optional<ExplainOptions::Verbosity> verbosity);
     /**
      * Constructs an ExpressionContext to be used for Pipeline parsing and evaluation.
      * 'resolvedNamespaces' maps collection names (not full namespaces) to ResolvedNamespaces.
@@ -395,8 +408,8 @@ public:
     }
 
     void addResolvedNamespaces(
-        mongo::stdx::unordered_set<mongo::NamespaceString> resolvedNamespaces) {
-        for (auto&& nss : resolvedNamespaces) {
+        const mongo::stdx::unordered_set<mongo::NamespaceString>& resolvedNamespaces) {
+        for (const auto& nss : resolvedNamespaces) {
             _resolvedNamespaces.try_emplace(nss.coll(), nss, std::vector<BSONObj>{});
         }
     }
@@ -484,18 +497,22 @@ public:
     }
 
     /**
-     * Sets the value of the $$USER_ROLES system variable.
+     * Initializes the value of system variables that are referenced by the query. This allows for
+     * lazy initialization of resources which may be expensive to construct (e.g. constructing
+     * cluster timestamp invokes taking a mutex). This function should be invoked after the parsing
+     * of all aggregation expressions in the query.
      */
-    void setUserRoles();
+    void initializeReferencedSystemVariables();
 
     /**
-     * Record that we have seen the given system variable in the query.
+     * Record that we have seen the given system variable in the query. Used for lazy initialization
+     * of variables.
      */
     void setSystemVarReferencedInQuery(Variables::Id var) {
         tassert(7612600,
                 "Cannot track references to user-defined variables.",
                 !Variables::isUserDefinedVariable(var));
-        _varsReferencedInQuery.insert(var);
+        _systemVarsReferencedInQuery.insert(var);
     }
 
     /**
@@ -506,8 +523,16 @@ public:
             7612601,
             "Cannot access whether a variable is referenced to or not for a user-defined variable.",
             !Variables::isUserDefinedVariable(var));
-        return _varsReferencedInQuery.count(var);
+        return _systemVarsReferencedInQuery.count(var);
     }
+
+    /**
+     * Throws if the provided feature flag is not enabled in the current FCV or
+     * 'maxFeatureCompatibilityVersion' if set. Will do nothing if the feature flag is enabled
+     * or boost::none.
+     */
+    void throwIfFeatureFlagIsNotEnabledOnFCV(StringData name,
+                                             const boost::optional<FeatureFlag>& flag);
 
     // The explain verbosity requested by the user, or boost::none if no explain was requested.
     boost::optional<ExplainOptions::Verbosity> explain;
@@ -579,24 +604,24 @@ public:
     const bool mayDbProfile = true;
 
     // The lowest SBE compatibility level of all expressions which use this expression context.
-    SbeCompatibility sbeCompatibility = SbeCompatibility::fullyCompatible;
+    SbeCompatibility sbeCompatibility = SbeCompatibility::noRequirements;
 
     // The lowest SBE compatibility level of all accumulators in the $group stage currently
     // being parsed using this expression context. This value is transient and gets
     // reset for every $group stage we parse. Each $group stage has its own per-stage flag.
-    SbeCompatibility sbeGroupCompatibility = SbeCompatibility::fullyCompatible;
+    SbeCompatibility sbeGroupCompatibility = SbeCompatibility::noRequirements;
 
     // The lowest SBE compatibility level of all window functions in the $_internalSetWindowFields
     // stage currently being parsed using this expression context. This value is transient and gets
     // reset for every $_internalSetWindowFields stage we parse. Each $_internalSetWindowFields
     // stage has its own per-stage flag.
-    SbeCompatibility sbeWindowCompatibility = SbeCompatibility::fullyCompatible;
+    SbeCompatibility sbeWindowCompatibility = SbeCompatibility::noRequirements;
 
     // In some situations we could lower the collection access and, maybe, a prefix of a pipeline to
     // SBE but doing so would prevent a specific optimization that exists in the classic engine from
     // being applied. Until we implement the same optimization in SBE, we need to fallback to
     // running the query in the classic engine entirely.
-    SbeCompatibility sbePipelineCompatibility = SbeCompatibility::fullyCompatible;
+    SbeCompatibility sbePipelineCompatibility = SbeCompatibility::noRequirements;
 
     // These fields can be used in a context when API version validations were not enforced during
     // parse time (Example creating a view or validator), but needs to be enforce while querying
@@ -646,8 +671,15 @@ public:
         return _querySettings;
     }
 
-    void setQuerySettings(query_settings::QuerySettings&& querySettings) {
+    const QueryKnobConfiguration& getQueryKnobConfiguration() const {
+        return _queryKnobConfiguration.get(_querySettings);
+    }
+
+    void setQuerySettings(query_settings::QuerySettings querySettings) {
         _querySettings = std::move(querySettings);
+        tassert(8827100,
+                "Query knobs shouldn't be initialized before query settings are set",
+                !_queryKnobConfiguration.isInitialized());
     }
 
     // Forces the plan cache to be used even if there's only one solution available. Queries that
@@ -766,7 +798,8 @@ protected:
 private:
     // Instantiates an ExpressionContext which does not increment expression counters and does not
     // enforce FCV restrictions. It is used for implementing the `makeBlankExpressionContext()`
-    // factory method.
+    // factory method. Please also note that the runtime constants are not given real/accurate
+    // values of '$$NOW' and '$$CLUSTER_TIME', in the name of efficiency.
     ExpressionContext(OperationContext* opCtx,
                       const NamespaceString& ns,
                       const boost::optional<BSONObj>& letParameters = boost::none);
@@ -776,9 +809,14 @@ private:
 
     // We use this set to indicate whether or not a system variable was referenced in the query that
     // is being executed (if the variable was referenced, it is an element of this set).
-    stdx::unordered_set<Variables::Id> _varsReferencedInQuery;
+    stdx::unordered_set<Variables::Id> _systemVarsReferencedInQuery;
 
     query_settings::QuerySettings _querySettings = query_settings::QuerySettings();
+
+    DeferredFn<QueryKnobConfiguration, const query_settings::QuerySettings&>
+        _queryKnobConfiguration{[](const auto& querySettings) {
+            return QueryKnobConfiguration(querySettings);
+        }};
 };
 
 }  // namespace mongo

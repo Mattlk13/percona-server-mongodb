@@ -1,10 +1,10 @@
 /**
- * Test that telemetry works properly for a find command that uses regex.
+ * Test that queryStats works properly for a find command that uses regex.
  * @tags: [requires_fcv_71]
  */
-import {getQueryStats} from "jstests/libs/query_stats_utils.js";
+import {getLatestQueryStatsEntry} from "jstests/libs/query_stats_utils.js";
 
-// Turn on the collecting of telemetry metrics.
+// Turn on the collecting of queryStats metrics.
 let options = {
     setParameter: {internalQueryStatsRateLimit: -1},
 };
@@ -24,9 +24,15 @@ assert.commandWorked(bulk.execute());
 
 {
     coll.find({foo: {$regex: "/^ABC/i"}}).itcount();
-    let queryStats = getQueryStats(testDB);
-    assert.eq(1, queryStats.length, queryStats);
-    assert.eq({"foo": {"$regex": "?string"}}, queryStats[0].key.queryShape.filter);
+    const queryStats = getLatestQueryStatsEntry(testDB);
+    assert.eq({"foo": {"$regex": "?string"}}, queryStats.key.queryShape.filter);
+}
+
+{
+    coll.find({foo: {$regex: ".*", $options: "m"}}).itcount();
+    const queryStats = getLatestQueryStatsEntry(testDB);
+    assert.eq({"foo": {"$regex": "?string", "$options": "?string"}},
+              queryStats.key.queryShape.filter);
 }
 
 MongoRunner.stopMongod(conn);

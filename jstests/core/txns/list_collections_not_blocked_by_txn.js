@@ -3,12 +3,12 @@
 //
 // @tags: [
 //   # The test runs commands that are not allowed with security token: endSession.
-//   not_allowed_with_security_token,
+//   not_allowed_with_signed_security_token,
 //   uses_transactions,
 //   uses_snapshot_read_concern
 // ]
 
-// TODO (SERVER-39704): Remove the following load after SERVER-397074 is completed
+// TODO (SERVER-39704): Remove the following load after SERVER-39704 is completed
 import {withTxnAndAutoRetryOnMongos} from "jstests/libs/auto_retry_transaction_in_sharding.js";
 import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
@@ -21,7 +21,7 @@ mydb.foo.drop({writeConcern: {w: "majority"}});
 
 assert.commandWorked(mydb.createCollection("foo", {writeConcern: {w: "majority"}}));
 
-if (FixtureHelpers.isMongos(db)) {
+if (FixtureHelpers.isMongos(db) || TestData.testingReplicaSetEndpoint) {
     // Before starting the transaction below, access the collection so it can be implicitly
     // sharded and force all shards to refresh their database versions because the refresh
     // requires an exclusive lock and would block behind the transaction.

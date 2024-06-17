@@ -1,5 +1,8 @@
 /**
  * Tests that when a load-balanced client disconnects, its cursors are killed.
+ * @tags: [
+ *   temp_disabled_embedded_router_uncategorized,
+ * ]
  */
 import {Thread} from "jstests/libs/parallelTester.js";
 
@@ -7,8 +10,8 @@ function setupShardedCollection(st, dbName, collName) {
     const fullNss = dbName + "." + collName;
     const admin = st.s.getDB("admin");
     // Shard collection; ensure docs on each shard
-    assert.commandWorked(admin.runCommand({enableSharding: dbName}));
-    assert.commandWorked(admin.runCommand({movePrimary: dbName, to: st.shard0.shardName}));
+    assert.commandWorked(
+        admin.runCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
     assert.commandWorked(admin.runCommand({shardCollection: fullNss, key: {_id: 1}}));
     assert.commandWorked(admin.runCommand({split: fullNss, middle: {_id: 0}}));
     assert.commandWorked(

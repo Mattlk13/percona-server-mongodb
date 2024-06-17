@@ -43,13 +43,13 @@
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/concurrency/locker.h"
-#include "mongo/db/concurrency/locker_impl.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/unittest/framework.h"
 #include "mongo/util/assert_util_core.h"
@@ -68,7 +68,6 @@ public:
     ClientAndCtx makeClientWithLocker(const std::string& clientName) {
         auto client = getServiceContext()->getService()->makeClient(clientName);
         auto opCtx = client->makeOperationContext();
-        client->swapLockState(std::make_unique<LockerImpl>(opCtx->getServiceContext()));
         return std::make_pair(std::move(client), std::move(opCtx));
     }
 
@@ -137,10 +136,11 @@ TEST_F(AutoGetCollectionMultiTest, SecondaryNssMinimumVisible) {
 
     // Set the read source earlier than Collection _secondaryNss2' min valid timestamp, but later
     // than _primaryNss' min visible timestamp.
-    opCtx1->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided, [&]() {
-        AutoGetCollection secondaryCollection1(opCtx1, _secondaryNss1, MODE_IS);
-        return secondaryCollection1->getMinimumValidSnapshot();
-    }());
+    shard_role_details::getRecoveryUnit(opCtx1)->setTimestampReadSource(
+        RecoveryUnit::ReadSource::kProvided, [&]() {
+            AutoGetCollection secondaryCollection1(opCtx1, _secondaryNss1, MODE_IS);
+            return secondaryCollection1->getMinimumValidSnapshot();
+        }());
 
     // Create the AutoGet* instance on multiple collections.
     std::vector<NamespaceStringOrUUID> secondaryNamespaces{NamespaceStringOrUUID(_secondaryNss1),
@@ -162,7 +162,8 @@ TEST_F(AutoGetCollectionMultiTest, LockFreeMultiCollectionSingleDB) {
 
     createCollections(opCtx1);
 
-    invariant(!opCtx1->lockState()->isCollectionLockedForMode(_primaryNss, MODE_IS));
+    invariant(
+        !shard_role_details::getLocker(opCtx1)->isCollectionLockedForMode(_primaryNss, MODE_IS));
 
     AutoGetCollectionForReadLockFree autoGet(
         opCtx1,
@@ -170,7 +171,7 @@ TEST_F(AutoGetCollectionMultiTest, LockFreeMultiCollectionSingleDB) {
         AutoGetCollection::Options{}.secondaryNssOrUUIDs(_secondaryNssOrUUIDVec.cbegin(),
                                                          _secondaryNssOrUUIDVec.cend()));
 
-    auto locker = opCtx1->lockState();
+    auto locker = shard_role_details::getLocker(opCtx1);
     locker->dump();
     invariant(locker->isLockHeldForMode(resourceIdGlobal, MODE_IS));
     invariant(!locker->isDbLockedForMode(_primaryNss.dbName(), MODE_IS));
@@ -193,14 +194,15 @@ TEST_F(AutoGetCollectionMultiTest, LockedDuplicateNamespaces) {
 
     createCollections(opCtx1);
 
-    invariant(!opCtx1->lockState()->isCollectionLockedForMode(_primaryNss, MODE_IS));
+    invariant(
+        !shard_role_details::getLocker(opCtx1)->isCollectionLockedForMode(_primaryNss, MODE_IS));
 
     AutoGetCollectionForRead autoGet(opCtx1,
                                      NamespaceStringOrUUID(_primaryNss),
                                      AutoGetCollection::Options{}.secondaryNssOrUUIDs(
                                          duplicateNssVector.cbegin(), duplicateNssVector.cend()));
 
-    auto locker = opCtx1->lockState();
+    auto locker = shard_role_details::getLocker(opCtx1);
     locker->dump();
     invariant(locker->isLockHeldForMode(resourceIdGlobal, MODE_IS));
     invariant(locker->isDbLockedForMode(_primaryNss.dbName(), MODE_IS));
@@ -224,7 +226,7 @@ TEST_F(AutoGetCollectionMultiTest, LockFreeMultiDBs) {
         AutoGetCollection::Options{}.secondaryNssOrUUIDs(_secondaryNssOtherDbNssVec.cbegin(),
                                                          _secondaryNssOtherDbNssVec.cend()));
 
-    auto locker = opCtx1->lockState();
+    auto locker = shard_role_details::getLocker(opCtx1);
     locker->dump();
     invariant(locker->isLockHeldForMode(resourceIdGlobal, MODE_IS));
     invariant(!locker->isDbLockedForMode(_primaryNss.dbName(), MODE_IS));
@@ -248,7 +250,7 @@ TEST_F(AutoGetCollectionMultiTest, LockFreeSecondaryNamespaceNotFoundIsOK) {
         AutoGetCollection::Options{}.secondaryNssOrUUIDs(_secondaryNssOrUUIDAllVec.cbegin(),
                                                          _secondaryNssOrUUIDAllVec.cend()));
 
-    invariant(opCtx1->lockState()->isLocked());
+    invariant(shard_role_details::getLocker(opCtx1)->isLocked());
     ASSERT(!CollectionCatalog::get(opCtx1)->lookupCollectionByNamespace(opCtx1, _secondaryNss2));
 }
 
@@ -263,7 +265,7 @@ TEST_F(AutoGetCollectionMultiTest, LockedSecondaryNamespaceNotFound) {
         AutoGetCollection::Options{}.secondaryNssOrUUIDs(_secondaryNssOrUUIDVec.cbegin(),
                                                          _secondaryNssOrUUIDVec.cend()));
 
-    auto locker = opCtx1->lockState();
+    auto locker = shard_role_details::getLocker(opCtx1);
 
     invariant(locker->isLocked());
     invariant(locker->isLockHeldForMode(resourceIdGlobal, MODE_IS));

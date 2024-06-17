@@ -46,15 +46,14 @@
 #include "mongo/db/ftdc/controller.h"
 #include "mongo/db/ftdc/ftdc_mongod.h"
 #include "mongo/db/ftdc/ftdc_mongod_gen.h"
+#include "mongo/db/ftdc/ftdc_mongos.h"
 #include "mongo/db/ftdc/ftdc_server.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/server_options.h"
-#include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/rpc/op_msg.h"
-#include "mongo/transport/transport_layer_ftdc_collector.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/synchronized_value.h"
 
@@ -98,7 +97,8 @@ public:
                     NamespaceStringUtil::parseFromStringExpectTenantIdInMultitenancyMode(nsStr);
                 auto result = CommandHelpers::runCommandDirectly(
                     opCtx,
-                    OpMsgRequest::fromDBAndBody(
+                    OpMsgRequestBuilder::create(
+                        auth::ValidatedTenancyScope::get(opCtx),
                         ns.dbName(),
                         BSON("aggregate" << ns.coll() << "cursor" << BSONObj{} << "pipeline"
                                          << BSON_ARRAY(BSON("$collStats" << BSON(
@@ -119,40 +119,54 @@ public:
 };
 
 
-void registerMongoDCollectors(FTDCController* controller) {
+void registerShardCollectors(FTDCController* controller) {
+    registerServerCollectorsForRole(controller, ClusterRole::ShardServer);
+
     // These metrics are only collected if replication is enabled
     if (repl::ReplicationCoordinator::get(getGlobalServiceContext())->getSettings().isReplSet()) {
         // CmdReplSetGetStatus
         controller->addPeriodicCollector(std::make_unique<FTDCSimpleInternalCommandCollector>(
-            "replSetGetStatus",
-            "replSetGetStatus",
-            DatabaseName::kEmpty,
-            BSON("replSetGetStatus" << 1 << "initialSync" << 0)));
+                                             "replSetGetStatus",
+                                             "replSetGetStatus",
+                                             DatabaseName::kEmpty,
+                                             BSON("replSetGetStatus" << 1 << "initialSync" << 0)),
+                                         ClusterRole::ShardServer);
 
         // CollectionStats
-        controller->addPeriodicCollector(std::make_unique<FTDCSimpleInternalCommandCollector>(
-            "aggregate",
-            "local.oplog.rs.stats",
-            DatabaseName::kLocal,
-            BSON("aggregate"
-                 << "oplog.rs"
-                 << "cursor" << BSONObj{} << "pipeline"
-                 << BSON_ARRAY(BSON("$collStats" << BSON(
-                                        "storageStats" << BSON(
-                                            "waitForLock" << false << "numericOnly" << true)))))));
-        if (!serverGlobalParams.clusterRole.hasExclusively(ClusterRole::ShardServer)) {
-            // GetDefaultRWConcern
-            controller->addOnRotateCollector(std::make_unique<FTDCSimpleInternalCommandCollector>(
-                "getDefaultRWConcern",
-                "getDefaultRWConcern",
-                DatabaseName::kEmpty,
-                BSON("getDefaultRWConcern" << 1 << "inMemory" << true)));
-        }
+        controller->addPeriodicCollector(
+            std::make_unique<FTDCSimpleInternalCommandCollector>(
+                "aggregate",
+                "local.oplog.rs.stats",
+                DatabaseName::kLocal,
+                BSON("aggregate"
+                     << "oplog.rs"
+                     << "cursor" << BSONObj{} << "pipeline"
+                     << BSON_ARRAY(BSON(
+                            "$collStats"
+                            << BSON("storageStats"
+                                    << BSON("waitForLock" << false << "numericOnly" << true)))))),
+            ClusterRole::ShardServer);
     }
+    controller->addPeriodicMetadataCollector(
+        std::make_unique<FTDCSimpleInternalCommandCollector>(
+            "getParameter",
+            "getParameter",
+            DatabaseName::kEmpty,
+            BSON("getParameter" << BSON("allParameters" << true << "setAt"
+                                                        << "runtime"))),
+        ClusterRole::ShardServer);
 
-    controller->addPeriodicCollector(std::make_unique<FTDCCollectionStatsCollector>());
+    controller->addPeriodicMetadataCollector(
+        std::make_unique<FTDCSimpleInternalCommandCollector>("getClusterParameter",
+                                                             "getClusterParameter",
+                                                             DatabaseName::kEmpty,
+                                                             BSON("getClusterParameter"
+                                                                  << "*")),
+        ClusterRole::ShardServer);
 
-    controller->addPeriodicCollector(std::make_unique<transport::TransportLayerFTDCCollector>());
+
+    controller->addPeriodicCollector(std::make_unique<FTDCCollectionStatsCollector>(),
+                                     ClusterRole::ShardServer);
 }
 
 }  // namespace
@@ -165,14 +179,27 @@ void startMongoDFTDC(ServiceContext* serviceContext) {
         dir /= kFTDCDefaultDirectory.toString();
     }
 
-    startFTDC(serviceContext->getService(ClusterRole::ShardServer),
-              dir,
-              FTDCStartMode::kStart,
-              registerMongoDCollectors);
+    std::vector<RegisterCollectorsFunction> registerFns{
+        registerShardCollectors,
+    };
+
+    // (Ignore FCV check): this feature flag is not FCV-gated.
+    const bool multiServiceFTDCSchema =
+        feature_flags::gMultiServiceLogAndFTDCFormat.isEnabledAndIgnoreFCVUnsafe();
+
+    const UseMultiServiceSchema multiversionSchema{
+        serviceContext->getService(ClusterRole::RouterServer) && multiServiceFTDCSchema};
+
+    if (multiversionSchema) {
+        registerFns.emplace_back(registerRouterCollectors);
+    }
+
+    startFTDC(
+        serviceContext, dir, FTDCStartMode::kStart, std::move(registerFns), multiversionSchema);
 }
 
-void stopMongoDFTDC(ServiceContext* serviceContext) {
-    stopFTDC(serviceContext->getService(ClusterRole::ShardServer));
+void stopMongoDFTDC() {
+    stopFTDC();
 }
 
 }  // namespace mongo

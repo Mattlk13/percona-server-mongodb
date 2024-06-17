@@ -30,12 +30,13 @@
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/concurrency/locker.h"
+#include "mongo/db/admission/execution_admission_context.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_set_command.h"
 #include "mongo/db/repl/repl_set_request_votes_args.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/admission_context.h"
 
@@ -61,8 +62,8 @@ private:
         // Operations that are part of Replica Set elections are crucial to the stability of the
         // cluster. Marking it as having Immediate priority will make it skip waiting for ticket
         // acquisition and Flow Control.
-        ScopedAdmissionPriorityForLock priority(opCtx->lockState(),
-                                                AdmissionContext::Priority::kImmediate);
+        ScopedAdmissionPriority<ExecutionAdmissionContext> priority(
+            opCtx, AdmissionContext::Priority::kExempt);
         ReplSetRequestVotesResponse response;
         status = ReplicationCoordinator::get(opCtx)->processReplSetRequestVotes(
             opCtx, parsedArgs, &response);

@@ -10,7 +10,7 @@ import {
     checkCascadesOptimizerEnabled,
     checkExperimentalCascadesOptimizerEnabled
 } from "jstests/libs/optimizer_utils.js";
-import {checkSBEEnabled} from "jstests/libs/sbe_util.js";
+import {checkSbeFullyEnabled} from "jstests/libs/sbe_util.js";
 
 // This test runs manual getMores using different connections, which will not inherit the
 // implicit session of the cursor establishing command.
@@ -54,6 +54,18 @@ function dropAndRecreateTestCollection() {
     assert(mongosColl.drop());
     assert.commandWorked(
         mongosDB.adminCommand({shardCollection: mongosColl.getFullName(), key: {_id: "hashed"}}));
+    // The insert via direct connection will fail with stale config if the metadata is unknown, so
+    // we wait for the refresh spawned by shardCollection to complete.
+    let curOps = [];
+    assert.soon(() => {
+        curOps = rsConn.getDB("admin")
+                     .aggregate([
+                         {$currentOp: {allUsers: true}},
+                         {$match: {"command._flushRoutingTableCacheUpdates": {$exists: true}}}
+                     ])
+                     .toArray();
+        return curOps.length == 0;
+    }, "Timed out waiting for create refreshes to finish, found: " + tojson(curOps));
 }
 
 /**
@@ -80,7 +92,7 @@ function runTests({conn, currentOp, truncatedOps, localOps}) {
     const isLocalMongosCurOp = (FixtureHelpers.isMongos(testDB) && localOps);
     const isRemoteShardCurOp = (FixtureHelpers.isMongos(testDB) && !localOps);
 
-    const sbeEnabled = checkSBEEnabled(testDB);
+    const sbeEnabled = checkSbeFullyEnabled(testDB);
     const cqfEnabled = checkCascadesOptimizerEnabled(testDB);
     const cqfExperimentalEnabled = checkExperimentalCascadesOptimizerEnabled(testDB);
 
@@ -447,12 +459,9 @@ function runTests({conn, currentOp, truncatedOps, localOps}) {
                     comment: "currentop_query_agg_getmore",
                     cursor: {batchSize: 0}
                 },
-                // Even when CQF is enabled, aggregation commands against sharded collections are
-                // not eligible for CQF because mongos attaches unsupported fields including
-                // let parameters and collation to the command sent to the shard.
-                queryFramework: (!isRemoteShardCurOp && cqfEnabled) ? "cqf"
-                    : sbeEnabled                                    ? "sbe"
-                                                                    : "classic",
+                queryFramework: cqfEnabled ? "cqf"
+                    : sbeEnabled           ? "sbe"
+                                           : "classic",
                 cmdName: "aggregate",
             },
         ];

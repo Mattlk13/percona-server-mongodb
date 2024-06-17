@@ -40,7 +40,6 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/basic_types.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/exec/multi_plan.h"
 #include "mongo/db/exec/plan_cache_util.h"
 #include "mongo/db/exec/subplan.h"
 #include "mongo/db/matcher/expression.h"
@@ -67,12 +66,12 @@ const char* SubplanStage::kStageType = "SUBPLAN";
 SubplanStage::SubplanStage(ExpressionContext* expCtx,
                            VariantCollectionPtrOrAcquisition collection,
                            WorkingSet* ws,
-                           const QueryPlannerParams& params,
-                           CanonicalQuery* cq)
+                           CanonicalQuery* cq,
+                           PlanCachingMode cachingMode)
     : RequiresAllIndicesStage(kStageType, expCtx, collection),
       _ws(ws),
-      _plannerParams(params),
-      _query(cq) {
+      _query(cq),
+      _planCachingMode(cachingMode) {
     invariant(cq);
     invariant(_query->getPrimaryMatchExpression()->matchType() == MatchExpression::OR);
     invariant(_query->getPrimaryMatchExpression()->numChildren(),
@@ -109,16 +108,14 @@ bool SubplanStage::canUseSubplanning(const CanonicalQuery& query) {
     return MatchExpression::OR == expr->matchType() && expr->numChildren() > 0;
 }
 
-Status SubplanStage::choosePlanWholeQuery(PlanYieldPolicy* yieldPolicy) {
-    tassert(5842902,
-            "Lowering parts of aggregation pipeline is only supported in SBE",
-            _query->cqPipeline().empty());
-
+Status SubplanStage::choosePlanWholeQuery(const QueryPlannerParams& plannerParams,
+                                          PlanYieldPolicy* yieldPolicy,
+                                          bool shouldConstructClassicExecutableTree) {
     // Clear out the working set. We'll start with a fresh working set.
     _ws->clear();
 
     // Use the query planning module to plan the whole query.
-    auto statusWithMultiPlanSolns = QueryPlanner::plan(*_query, _plannerParams);
+    auto statusWithMultiPlanSolns = QueryPlanner::plan(*_query, plannerParams);
     if (!statusWithMultiPlanSolns.isOK()) {
         return statusWithMultiPlanSolns.getStatus().withContext(
             str::stream() << "error processing query: " << _query->toStringForErrorMsg()
@@ -128,11 +125,12 @@ Status SubplanStage::choosePlanWholeQuery(PlanYieldPolicy* yieldPolicy) {
 
     if (1 == solutions.size()) {
         // Only one possible plan.  Run it.  Build the stages from the solution.
-        auto&& root = stage_builder::buildClassicExecutableTree(
-            expCtx()->opCtx, collection(), *_query, *solutions[0], _ws);
-        invariant(_children.empty());
-        _children.emplace_back(std::move(root));
-
+        if (shouldConstructClassicExecutableTree) {
+            auto&& root = stage_builder::buildClassicExecutableTree(
+                expCtx()->opCtx, collection(), *_query, *solutions[0], _ws);
+            invariant(_children.empty());
+            _children.emplace_back(std::move(root));
+        }
         // This SubplanStage takes ownership of the query solution.
         _compositeSolution = std::move(solutions.back());
         solutions.pop_back();
@@ -142,11 +140,16 @@ Status SubplanStage::choosePlanWholeQuery(PlanYieldPolicy* yieldPolicy) {
         // Many solutions. Create a MultiPlanStage to pick the best, update the cache,
         // and so on. The working set will be shared by all candidate plans.
         invariant(_children.empty());
-        _children.emplace_back(new MultiPlanStage(expCtx(), collection(), _query));
+
+        _usesMultiplanning = true;
+
+        _children.emplace_back(
+            new MultiPlanStage(expCtx(), collection(), _query, _planCachingMode));
+
         MultiPlanStage* multiPlanStage = static_cast<MultiPlanStage*>(child().get());
 
         for (size_t ix = 0; ix < solutions.size(); ++ix) {
-            solutions[ix]->indexFilterApplied = _plannerParams.indexFiltersApplied;
+            solutions[ix]->indexFilterApplied = plannerParams.indexFiltersApplied;
 
             auto&& nextPlanRoot = stage_builder::buildClassicExecutableTree(
                 expCtx()->opCtx, collection(), *_query, *solutions[ix], _ws);
@@ -163,7 +166,9 @@ Status SubplanStage::choosePlanWholeQuery(PlanYieldPolicy* yieldPolicy) {
     }
 }
 
-Status SubplanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
+Status SubplanStage::pickBestPlan(const QueryPlannerParams& plannerParams,
+                                  PlanYieldPolicy* yieldPolicy,
+                                  bool shouldConstructClassicExecutableTree) {
     // Adds the amount of time taken by pickBestPlan() to executionTime. There's lots of work that
     // happens here, so this is needed for the time accounting to make sense.
     auto optTimer = getOptTimer();
@@ -195,9 +200,10 @@ Status SubplanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
 
     // Plan each branch of the $or.
     auto subplanningStatus = QueryPlanner::planSubqueries(
-        expCtx()->opCtx, getSolutionCachedData, collectionPtr(), *_query, _plannerParams);
+        expCtx()->opCtx, getSolutionCachedData, collectionPtr(), *_query, plannerParams);
     if (!subplanningStatus.isOK()) {
-        return choosePlanWholeQuery(yieldPolicy);
+        return choosePlanWholeQuery(
+            plannerParams, yieldPolicy, shouldConstructClassicExecutableTree);
     }
 
     // Remember whether each branch of the $or was planned from a cached solution.
@@ -214,15 +220,22 @@ Status SubplanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
         -> StatusWith<std::unique_ptr<QuerySolution>> {
         _ws->clear();
 
-        // We pass the SometimesCache option to the MPS because the SubplanStage currently does
-        // not use the CachedPlanStage's eviction mechanism. We therefore are more conservative
-        // about putting a potentially bad plan into the cache in the subplan path.
+        // By default, '_planCachingMode' is set to AlwaysCache, but we pass the SometimesCache
+        // option to the MPS here, because the SubplanStage currently does not use the
+        // CachedPlanStage's eviction mechanism. We therefore are more conservative about putting a
+        // potentially bad plan into the cache in the subplan path. When using the sub planner for
+        // SBE, we set '_planCachingMode' to NeverCache since we don't want to use the classic plan
+        // cache for SBE queries. We use the stricter PlanCachingMode to determine this based on the
+        // value of '_planCachingMode'.
         //
         // We temporarily add the MPS to _children to ensure that we pass down all save/restore
         // messages that can be generated if pickBestPlan yields.
         invariant(_children.empty());
         _children.emplace_back(std::make_unique<MultiPlanStage>(
-            expCtx(), collection(), cq, PlanCachingMode::SometimesCache));
+            expCtx(),
+            collection(),
+            cq,
+            stricter(PlanCachingMode::SometimesCache, _planCachingMode)));
         ON_BLOCK_EXIT([&] {
             invariant(_children.size() == 1);  // Make sure nothing else was added to _children.
             _children.pop_back();
@@ -247,10 +260,10 @@ Status SubplanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
             ss << "Failed to pick best plan for subchild " << cq->toStringForErrorMsg();
             return Status(ErrorCodes::NoQueryExecutionPlans, ss);
         }
-        return multiPlanStage->bestSolution();
+        return multiPlanStage->extractBestSolution();
     };
     auto subplanSelectStat = QueryPlanner::choosePlanForSubqueries(
-        *_query, _plannerParams, std::move(subplanningResult), multiplanCallback);
+        *_query, plannerParams, std::move(subplanningResult), multiplanCallback);
     if (!subplanSelectStat.isOK()) {
         if (subplanSelectStat != ErrorCodes::NoQueryExecutionPlans) {
             // Query planning can continue if we failed to find a solution for one of the
@@ -258,15 +271,20 @@ Status SubplanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
             // (and index may have been dropped, we may have exceeded the time limit, etc).
             return subplanSelectStat.getStatus();
         }
-        return choosePlanWholeQuery(yieldPolicy);
+        return choosePlanWholeQuery(
+            plannerParams, yieldPolicy, shouldConstructClassicExecutableTree);
     }
 
     // Build a plan stage tree from the the composite solution and add it as our child stage.
     _compositeSolution = std::move(subplanSelectStat.getValue());
-    invariant(_children.empty());
-    auto&& root = stage_builder::buildClassicExecutableTree(
-        expCtx()->opCtx, collection(), *_query, *_compositeSolution, _ws);
-    _children.emplace_back(std::move(root));
+
+    if (shouldConstructClassicExecutableTree) {
+        invariant(_children.empty());
+        auto&& root = stage_builder::buildClassicExecutableTree(
+            expCtx()->opCtx, collection(), *_query, *_compositeSolution, _ws);
+        _children.emplace_back(std::move(root));
+    }
+
     _ws->clear();
 
     return Status::OK();

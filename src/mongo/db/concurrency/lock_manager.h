@@ -40,6 +40,7 @@
 #include "mongo/db/auth/cluster_auth_mode.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/concurrency/lock_request_list.h"
+#include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/platform/mutex.h"
@@ -48,9 +49,6 @@
 #include "mongo/util/concurrency/mutex.h"
 
 namespace mongo {
-
-class OperationContext;
-class ServiceContext;
 
 /**
  * Entry point for the lock manager scheduling functionality. Don't use it directly, but
@@ -68,13 +66,6 @@ public:
      */
     static LockManager* get(ServiceContext* service);
     static LockManager* get(ServiceContext& service);
-    static LockManager* get(OperationContext* opCtx);
-
-    /**
-     * Gets a mapping of lock to client info.
-     * Used by dump() and the lockInfo command.
-     */
-    static std::map<LockerId, BSONObj> getLockToClientMap(ServiceContext* serviceContext);
 
     /**
      * Default constructors are meant for unit tests only. The lock manager should generally be
@@ -111,7 +102,6 @@ public:
      * @return See comments for LockResult.
      */
     LockResult lock(ResourceId resId, LockRequest* request, LockMode mode);
-    LockResult convert(ResourceId resId, LockRequest* request, LockMode newMode);
 
     /**
      * Decrements the reference count of a previously locked request and if the reference count
@@ -152,26 +142,14 @@ public:
     bool hasConflictingRequests(ResourceId resId, const LockRequest* request) const;
 
     /**
-     * Dumps the contents of all locks to the log.
+     * The backend of `dump` and `getLockInfoBSON`.
+     * If `mutableThis`, then we also clean the unused locks in the buckets while iterating.
+     * @param `mutableThis` is a nonconst `this`, but it is null if caller is const.
      */
-    void dump() const;
-
-    /**
-     * Dumps the contents of all locks into a BSON object
-     * to be used in lockInfo command in the shell.
-     * Adds a "lockInfo" element to the `result` object:
-     *     "lockInfo": [
-     *         // object for each lock in the LockManager (in any bucket),
-     *         {
-     *             "resourceId": <string>,
-     *             "granted": [ {...}, ... ],  // array of lock requests
-     *             "pending": [ {...}, ... ],  // array of lock requests
-     *         },
-     *         ...
-     *     ]
-     */
-    void getLockInfoBSON(const std::map<LockerId, BSONObj>& lockToClientMap,
-                         BSONObjBuilder* result);
+    void getLockInfoArray(const std::map<LockerId, BSONObj>& lockToClientMap,
+                          bool forLogging,
+                          LockManager* mutableThis,
+                          BSONArrayBuilder* buckets) const;
 
     /**
      * Returns a vector of those locks granted for the given resource.
@@ -213,16 +191,6 @@ private:
      * Retrieves the Partition that a particular LockRequest should use for intent locking.
      */
     Partition* _getPartition(LockRequest* request) const;
-
-    /**
-     * The backend of `dump` and `getLockInfoBSON`.
-     * If `mutableThis`, then we also clean the unused locks in the buckets while iterating.
-     * @param `mutableThis` is a nonconst `this`, but it is null if caller is const.
-     */
-    void _buildLocksArray(const std::map<LockerId, BSONObj>& lockToClientMap,
-                          bool forLogging,
-                          LockManager* mutableThis,
-                          BSONArrayBuilder* buckets) const;
 
     /**
      * Should be invoked when the state of a lock changes in a way, which could potentially

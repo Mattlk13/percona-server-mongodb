@@ -33,11 +33,8 @@
 #include <jsapi.h>
 #include <string>
 
-#include "mongo/platform/mutex.h"
 #include "mongo/scripting/deadline_monitor.h"
 #include "mongo/scripting/engine.h"
-#include "mongo/stdx/unordered_map.h"
-#include "mongo/util/concurrency/mutex.h"
 
 namespace mongo {
 namespace mozjs {
@@ -50,11 +47,8 @@ class MozJSImplScope;
  */
 class MozJSScriptEngine final : public mongo::ScriptEngine {
 public:
-    MozJSScriptEngine(bool disableLoadStored);
+    MozJSScriptEngine(ExecutionEnvironment env);
     ~MozJSScriptEngine() override;
-
-    mongo::Scope* createScope() override;
-    mongo::Scope* createScopeForCurrentThread(boost::optional<int> jsHeapLimitMB) override;
 
     void runTest() override {}
 
@@ -62,9 +56,9 @@ public:
         return true;
     }
 
-    void interrupt(unsigned opId) override;
+    void interrupt(ClientLock&, OperationContext*) override;
 
-    void interruptAll() override;
+    void interruptAll(ServiceContextLock&) override;
 
     void enableJIT(bool value) override;
     bool isJITEnabled() const override;
@@ -79,28 +73,23 @@ public:
     void setLoadPath(const std::string& loadPath) override;
 
     void registerOperation(OperationContext* ctx, MozJSImplScope* scope);
-    void unregisterOperation(unsigned int opId);
-
-    using ScopeCallback = void (*)(Scope&);
-    ScopeCallback getScopeInitCallback() {
-        return _scopeInitCallback;
-    };
+    void unregisterOperation(OperationContext* opCtx);
 
     DeadlineMonitor<MozJSImplScope>& getDeadlineMonitor() {
         return _deadlineMonitor;
     }
 
+    ExecutionEnvironment executionEnvironment() const {
+        return _executionEnvironment;
+    }
+
+protected:
+    mongo::Scope* createScope() override;
+    mongo::Scope* createScopeForCurrentThread(boost::optional<int> jsHeapLimitMB) override;
+
 private:
-    /**
-     * This mutex protects _opToScopeMap
-     */
-    Mutex _globalInterruptLock = MONGO_MAKE_LATCH("MozJSScriptEngine::_globalInterruptLock");
-
-    using OpIdToScopeMap = stdx::unordered_map<unsigned, MozJSImplScope*>;
-    OpIdToScopeMap _opToScopeMap;  // map of mongo op ids to scopes (protected by
-                                   // _globalInterruptLock).
-
     DeadlineMonitor<MozJSImplScope> _deadlineMonitor;
+    ExecutionEnvironment _executionEnvironment;
     std::string _loadPath;
 };
 

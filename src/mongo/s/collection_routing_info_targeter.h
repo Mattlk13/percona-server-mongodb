@@ -49,6 +49,7 @@
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/shard_id.h"
 #include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/s/cannot_implicitly_create_collection_info.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
@@ -68,7 +69,12 @@ namespace mongo {
  */
 class CollectionRoutingInfoTargeter : public NSTargeter {
 public:
-    enum class LastErrorType { kCouldNotTarget, kStaleShardVersion, kStaleDbVersion };
+    enum class LastErrorType {
+        kCouldNotTarget,
+        kStaleShardVersion,
+        kStaleDbVersion,
+        kCannotImplicitlyCreateCollection
+    };
     /**
      * Initializes the targeter with the latest routing information for the namespace, which means
      * it may have to block and load information from the config server.
@@ -119,6 +125,7 @@ public:
         OperationContext* opCtx,
         const BatchItemRef& itemRef,
         bool* useTwoPhaseWriteProtocol = nullptr,
+        bool* isNonTargetedWriteWithoutShardKeyWithExactId = nullptr,
         std::set<ChunkRange>* chunkRanges = nullptr) const override;
 
     std::vector<ShardEndpoint> targetAllShards(
@@ -139,6 +146,10 @@ public:
      */
     bool hasStaleShardResponse() override;
 
+
+    void noteCannotImplicitlyCreateCollectionResponse(
+        OperationContext* optCtx, const CannotImplicitlyCreateCollectionInfo& createInfo) override;
+
     /**
      * Replaces the targeting information with the latest information from the cache.  If this
      * information is stale WRT the noted stale responses or a remote refresh is needed due
@@ -151,9 +162,21 @@ public:
     bool refreshIfNeeded(OperationContext* opCtx) override;
 
     /**
+     * Creates a collection if there was a prior CannotImplicitlyCreateCollection error thrown.
+     *
+     * Return true if a collection was created and false if the collection already existed, throwing
+     * on any errors.
+     *
+     * Also see NSTargeter::createCollectionIfNeeded().
+     */
+    bool createCollectionIfNeeded(OperationContext* opCtx) override;
+
+    /**
      * Returns the number of shards on which the collection has any chunks.
      */
     int getNShardsOwningChunks() const override;
+
+    bool isTargetedCollectionSharded() const override;
 
     bool isTrackedTimeSeriesBucketsNamespace() const override;
 
@@ -185,6 +208,9 @@ public:
                                const ChunkManager& cm);
 
 private:
+    // Maximum number of database creation attempts, which may fail due to a concurrent drop.
+    static const size_t kMaxDatabaseCreationAttempts;
+
     CollectionRoutingInfo _init(OperationContext* opCtx, bool refresh);
 
     /**
@@ -207,12 +233,12 @@ private:
     /**
      * Returns a vector of ShardEndpoints for a potentially multi-shard query.
      *
-     * Returns !OK with message if query could not be targeted.
+     * Uses the collation specified on the CanonicalQuery for targeting. If there is no query
+     * collation, uses the collection default.
      *
-     * If 'collation' is empty, we use the collection default collation for targeting.
+     * Returns !OK with message if query could not be targeted.
      */
     StatusWith<std::vector<ShardEndpoint>> _targetQuery(const CanonicalQuery& query,
-                                                        const BSONObj& collation,
                                                         std::set<ChunkRange>* chunkRanges) const;
 
     /**

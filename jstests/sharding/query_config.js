@@ -1,4 +1,8 @@
 // Tests user queries over the config servers.
+// @tags: [
+//    temp_disabled_embedded_router_known_issues,
+// ]
+
 import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
 
 var getListCollectionsCursor = function(database, options, subsequentBatchSize) {
@@ -84,7 +88,7 @@ var testListConfigCollections = function(st) {
     configDB.createCollection(userAddedColl.getName());
     configCollList.push(userAddedColl.getName());
 
-    // wait for config.mongos to be created by ShardingUptimeReporter
+    // wait for config.mongos to be created by RouterUptimeReporter
     assert.soon(() => configDB.mongos.exists());
 
     cursor = getListCollectionsCursor(configDB);

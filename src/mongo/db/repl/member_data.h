@@ -103,6 +103,9 @@ public:
     OpTime getHeartbeatAppliedOpTime() const {
         return _lastResponse.getAppliedOpTime();
     }
+    OpTime getHeartbeatWrittenOpTime() const {
+        return _lastResponse.getWrittenOpTime();
+    }
     OpTime getHeartbeatDurableOpTime() const {
         return _lastResponse.hasDurableOpTime() ? _lastResponse.getDurableOpTime() : OpTime();
     }
@@ -135,6 +138,10 @@ public:
         return _health > 0;
     }
 
+    OpTime getLastWrittenOpTime() const {
+        return _lastWrittenOpTime;
+    }
+
     OpTime getLastAppliedOpTime() const {
         return _lastAppliedOpTime;
     }
@@ -143,9 +150,14 @@ public:
         return _lastDurableOpTime;
     }
 
+    Date_t getLastWrittenWallTime() const {
+        return _lastWrittenWallTime;
+    }
+
     Date_t getLastAppliedWallTime() const {
         return _lastAppliedWallTime;
     }
+
     Date_t getLastDurableWallTime() const {
         return _lastDurableWallTime;
     }
@@ -215,6 +227,12 @@ public:
     }
 
     /**
+     * Performs setLastWrittenOpTime and also sets the wall clock time corresponding to the last
+     * written opTime. Should only be used on the current node.
+     */
+    void setLastWrittenOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now);
+
+    /**
      * Performs setLastAppliedOpTime and also sets the wall clock time corresponding to the last
      * applied opTime. Should only be used on the current node.
      */
@@ -225,6 +243,14 @@ public:
      * durable opTime. Should only be used on the current node.
      */
     void setLastDurableOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now);
+
+    /**
+     * Sets the lastWritten op time iff the new optime is later than the current optime, and updates
+     * the lastUpdate time.  Returns true if the optime was advanced.
+     * Performs advanceLastWrittenOpTime and also sets the wall clock time corresponding to the last
+     * written opTime. Should only be used on the current node.
+     */
+    bool advanceLastWrittenOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_t now);
 
     /**
      * Sets the last applied op time (not the heartbeat applied op time) iff the new optime is
@@ -315,7 +341,11 @@ private:
     // on the primary, but not the secondaries.
     bool _lastUpdateStale = false;
 
-    // Last known OpTime that the replica has applied and journaled to.
+    // Last known OpTime that the replica has written oplog entry into memory.
+    OpTime _lastWrittenOpTime;
+    Date_t _lastWrittenWallTime = Date_t();
+
+    // Last known OpTime that the replica has journaled to.
     OpTime _lastDurableOpTime;
     Date_t _lastDurableWallTime = Date_t();
 

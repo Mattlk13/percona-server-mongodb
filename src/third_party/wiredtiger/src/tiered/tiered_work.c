@@ -124,6 +124,17 @@ __tiered_push_new_work(WT_SESSION_IMPL *session, WT_TIERED_WORK_UNIT *entry)
 }
 
 /*
+ * __tiered_queue_peek_empty --
+ *     Peek at the tiered queue to see if it's empty. This is an unsafe check to avoid claiming the
+ *     tiered lock when we don't need it. This is in it's own function to suppress the TSan warning.
+ */
+static inline bool
+__tiered_queue_peek_empty(WT_CONNECTION_IMPL *conn)
+{
+    return (TAILQ_EMPTY(&conn->tieredqh));
+}
+
+/*
  * __wt_tiered_pop_work --
  *     Pop a work unit of the given type from the queue. If a maximum value is given, only return a
  *     work unit that is less than the maximum value. The caller is responsible for freeing the
@@ -139,7 +150,7 @@ __wt_tiered_pop_work(
     *entryp = entry = NULL;
 
     conn = S2C(session);
-    if (TAILQ_EMPTY(&conn->tieredqh))
+    if (__tiered_queue_peek_empty(conn))
         return;
     __wt_spin_lock(session, &conn->tiered_lock);
 
@@ -208,13 +219,14 @@ __wt_tiered_get_flush_finish(WT_SESSION_IMPL *session, WT_TIERED_WORK_UNIT **ent
 
 /*
  * __wt_tiered_get_flush --
- *     Get the first flush work unit from the queue. The id information cannot change between our
- *     caller and here. The caller is responsible for freeing the work unit.
+ *     Get the first flush work unit from the queue. If a non zero generation value is given, only
+ *     return work units less than that value. The id information cannot change between our caller
+ *     and here. The caller is responsible for freeing the work unit.
  */
 void
-__wt_tiered_get_flush(WT_SESSION_IMPL *session, WT_TIERED_WORK_UNIT **entryp)
+__wt_tiered_get_flush(WT_SESSION_IMPL *session, uint64_t generation, WT_TIERED_WORK_UNIT **entryp)
 {
-    __wt_tiered_pop_work(session, WT_TIERED_WORK_FLUSH, 0, entryp);
+    __wt_tiered_pop_work(session, WT_TIERED_WORK_FLUSH, generation, entryp);
     return;
 }
 
@@ -303,7 +315,7 @@ __wt_tiered_put_remove_shared(WT_SESSION_IMPL *session, WT_TIERED *tiered, uint3
  *     information cannot change between our caller and here.
  */
 int
-__wt_tiered_put_flush(WT_SESSION_IMPL *session, WT_TIERED *tiered, uint32_t id)
+__wt_tiered_put_flush(WT_SESSION_IMPL *session, WT_TIERED *tiered, uint32_t id, uint64_t generation)
 {
     WT_TIERED_WORK_UNIT *entry;
 
@@ -311,6 +323,7 @@ __wt_tiered_put_flush(WT_SESSION_IMPL *session, WT_TIERED *tiered, uint32_t id)
     entry->type = WT_TIERED_WORK_FLUSH;
     entry->id = id;
     entry->tiered = tiered;
+    entry->op_val = generation;
     __tiered_push_new_work(session, entry);
     return (0);
 }

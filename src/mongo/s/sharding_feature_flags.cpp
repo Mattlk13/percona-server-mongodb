@@ -29,6 +29,7 @@
 
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/server_options.h"
 #include "mongo/logv2/log_util.h"
 #include "mongo/s/sharding_feature_flags_gen.h"
@@ -38,7 +39,11 @@ namespace mongo {
 MONGO_INITIALIZER_GENERAL(SetShouldEmitLogService, ("EndServerParameterRegistration"), ())
 (InitializerContext*) {
     logv2::setShouldEmitLogService([]() {
-        return feature_flags::gEmbeddedRouter.isEnabled(serverGlobalParams.featureCompatibility);
+        // We need to use isEnabledUseLatestFCVWhenUninitialized instead of isEnabled because
+        // this could run during startup while the FCV is still uninitialized.
+        return serverGlobalParams.clusterRole.has(ClusterRole::ShardServer) &&
+            feature_flags::gMultiServiceLogAndFTDCFormat.isEnabledUseLatestFCVWhenUninitialized(
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
     });
 }
 

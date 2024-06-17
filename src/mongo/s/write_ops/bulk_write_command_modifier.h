@@ -133,6 +133,7 @@ public:
                      bool upsert,
                      bool multi,
                      const boost::optional<std::vector<BSONObj>>& arrayFilters,
+                     const boost::optional<BSONObj>& sort,
                      const boost::optional<BSONObj>& collation,
                      const boost::optional<BSONObj>& hint);
 
@@ -153,9 +154,7 @@ private:
 
     stdx::unordered_map<NamespaceString, size_t> _nsInfoIdxes;
 
-    std::vector<
-        stdx::variant<mongo::BulkWriteInsertOp, mongo::BulkWriteUpdateOp, mongo::BulkWriteDeleteOp>>
-        _ops;
+    std::vector<BulkWriteOpVariant> _ops;
     std::vector<mongo::NamespaceInfoEntry> _nsInfos;
 
     /**

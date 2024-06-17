@@ -116,6 +116,7 @@ public:
     struct IndexBuildOptions {
         boost::optional<CommitQuorumOptions> commitQuorum;
         ApplicationMode applicationMode = ApplicationMode::kNormal;
+        boost::optional<repl::OpTime> startIndexBuildOpTime;
     };
 
     virtual ~IndexBuildsCoordinator() = default;
@@ -413,7 +414,7 @@ public:
     virtual Status voteAbortIndexBuild(OperationContext* opCtx,
                                        const UUID& buildUUID,
                                        const HostAndPort& hostAndPort,
-                                       const StringData& reason) = 0;
+                                       StringData reason) = 0;
 
     /**
      * Handles the 'VoteCommitIndexBuild' command request.
@@ -557,52 +558,6 @@ public:
      * Expects a lock to be held by the caller, so that 'collection' is safe to use.
      */
     static int getNumIndexesTotal(OperationContext* opCtx, const CollectionPtr& collection);
-
-    class IndexBuildsSSS : public ServerStatusSection {
-    public:
-        IndexBuildsSSS();
-
-        bool includeByDefault() const final {
-            return true;
-        }
-
-        BSONObj generateSection(OperationContext* opCtx,
-                                const BSONElement& configElement) const final {
-            BSONObjBuilder indexBuilds;
-
-            indexBuilds.append("total", registered.loadRelaxed());
-            indexBuilds.append("killedDueToInsufficientDiskSpace",
-                               killedDueToInsufficientDiskSpace.loadRelaxed());
-            indexBuilds.append("failedDueToDataCorruption",
-                               failedDueToDataCorruption.loadRelaxed());
-
-            BSONObjBuilder phases;
-            phases.append("scanCollection", scanCollection.loadRelaxed());
-            phases.append("drainSideWritesTable", drainSideWritesTable.loadRelaxed());
-            phases.append("drainSideWritesTablePreCommit",
-                          drainSideWritesTablePreCommit.loadRelaxed());
-            phases.append("waitForCommitQuorum", waitForCommitQuorum.loadRelaxed());
-            phases.append("drainSideWritesTableOnCommit",
-                          drainSideWritesTableOnCommit.loadRelaxed());
-            phases.append("processConstraintsViolatonTableOnCommit",
-                          processConstraintsViolatonTableOnCommit.loadRelaxed());
-            phases.append("commit", commit.loadRelaxed());
-            indexBuilds.append("phases", phases.obj());
-
-            return indexBuilds.obj();
-        }
-
-        AtomicWord<int> registered;
-        AtomicWord<int> killedDueToInsufficientDiskSpace;
-        AtomicWord<int> failedDueToDataCorruption;
-        AtomicWord<int> scanCollection;
-        AtomicWord<int> drainSideWritesTable;
-        AtomicWord<int> drainSideWritesTablePreCommit;
-        AtomicWord<int> waitForCommitQuorum;
-        AtomicWord<int> drainSideWritesTableOnCommit;
-        AtomicWord<int> processConstraintsViolatonTableOnCommit;
-        AtomicWord<int> commit;
-    } indexBuildsSSS;
 
 private:
     /**
@@ -965,6 +920,9 @@ protected:
      * Looks up active index build by UUID. Returns NoSuchKey if the build does not exist.
      */
     StatusWith<std::shared_ptr<ReplIndexBuildState>> _getIndexBuild(const UUID& buildUUID) const;
+
+    /** Called by implementations to bump the waitForCommitQuorum counter when they do so.*/
+    void _incWaitForCommitQuorum();
 
     /**
      * Returns a list of index builds matching the criteria 'indexBuildFilter'.

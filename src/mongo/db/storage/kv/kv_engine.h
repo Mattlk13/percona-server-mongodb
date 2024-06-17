@@ -39,6 +39,7 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/import_options.h"
 #include "mongo/db/storage/column_store.h"
+#include "mongo/db/storage/compact_options.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/engine_extension.h"
 #include "mongo/db/storage/record_store.h"
@@ -67,7 +68,18 @@ public:
      * When all of the storage startup tasks are completed as a whole, then this function is called
      * by the external force managing the startup process.
      */
-    virtual void notifyStartupComplete() {}
+    virtual void notifyStorageStartupRecoveryComplete() {}
+
+    /**
+     * Perform any operations in the storage layer that are unblocked now that the server has exited
+     * recovery and considers itself stable.
+     *
+     * This will be called during a node's transition to steady state replication.
+     *
+     * This function may race with shutdown. As a result, any steps within this function that should
+     * not race with shutdown should obtain the global lock.
+     */
+    virtual void notifyReplStartupRecoveryComplete(OperationContext* opCtx) {}
 
     virtual RecoveryUnit* newRecoveryUnit() = 0;
 
@@ -84,6 +96,16 @@ public:
                                                         const NamespaceString& nss,
                                                         StringData ident,
                                                         const CollectionOptions& options) = 0;
+
+    /**
+     * Opens an existing ident as a temporary record store. Must be used for record stores created
+     * with `makeTemporaryRecordStore`. Using `getRecordStore` would cause the record store to use
+     * the same settings as a regular collection, and would differ in behaviour as when it was
+     * originally created with `makeTemporaryRecordStore`.
+     */
+    virtual std::unique_ptr<RecordStore> getTemporaryRecordStore(OperationContext* opCtx,
+                                                                 StringData ident,
+                                                                 KeyFormat keyFormat) = 0;
 
     virtual std::unique_ptr<SortedDataInterface> getSortedDataInterface(
         OperationContext* opCtx,
@@ -110,6 +132,10 @@ public:
                                      const CollectionOptions& options,
                                      KeyFormat keyFormat = KeyFormat::Long) = 0;
 
+    /**
+     * RecordStores initially created with `makeTemporaryRecordStore` must be opened with
+     * `getTemporaryRecordStore`.
+     */
     virtual std::unique_ptr<RecordStore> makeTemporaryRecordStore(OperationContext* opCtx,
                                                                   StringData ident,
                                                                   KeyFormat keyFormat) = 0;
@@ -224,9 +250,7 @@ public:
     }
 
     virtual StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>> beginNonBlockingBackup(
-        OperationContext* opCtx,
-        boost::optional<Timestamp> checkpointTimestamp,
-        const StorageEngine::BackupOptions& options) {
+        OperationContext* opCtx, const StorageEngine::BackupOptions& options) {
         return Status(ErrorCodes::CommandNotSupported,
                       "The current storage engine doesn't support backup mode");
     }
@@ -247,7 +271,7 @@ public:
         return false;
     }
 
-    virtual void checkpoint(OperationContext* opCtx) {}
+    virtual void checkpoint() {}
 
     virtual StorageEngine::CheckpointIteration getCheckpointIteration() const {
         return StorageEngine::CheckpointIteration{0};
@@ -472,9 +496,17 @@ public:
      *
      * TODO SERVER-81069: Remove this since it's intrinsically tied to encryption options only.
      */
-    virtual StatusWith<BSONObj> getSanitizedStorageOptionsForSecondaryReplication(
+    virtual BSONObj getSanitizedStorageOptionsForSecondaryReplication(
         const BSONObj& options) const {
         return options;
+    }
+
+    /**
+     * See StorageEngine::autoCompact for details
+     */
+    virtual Status autoCompact(OperationContext* opCtx, const AutoCompactOptions& options) {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "The current storage engine doesn't support auto compact");
     }
 
     /**

@@ -81,6 +81,7 @@
 #include "mongo/db/session/session_txn_record_gen.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/executor/task_executor.h"
@@ -155,6 +156,9 @@ MONGO_FAIL_POINT_DEFINE(initialSyncHangBeforeChoosingSyncSource);
 
 // Failpoint which causes the initial sync function to hang after finishing.
 MONGO_FAIL_POINT_DEFINE(initialSyncHangAfterFinish);
+
+// Failpoint which causes the initial sync function to hang after resetting the in-memory FCV.
+MONGO_FAIL_POINT_DEFINE(initialSyncHangAfterResettingFCV);
 
 // Failpoints for synchronization, shared with cloners.
 extern FailPoint initialSyncFuzzerSynchronizationPoint1;
@@ -678,7 +682,9 @@ void InitialSyncer::_startInitialSyncAttemptCallback(
         // since that would also set the all_durable point to zero. We specifically don't set
         // the stable timestamp here because that will trigger taking a first stable checkpoint even
         // though the initialDataTimestamp is still set to kAllowUnstableCheckpointsSentinel.
-        storageEngine->setOldestTimestamp(kTimestampOne);
+        // We need to use force in case we are resetting the oldest timestamp backwards after a
+        // failed initial sync attempt.
+        storageEngine->setOldestTimestamp(kTimestampOne, true /*force*/);
     }
 
     LOGV2_DEBUG(21168,
@@ -686,7 +692,12 @@ void InitialSyncer::_startInitialSyncAttemptCallback(
                 "Resetting feature compatibility version to last-lts. If the sync source is in "
                 "latest feature compatibility version, we will find out when we clone the "
                 "server configuration collection (admin.system.version)");
-    serverGlobalParams.mutableFeatureCompatibility.reset();
+    serverGlobalParams.mutableFCV.reset();
+
+    if (MONGO_unlikely(initialSyncHangAfterResettingFCV.shouldFail())) {
+        LOGV2(8206400, "initialSyncHangAfterResettingFCV fail point enabled");
+        initialSyncHangAfterResettingFCV.pauseWhileSet();
+    }
 
     // Clear the oplog buffer.
     _oplogBuffer->clear(makeOpCtx().get());
@@ -826,7 +837,7 @@ Status InitialSyncer::_truncateOplogAndDropReplicatedDatabases() {
     auto opCtx = makeOpCtx();
     // This code can make untimestamped writes (deletes) to the _mdb_catalog on top of existing
     // timestamped updates.
-    opCtx->recoveryUnit()->allowAllUntimestampedWrites();
+    shard_role_details::getRecoveryUnit(opCtx.get())->allowAllUntimestampedWrites();
 
     // We are not replicating nor validating these writes.
     UnreplicatedWritesBlock unreplicatedWritesBlock(opCtx.get());
@@ -1138,7 +1149,8 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
 
     // Changing the featureCompatibilityVersion during initial sync is unsafe.
     // (Generic FCV reference): This FCV check should exist across LTS binary versions.
-    if (serverGlobalParams.featureCompatibility.isUpgradingOrDowngrading(version)) {
+    if (serverGlobalParams.featureCompatibility.acquireFCVSnapshot().isUpgradingOrDowngrading(
+            version)) {
         onCompletionGuard->setResultAndCancelRemainingWork_inlock(
             lock,
             Status(ErrorCodes::IncompatibleServerVersion,
@@ -1150,7 +1162,7 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
         // and collection/index creation can depend on FCV, we set the in-memory FCV value to match
         // the version on the sync source. We won't persist the FCV on disk nor will we update our
         // minWireVersion until we clone the actual document.
-        serverGlobalParams.mutableFeatureCompatibility.setVersion(version);
+        serverGlobalParams.mutableFCV.setVersion(version);
     }
 
     if (MONGO_unlikely(initialSyncHangBeforeSplittingControlFlow.shouldFail())) {
@@ -1530,7 +1542,7 @@ void InitialSyncer::_getNextApplierBatchCallback(
 
     std::string logMsg = str::stream()
         << "Initial Syncer is about to apply the next oplog batch of size: "
-        << batchResult.getValue().size();
+        << batchResult.getValue().count();
     pauseAtInitialSyncFuzzerSyncronizationPoints(logMsg);
 
     if (MONGO_unlikely(failInitialSyncBeforeApplyingBatch.shouldFail())) {
@@ -1545,7 +1557,7 @@ void InitialSyncer::_getNextApplierBatchCallback(
     }
 
     // Schedule MultiApplier if we have operations to apply.
-    const auto& ops = batchResult.getValue();
+    const auto& ops = batchResult.getValue().getBatch();
     if (!ops.empty()) {
         _fetchCount.store(0);
         MultiApplier::MultiApplyFn applyBatchOfOperationsFn = [this](OperationContext* opCtx,
@@ -2108,12 +2120,12 @@ void InitialSyncer::_shutdownComponent_inlock(Component& component) {
     component->shutdown();
 }
 
-StatusWith<std::vector<OplogEntry>> InitialSyncer::_getNextApplierBatch_inlock() {
+StatusWith<OplogApplierBatch> InitialSyncer::_getNextApplierBatch_inlock() {
     // If the fail-point is active, delay the apply batch by returning an empty batch so that
     // _getNextApplierBatchCallback() will reschedule itself at a later time.
     // See InitialSyncerInterface::Options::getApplierBatchCallbackRetryWait.
     if (MONGO_unlikely(rsSyncApplyStop.shouldFail())) {
-        return std::vector<OplogEntry>();
+        return OplogApplierBatch();
     }
 
     // Obtain next batch of operations from OplogApplier.
@@ -2152,11 +2164,8 @@ Status InitialSyncer::_enqueueDocuments(OplogFetcher::Documents::const_iterator 
 
     invariant(_oplogBuffer);
 
-    // Wait for enough space.
-    _oplogApplier->waitForSpace(makeOpCtx().get(), info.toApplyDocumentBytes);
-
     // Buffer docs for later application.
-    _oplogApplier->enqueue(makeOpCtx().get(), begin, end);
+    _oplogApplier->enqueue(makeOpCtx().get(), begin, end, info.toApplyDocumentBytes);
 
     _lastFetched = info.lastDocument;
 

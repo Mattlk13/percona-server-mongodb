@@ -53,6 +53,7 @@
 #include "mongo/db/s/balancer/balancer_commands_scheduler.h"
 #include "mongo/db/s/balancer/balancer_commands_scheduler_impl.h"
 #include "mongo/db/s/config/config_server_test_fixture.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/executor/network_test_env.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/s/catalog/type_shard.h"
@@ -160,7 +161,7 @@ protected:
     void configureTargeter(OperationContext* opCtx, ShardId shardId, const HostAndPort& host) {
         auto targeter = RemoteCommandTargeterMock::get(
             uassertStatusOK(shardRegistry()->getShard(opCtx, shardId))->getTargeter());
-        targeter->setFindHostReturnValue(kShardHost0);
+        targeter->setFindHostReturnValue(host);
     }
 
     BalancerCommandsSchedulerImpl _scheduler;
@@ -252,6 +253,52 @@ TEST_F(BalancerCommandsSchedulerTest, SuccessfulRequestChunkDataSizeCommand) {
     auto receivedDataSize = swReceivedDataSize.getValue();
     ASSERT_EQ(receivedDataSize.sizeBytes, 156);
     ASSERT_EQ(receivedDataSize.numObjects, 25);
+    remoteResponsesFuture.default_timed_get();
+    _scheduler.stop();
+}
+
+TEST_F(BalancerCommandsSchedulerTest, SuccessfulMoveCollectionRequest) {
+
+    ConfigServerTestFixture::setupDatabase(kNss.dbName(), kShardId1);
+
+    auto remoteResponsesFuture = setRemoteResponses({[&](const executor::RemoteCommandRequest&
+                                                             request) {
+        // Expect to target the DBPrimary shard.
+        ASSERT_EQ(request.target, kShardHost1);
+
+        // Expect to get the correct nss.
+        ASSERT_EQ(
+            kNss.toString_forTest(),
+            request.cmdObj.getStringField(ShardsvrReshardCollection::kCommandParameterFieldName));
+
+        // Expect to get 1 num initial chunks.
+        ASSERT(request.cmdObj.hasField(ShardsvrReshardCollection::kNumInitialChunksFieldName));
+        ASSERT_EQ(
+            1, request.cmdObj.getIntField(ShardsvrReshardCollection::kNumInitialChunksFieldName));
+
+        // Expect to get the proper shard as a destination for the collection.
+        ASSERT(request.cmdObj.hasField(ShardsvrReshardCollection::kShardDistributionFieldName));
+        const auto shardDistributionArray =
+            request.cmdObj.getField(ShardsvrReshardCollection::kShardDistributionFieldName).Array();
+        ASSERT_EQ(1, shardDistributionArray.size());
+
+        const auto shardKeyRange = ShardKeyRange::parse(
+            IDLParserContext("BalancerCommandsSchedulerTest"), shardDistributionArray.at(0).Obj());
+        ASSERT_EQ(kShardId0, shardKeyRange.getShard());
+
+        ASSERT_EQ(Provenance_serializer(ProvenanceEnum::kBalancerMoveCollection),
+                  request.cmdObj.getStringField(ShardsvrReshardCollection::kProvenanceFieldName));
+
+        return OkReply().toBSON();
+    }});
+    _scheduler.start(operationContext());
+
+    auto catalogClient = ShardingCatalogManager::get(operationContext())->localCatalogClient();
+    const auto dbEntry = catalogClient->getDatabase(
+        operationContext(), kNss.dbName(), repl::ReadConcernLevel::kMajorityReadConcern);
+    auto futureResponse = _scheduler.requestMoveCollection(
+        operationContext(), kNss, kShardId0, kShardId1, dbEntry.getVersion());
+    ASSERT_OK(futureResponse.getNoThrow());
     remoteResponsesFuture.default_timed_get();
     _scheduler.stop();
 }

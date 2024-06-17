@@ -55,7 +55,6 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/feature_flag.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -84,6 +83,7 @@
 #include "mongo/db/timeseries/timeseries_constants.h"
 #include "mongo/db/timeseries/timeseries_gen.h"
 #include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -169,11 +169,11 @@ auto makeOnSuppressedErrorFn(const std::function<void()>& saveCursorBeforeWrite,
 
 bool shouldRelaxConstraints(OperationContext* opCtx, const CollectionPtr& collection) {
     if (!feature_flags::gIndexBuildGracefulErrorHandling.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
         // Always suppress.
         return true;
     }
-    invariant(opCtx->lockState()->isRSTLLocked());
+    invariant(shard_role_details::getLocker(opCtx)->isRSTLLocked());
     const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     bool isPrimary = replCoord->canAcceptWritesFor(opCtx, collection->ns());
 
@@ -293,10 +293,10 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(
     OnInitFn onInit,
     InitMode initMode,
     const boost::optional<ResumeIndexInfo>& resumeInfo) {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_X),
-              str::stream() << "Collection " << collection->ns().toStringForErrorMsg()
-                            << " with UUID " << collection->uuid()
-                            << " is holding the incorrect lock");
+    invariant(
+        shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(collection->ns(), MODE_X),
+        str::stream() << "Collection " << collection->ns().toStringForErrorMsg() << " with UUID "
+                      << collection->uuid() << " is holding the incorrect lock");
     _collectionUUID = collection->uuid();
 
     _buildIsCleanedUp = false;
@@ -316,7 +316,7 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(
         // On rollback in init(), cleans up _indexes so that ~MultiIndexBlock doesn't try to clean
         // up _indexes manually (since the changes were already rolled back). Due to this, it is
         // thus legal to call init() again after it fails.
-        opCtx->recoveryUnit()->onRollback([this](OperationContext*) {
+        shard_role_details::getRecoveryUnit(opCtx)->onRollback([this](OperationContext*) {
             _indexes.clear();
             _buildIsCleanedUp = true;
         });
@@ -457,7 +457,7 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(
             index.filterExpression = indexCatalogEntry->getFilterExpression();
         }
 
-        opCtx->recoveryUnit()->onCommit(
+        shard_role_details::getRecoveryUnit(opCtx)->onCommit(
             [ns = collection->ns(), this](OperationContext*, boost::optional<Timestamp> commitTs) {
                 if (!_buildUUID) {
                     return;
@@ -497,7 +497,7 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(
     const CollectionPtr& collection,
     const boost::optional<RecordId>& resumeAfterRecordId) {
     invariant(!_buildIsCleanedUp);
-    invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
     // UUIDs are not guaranteed during startup because the check happens after indexes are rebuilt.
     if (_collectionUUID) {
@@ -548,21 +548,21 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(
         // Unlock before hanging so replication recognizes we've completed.
         collection.yield();
         Locker::LockSnapshot lockInfo;
-        opCtx->lockState()->saveLockStateAndUnlock(&lockInfo);
+        shard_role_details::getLocker(opCtx)->saveLockStateAndUnlock(&lockInfo);
 
         LOGV2(4585201,
               "Hanging index build with no locks due to "
               "'hangAfterSettingUpIndexBuildUnlocked' failpoint");
         hangAfterSettingUpIndexBuildUnlocked.pauseWhileSet();
 
-        opCtx->lockState()->restoreLockState(opCtx, lockInfo);
-        opCtx->recoveryUnit()->abandonSnapshot();
+        shard_role_details::getLocker(opCtx)->restoreLockState(opCtx, lockInfo);
+        shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
         collection.restore();
     }
 
     // Hint to the storage engine that this collection scan should not keep data in the cache.
     bool readOnce = useReadOnceCursorsForIndexBuilds.load();
-    opCtx->recoveryUnit()->setReadOnce(readOnce);
+    shard_role_details::getRecoveryUnit(opCtx)->setReadOnce(readOnce);
 
     size_t numScanRestarts = 0;
     bool restartCollectionScan = false;
@@ -585,8 +585,8 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(
                       "duration"_attr = duration_cast<Milliseconds>(timer.elapsed()),
                       "phase"_attr = IndexBuildPhase_serializer(_phase),
                       "collectionScanPosition"_attr = _lastRecordIdInserted,
-                      "readSource"_attr =
-                          RecoveryUnit::toString(opCtx->recoveryUnit()->getTimestampReadSource()),
+                      "readSource"_attr = RecoveryUnit::toString(
+                          shard_role_details::getRecoveryUnit(opCtx)->getTimestampReadSource()),
                       "error"_attr = ex);
 
         _lastRecordIdInserted = boost::none;
@@ -622,15 +622,15 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(
                   "collectionUUID"_attr = _collectionUUID,
                   logAttrs(collection->ns()),
                   "totalRecords"_attr = progress.get(WithLock::withoutLock())->hits(),
-                  "readSource"_attr =
-                      RecoveryUnit::toString(opCtx->recoveryUnit()->getTimestampReadSource()),
+                  "readSource"_attr = RecoveryUnit::toString(
+                      shard_role_details::getRecoveryUnit(opCtx)->getTimestampReadSource()),
                   "duration"_attr = duration_cast<Milliseconds>(timer.elapsed()));
         } catch (const ExceptionFor<ErrorCodes::ReadConcernMajorityNotAvailableYet>& ex) {
             restart(ex);
         } catch (const ExceptionFor<ErrorCodes::CappedPositionLost>& ex) {
             restart(ex);
         } catch (DBException& ex) {
-            auto readSource = opCtx->recoveryUnit()->getTimestampReadSource();
+            auto readSource = shard_role_details::getRecoveryUnit(opCtx)->getTimestampReadSource();
             LOGV2(4984704,
                   "Index build: collection scan stopped",
                   "buildUUID"_attr = _buildUUID,
@@ -665,7 +665,7 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(
         // Unlock before hanging so replication recognizes we've completed.
         collection.yield();
         Locker::LockSnapshot lockInfo;
-        opCtx->lockState()->saveLockStateAndUnlock(&lockInfo);
+        shard_role_details::getLocker(opCtx)->saveLockStateAndUnlock(&lockInfo);
 
         LOGV2(20390,
               "Hanging index build with no locks due to "
@@ -673,8 +673,8 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(
         hangAfterStartingIndexBuildUnlocked.pauseWhileSet();
 
         if (isBackgroundBuilding()) {
-            opCtx->lockState()->restoreLockState(opCtx, lockInfo);
-            opCtx->recoveryUnit()->abandonSnapshot();
+            shard_role_details::getLocker(opCtx)->restoreLockState(opCtx, lockInfo);
+            shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
         } else {
             invariant(false,
                       "the hangAfterStartingIndexBuildUnlocked failpoint can't be turned off for "
@@ -812,10 +812,10 @@ Status MultiIndexBlock::_insert(
     // collection to have it.
     if (_containsIndexBuildOnTimeseriesMeasurement &&
         *collection->getTimeseriesBucketsMayHaveMixedSchemaData()) {
-        bool docHasMixedSchemaData =
+        auto docHasMixedSchemaData =
             collection->doesTimeseriesBucketsDocContainMixedSchemaData(doc);
 
-        if (docHasMixedSchemaData) {
+        if (docHasMixedSchemaData.isOK() && docHasMixedSchemaData.getValue()) {
             LOGV2(6057700,
                   "Detected mixed-schema data in time-series bucket collection",
                   logAttrs(collection->ns()),
@@ -881,7 +881,7 @@ Status MultiIndexBlock::dumpInsertsFromBulk(
     const IndexAccessMethod::RecordIdHandlerFn& onDuplicateRecord) {
     opCtx->checkForInterrupt();
     invariant(!_buildIsCleanedUp);
-    invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
     // Initial sync adds documents to the sorter using
     // insertSingleDocumentForInitialSyncOrRecovery() instead of delegating to
@@ -958,7 +958,7 @@ Status MultiIndexBlock::drainBackgroundWrites(
     RecoveryUnit::ReadSource readSource,
     IndexBuildInterceptor::DrainYieldPolicy drainYieldPolicy) {
     invariant(!_buildIsCleanedUp);
-    invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
     // Background writes are drained three times (once without blocking writes and twice blocking
     // writes), so we may either be coming from the bulk load phase or be already in the drain
@@ -1048,10 +1048,10 @@ Status MultiIndexBlock::commit(OperationContext* opCtx,
                                OnCreateEachFn onCreateEach,
                                OnCommitFn onCommit) {
     invariant(!_buildIsCleanedUp);
-    invariant(opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_X),
-              str::stream() << "Collection " << collection->ns().toStringForErrorMsg()
-                            << " with UUID " << collection->uuid()
-                            << " is holding the incorrect lock");
+    invariant(
+        shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(collection->ns(), MODE_X),
+        str::stream() << "Collection " << collection->ns().toStringForErrorMsg() << " with UUID "
+                      << collection->uuid() << " is holding the incorrect lock");
 
     // UUIDs are not guaranteed during startup because the check happens after indexes are rebuilt.
     if (_collectionUUID) {
@@ -1138,7 +1138,7 @@ Status MultiIndexBlock::commit(OperationContext* opCtx,
     }
 
     CollectionQueryInfo::get(collection).clearQueryCache(opCtx, CollectionPtr(collection));
-    opCtx->recoveryUnit()->onCommit(
+    shard_role_details::getRecoveryUnit(opCtx)->onCommit(
         [this](OperationContext*, boost::optional<Timestamp>) { _buildIsCleanedUp = true; });
 
     return Status::OK();
@@ -1164,11 +1164,11 @@ void MultiIndexBlock::abortWithoutCleanup(OperationContext* opCtx,
     invariant(!_buildIsCleanedUp);
     // Aborting without cleanup is done during shutdown. At this point the operation context is
     // killed, but acquiring locks must succeed.
-    UninterruptibleLockGuard noInterrupt(opCtx->lockState());  // NOLINT.
+    UninterruptibleLockGuard noInterrupt(shard_role_details::getLocker(opCtx));  // NOLINT.
     // Lock if it's not already locked, to ensure storage engine cannot be destructed out from
     // underneath us.
     boost::optional<Lock::GlobalLock> lk;
-    if (!opCtx->lockState()->isWriteLocked()) {
+    if (!shard_role_details::getLocker(opCtx)->isWriteLocked()) {
         lk.emplace(opCtx, MODE_IX);
     }
 

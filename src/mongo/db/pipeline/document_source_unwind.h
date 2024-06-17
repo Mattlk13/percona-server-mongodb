@@ -66,7 +66,7 @@ public:
     // virtuals from DocumentSource
     const char* getSourceName() const final;
 
-    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final override;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     /**
      * Returns the unwound path, and the 'includeArrayIndex' path, if specified.
@@ -158,8 +158,8 @@ private:
     // one we already pushed down. boost::none means no push down has occurred yet.
     boost::optional<long long> _smallestLimitPushedDown;
 
-    // TODO SERVER-80226: Change to SbeCompatibility::fullyCompatible when $unwind pushdown enabled.
-    SbeCompatibility _sbeCompatibility{SbeCompatibility::flagGuarded};
-};
+    // Standalone $unwind pushdown to SBE requires featureFlagSbeFull.
+    SbeCompatibility _sbeCompatibility{SbeCompatibility::requiresSbeFull};
+};  // class DocumentSourceUnwind
 
 }  // namespace mongo

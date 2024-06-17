@@ -81,12 +81,12 @@ public:
                                      const NamespaceString& ns,
                                      bool includeBuildUUIDs) override;
 
-    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+    std::unique_ptr<Pipeline, PipelineDeleter> preparePipelineForExecution(
         Pipeline* pipeline,
         ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
         boost::optional<BSONObj> readConcern = boost::none) override;
 
-    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+    std::unique_ptr<Pipeline, PipelineDeleter> preparePipelineForExecution(
         const AggregateCommandRequest& aggRequest,
         Pipeline* pipeline,
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -94,7 +94,8 @@ public:
         ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
         boost::optional<BSONObj> readConcern = boost::none) override;
 
-    BSONObj preparePipelineAndExplain(Pipeline* ownedPipeline, ExplainOptions::Verbosity verbosity);
+    BSONObj preparePipelineAndExplain(Pipeline* ownedPipeline,
+                                      ExplainOptions::Verbosity verbosity) override;
 
     boost::optional<ShardVersion> refreshAndGetCollectionVersion(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -102,7 +103,7 @@ public:
         return boost::none;  // Nothing is sharded here.
     }
 
-    virtual void checkRoutingInfoEpochOrThrow(
+    void checkRoutingInfoEpochOrThrow(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const NamespaceString& nss,
         ChunkVersion targetCollectionPlacementVersion) const override {
@@ -154,7 +155,8 @@ public:
 
     void createTempCollection(OperationContext* opCtx,
                               const NamespaceString& nss,
-                              const BSONObj& collectionOptions) override;
+                              const BSONObj& collectionOptions,
+                              boost::optional<ShardId> dataShard) override;
 
     void createTimeseriesView(OperationContext* opCtx,
                               const NamespaceString& ns,

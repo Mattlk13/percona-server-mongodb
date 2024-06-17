@@ -7,12 +7,18 @@ export var configureFailPoint;
 export var configureFailPointForRS;
 export var kDefaultWaitForFailPointTimeout;
 
+/**
+ * Utility to get the correct name of a fail point given the name of the fail point on the main
+ * branch and the wire-version of the server you are speaking to.
+ */
+export var getFailPointName;
+
 (function() {
 if (configureFailPoint) {
     return;  // Protect against this file being double-loaded.
 }
 
-kDefaultWaitForFailPointTimeout = 5 * 60 * 1000;
+kDefaultWaitForFailPointTimeout = 10 * 60 * 1000;
 
 configureFailPoint = function(conn, failPointName, data = {}, failPointMode = "alwaysOn") {
     const res = sh.assertRetryableCommandWorkedOrFailedWithCodes(() => {
@@ -78,5 +84,28 @@ configureFailPointForRS = function(conns, failPointName, data = {}, failPointMod
             });
         }
     };
+};
+
+// Add an entry to this map if you are changing the name of an existing fail point.
+// Key is name of the failpoint on master. Value is a function taking wireVersion
+// that returns the correct name of the fail point on that wireVersion.
+const kWireVersion73 = 24;
+const failPointRenameTable = {
+    "routerWaitInHello": function(wireVersion) {
+        if (wireVersion >= kWireVersion73) {
+            return "routerWaitInHello";
+        }
+        return "waitInHello";
+    },
+    "shardWaitInHello": function(wireVersion) {
+        if (wireVersion >= kWireVersion73) {
+            return "shardWaitInHello";
+        }
+        return "waitInHello";
+    }
+};
+
+getFailPointName = function(failPointNameOnMain, wireVersion) {
+    return failPointRenameTable[failPointNameOnMain](wireVersion);
 };
 })();

@@ -1,13 +1,9 @@
 /**
  * Validates the behaviour of the the SBE plan cache when the API version was provided to the
  * aggregate command.
- * @tags: [
- *   # TODO SERVER-67607: Test plan cache with CQF enabled.
- *   cqf_incompatible,
- * ]
  */
 
-import {checkSBEEnabled} from "jstests/libs/sbe_util.js";
+import {checkSbeFullyEnabled} from "jstests/libs/sbe_util.js";
 
 const conn = MongoRunner.runMongod({});
 assert.neq(conn, null, "mongod failed to start");
@@ -15,7 +11,7 @@ const db = conn.getDB("plan_cache_api_version");
 const coll = db.coll;
 coll.drop();
 
-const isSBEEnabled = checkSBEEnabled(db);
+const isSBEEnabled = checkSbeFullyEnabled(db);
 
 assert.commandWorked(coll.insert([{a: 1, b: 1}, {a: 2, b: 2}]));
 

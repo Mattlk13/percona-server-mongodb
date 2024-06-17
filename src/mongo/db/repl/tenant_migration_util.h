@@ -182,7 +182,8 @@ inline Status validateProtocolFCVCompatibility(
         return Status::OK();
 
     if (*protocol == MigrationProtocolEnum::kShardMerge &&
-        !repl::feature_flags::gShardMerge.isEnabled(serverGlobalParams.featureCompatibility)) {
+        !repl::feature_flags::gShardMerge.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
         return Status(ErrorCodes::IllegalOperation,
                       str::stream() << "protocol '" << MigrationProtocol_serializer(*protocol)
                                     << "' not supported");
@@ -196,7 +197,7 @@ inline Status validateTimestampNotNull(const Timestamp& ts) {
         : Status(ErrorCodes::BadValue, str::stream() << "Timestamp can't be null");
 }
 
-inline Status validateConnectionString(const StringData& donorOrRecipientConnectionString) {
+inline Status validateConnectionString(StringData donorOrRecipientConnectionString) {
     const auto donorOrRecipientUri =
         uassertStatusOK(MongoURI::parse(donorOrRecipientConnectionString.toString()));
     const auto donorOrRecipientServers = donorOrRecipientUri.getServers();

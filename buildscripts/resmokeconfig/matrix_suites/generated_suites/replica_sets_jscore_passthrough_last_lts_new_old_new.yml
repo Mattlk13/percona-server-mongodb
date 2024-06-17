@@ -18,11 +18,15 @@ executor:
   config:
     shell_options:
       eval: globalThis.testingReplication = true;
+      global_vars:
+        TestData:
+          nonClusteredConfigTransactions: true
   fixture:
     class: ReplicaSetFixture
     mixed_bin_versions: new_old_new
     mongod_options:
       set_parameters:
+        enableAutoCompaction: 1
         enableTestCommands: 1
     num_nodes: 3
     old_bin_version: last_lts
@@ -46,8 +50,11 @@ selector:
   - jstests/core/administrative/current_op/currentop.js
   - jstests/core/fsync.js
   - jstests/core/txns/prepare_conflict.js
+  - jstests/core/txns/prepare_conflict_aggregation_behavior.js
+  - jstests/core/ddl/collmod_convert_index_uniqueness.js
   exclude_with_any_tags:
   - assumes_standalone_mongod
+  - requires_profiling
   roots:
   - jstests/core/**/*.js
   - jstests/fle2/**/*.js

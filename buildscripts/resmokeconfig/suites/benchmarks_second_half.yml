@@ -53,6 +53,8 @@ selector:
   - build/install/bin/percentile_algo_bm*
   - build/install/bin/window_function_percentile_bm*
   - build/install/bin/rate_limiting_bm*
+  - build/install/bin/profile_filter_bm*
+  - build/install/bin/plan_cache_key_encoding_bm*
   # These benchmarks are being run as part of the benchmarks_expression*.yml
   - build/install/bin/expression_bm*
   - build/install/bin/sbe_expression_bm*
@@ -60,6 +62,7 @@ selector:
   - build/install/bin/abt_translation_bm*
   # These benchmarks are being run as part of the benchmarks_streams.yml test suite.
   - build/install/bin/streams_operator_dag_bm*
+  - build/install/bin/streams_window_operator_bm*
   # These benchmarks are only run when modifying or upgrading the immutable library.
   - build/install/bin/immutable_absl_comparison_bm*
   - build/install/bin/immutable_std_comparison_bm*
@@ -71,4 +74,4 @@ selector:
 executor:
   config: {}
   hooks:
-  - class: CombineBenchmarkResults
+  - class: GenerateAndCheckPerfResults

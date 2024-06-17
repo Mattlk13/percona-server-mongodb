@@ -73,40 +73,44 @@ namespace {
  * An element in this histogram is the number of plans in the candidate set of an invocation (of the
  * SBE multiplanner).
  */
-HistogramServerStatusMetric sbeNumPlansHistogram("query.multiPlanner.histograms.sbeNumPlans",
-                                                 HistogramServerStatusMetric::pow(5, 2, 2));
+auto& sbeNumPlansHistogram =
+    *MetricBuilder<HistogramServerStatusMetric>{"query.multiPlanner.histograms.sbeNumPlans"}.bind(
+        HistogramServerStatusMetric::pow(5, 2, 2));
 
 /**
  * Aggregation of the total number of invocations (of the SBE multiplanner).
  */
-CounterMetric sbeCount("query.multiPlanner.sbeCount");
+auto& sbeCount = *MetricBuilder<Counter64>{"query.multiPlanner.sbeCount"};
 
 /**
  * Aggregation of the total number of microseconds spent (in SBE multiplanner).
  */
-CounterMetric sbeMicrosTotal("query.multiPlanner.sbeMicros");
+auto& sbeMicrosTotal = *MetricBuilder<Counter64>{"query.multiPlanner.sbeMicros"};
 
 /**
  * Aggregation of the total number of reads done (in SBE multiplanner).
  */
-CounterMetric sbeNumReadsTotal("query.multiPlanner.sbeNumReads");
+auto& sbeNumReadsTotal = *MetricBuilder<Counter64>{"query.multiPlanner.sbeNumReads"};
 
 /**
  * An element in this histogram is the number of microseconds spent in an invocation (of the SBE
  * multiplanner).
  */
-HistogramServerStatusMetric sbeMicrosHistogram("query.multiPlanner.histograms.sbeMicros",
-                                               HistogramServerStatusMetric::pow(11, 1024, 4));
+auto& sbeMicrosHistogram =
+    *MetricBuilder<HistogramServerStatusMetric>{"query.multiPlanner.histograms.sbeMicros"}.bind(
+        HistogramServerStatusMetric::pow(11, 1024, 4));
 
 /**
  * An element in this histogram is the number of reads performance during an invocation (of the SBE
  * multiplanner).
  */
-HistogramServerStatusMetric sbeNumReadsHistogram("query.multiPlanner.histograms.sbeNumReads",
-                                                 HistogramServerStatusMetric::pow(9, 128, 2));
+auto& sbeNumReadsHistogram =
+    *MetricBuilder<HistogramServerStatusMetric>{"query.multiPlanner.histograms.sbeNumReads"}.bind(
+        HistogramServerStatusMetric::pow(9, 128, 2));
 }  // namespace
 
 CandidatePlans MultiPlanner::plan(
+    const QueryPlannerParams& plannerParams,
     std::vector<std::unique_ptr<QuerySolution>> solutions,
     std::vector<std::pair<std::unique_ptr<PlanStage>, stage_builder::PlanStageData>> roots) {
     auto candidates = collectExecutionStats(
@@ -117,7 +121,7 @@ CandidatePlans MultiPlanner::plan(
                                              internalQueryPlanEvaluationWorksSbe.load(),
                                              internalQueryPlanEvaluationCollFractionSbe.load()));
     auto decision = uassertStatusOK(mongo::plan_ranker::pickBestPlan<PlanStageStats>(candidates));
-    return finalizeExecutionPlans(std::move(decision), std::move(candidates));
+    return finalizeExecutionPlans(plannerParams, std::move(decision), std::move(candidates));
 }
 
 bool MultiPlanner::CandidateCmp::operator()(const plan_ranker::CandidatePlan* lhs,
@@ -144,7 +148,10 @@ MultiPlanner::PlanQ MultiPlanner::preparePlans(
 
         // Attach a unique TrialRunTracker to the plan, which is configured to use at most
         // '_maxNumReads' reads.
-        auto tracker = std::make_unique<TrialRunTracker>(trackerResultsBudget, _maxNumReads);
+        auto tracker = std::make_unique<TrialRunTracker>(
+            trackerResultsBudget,
+            _maxNumReads,
+            size_t{0} /*kNumPlanningResults - used only in crp_sbe*/);
         root->attachToTrialRunTracker(tracker.get());
 
         plan_ranker::CandidatePlanData data = {std::move(stageData), std::move(tracker)};
@@ -156,7 +163,7 @@ MultiPlanner::PlanQ MultiPlanner::preparePlans(
         auto* candidatePtr = &_candidates.back();
         // Store the original plan in the CandidatePlan.
         candidatePtr->clonedPlan.emplace(std::move(origPlan));
-        prepareCandidate(candidatePtr, false /*preparingFromCache*/);
+        _trialRuntimeExecutor.prepareCandidate(candidatePtr, false /*preparingFromCache*/);
         if (fetchOneDocument(candidatePtr)) {
             planq.push(candidatePtr);
         }
@@ -177,7 +184,7 @@ void MultiPlanner::trialPlans(PlanQ planq) {
 }
 
 bool MultiPlanner::fetchOneDocument(plan_ranker::CandidatePlan* candidate) {
-    if (!fetchNextDocument(candidate, _maxNumResults)) {
+    if (!_trialRuntimeExecutor.fetchNextDocument(candidate, _maxNumResults)) {
         candidate->root->detachFromTrialRunTracker();
         if (candidate->status.isOK()) {
             auto numReads =
@@ -259,6 +266,7 @@ std::vector<plan_ranker::CandidatePlan> MultiPlanner::collectExecutionStats(
 }
 
 CandidatePlans MultiPlanner::finalizeExecutionPlans(
+    const QueryPlannerParams& plannerParams,
     std::unique_ptr<mongo::plan_ranker::PlanRankingDecision> decision,
     std::vector<plan_ranker::CandidatePlan> candidates) const {
     invariant(decision);
@@ -287,8 +295,11 @@ CandidatePlans MultiPlanner::finalizeExecutionPlans(
             str::stream() << "winning candidate returned an error: " << winner.status,
             winner.status.isOK());
 
-    LOGV2_DEBUG(
-        4822875, 5, "Winning solution", "bestSolution"_attr = redact(winner.solution->toString()));
+    LOGV2_DEBUG(4822875,
+                5,
+                "Winning solution",
+                "bestSolution"_attr = redact(winner.solution->toString()),
+                "bestSolutionHash"_attr = winner.solution->hash());
 
     auto explainer = plan_explainer_factory::make(
         winner.root.get(), &winner.data.stageData, winner.solution.get());
@@ -336,14 +347,15 @@ CandidatePlans MultiPlanner::finalizeExecutionPlans(
     }
 
     // Extend the winning candidate with the agg pipeline and rebuild the execution tree. Because
-    // the trial was done with find-only part of the query, we cannot reuse the results. The
-    // non-winning plans are only used in 'explain()' so, to save on unnecessary work, we extend
-    // them only if this is an 'explain()' request.
+    // the trial was done with find-only part of the query, we cannot reuse the results. We do not
+    // extend the rejected plans because doing so erases execution statistics. The agg pipeline does
+    // not affect plan selection anyway. This is consistent with the classic runtime planner for
+    // SBE.
     if (!_cq.cqPipeline().empty()) {
         winner.root->close();
         _yieldPolicy->clearRegisteredPlans();
         auto solution = QueryPlanner::extendWithAggPipeline(
-            _cq, std::move(winner.solution), _queryParams.secondaryCollectionsInfo);
+            _cq, std::move(winner.solution), plannerParams.secondaryCollectionsInfo);
         auto [rootStage, data] = stage_builder::buildSlotBasedExecutableTree(
             _opCtx, _collections, _cq, *solution, _yieldPolicy);
         // The winner might have been replanned. So, pass through the replanning reason to the new
@@ -367,24 +379,10 @@ CandidatePlans MultiPlanner::finalizeExecutionPlans(
                                             plan_ranker::CandidatePlanData{std::move(data)}};
         candidates[winnerIdx].clonedPlan.emplace(std::move(clonedPlan));
         candidates[winnerIdx].root->open(false);
-
-        if (_cq.getExplain()) {
-            for (size_t i = 0; i < candidates.size(); ++i) {
-                if (i == winnerIdx)
-                    continue;  // have already done the winner
-
-                auto solution = QueryPlanner::extendWithAggPipeline(
-                    _cq, std::move(candidates[i].solution), _queryParams.secondaryCollectionsInfo);
-                auto&& [rootStage, data] = stage_builder::buildSlotBasedExecutableTree(
-                    _opCtx, _collections, _cq, *solution, _yieldPolicy);
-                candidates[i] = sbe::plan_ranker::CandidatePlan{
-                    std::move(solution), std::move(rootStage), std::move(data)};
-            }
-        }
     }
 
     // Writes a cache entry for the winning plan to the plan cache if possible.
-    plan_cache_util::updatePlanCacheFromCandidates(
+    plan_cache_util::updateSbePlanCacheFromSbeCandidates(
         _opCtx, _collections, _cachingMode, _cq, std::move(decision), candidates);
 
     return {std::move(candidates), winnerIdx};

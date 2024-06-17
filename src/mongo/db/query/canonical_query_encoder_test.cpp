@@ -53,8 +53,6 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
-#include "mongo/db/pipeline/inner_pipeline_stage_impl.h"
-#include "mongo/db/pipeline/inner_pipeline_stage_interface.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/canonical_query_test_util.h"
@@ -82,13 +80,19 @@ static const NamespaceString foreignNss =
 
 unittest::GoldenTestConfig goldenTestConfig{"src/mongo/db/test_output/query"};
 
-std::vector<std::unique_ptr<InnerPipelineStageInterface>> parsePipeline(
-    const boost::intrusive_ptr<ExpressionContext> expCtx, const std::vector<BSONObj>& rawPipeline) {
+std::vector<boost::intrusive_ptr<DocumentSource>> parsePipeline(
+    const boost::intrusive_ptr<ExpressionContext> expCtx,
+    const std::vector<BSONObj>& rawPipeline,
+    bool shouldParameterize = false) {
     auto pipeline = Pipeline::parse(rawPipeline, expCtx);
 
-    std::vector<std::unique_ptr<InnerPipelineStageInterface>> stages;
+    if (shouldParameterize) {
+        pipeline->parameterize();
+    }
+
+    std::vector<boost::intrusive_ptr<DocumentSource>> stages;
     for (auto&& source : pipeline->getSources()) {
-        stages.emplace_back(std::make_unique<InnerPipelineStageImpl>(source));
+        stages.emplace_back(source);
     }
     return stages;
 }
@@ -205,8 +209,44 @@ protected:
                                                    isCountLike,
                                                    needsMerge));
         cq->setSbeCompatible(true);
-        const auto key = canonical_query_encoder::encodeSBE(*cq);
+        const auto key = canonical_query_encoder::encodeSBE(
+            *cq, canonical_query_encoder::Optimizer::kSbeStageBuilders);
         gctx.outStream() << key << std::endl;
+    }
+
+    void testComputeKeyForPipeline(unittest::GoldenTestContext& gctx,
+                                   StringData matchStr,
+                                   StringData projStr) {
+        auto& stream = gctx.outStream();
+        stream << "==== VARIATION: bonsai + sbe, " << matchStr << ", " << projStr;
+        stream << std::endl;
+
+        auto pipelineObj = [](StringData matchStr, StringData projStr) -> std::vector<BSONObj> {
+            auto matchObj = fromjson(matchStr);
+            if (projStr == "{}") {
+                return {matchObj};
+            }
+
+            auto projObj = fromjson(projStr);
+            return {matchObj, projObj};
+        };
+
+        const auto expCtx = make_intrusive<ExpressionContextForTest>(opCtx(), nss);
+        auto pipeline = parsePipeline(expCtx, pipelineObj(matchStr, projStr), true);
+
+        const auto key = canonical_query_encoder::encodePipeline(
+            expCtx.get(), pipeline, canonical_query_encoder::Optimizer::kBonsai);
+        gctx.outStream() << key << std::endl;
+    }
+
+    CanonicalQuery::QueryShapeString encodeBonsai(const char* queryStr) {
+        RAIIServerParameterControllerForTest cqf("featureFlagCommonQueryFramework", "true");
+        RAIIServerParameterControllerForTest tryBonsai("internalQueryFrameworkControl",
+                                                       "tryBonsai");
+        auto cqfQuery = canonicalize(opCtx(), queryStr);
+        cqfQuery->setSbeCompatible(true);
+        return canonical_query_encoder::encodeSBE(*cqfQuery,
+                                                  canonical_query_encoder::Optimizer::kBonsai);
     }
 };
 
@@ -636,6 +676,61 @@ TEST_F(CanonicalQueryEncoderTest, ComputeKeyWithNeedsMerge) {
                       {groupStage},
                       false /* isCountLike */,
                       true /* needsMerge */);
+}
+
+TEST_F(CanonicalQueryEncoderTest, ComputeKeyForPipeline) {
+    unittest::GoldenTestContext gctx(&goldenTestConfig);
+    // SBE must be enabled in order to generate SBE plan cache keys.
+    // Bonsai plan cache
+    RAIIServerParameterControllerForTest controllerSBE("internalQueryFrameworkControl",
+                                                       "trySbeEngine");
+
+    testComputeKeyForPipeline(gctx, "{$match: {a: 1}}", "{}");
+    testComputeKeyForPipeline(gctx, "{$match: {a: 2}}", "{}");
+    testComputeKeyForPipeline(gctx, "{$match: {b: 1}}", "{}");
+    testComputeKeyForPipeline(gctx, "{$match: {$and: [{a: 1}, {b: 1}]}}", "{}");
+    testComputeKeyForPipeline(gctx, "{$match: {$or: [{a: 1}, {b: 1}]}}", "{}");
+
+    // with projection
+    testComputeKeyForPipeline(gctx, "{$match: {a: 1}}", "{$project: {a: 1}}");
+    testComputeKeyForPipeline(gctx, "{$match: {b: 1}}", "{$project: {b: 1}}");
+    testComputeKeyForPipeline(
+        gctx, "{$match: {$and: [{a: 1}, {b: 1}]}}", "{$project: {a: 1, b: 1}}");
+    testComputeKeyForPipeline(
+        gctx, "{$match: {$or: [{a: 1}, {b: 1}]}}", "{$project: {a: 1, b: 1}}");
+}
+
+TEST_F(CanonicalQueryEncoderTest, EncodeOptimizerType) {
+    auto query = canonicalize(opCtx(), "{a: 1}");
+    query->setSbeCompatible(true);
+    auto classicEncoding = canonical_query_encoder::encodeSBE(
+        *query, canonical_query_encoder::Optimizer::kSbeStageBuilders);
+    auto cqfEncoding =
+        canonical_query_encoder::encodeSBE(*query, canonical_query_encoder::Optimizer::kBonsai);
+    ASSERT_NE(classicEncoding, cqfEncoding);
+}
+
+TEST_F(CanonicalQueryEncoderTest, BonsaiComparisonOperationsEncodeTypes) {
+    ASSERT_NE(encodeBonsai("{a: 1}"), encodeBonsai("{a: 'str'}"));
+    ASSERT_NE(encodeBonsai("{a: {$gt: 1}}"), encodeBonsai("{a: {$gt: 'str'}}"));
+    ASSERT_NE(encodeBonsai("{a: {$gte: 1}}"), encodeBonsai("{a: {$gte: 'str'}}"));
+    ASSERT_NE(encodeBonsai("{a: {$lt: 1}}"), encodeBonsai("{a: {$lt: 'str'}}"));
+    ASSERT_NE(encodeBonsai("{a: {$lte: 1}}"), encodeBonsai("{a: {$lte: 'str'}}"));
+
+    // Different constants of the same canonical BSON type should have the same key.
+    ASSERT_EQ(encodeBonsai("{a: 1}"), encodeBonsai("{a: 5}"));
+    ASSERT_EQ(encodeBonsai("{a: 1}"), encodeBonsai("{a: 5.0}"));
+}
+
+TEST_F(CanonicalQueryEncoderTest, BonsaiInEncoding) {
+    // Single element $in's are translated as $eq's, which means that two single element $in's with
+    // different types shouldn't have the same key.
+    ASSERT_NE(encodeBonsai("{a: {$in: [1]}}"), encodeBonsai("{a: {$in: ['str']}}"));
+    // $in's with different lengths should not have the same key.
+    ASSERT_NE(encodeBonsai("{a: {$in: [1]}}"), encodeBonsai("{a: {$in: [1, 2]}}"));
+    ASSERT_NE(encodeBonsai("{a: {$in: [1, 2]}}"), encodeBonsai("{a: {$in: [1, 2, 3]}}"));
+    // $in with same length but different types have the same key.
+    ASSERT_EQ(encodeBonsai("{a: {$in: [1, 2]}}"), encodeBonsai("{a: {$in: ['str1', 'str2']}}"));
 }
 
 }  // namespace

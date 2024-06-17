@@ -43,6 +43,7 @@
 
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonelement.h"
+#include "mongo/db/admission/execution_admission_context.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/catalog/catalog_control.h"
 #include "mongo/db/catalog/clustered_collection_options_gen.h"
@@ -59,7 +60,6 @@
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/global_settings.h"
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/operation_context.h"
@@ -75,6 +75,7 @@
 #include "mongo/db/storage/storage_repair_observer.h"
 #include "mongo/db/storage/storage_util.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
@@ -104,7 +105,7 @@ MONGO_FAIL_POINT_DEFINE(pauseTimestampMonitor);
 MONGO_FAIL_POINT_DEFINE(setMinVisibleForAllCollectionsToOldestOnStartup);
 
 namespace {
-const std::string kCatalogInfo = DatabaseName::kMdbCatalog.db().toString();
+const std::string kCatalogInfo = DatabaseName::kMdbCatalog.db(omitTenant).toString();
 const NamespaceString kCatalogInfoNamespace = NamespaceString(DatabaseName::kMdbCatalog);
 const auto kCatalogLogLevel = logv2::LogSeverity::Debug(2);
 }  // namespace
@@ -166,16 +167,18 @@ StorageEngineImpl::StorageEngineImpl(OperationContext* opCtx,
     // has been initialized. This is needed because at the time of startup, when the operation
     // context gets created, the storage engine initialization has not yet begun and so it gets
     // assigned a noop recovery unit. See the StorageClientObserver class.
-    invariant(opCtx->recoveryUnit()->isNoop());
-    opCtx->setRecoveryUnit(std::unique_ptr<RecoveryUnit>(_engine->newRecoveryUnit()),
-                           WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+    invariant(shard_role_details::getRecoveryUnit(opCtx)->isNoop());
+    shard_role_details::setRecoveryUnit(opCtx,
+                                        std::unique_ptr<RecoveryUnit>(_engine->newRecoveryUnit()),
+                                        WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
 
     // If we are loading the catalog after an unclean shutdown, it's possible that there are
     // collections in the catalog that are unknown to the storage engine. We should attempt to
     // recover these orphaned idents.
     // Allowing locking in write mode as reinitializeStorageEngine will be called while holding the
     // global lock in exclusive mode.
-    invariant(!opCtx->lockState()->isLocked() || opCtx->lockState()->isW());
+    invariant(!shard_role_details::getLocker(opCtx)->isLocked() ||
+              shard_role_details::getLocker(opCtx)->isW());
     Lock::GlobalWrite globalLk(opCtx);
     loadCatalog(opCtx,
                 _engine->getRecoveryTimestamp(),
@@ -448,7 +451,7 @@ void StorageEngineImpl::loadCatalog(OperationContext* opCtx,
         }
     }
 
-    opCtx->recoveryUnit()->abandonSnapshot();
+    shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
 }
 
 void StorageEngineImpl::_initCollection(OperationContext* opCtx,
@@ -485,7 +488,7 @@ void StorageEngineImpl::_initCollection(OperationContext* opCtx,
 }
 
 void StorageEngineImpl::closeCatalog(OperationContext* opCtx) {
-    dassert(opCtx->lockState()->isLocked());
+    dassert(shard_role_details::getLocker(opCtx)->isLocked());
     if (shouldLog(::mongo::logv2::LogComponent::kStorageRecovery, kCatalogLogLevel)) {
         LOGV2_FOR_RECOVERY(4615632, kCatalogLogLevel.toInt(), "loadCatalog:");
         _dumpCatalog(opCtx);
@@ -709,7 +712,8 @@ StatusWith<StorageEngine::ReconcileResult> StorageEngineImpl::reconcileCatalogAn
             addDropPendingIdent(identDropTs, std::make_shared<Ident>(toRemove), /*onDrop=*/nullptr);
         } else {
             WriteUnitOfWork wuow(opCtx);
-            Status status = _engine->dropIdent(opCtx->recoveryUnit(), toRemove);
+            Status status =
+                _engine->dropIdent(shard_role_details::getRecoveryUnit(opCtx), toRemove);
             if (!status.isOK()) {
                 // A concurrent operation, such as a checkpoint could be holding an open data handle
                 // on the ident. Handoff the ident drop to the ident reaper to retry later.
@@ -841,7 +845,8 @@ StatusWith<StorageEngine::ReconcileResult> StorageEngineImpl::reconcileCatalogAn
                       logAttrs(md->nss),
                       "index"_attr = indexName);
                 // Ensure the `ident` is dropped while we have the `indexIdent` value.
-                Status status = _engine->dropIdent(opCtx->recoveryUnit(), indexIdent);
+                Status status =
+                    _engine->dropIdent(shard_role_details::getRecoveryUnit(opCtx), indexIdent);
                 if (!status.isOK()) {
                     // A concurrent operation, such as a checkpoint could be holding an open data
                     // handle on the ident. Handoff the ident drop to the ident reaper to retry
@@ -878,7 +883,7 @@ StatusWith<StorageEngine::ReconcileResult> StorageEngineImpl::reconcileCatalogAn
     for (auto&& temp : internalIdentsToDrop) {
         LOGV2(22257, "Dropping internal ident", "ident"_attr = temp);
         WriteUnitOfWork wuow(opCtx);
-        Status status = _engine->dropIdent(opCtx->recoveryUnit(), temp);
+        Status status = _engine->dropIdent(shard_role_details::getRecoveryUnit(opCtx), temp);
         if (!status.isOK()) {
             // A concurrent operation, such as a checkpoint could be holding an open data handle on
             // the ident. Handoff the ident drop to the ident reaper to retry later.
@@ -923,8 +928,12 @@ void StorageEngineImpl::startTimestampMonitor() {
     _timestampMonitor->addListener(&_collectionCatalogCleanupTimestampListener);
 }
 
-void StorageEngineImpl::notifyStartupComplete() {
-    _engine->notifyStartupComplete();
+void StorageEngineImpl::notifyStorageStartupRecoveryComplete() {
+    _engine->notifyStorageStartupRecoveryComplete();
+}
+
+void StorageEngineImpl::notifyReplStartupRecoveryComplete(OperationContext* opCtx) {
+    _engine->notifyReplStartupRecoveryComplete(opCtx);
 }
 
 RecoveryUnit* StorageEngineImpl::newRecoveryUnit() {
@@ -1025,9 +1034,8 @@ Status StorageEngineImpl::disableIncrementalBackup(OperationContext* opCtx) {
 
 StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>>
 StorageEngineImpl::beginNonBlockingBackup(OperationContext* opCtx,
-                                          boost::optional<Timestamp> checkpointTimestamp,
                                           const StorageEngine::BackupOptions& options) {
-    return _engine->beginNonBlockingBackup(opCtx, checkpointTimestamp, options);
+    return _engine->beginNonBlockingBackup(opCtx, options);
 }
 
 void StorageEngineImpl::endNonBlockingBackup(OperationContext* opCtx) {
@@ -1102,8 +1110,8 @@ StorageEngineImpl::makeTemporaryRecordStoreForResumableIndexBuild(OperationConte
 }
 
 std::unique_ptr<TemporaryRecordStore> StorageEngineImpl::makeTemporaryRecordStoreFromExistingIdent(
-    OperationContext* opCtx, StringData ident) {
-    auto rs = _engine->getRecordStore(opCtx, NamespaceString::kEmpty, ident, CollectionOptions());
+    OperationContext* opCtx, StringData ident, KeyFormat keyFormat) {
+    auto rs = _engine->getTemporaryRecordStore(opCtx, ident, keyFormat);
     return std::make_unique<DeferredDropRecordStore>(std::move(rs), this);
 }
 
@@ -1131,8 +1139,7 @@ void StorageEngineImpl::setOldestTimestampFromStable() {
     _engine->setOldestTimestampFromStable();
 }
 
-void StorageEngineImpl::setOldestTimestamp(Timestamp newOldestTimestamp) {
-    const bool force = true;
+void StorageEngineImpl::setOldestTimestamp(Timestamp newOldestTimestamp, bool force) {
     _engine->setOldestTimestamp(newOldestTimestamp, force);
 }
 
@@ -1154,13 +1161,13 @@ bool StorageEngineImpl::supportsRecoveryTimestamp() const {
 }
 
 StatusWith<Timestamp> StorageEngineImpl::recoverToStableTimestamp(OperationContext* opCtx) {
-    invariant(opCtx->lockState()->isW());
+    invariant(shard_role_details::getLocker(opCtx)->isW());
 
     auto state = catalog::closeCatalog(opCtx);
 
     // SERVER-58311: Reset the recovery unit to unposition storage engine cursors. This allows WT to
     // assert it has sole access when performing rollback_to_stable().
-    opCtx->replaceRecoveryUnit();
+    shard_role_details::replaceRecoveryUnit(opCtx);
 
     StatusWith<Timestamp> swTimestamp = _engine->recoverToStableTimestamp(opCtx);
     if (!swTimestamp.isOK()) {
@@ -1238,11 +1245,11 @@ void StorageEngineImpl::_dumpCatalog(OperationContext* opCtx) {
         }
         rec = cursor->next();
     }
-    opCtx->recoveryUnit()->abandonSnapshot();
+    shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
 }
 
 void StorageEngineImpl::addDropPendingIdent(
-    const stdx::variant<Timestamp, StorageEngine::CheckpointIteration>& dropTime,
+    const std::variant<Timestamp, StorageEngine::CheckpointIteration>& dropTime,
     std::shared_ptr<Ident> ident,
     DropIdentCallback&& onDrop) {
     _dropPendingIdentReaper.addDropPendingIdent(dropTime, ident, std::move(onDrop));
@@ -1256,8 +1263,8 @@ std::shared_ptr<Ident> StorageEngineImpl::markIdentInUse(StringData ident) {
     return _dropPendingIdentReaper.markIdentInUse(ident);
 }
 
-void StorageEngineImpl::checkpoint(OperationContext* opCtx) {
-    _engine->checkpoint(opCtx);
+void StorageEngineImpl::checkpoint() {
+    _engine->checkpoint();
 }
 
 StorageEngine::CheckpointIteration StorageEngineImpl::getCheckpointIteration() const {
@@ -1321,8 +1328,8 @@ void StorageEngineImpl::TimestampMonitor::_startup() {
 
                 // The TimestampMonitor is an important background cleanup task for the storage
                 // engine and needs to be able to make progress to free up resources.
-                ScopedAdmissionPriorityForLock immediatePriority(
-                    opCtx->lockState(), AdmissionContext::Priority::kImmediate);
+                ScopedAdmissionPriority<ExecutionAdmissionContext> immediatePriority(
+                    opCtx, AdmissionContext::Priority::kExempt);
 
                 Timestamp checkpoint;
                 Timestamp oldest;
@@ -1465,13 +1472,17 @@ const DurableCatalog* StorageEngineImpl::getCatalog() const {
     return _catalog.get();
 }
 
-StatusWith<BSONObj> StorageEngineImpl::getSanitizedStorageOptionsForSecondaryReplication(
+BSONObj StorageEngineImpl::getSanitizedStorageOptionsForSecondaryReplication(
     const BSONObj& options) const {
     return _engine->getSanitizedStorageOptionsForSecondaryReplication(options);
 }
 
 void StorageEngineImpl::dump() const {
     _engine->dump();
+}
+
+Status StorageEngineImpl::autoCompact(OperationContext* opCtx, const AutoCompactOptions& options) {
+    return _engine->autoCompact(opCtx, options);
 }
 
 }  // namespace mongo

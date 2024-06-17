@@ -35,12 +35,12 @@
 #include <vector>
 
 #include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/stages/plan_stats.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
 #include "mongo/db/exec/sbe/util/debug_print.h"
 #include "mongo/db/exec/sbe/values/slot.h"
 #include "mongo/db/exec/sbe/values/value.h"
-#include "mongo/db/exec/trial_run_tracker.h"
 #include "mongo/db/query/stage_types.h"
 #include "mongo/db/sorter/sorter_stats.h"
 
@@ -81,13 +81,14 @@ public:
               value::SlotVector obs,
               std::vector<value::SortDirection> dirs,
               value::SlotVector vals,
-              size_t limit,
+              std::unique_ptr<EExpression> limit,
               size_t memoryLimit,
               bool allowDiskUse,
+              PlanYieldPolicy* yieldPolicy,
               PlanNodeId planNodeId,
               bool participateInTrialRunTracking = true);
 
-    ~SortStage();
+    ~SortStage() override;
 
     std::unique_ptr<PlanStage> clone() const final;
 
@@ -101,11 +102,6 @@ public:
     const SpecificStats* getSpecificStats() const final;
     std::vector<DebugPrinter::Block> debugPrint() const final;
     size_t estimateCompileTimeSize() const final;
-
-protected:
-    void doDetachFromTrialRunTracker() override;
-    TrialRunTrackerAttachResultMask doAttachToTrialRunTracker(
-        TrialRunTracker* tracker, TrialRunTrackerAttachResultMask childrenAttachResult) override;
 
 private:
     class SortIface {
@@ -122,7 +118,7 @@ private:
     class SortImpl : public SortIface {
     public:
         SortImpl(SortStage& stage);
-        ~SortImpl();
+        ~SortImpl() override;
 
         void prepare(CompileCtx& ctx) final;
         value::SlotAccessor* getAccessor(CompileCtx& ctx, value::SlotId slot) final;
@@ -131,6 +127,7 @@ private:
         void close() final;
 
     private:
+        int64_t runLimitCode();
         void makeSorter();
 
         using SorterIterator = SortIteratorInterface<KeyRow, ValueRow>;
@@ -147,6 +144,8 @@ private:
         SorterData _mergeData;
         SorterData* _mergeDataIt{&_mergeData};
         std::unique_ptr<Sorter<KeyRow, ValueRow>> _sorter;
+
+        std::unique_ptr<vm::CodeFragment> _limitCode;
     };
 
 private:
@@ -168,9 +167,8 @@ private:
 
     std::unique_ptr<SortIface> _stageImpl;
 
+    std::unique_ptr<EExpression> _limitExpr;
+
     SortStats _specificStats;
-    // If provided, used during a trial run to accumulate certain execution stats. Once the
-    // trial run is complete, this pointer is reset to nullptr.
-    TrialRunTracker* _tracker{nullptr};
 };
 }  // namespace mongo::sbe

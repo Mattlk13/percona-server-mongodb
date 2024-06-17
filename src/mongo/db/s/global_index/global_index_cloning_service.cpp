@@ -51,7 +51,6 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/create_indexes_gen.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/ops/write_ops_gen.h"
@@ -65,6 +64,7 @@
 #include "mongo/db/s/resharding/resharding_data_copy_util.h"
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
@@ -505,7 +505,7 @@ ExecutorFuture<void> GlobalIndexCloningService::CloningStateMachine::_processBat
 
 void GlobalIndexCloningService::CloningStateMachine::_ensureCollection(OperationContext* opCtx,
                                                                        const NamespaceString& nss) {
-    invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
     // Create the destination collection if necessary.
     writeConflictRetry(opCtx, "CloningStateMachine::_ensureCollection", nss, [&] {

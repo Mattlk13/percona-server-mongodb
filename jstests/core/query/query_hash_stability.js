@@ -17,8 +17,8 @@
  *   assumes_no_implicit_index_creation,
  * ]
  */
-import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
-import {checkSBEEnabled} from "jstests/libs/sbe_util.js";
+import {getOptimizer} from "jstests/libs/analyze_plan.js";
+import {checkSbeFullyEnabled} from "jstests/libs/sbe_util.js";
 
 const collName = "query_hash_stability";
 const coll = db[collName];
@@ -41,11 +41,21 @@ let assertPlanCacheField = function(
                       tojson(firstExplain) + " with " + tojson(secondExplain));
     };
 
+    // TODO SERVER-77719: Ensure that the test is valid for different combinations of optimizer used
+    // for with/without index cases.
+    if (!(getOptimizer(firstExplain) == getOptimizer(secondExplain))) {
+        return;
+    }
+
     // SERVER-56980: When running in a sharded environment, we group the values for 'planCacheField'
     // by shard. This is because in a multi-version environment, we want to ensure that we are
     // comparing the results produced by the same shard in the event that the planCacheKey format
     // changed in between versions.
-    if (FixtureHelpers.isMongos(db)) {
+    if (firstExplain.queryPlanner.hasOwnProperty("winningPlan") &&
+        firstExplain.queryPlanner.winningPlan.hasOwnProperty("shards")) {
+        assert(secondExplain.queryPlanner.hasOwnProperty("winningPlan"), secondExplain);
+        assert(secondExplain.queryPlanner.winningPlan.hasOwnProperty("shards"), secondExplain);
+
         let buildShardMap = function(shardedPlan) {
             let explainMap = {};
             for (const shard of shardedPlan.queryPlanner.winningPlan.shards) {
@@ -117,7 +127,7 @@ assertPlanCacheField({
 
 // SBE's planCacheKey encoding encodes "collection version" which will be increased after dropping
 // an index.
-if (!checkSBEEnabled(db)) {
+if (!checkSbeFullyEnabled(db)) {
     // The 'planCacheKey' should be the same as what it was before we dropped the index.
     assertPlanCacheField({
         firstExplain: initialExplain,

@@ -198,7 +198,6 @@ void MozJSImplScope::registerOperation(OperationContext* opCtx) {
         return;
 
     _opCtx = opCtx;
-    _opId = opCtx->getOpID();
     _opCtxThreadId = stdx::this_thread::get_id();
 
     _engine->registerOperation(opCtx, this);
@@ -206,7 +205,7 @@ void MozJSImplScope::registerOperation(OperationContext* opCtx) {
 
 void MozJSImplScope::unregisterOperation() {
     if (_opCtx) {
-        _engine->unregisterOperation(_opId);
+        _engine->unregisterOperation(_opCtx);
         _opCtx = nullptr;
     }
 }
@@ -466,7 +465,6 @@ MozJSImplScope::MozJSImplScope(MozJSScriptEngine* engine, boost::optional<int> j
       _funcs(),
       _internedStrings(_context),
       _killStatus(Status::OK()),
-      _opId(0),
       _opCtx(nullptr),
       _inOp(0),
       _pendingGC(false),
@@ -525,6 +523,13 @@ MozJSImplScope::MozJSImplScope(MozJSScriptEngine* engine, boost::optional<int> j
 
         execSetup(JSFiles::assert);
         execSetup(JSFiles::types);
+
+        if (_engine->executionEnvironment() == ExecutionEnvironment::Server) {
+            // For legacy support in server-side javascript execution, delete the ECMAScript defined
+            // `Map` type and replace it with our `BSONAwareMap` implementation.
+            ObjectWrapper(_context, _global).deleteProperty("Map");
+            ObjectWrapper(_context, _global).renameAndDeleteProperty("BSONAwareMap", "Map");
+        }
 
         // install global utility functions
         installGlobalUtils(*this);
@@ -1110,10 +1115,6 @@ void MozJSImplScope::installBSONTypes() {
     _timestampProto.install(_global);
     _uriProto.install(_global);
     _statusProto.install(_global);
-
-    // This builtin map is a javascript 6 thing.  We want our version.  so
-    // take theirs out
-    ObjectWrapper(_context, _global).deleteProperty("Map");
 }
 
 void MozJSImplScope::installDBAccess() {

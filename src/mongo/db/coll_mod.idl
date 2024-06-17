@@ -170,6 +170,13 @@ structs:
                 optional: true
                 type: CollModTimeseries
                 stability: stable
+            timeseriesBucketsMayHaveMixedSchemaData:
+                description: >-
+                    Whether the time-series collection may have mixed schema data, which was only
+                    possible to write in FCV 5.1 and earlier.
+                optional: true
+                type: safeBool
+                stability: unstable
             dryRun:
                 description: "Runs the requested modification without modifying any database state.
                               This can be used to determine in advance if a particular collMod
@@ -197,6 +204,16 @@ structs:
                 validator:
                     lt: 2147483648  # 2^31
                 stability: stable
+            recordIdsReplicated:
+                description: >-
+                    Unsets and removes the 'recordIdsReplicated' option for the collection.
+                    Once this modification is applied, the collection will no longer guarantee the
+                    same recordId for a given document across all nodes in the a replica set.
+                    This collMod option must be set to 'false' (or equivalent according to
+                    BSONElement::booleanSafe()) if provided.
+                optional: true
+                type: safeBool
+                stability: unstable
 
 commands:
     collMod:
@@ -219,3 +236,12 @@ commands:
         chained_structs:
             CollModRequest: CollModRequest
         reply_type: CollModReply
+
+feature_flags:
+    featureFlagCollModTimeseriesBucketsMayHaveMixedSchemaData:
+        description: >-
+            Feature flag for the timeseriesBucketsMayHaveMixedSchemaData collMod parameter
+        cpp_varname: gCollModTimeseriesBucketsMayHaveMixedSchemaData
+        default: true
+        version: 8.0
+        shouldBeFCVGated: true

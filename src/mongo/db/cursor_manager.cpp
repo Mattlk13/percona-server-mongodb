@@ -71,10 +71,9 @@
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 namespace mongo {
-
-constexpr int CursorManager::kNumPartitions;
-
 namespace {
+
+constexpr int kNumPartitions = 16;
 
 const auto serviceCursorManager =
     ServiceContext::declareDecoration<std::unique_ptr<CursorManager>>();
@@ -84,6 +83,7 @@ ServiceContext::ConstructorActionRegisterer cursorManagerRegisterer{
         auto cursorManager = std::make_unique<CursorManager>(svcCtx->getPreciseClockSource());
         CursorManager::set(svcCtx, std::move(cursorManager));
     }};
+
 }  // namespace
 
 CursorManager* CursorManager::get(ServiceContext* svcCtx) {
@@ -115,10 +115,10 @@ std::pair<Status, int> CursorManager::killCursorsWithMatchingSessions(
 }
 
 CursorManager::CursorManager(ClockSource* preciseClockSource)
-    : _random(std::make_unique<PseudoRandom>(SecureRandom().nextInt64())),
+    : _preciseClockSource(preciseClockSource),
+      _random(std::make_unique<PseudoRandom>(SecureRandom().nextInt64())),
       _cursorMap(std::make_unique<Partitioned<stdx::unordered_map<CursorId, ClientCursor*>>>(
-          kNumPartitions)),
-      _preciseClockSource(preciseClockSource) {}
+          kNumPartitions)) {}
 
 CursorManager::~CursorManager() {
     auto allPartitions = _cursorMap->lockAllPartitions();
@@ -228,7 +228,7 @@ StatusWith<ClientCursorPin> CursorManager::pinCursor(
     CurOp::get(opCtx)->debug().planCacheKey = cursor->_planCacheKey;
 
     // Pass along queryStats context so it is retrievable after query execution for storing metrics.
-    CurOp::get(opCtx)->debug().queryStatsKeyHash = cursor->_queryStatsKeyHash;
+    CurOp::get(opCtx)->debug().queryStatsInfo.keyHash = cursor->_queryStatsKeyHash;
 
     cursor->_operationUsingCursor = opCtx;
 
@@ -451,7 +451,7 @@ Status CursorManager::killCursor(OperationContext* opCtx, CursorId id) {
         // cursor. It will stop on its own (and remove the cursor) when it sees that it's been
         // interrupted.
         {
-            stdx::unique_lock<Client> lk(*cursor->_operationUsingCursor->getClient());
+            ClientLock lk(cursor->_operationUsingCursor->getClient());
             cursor->_operationUsingCursor->getServiceContext()->killOperation(
                 lk, cursor->_operationUsingCursor, ErrorCodes::CursorKilled);
         }

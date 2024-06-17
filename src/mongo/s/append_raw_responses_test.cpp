@@ -68,7 +68,7 @@
 #include "mongo/s/index_version.h"
 #include "mongo/s/shard_version.h"
 #include "mongo/s/shard_version_factory.h"
-#include "mongo/s/sharding_router_test_fixture.h"
+#include "mongo/s/sharding_mongos_test_fixture.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/unittest/bson_test_util.h"
@@ -119,7 +119,7 @@ HostAndPort makeHostAndPort(const ShardId& shardId) {
 
 class AppendRawResponsesTest : public ShardingTestFixture {
 protected:
-    void setUp() {
+    void setUp() override {
         ShardingTestFixture::setUp();
 
         configTargeter()->setFindHostReturnValue(kTestConfigShardHost);
@@ -205,7 +205,9 @@ protected:
             StaticCatalogClient(std::vector<ShardId> shardIds) : _shardIds(std::move(shardIds)) {}
 
             StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
-                OperationContext* opCtx, repl::ReadConcernLevel readConcern) override {
+                OperationContext* opCtx,
+                repl::ReadConcernLevel readConcern,
+                bool excludeDraining) override {
                 std::vector<ShardType> shardTypes;
                 for (const auto& shardId : _shardIds) {
                     const ConnectionString cs = ConnectionString::forReplicaSet(

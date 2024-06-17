@@ -56,10 +56,11 @@ const auto getIngressHandshakeMetricsDecoration =
     Session::declareDecoration<IngressHandshakeMetrics>();
 
 bool connHealthMetricsLoggingEnabled() {
-    return gEnableDetailedConnectionHealthMetricLogLines;
+    return gEnableDetailedConnectionHealthMetricLogLines.load();
 }
 
-CounterMetric totalTimeToFirstNonAuthCommandMillis("network.totalTimeToFirstNonAuthCommandMillis");
+auto& totalTimeToFirstNonAuthCommandMillis =
+    *MetricBuilder<Counter64>("network.totalTimeToFirstNonAuthCommandMillis");
 }  // namespace
 
 IngressHandshakeMetrics& IngressHandshakeMetrics::get(Session& session) {

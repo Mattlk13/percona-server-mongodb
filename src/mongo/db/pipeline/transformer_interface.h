@@ -58,6 +58,8 @@ public:
     virtual Document applyTransformation(const Document& input) const = 0;
     virtual TransformerType getType() const = 0;
     virtual void optimize() = 0;
+    virtual Pipeline::SourceContainer::iterator doOptimizeAt(
+        Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) = 0;
     virtual DepsTracker::State addDependencies(DepsTracker* deps) const = 0;
     virtual void addVariableRefs(std::set<Variables::Id>* refs) const = 0;
     virtual DocumentSource::GetModPathsReturn getModifiedPaths() const = 0;
@@ -76,14 +78,12 @@ public:
      * become empty after the extraction and can be deleted by the caller.
      */
     virtual std::pair<BSONObj, bool> extractComputedProjections(
-        const StringData& oldName,
-        const StringData& newName,
-        const std::set<StringData>& reservedNames) {
+        StringData oldName, StringData newName, const std::set<StringData>& reservedNames) {
         return {BSONObj{}, false};
     }
 
-    virtual std::pair<BSONObj, bool> extractProjectOnFieldAndRename(const StringData& oldName,
-                                                                    const StringData& newName) {
+    virtual std::pair<BSONObj, bool> extractProjectOnFieldAndRename(StringData oldName,
+                                                                    StringData newName) {
         return {BSONObj{}, false};
     }
 };

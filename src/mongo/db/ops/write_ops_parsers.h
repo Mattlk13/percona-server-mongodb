@@ -47,8 +47,8 @@
 #include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/update/document_diff_applier.h"
 #include "mongo/db/update/document_diff_serialization.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/assert_util_core.h"
 #include "mongo/util/overloaded_visitor.h"  // IWYU pragma: keep
 
@@ -137,6 +137,10 @@ public:
     // $-field to distinguish modifier style updates.
     UpdateModification(const BSONObj& update);
 
+    // 'verifierFunction' is an optional field that can be set to perform a check during diff
+    // application.
+    doc_diff::VerifierFunc verifierFunction = nullptr;
+
     /**
      * These methods support IDL parsing of the "u" field from the update command and OP_UPDATE.
      *
@@ -157,54 +161,54 @@ public:
 
     BSONObj getUpdateReplacement() const {
         invariant(type() == Type::kReplacement);
-        return stdx::get<ReplacementUpdate>(_update).bson;
+        return get<ReplacementUpdate>(_update).bson;
     }
 
     BSONObj getUpdateModifier() const {
         invariant(type() == Type::kModifier);
-        return stdx::get<ModifierUpdate>(_update).bson;
+        return get<ModifierUpdate>(_update).bson;
     }
 
     const std::vector<BSONObj>& getUpdatePipeline() const {
         invariant(type() == Type::kPipeline);
-        return stdx::get<PipelineUpdate>(_update);
+        return get<PipelineUpdate>(_update);
     }
 
     doc_diff::Diff getDiff() const {
         invariant(type() == Type::kDelta);
-        return stdx::get<DeltaUpdate>(_update).diff;
+        return get<DeltaUpdate>(_update).diff;
     }
 
     const TransformFunc& getTransform() const {
         invariant(type() == Type::kTransform);
-        return stdx::get<TransformUpdate>(_update).transform;
+        return get<TransformUpdate>(_update).transform;
     }
 
     bool mustCheckExistenceForInsertOperations() const {
         invariant(type() == Type::kDelta);
-        return stdx::get<DeltaUpdate>(_update).options.mustCheckExistenceForInsertOperations;
+        return get<DeltaUpdate>(_update).options.mustCheckExistenceForInsertOperations;
     }
 
     std::string toString() const {
         StringBuilder sb;
 
-        stdx::visit(OverloadedVisitor{
-                        [&sb](const ReplacementUpdate& replacement) {
-                            sb << "{type: Replacement, update: " << replacement.bson << "}";
-                        },
-                        [&sb](const ModifierUpdate& modifier) {
-                            sb << "{type: Modifier, update: " << modifier.bson << "}";
-                        },
-                        [&sb](const PipelineUpdate& pipeline) {
-                            sb << "{type: Pipeline, update: " << Value(pipeline).toString() << "}";
-                        },
-                        [&sb](const DeltaUpdate& delta) {
-                            sb << "{type: Delta, update: " << delta.diff << "}";
-                        },
-                        [&sb](const TransformUpdate& transform) {
-                            sb << "{type: Transform}";
-                        }},
-                    _update);
+        visit(OverloadedVisitor{[&sb](const ReplacementUpdate& replacement) {
+                                    sb << "{type: Replacement, update: " << replacement.bson << "}";
+                                },
+                                [&sb](const ModifierUpdate& modifier) {
+                                    sb << "{type: Modifier, update: " << modifier.bson << "}";
+                                },
+                                [&sb](const PipelineUpdate& pipeline) {
+                                    sb << "{type: Pipeline, update: " << Value(pipeline).toString()
+                                       << "}";
+                                },
+                                [&sb](const DeltaUpdate& delta) {
+                                    sb << "{type: Delta, update: " << delta.diff << "}";
+                                },
+                                [&sb](const TransformUpdate& transform) {
+                                    sb << "{type: Transform}";
+                                }},
+              _update);
 
         return sb.str();
     }
@@ -225,7 +229,7 @@ private:
     struct TransformUpdate {
         TransformFunc transform;
     };
-    stdx::variant<ReplacementUpdate, ModifierUpdate, PipelineUpdate, DeltaUpdate, TransformUpdate>
+    std::variant<ReplacementUpdate, ModifierUpdate, PipelineUpdate, DeltaUpdate, TransformUpdate>
         _update;
 };
 

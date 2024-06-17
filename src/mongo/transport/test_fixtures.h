@@ -37,15 +37,18 @@
 
 #include "mongo/db/dbmessage.h"
 #include "mongo/logv2/log.h"
-#include "mongo/stdx/thread.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer_mock.h"
+#include "mongo/unittest/join_thread.h"
 #include "mongo/unittest/temp_dir.h"
+#include "mongo/util/net/ssl_options.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 namespace mongo::transport::test {
+
+constexpr auto kLetKernelChoosePort = 0;
 
 template <typename T>
 class BlockingQueue {
@@ -71,14 +74,7 @@ private:
     std::queue<T> _q;
 };
 
-class JoinThread : public stdx::thread {
-public:
-    using stdx::thread::thread;
-    ~JoinThread() {
-        if (joinable())
-            join();
-    }
-};
+using unittest::JoinThread;
 
 struct SessionThread {
     struct StopException {};
@@ -98,8 +94,8 @@ struct SessionThread {
         _tasks.push(std::move(task));
     }
 
-    transport::Session& session() const {
-        return *_session;
+    std::shared_ptr<transport::Session> session() const {
+        return _session;
     }
 
 private:
@@ -153,7 +149,7 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    void appendStats(BSONObjBuilder&) const {
+    void appendStats(BSONObjBuilder&) const override {
         MONGO_UNREACHABLE;
     }
 };
@@ -180,10 +176,6 @@ public:
         _join();
     }
 
-    Status start() override {
-        return Status::OK();
-    }
-
     void startSession(std::shared_ptr<transport::Session> session) override {
         LOGV2(6109510, "Accepted connection", "remote"_attr = session->remote());
         auto& newSession = [&]() -> SessionThread& {
@@ -197,8 +189,6 @@ public:
     }
 
     void endSessionByClient(Client* client) override {}
-
-    void appendStats(BSONObjBuilder*) const override {}
 
     void endAllSessions(Client::TagMask tags) override {
         _join();
@@ -281,7 +271,31 @@ inline std::unique_ptr<TempCertificatesDir> copyCertsToTempDir(std::string caFil
     boost::filesystem::copy_file(pemFile, tempDir->getPEMKeyFile().toString());
 
     return tempDir;
-}
+};
+
+/**
+ * RAII type that caches the sslGlobalParams sslCAFile, sslPEMKeyFile, and sslMode on construction,
+ * and restores them to the cached values on destruction.
+ */
+class SSLGlobalParamsGuard {
+public:
+    SSLGlobalParamsGuard() {
+        _sslCAFile = sslGlobalParams.sslCAFile;
+        _sslPEMKeyFile = sslGlobalParams.sslPEMKeyFile;
+        _sslMode = sslGlobalParams.sslMode.load();
+    }
+
+    ~SSLGlobalParamsGuard() {
+        sslGlobalParams.sslCAFile = _sslCAFile;
+        sslGlobalParams.sslPEMKeyFile = _sslPEMKeyFile;
+        sslGlobalParams.sslMode.store(_sslMode);
+    }
+
+private:
+    std::string _sslCAFile;
+    std::string _sslPEMKeyFile;
+    int _sslMode;
+};
 
 }  // namespace mongo::transport::test
 

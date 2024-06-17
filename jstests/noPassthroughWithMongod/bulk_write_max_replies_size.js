@@ -7,8 +7,7 @@
  * @tags: [
  *   # Contains commands that fail which will fail the entire transaction
  *   does_not_support_transactions,
- *   # TODO SERVER-52419 Remove this tag.
- *   featureFlagBulkWriteCommand,
+ *   requires_fcv_80
  * ]
  */
 import {cursorEntryValidator} from "jstests/libs/bulk_write_utils.js";
@@ -32,7 +31,7 @@ let res = db.adminCommand({
 });
 
 assert.commandWorked(res);
-assert.eq(res.numErrors, 1);
+assert.eq(res.nErrors, 1);
 
 cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1});
 cursorEntryValidator(res.cursor.firstBatch[1],
@@ -52,7 +51,7 @@ res = db.adminCommand({
 });
 
 assert.commandWorked(res);
-assert.eq(res.numErrors, 1);
+assert.eq(res.nErrors, 1);
 
 cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1});
 cursorEntryValidator(res.cursor.firstBatch[1],

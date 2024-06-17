@@ -277,18 +277,18 @@ public:
     }
 };
 
-class All : public OldStyleSuiteSpecification {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("logical_sessions") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<SessionsCollectionStandaloneRemoveTest>();
         add<SessionsCollectionStandaloneRefreshTest>();
         add<SessionsCollectionStandaloneFindTest>();
     }
 };
 
-OldStyleSuiteInitializer<All> all;
+unittest::OldStyleSuiteInitializer<All> all;
 
 }  // namespace
 }  // namespace mongo

@@ -91,10 +91,8 @@
  * This file tests db/exec/sort.cpp
  */
 
+namespace mongo {
 namespace QueryStageSortTests {
-
-using std::set;
-using std::unique_ptr;
 
 namespace dps = ::mongo::dotted_path_support;
 
@@ -116,7 +114,7 @@ public:
         _client.insert(nss(), obj);
     }
 
-    void getRecordIds(set<RecordId>* out, const CollectionPtr& coll) {
+    void getRecordIds(std::set<RecordId>* out, const CollectionPtr& coll) {
         auto cursor = coll->getCursor(&_opCtx);
         while (auto record = cursor->next()) {
             out->insert(record->id);
@@ -127,10 +125,10 @@ public:
      * We feed a mix of (key, unowned, owned) data to the sort stage.
      */
     void insertVarietyOfObjects(WorkingSet* ws, QueuedDataStage* ms, const CollectionPtr& coll) {
-        set<RecordId> recordIds;
+        std::set<RecordId> recordIds;
         getRecordIds(&recordIds, coll);
 
-        set<RecordId>::iterator it = recordIds.begin();
+        std::set<RecordId>::iterator it = recordIds.begin();
 
         for (int i = 0; i < numObj(); ++i, ++it) {
             ASSERT_FALSE(it == recordIds.end());
@@ -150,7 +148,7 @@ public:
      * Wraps a sort stage with a QueuedDataStage in a plan executor. Returns the plan executor,
      * which is owned by the caller.
      */
-    unique_ptr<PlanExecutor, PlanExecutor::Deleter> makePlanExecutorWithSortStage(
+    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makePlanExecutorWithSortStage(
         const CollectionPtr& coll) {
         // Build the mock scan stage which feeds the data.
         auto ws = std::make_unique<WorkingSet>();
@@ -298,7 +296,7 @@ protected:
 // Sort some small # of results in increasing order.
 class QueryStageSortInc : public QueryStageSortTestBase {
 public:
-    virtual int numObj() {
+    int numObj() override {
         return 100;
     }
 
@@ -321,7 +319,7 @@ public:
 // Sort some small # of results in decreasing order.
 class QueryStageSortDec : public QueryStageSortTestBase {
 public:
-    virtual int numObj() {
+    int numObj() override {
         return 100;
     }
 
@@ -345,7 +343,7 @@ public:
 template <int LIMIT>
 class QueryStageSortDecWithLimit : public QueryStageSortDec {
 public:
-    virtual int limit() const {
+    int limit() const override {
         return LIMIT;
     }
 };
@@ -353,7 +351,7 @@ public:
 // Sort a big bunch of objects.
 class QueryStageSortExt : public QueryStageSortTestBase {
 public:
-    virtual int numObj() {
+    int numObj() override {
         return 10000;
     }
 
@@ -376,10 +374,10 @@ public:
 // Mutation invalidation of docs fed to sort.
 class QueryStageSortMutationInvalidation : public QueryStageSortTestBase {
 public:
-    virtual int numObj() {
+    int numObj() override {
         return 2000;
     }
-    virtual int limit() const {
+    int limit() const override {
         return 10;
     }
 
@@ -398,7 +396,7 @@ public:
         fillData();
 
         // The data we're going to later invalidate.
-        set<RecordId> recordIds;
+        std::set<RecordId> recordIds;
         getRecordIds(&recordIds, coll);
 
         auto exec = makePlanExecutorWithSortStage(coll);
@@ -425,7 +423,7 @@ public:
         // We should have read in the first 'firstRead' recordIds.  Invalidate the first one.
         // Since it's in the WorkingSet, the updates should not be reflected in the output.
         exec->saveState();
-        set<RecordId>::iterator it = recordIds.begin();
+        std::set<RecordId>::iterator it = recordIds.begin();
         Snapshotted<BSONObj> oldDoc = coll->docFor(&_opCtx, *it);
 
         const OID updatedId = oldDoc.value().getField("_id").OID();
@@ -511,7 +509,7 @@ public:
 // Deletion invalidation of everything fed to sort.
 class QueryStageSortDeletionInvalidation : public QueryStageSortTestBase {
 public:
-    virtual int numObj() {
+    int numObj() override {
         return 2000;
     }
 
@@ -530,7 +528,7 @@ public:
         fillData();
 
         // The data we're going to later invalidate.
-        set<RecordId> recordIds;
+        std::set<RecordId> recordIds;
         getRecordIds(&recordIds, coll);
 
         auto exec = makePlanExecutorWithSortStage(coll);
@@ -556,8 +554,9 @@ public:
 
         // We should have read in the first 'firstRead' recordIds.  Invalidate the first.
         exec->saveState();
+
         OpDebug* const nullOpDebug = nullptr;
-        set<RecordId>::iterator it = recordIds.begin();
+        std::set<RecordId>::iterator it = recordIds.begin();
         {
             WriteUnitOfWork wuow(&_opCtx);
             collection_internal::deleteDocument(
@@ -610,7 +609,7 @@ public:
 template <int LIMIT>
 class QueryStageSortDeletionInvalidationWithLimit : public QueryStageSortDeletionInvalidation {
 public:
-    virtual int limit() const {
+    int limit() const override {
         return LIMIT;
     }
 };
@@ -618,7 +617,7 @@ public:
 // Should error out if we sort with parallel arrays.
 class QueryStageSortParallelArrays : public QueryStageSortTestBase {
 public:
-    virtual int numObj() {
+    int numObj() override {
         return 100;
     }
 
@@ -688,11 +687,11 @@ public:
     }
 };
 
-class All : public OldStyleSuiteSpecification {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("query_stage_sort") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<QueryStageSortInc>();
         add<QueryStageSortDec>();
         // Sort with limit has a general limiting strategy for limit > 1
@@ -708,6 +707,7 @@ public:
     }
 };
 
-OldStyleSuiteInitializer<All> queryStageSortTest;
+unittest::OldStyleSuiteInitializer<All> queryStageSortTest;
 
 }  // namespace QueryStageSortTests
+}  // namespace mongo

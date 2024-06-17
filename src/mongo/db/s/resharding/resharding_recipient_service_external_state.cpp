@@ -43,7 +43,6 @@
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/resharding/resharding_donor_recipient_common.h"
 #include "mongo/db/s/sharding_index_catalog_ddl_util.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/logv2/log.h"
@@ -58,6 +57,7 @@
 #include "mongo/s/resharding/common_types_gen.h"
 #include "mongo/s/resharding/resharding_feature_flag_gen.h"
 #include "mongo/s/sharding_feature_flags_gen.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/s/stale_shard_version_helpers.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/util/assert_util.h"
@@ -108,7 +108,7 @@ void ReshardingRecipientService::RecipientStateMachineExternalState::
                                                       std::move(idIndex),
                                                       std::move(collOptions)};
     if (resharding::gFeatureFlagReshardingImprovements.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
         // The indexSpecs are cleared here so we don't create those indexes when creating temp
         // collections. These indexes will be fetched and built during building-index stage.
         collOptionsAndIndexes.indexSpecs = {};
@@ -117,7 +117,7 @@ void ReshardingRecipientService::RecipientStateMachineExternalState::
         opCtx, metadata.getTempReshardingNss(), collOptionsAndIndexes);
 
     if (feature_flags::gGlobalIndexesShardingCatalog.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
         auto optSii = getCollectionIndexInfoWithRefresh(opCtx, metadata.getTempReshardingNss());
 
         if (optSii) {
@@ -174,9 +174,8 @@ RecipientStateMachineExternalStateImpl::getCollectionOptions(OperationContext* o
                                                              StringData reason) {
     // Load the collection options from the primary shard for the database.
     return _withShardVersionRetry(opCtx, nss, reason, [&] {
-        auto [cm, _] = getTrackedCollectionRoutingInfo(opCtx, nss);
         return MigrationDestinationManager::getCollectionOptions(
-            opCtx, NamespaceStringOrUUID{nss.dbName(), uuid}, cm.dbPrimary(), cm, afterClusterTime);
+            opCtx, NamespaceStringOrUUID{nss.dbName(), uuid}, afterClusterTime);
     });
 }
 
@@ -190,11 +189,7 @@ RecipientStateMachineExternalStateImpl::getCollectionIndexes(OperationContext* o
     return _withShardVersionRetry(opCtx, nss, reason, [&] {
         auto cri = getTrackedCollectionRoutingInfo(opCtx, nss);
         return MigrationDestinationManager::getCollectionIndexes(
-            opCtx,
-            NamespaceStringOrUUID{nss.dbName(), uuid},
-            cri.cm.getMinKeyShardIdWithSimpleCollation(),
-            cri,
-            afterClusterTime);
+            opCtx, nss, cri.cm.getMinKeyShardIdWithSimpleCollation(), cri, afterClusterTime);
     });
 }
 

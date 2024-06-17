@@ -54,6 +54,8 @@ public:
 
     virtual void shutdown() = 0;
 
+    virtual void stopAcceptingRequests() = 0;
+
     std::string toString() const {
         return name().toString();
     }
@@ -88,7 +90,8 @@ public:
      */
     CommandService(TransportLayer* tl,
                    RPCHandler callback,
-                   std::shared_ptr<WireVersionProvider> wvProvider);
+                   std::shared_ptr<WireVersionProvider> wvProvider,
+                   std::shared_ptr<ClientCache> clientCache = nullptr);
 
     ~CommandService() = default;
 
@@ -97,6 +100,8 @@ public:
     }
 
     void shutdown() override;
+
+    void stopAcceptingRequests() override;
 
 private:
     friend class MockServer;
@@ -110,11 +115,12 @@ private:
     TransportLayer* _tl;
     RPCHandler _callback;
     std::shared_ptr<WireVersionProvider> _wvProvider;
-    std::unique_ptr<ClientCache> _clientCache;
+    std::shared_ptr<ClientCache> _clientCache;
 
     mutable stdx::mutex _mutex;  // NOLINT
     stdx::condition_variable _shutdownCV;
     std::list<InSessionPtr> _sessions;
+    bool _acceptNewRequests = true;
     bool _shutdown = false;
 };
 }  // namespace mongo::transport::grpc

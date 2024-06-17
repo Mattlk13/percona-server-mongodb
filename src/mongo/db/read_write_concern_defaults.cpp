@@ -45,6 +45,7 @@
 #include "mongo/db/read_write_concern_provenance.h"
 #include "mongo/db/read_write_concern_provenance_base_gen.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/vector_clock.h"
 #include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
@@ -130,6 +131,10 @@ RWConcernDefault ReadWriteConcernDefaults::generateNewCWRWCToBeSavedOnDisk(
                           << "\" fields must be present",
             rc || wc);
 
+    uassert(ErrorCodes::BadValue,
+            "Default write concern must have 'w' field.",
+            !wc || !wc->isExplicitWithoutWField());
+
     RWConcernDefault rwc;
 
     if (rc && !rc->isEmpty()) {
@@ -187,7 +192,7 @@ void ReadWriteConcernDefaults::observeDirectWriteToConfigSettings(OperationConte
         ? RWConcernDefault::parse(IDLParserContext("RWDefaultsWriteObserver"), newDoc->getOwned())
         : RWConcernDefault();
 
-    opCtx->recoveryUnit()->onCommit(
+    shard_role_details::getRecoveryUnit(opCtx)->onCommit(
         [this, newDefaultsDoc = std::move(newDefaultsDoc)](OperationContext* opCtx,
                                                            boost::optional<Timestamp>) mutable {
             setDefault(opCtx, std::move(newDefaultsDoc));
@@ -361,7 +366,7 @@ ReadWriteConcernDefaults::Cache::Cache(ServiceContext* service,
                                        FetchDefaultsFn fetchDefaultsFn)
     : ReadThroughCache(
           _mutex,
-          service,
+          service->getService(),
           threadPool,
           [this](OperationContext* opCtx, Type, const ValueHandle& unusedCachedValue) {
               return LookupResult(lookup(opCtx));

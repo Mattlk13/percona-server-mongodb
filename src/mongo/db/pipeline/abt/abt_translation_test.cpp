@@ -100,7 +100,17 @@ TEST_F(ABTTranslationTest, InTranslation) {
 TEST_F(ABTTranslationTest, AndOrTranslation) {
     testABTTranslationAndOptimization("$match conjunction", "[{$match: {$and: [{a: 1}, {b: 2}]}}]");
 
-    testABTTranslationAndOptimization("$match disjunction", "[{$match: {$or: [{a: 1}, {b: 2}]}}]");
+    // We need to set call with shouldNormalizeMatchExpr = true to ensure the stability of the
+    // predicate order after optimizations.
+    testABTTranslationAndOptimization("$match disjunction",
+                                      "[{$match: {$or: [{a: 1}, {b: 2}]}}]",
+                                      "collection" /* scanDefName */,
+                                      {} /* phaseSet */,
+                                      {{{"collection", createScanDef({}, {})}}} /* metadata */,
+                                      {} /* pathToInterval */,
+                                      false /* phaseManagerDisableScan */,
+                                      {} /* involvedNss */,
+                                      true /* shouldNormalizeMatchExpr */);
 
     testABTTranslationAndOptimization("$match nested conjunction",
                                       "[{$match: {$and: [{$and: [{a: 1}, {b: 2}]}, {c: 3}]}}]");
@@ -242,33 +252,64 @@ TEST_F(ServiceContextTest, BasicCanonicalQueryTranslation) {
 
     MatchExpression::unparameterize(cq->getPrimaryMatchExpression());
 
-    auto translation = translateCanonicalQueryToABT(
-        metadata, *cq, ProjectionName{"test"}, make<ScanNode>("test", "test"), prefixId);
-    ASSERT_EXPLAIN_V2_AUTO(
-        "Root [{test}]\n"
-        "Filter []\n"
-        "|   EvalFilter []\n"
-        "|   |   Variable [test]\n"
-        "|   PathGet [b]\n"
-        "|   PathTraverse [1]\n"
-        "|   PathCompare [Eq]\n"
-        "|   Const [20]\n"
-        "Filter []\n"
-        "|   EvalFilter []\n"
-        "|   |   Variable [test]\n"
-        "|   PathGet [a]\n"
-        "|   PathTraverse [1]\n"
-        "|   PathCompare [Eq]\n"
-        "|   Const [10]\n"
-        "Filter []\n"
-        "|   EvalFilter []\n"
-        "|   |   Variable [test]\n"
-        "|   PathGet [c]\n"
-        "|   PathTraverse [1]\n"
-        "|   PathCompare [Eq]\n"
-        "|   Const [30]\n"
-        "Scan [test, {test}]\n",
-        translation);
+    {
+        QueryParameterMap qp;
+        auto translation = translateCanonicalQueryToABT(
+            metadata, *cq, ProjectionName{"test"}, make<ScanNode>("test", "test"), prefixId, qp);
+        ASSERT_EXPLAIN_V2_AUTO(
+            "Root [{test}]\n"
+            "Filter []\n"
+            "|   EvalFilter []\n"
+            "|   |   Variable [test]\n"
+            "|   PathGet [b]\n"
+            "|   PathTraverse [1]\n"
+            "|   PathCompare [Eq]\n"
+            "|   Const [20]\n"
+            "Filter []\n"
+            "|   EvalFilter []\n"
+            "|   |   Variable [test]\n"
+            "|   PathGet [a]\n"
+            "|   PathTraverse [1]\n"
+            "|   PathCompare [Eq]\n"
+            "|   Const [10]\n"
+            "Filter []\n"
+            "|   EvalFilter []\n"
+            "|   |   Variable [test]\n"
+            "|   PathGet [c]\n"
+            "|   PathTraverse [1]\n"
+            "|   PathCompare [Eq]\n"
+            "|   Const [30]\n"
+            "Scan [test, {test}]\n",
+            translation);
+    }
+
+    {
+        // Repeat translation to verify case where we generate a single output FilterNode.
+        QueryParameterMap qp;
+        auto translation = translateCanonicalQueryToABT(
+            metadata, *cq, ProjectionName{"test"}, make<ScanNode>("test", "test"), prefixId, qp, 1);
+        ASSERT_EXPLAIN_V2_AUTO(
+            "Root [{test}]\n"
+            "Filter []\n"
+            "|   EvalFilter []\n"
+            "|   |   Variable [test]\n"
+            "|   PathComposeM []\n"
+            "|   |   PathGet [b]\n"
+            "|   |   PathTraverse [1]\n"
+            "|   |   PathCompare [Eq]\n"
+            "|   |   Const [20]\n"
+            "|   PathComposeM []\n"
+            "|   |   PathGet [a]\n"
+            "|   |   PathTraverse [1]\n"
+            "|   |   PathCompare [Eq]\n"
+            "|   |   Const [10]\n"
+            "|   PathGet [c]\n"
+            "|   PathTraverse [1]\n"
+            "|   PathCompare [Eq]\n"
+            "|   Const [30]\n"
+            "Scan [test, {test}]\n",
+            translation);
+    }
 }
 
 TEST_F(ServiceContextTest, NonDescriptiveNames) {

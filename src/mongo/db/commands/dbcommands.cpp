@@ -45,6 +45,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/admission/execution_admission_context.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_checks.h"
 #include "mongo/db/auth/authorization_session.h"
@@ -91,6 +92,7 @@
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/timeseries/timeseries_collmod.h"
 #include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/executor/async_request_executor.h"
 #include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
@@ -210,6 +212,11 @@ public:
         NamespaceString ns() const final {
             return request().getNamespace();
         }
+
+        bool isSubjectToIngressAdmissionControl() const override {
+            return true;
+        }
+
         void doCheckAuthorization(OperationContext* opCtx) const final {
             auto ns = request().getNamespace();
             uassert(ErrorCodes::Unauthorized,
@@ -485,8 +492,8 @@ public:
         void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* reply) final {
             // Critical to monitoring and observability, categorize the command as immediate
             // priority.
-            ScopedAdmissionPriorityForLock skipAdmissionControl(
-                opCtx->lockState(), AdmissionContext::Priority::kImmediate);
+            ScopedAdmissionPriority<ExecutionAdmissionContext> skipAdmissionControl(
+                opCtx, AdmissionContext::Priority::kExempt);
 
             if (_collStatsSampler.tick())
                 LOGV2_WARNING(7024600,
@@ -520,7 +527,7 @@ public:
     using Request = CollMod;
     using Reply = CollModReply;
 
-    const std::set<std::string>& apiVersions() const {
+    const std::set<std::string>& apiVersions() const override {
         return kApiVersions1;
     }
 
@@ -556,6 +563,10 @@ public:
 
         NamespaceString ns() const final {
             return request().getNamespace();
+        }
+
+        bool isSubjectToIngressAdmissionControl() const override {
+            return true;
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const override {
@@ -663,8 +674,8 @@ public:
         Reply typedRun(OperationContext* opCtx) {
             // Critical to monitoring and observability, categorize the command as immediate
             // priority.
-            ScopedAdmissionPriorityForLock skipAdmissionControl(
-                opCtx->lockState(), AdmissionContext::Priority::kImmediate);
+            ScopedAdmissionPriority<ExecutionAdmissionContext> skipAdmissionControl(
+                opCtx, AdmissionContext::Priority::kExempt);
 
             const auto& cmd = request();
             const auto& dbname = cmd.getDbName();
@@ -749,10 +760,10 @@ class BuildInfoExecutor final : public AsyncRequestExecutor {
 public:
     BuildInfoExecutor() : AsyncRequestExecutor("BuildInfoExecutor") {}
 
-    Status handleRequest(std::shared_ptr<RequestExecutionContext> rec) {
+    Status handleRequest(std::shared_ptr<RequestExecutionContext> rec) override {
         // Critical to observability and diagnosability, categorize as immediate priority.
-        ScopedAdmissionPriorityForLock skipAdmissionControl(rec->getOpCtx()->lockState(),
-                                                            AdmissionContext::Priority::kImmediate);
+        ScopedAdmissionPriority<ExecutionAdmissionContext> skipAdmissionControl(
+            rec->getOpCtx(), AdmissionContext::Priority::kExempt);
 
         auto result = rec->getReplyBuilder()->getBodyBuilder();
         VersionInfoInterface::instance().appendBuildInfo(&result);
@@ -816,8 +827,8 @@ public:
              BSONObjBuilder& result) final {
         // Critical to monitoring and observability, categorize the command as immediate
         // priority.
-        ScopedAdmissionPriorityForLock skipAdmissionControl(opCtx->lockState(),
-                                                            AdmissionContext::Priority::kImmediate);
+        ScopedAdmissionPriority<ExecutionAdmissionContext> skipAdmissionControl(
+            opCtx, AdmissionContext::Priority::kExempt);
         VersionInfoInterface::instance().appendBuildInfo(&result);
         appendStorageEngineList(opCtx->getServiceContext(), &result);
         return true;

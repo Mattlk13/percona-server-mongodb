@@ -72,8 +72,8 @@ public:
     std::pair<value::SlotId, std::unique_ptr<PlanStage>> makeSpoolConsumer(
         std::unique_ptr<PlanStage> outerBranch, SpoolId spoolId) {
         auto spoolOutputSlot = generateSlotId();
-        auto spoolConsumer =
-            makeS<SpoolConsumerStage<IsStack>>(spoolId, makeSV(spoolOutputSlot), kEmptyPlanNodeId);
+        auto spoolConsumer = makeS<SpoolConsumerStage<IsStack>>(
+            spoolId, makeSV(spoolOutputSlot), nullptr /* yieldPolicy */, kEmptyPlanNodeId);
 
         auto loopJoin = makeS<LoopJoinStage>(std::move(outerBranch),
                                              std::move(spoolConsumer),
@@ -99,11 +99,17 @@ public:
     std::pair<value::SlotId, std::unique_ptr<PlanStage>> makeSpoolUnspoolPlan(
         value::SlotId mockScanSlot, std::unique_ptr<PlanStage> mockScanStage) {
         auto spoolId = generateSpoolId();
-        std::unique_ptr<PlanStage> spoolProducer = makeS<SpoolEagerProducerStage>(
-            std::move(mockScanStage), spoolId, makeSV(mockScanSlot), kEmptyPlanNodeId);
+        std::unique_ptr<PlanStage> spoolProducer =
+            makeS<SpoolEagerProducerStage>(std::move(mockScanStage),
+                                           spoolId,
+                                           makeSV(mockScanSlot),
+                                           nullptr /* yieldPolicy */,
+                                           kEmptyPlanNodeId);
 
-        auto outerBranch =
-            makeS<LimitSkipStage>(std::move(spoolProducer), 1, boost::none, kEmptyPlanNodeId);
+        auto outerBranch = makeS<LimitSkipStage>(std::move(spoolProducer),
+                                                 makeE<EConstant>(value::TypeTags::NumberInt64, 1),
+                                                 nullptr,
+                                                 kEmptyPlanNodeId);
 
         return makeSpoolConsumer<false>(std::move(outerBranch), spoolId);
     }
@@ -123,8 +129,11 @@ TEST_F(SbeSpoolTest, SpoolEagerProducerBasic) {
 
     auto makeStageFn = [this](value::SlotId mockScanSlot,
                               std::unique_ptr<PlanStage> mockScanStage) {
-        auto eagerSpoolProducer = makeS<SpoolEagerProducerStage>(
-            std::move(mockScanStage), generateSpoolId(), makeSV(mockScanSlot), kEmptyPlanNodeId);
+        auto eagerSpoolProducer = makeS<SpoolEagerProducerStage>(std::move(mockScanStage),
+                                                                 generateSpoolId(),
+                                                                 makeSV(mockScanSlot),
+                                                                 nullptr /* yieldPolicy */,
+                                                                 kEmptyPlanNodeId);
         return std::make_pair(mockScanSlot, std::move(eagerSpoolProducer));
     };
 
@@ -284,8 +293,7 @@ TEST_F(SbeSpoolTest, SpoolAndConsumeCloseAndReopen) {
     for (int i = 0; i < 4; ++i) {
         auto planState = rootStage->getNext();
         ASSERT(planState == PlanState::ADVANCED);
-        auto [tag, val] = accessor->copyOrMoveValue();
-        value::ValueGuard planOutputGuard{tag, val};
+        auto [tag, val] = accessor->getViewOfValue();
         char expectedChar = 'a' + i;
         auto [expectedTag, expectedValue] =
             value::makeNewString(StringData{std::string(1, expectedChar)});

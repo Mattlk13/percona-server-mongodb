@@ -3,11 +3,11 @@
  * information for the associated temporary resharding collection is stale.
  *
  * @tags: [
- *  requires_fcv_72,
+ *  requires_fcv_80,
  *  featureFlagReshardingImprovements,
  *  featureFlagUnshardCollection,
- *  featureFlagTrackUnshardedCollectionsOnShardingCatalog,
- *   multiversion_incompatible
+ *  # TODO (SERVER-87812) Remove multiversion_incompatible tag
+ *  multiversion_incompatible
  * ]
  */
 import {DiscoverTopology} from "jstests/libs/discover_topology.js";

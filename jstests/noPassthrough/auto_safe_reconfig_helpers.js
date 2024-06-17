@@ -5,7 +5,7 @@
  *   requires_replication,
  * ]
  */
-import {assertSameConfigContent, reconfig, waitAllNodesHaveConfig} from "jstests/replsets/rslib.js";
+import {assertSameConfigContent, reconfig} from "jstests/replsets/rslib.js";
 
 // Make secondaries unelectable.
 const replTest =
@@ -183,7 +183,6 @@ assertSameConfigContent(replTest.getReplSetConfigFromNode(), config);
 // Restore the original config before shutting down.
 reconfig(replTest, origConfig);
 // There is a chance that some nodes haven't finished reconfig, if we directly call stopSet, those
-// nodes may fail to answer certain commands and fail the test. When a node got removed from the
-// configuration it kills all connections hence we should retry on connection closed error.
-waitAllNodesHaveConfig(replTest, origConfig, true /* retryOnConnectionClosedError */);
+// nodes may fail to answer certain commands and fail the test.
+replTest.waitForAllNewlyAddedRemovals();
 replTest.stopSet();

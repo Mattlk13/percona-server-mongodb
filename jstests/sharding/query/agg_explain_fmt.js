@@ -1,12 +1,11 @@
 /* This test ensures that explain of an aggregate through mongos has the intended format.
-
  * @tags: [
  * # $mergeCursors was added to explain output in 5.3.
- * requires_fcv_53
+ * requires_fcv_80
  * ]
  */
 
-import {planHasStage} from "jstests/libs/analyze_plan.js";
+import {getOptimizer, planHasStage} from "jstests/libs/analyze_plan.js";
 
 const st = new ShardingTest({shards: 2});
 const mongosDB = st.s.getDB("test");
@@ -20,7 +19,15 @@ let explain = coll.explain().aggregate([{$project: {a: 1}}]);
 if (explain.hasOwnProperty("splitPipeline")) {
     assert.eq(explain.splitPipeline, null, explain);
 }
-assert(planHasStage(mongosDB, explain, "PROJECTION_SIMPLE"), explain);
+let optimizer = getOptimizer(explain);
+switch (optimizer) {
+    case "classic":
+        assert(planHasStage(mongosDB, explain, "PROJECTION_SIMPLE"), explain);
+        break;
+    case "CQF":
+        // TODO SERVER-77719: Implement the assertion for CQF.
+        break;
+}
 
 // Now shard the collection by _id and move a chunk to each shard.
 st.shardColl(coll, {_id: 1}, {_id: 0}, {_id: 0});
@@ -34,6 +41,7 @@ assert(explain.splitPipeline.hasOwnProperty("mergerPart"), explain.splitPipeline
 assert(explain.hasOwnProperty("shards"), explain);
 for (let shardId in explain.shards) {
     const shardExplain = explain.shards[shardId];
+    assert(shardExplain.hasOwnProperty("explainVersion"));
     assert(shardExplain.hasOwnProperty("host"), shardExplain);
     assert(shardExplain.hasOwnProperty("stages") || shardExplain.hasOwnProperty("queryPlanner"),
            shardExplain);

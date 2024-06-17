@@ -34,6 +34,7 @@
 #include "mongo/db/change_stream_pre_images_collection_manager.h"
 #include "mongo/db/pipeline/change_stream_preimage_gen.h"
 #include "mongo/db/repl/tenant_migration_decoration.h"
+#include "mongo/db/transaction_resources.h"
 
 namespace mongo {
 
@@ -101,7 +102,7 @@ void writeChangeStreamPreImagesForTransaction(
     Date_t operationTime) {
     // This function must be called from an outer WriteUnitOfWork in order to be rolled back upon
     // reaching the exception.
-    invariant(opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
     auto applyOpsEntriesIt = applyOpsOperationAssignment.applyOpsEntries.begin();
     for (auto operationIter = operations.begin(); operationIter != operations.end();) {

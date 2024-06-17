@@ -617,7 +617,7 @@ DB.prototype.groupeval = function(parmsObj) {
     var groupFunction = function() {
         var parms = args[0];  // eslint-disable-line
         var c = globalThis.db[parms.ns].find(parms.cond || {});
-        var map = new Map();
+        var map = new BSONAwareMap();
         var pks = parms.key ? Object.keySet(parms.key) : null;
         var pkl = pks ? pks.length : 0;
         var key = {};
@@ -1177,7 +1177,7 @@ DB.prototype.getQueryOptions = function() {
  */
 DB.prototype.loadServerScripts = function() {
     var global = Function('return this')();
-    this.system.js.find().forEach(function(u) {
+    this.getCollection('system.js').find().forEach(function(u) {
         if (u.value.constructor === Code) {
             global[u._id] = eval("(" + u.value.code + ")");
         } else {

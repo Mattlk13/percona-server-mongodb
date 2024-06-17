@@ -106,11 +106,13 @@ static ProjectionNameVector extractProjectionNamesForScan(
 
 PhysicalScanNode::PhysicalScanNode(FieldProjectionMap fieldProjectionMap,
                                    std::string scanDefName,
-                                   bool useParallelScan)
+                                   bool useParallelScan,
+                                   ScanOrder scanOrder)
     : Base(buildSimpleBinder(extractProjectionNamesForScan(fieldProjectionMap))),
       _fieldProjectionMap(std::move(fieldProjectionMap)),
       _scanDefName(std::move(scanDefName)),
-      _useParallelScan(useParallelScan) {}
+      _useParallelScan(useParallelScan),
+      _scanOrder(scanOrder) {}
 
 bool PhysicalScanNode::operator==(const PhysicalScanNode& other) const {
     return _fieldProjectionMap == other._fieldProjectionMap && _scanDefName == other._scanDefName &&
@@ -127,6 +129,10 @@ const std::string& PhysicalScanNode::getScanDefName() const {
 
 bool PhysicalScanNode::useParallelScan() const {
     return _useParallelScan;
+}
+
+ScanOrder PhysicalScanNode::getScanOrder() const {
+    return _scanOrder;
 }
 
 ValueScanNode::ValueScanNode(ProjectionNameVector projections,
@@ -155,13 +161,17 @@ ValueScanNode::ValueScanNode(ProjectionNameVector projections,
     for (size_t i = 0; i < _arraySize; i++) {
         const auto [tag1, val1] = arr->getAt(i);
         tassert(6624083,
-                "ValueScan must be initialized with an array",
+                "ValueScan must be initialized with an array of arrays: each subarray is a row, "
+                "with one element per projection",
                 tag1 == sbe::value::TypeTags::Array);
 
         const auto innerArray = sbe::value::getArrayView(val1);
+        size_t expectedSize = projectionCount + (_hasRID ? 1 : 0);
         tassert(6624084,
-                "Unexpected number of elements in inner array",
-                innerArray->size() == projectionCount + (_hasRID ? 1 : 0));
+                str::stream() << "ValueScanNode expected " << expectedSize
+                              << " elements in each subarray (one per projection) but got "
+                              << innerArray->size(),
+                innerArray->size() == expectedSize);
         tassert(6624177,
                 "First element must be a RecordId",
                 !_hasRID || innerArray->getAt(0).first == sbe::value::TypeTags::RecordId);

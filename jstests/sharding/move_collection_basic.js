@@ -2,10 +2,10 @@
  * Tests for basic functionality of the move collection feature.
  *
  * @tags: [
- *  requires_fcv_72,
+ *  requires_fcv_80,
  *  featureFlagReshardingImprovements,
  *  featureFlagMoveCollection,
- *  featureFlagTrackUnshardedCollectionsOnShardingCatalog,
+ *  # TODO (SERVER-87812) Remove multiversion_incompatible tag
  *  multiversion_incompatible,
  *  assumes_balancer_off,
  * ]
@@ -36,8 +36,7 @@ assert.commandFailedWithCode(mongos.adminCommand(cmdObj), ErrorCodes.NamespaceNo
 
 const unsplittableCollName = "foo_unsplittable"
 const unsplittableCollNs = dbName + '.' + unsplittableCollName;
-assert.commandWorked(
-    st.s.getDB(dbName).runCommand({createUnsplittableCollection: unsplittableCollName}));
+assert.commandWorked(st.s.getDB(dbName).runCommand({create: unsplittableCollName}));
 
 // Fail if missing required field toShard.
 assert.commandFailedWithCode(mongos.adminCommand({moveCollection: unsplittableCollNs}),

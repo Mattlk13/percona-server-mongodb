@@ -48,13 +48,13 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/admission/execution_admission_context.h"
 #include "mongo/db/api_parameters.h"
 #include "mongo/db/catalog/uncommitted_multikey.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_stats.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/multi_key_path_tracker.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
@@ -75,9 +75,9 @@
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/db/transaction/transaction_metrics_observer.h"
 #include "mongo/db/transaction/transaction_operations.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/idl/mutable_observer_registry.h"
 #include "mongo/logv2/attribute_storage.h"
-#include "mongo/stdx/unordered_map.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/future.h"
@@ -207,6 +207,8 @@ public:
 
     ~TransactionParticipant();
 
+    enum class TransactionActions { kNone, kStart, kContinue, kStartOrContinue };
+
     /**
      * Holds state for a snapshot read or multi-statement transaction in between network
      * operations.
@@ -236,6 +238,10 @@ public:
 
         RecoveryUnit* recoveryUnit() const {
             return _recoveryUnit.get();
+        }
+
+        const ExecutionAdmissionContext& executionControlContext() const {
+            return _execCtrlCtx;
         }
 
         /**
@@ -268,6 +274,7 @@ public:
         APIParameters _apiParameters;
         repl::ReadConcernArgs _readConcernArgs;
         WriteUnitOfWork::RecoveryUnitState _ruState;
+        ExecutionAdmissionContext _execCtrlCtx;
     };  // class TxnResources
 
     /**
@@ -290,7 +297,7 @@ public:
         OperationContext* _opCtx;
     };  // class SideTransactionBlock
 
-    using CommittedStatementTimestampMap = stdx::unordered_map<StmtId, repl::OpTime>;
+    using CommittedStatementTimestampMap = absl::flat_hash_map<StmtId, repl::OpTime>;
 
     static const BSONObj kDeadEndSentinel;
 
@@ -372,8 +379,16 @@ public:
             return o().txnState.isInRetryableWriteMode();
         }
 
-        const std::vector<NamespaceString>& affectedNamespaces() const {
+        const absl::flat_hash_set<NamespaceString>& affectedNamespaces() const {
             return o().affectedNamespaces;
+        }
+
+        bool isValid() const {
+            return o().isValid;
+        }
+
+        bool hasIncompleteHistory() const {
+            return o().hasIncompleteHistory;
         }
 
         /**
@@ -494,22 +509,37 @@ public:
          * valid values are boost::none (meaning no autocommit was specified) and false (meaning
          * that this is the beginning of a multi-statement transaction).
          *
-         * 'startTransaction' comes from the 'startTransaction' field in the original client
-         * request. See below for the acceptable values and the meaning of the combinations of
-         * autocommit, startTransaction and txnRetryCounter.
+         * 'action' comes from one of the 'startTransaction' (kStart) or
+         * 'startOrContinueTransaction' (kStartOrContinue) fields in the original client request. If
+         * neither 'startTransaction' nor 'startOrContinueTransaction' was specified in the original
+         * request, the caller is responsible for passing either kNone or kContinue depending on if
+         * the partipant should execute a retryable write or transaction statement. See below for
+         * the acceptable values and the meaning of the combinations of autocommit, action and
+         * txnRetryCounter.
          *
-         * autocommit = boost::none, startTransaction = boost::none and txnRetryCounter =
+         * autocommit = boost::none, action = kNone and txnRetryCounter =
          * boost::none means retryable write.
          *
-         * autocommit = false, startTransaction = boost::none and txnRetryCounter = last seen
+         * autocommit = false, action = kContinue and txnRetryCounter = last seen
          * txnRetryCounter means continuation of a multi-statement transaction.
          *
-         * autocommit = false, startTransaction = true, txnNumber = active txnNumber and
+         * autocommit = false, action = kStart, txnNumber = active txnNumber and
          * txnRetryCounter > last seen txnRetryCounter (defaults to 0) means restart the existing
          * transaction as long as it has not been committed or prepared.
          *
-         * autocommit = false, startTransaction = true, txnNumber > active txnNumber means abort
+         * autocommit = false, action = kStart, txnNumber > active txnNumber means abort
          * whatever transaction is in progress on the session and starts a new transaction.
+         *
+         * autocommit = false, action = kStartOrContinue, txnNumber = active txnNumber and
+         * txnRetryCounter > last seen txnRetryCounter (defaults to 0) means restart the existing
+         * transaction as long as it has not been committed or prepared.
+         *
+         * autocommit = false, action = kStartOrContinue, txnNumber > active txnNumber means abort
+         * whatever transaction is in progress on the session and starts a new transaction.
+         *
+         * autocommit = false, action = kStartOrContinue, txnNumber = active txnNumber and
+         * txnRetryCounter = last seen txnRetryCounter (defaults to 0) means continue the existing
+         * transaction.
          *
          * Any combination other than the ones listed above will invariant since it is expected that
          * the caller has performed the necessary customer input validations.
@@ -533,7 +563,7 @@ public:
         void beginOrContinue(OperationContext* opCtx,
                              TxnNumberAndRetryCounter txnNumberAndRetryCounter,
                              boost::optional<bool> autocommit,
-                             boost::optional<bool> startTransaction);
+                             TransactionActions action);
 
         /**
          * Used only by the secondary oplog application logic. Similar to 'beginOrContinue' without
@@ -592,7 +622,9 @@ public:
          * Transfers management of transaction resources from the Session to the currently
          * checked-out OperationContext.
          */
-        void unstashTransactionResources(OperationContext* opCtx, const std::string& cmdName);
+        void unstashTransactionResources(OperationContext* opCtx,
+                                         const std::string& cmdName,
+                                         bool forRecoveryPreparedTxnApplication = false);
 
         /**
          * Puts a transaction into a prepared state and returns the prepareTimestamp and the list of
@@ -600,7 +632,7 @@ public:
          *
          * On secondary, the "prepareTimestamp" will be given in the oplog.
          */
-        std::pair<Timestamp, std::vector<NamespaceString>> prepareTransaction(
+        std::pair<Timestamp, absl::flat_hash_set<NamespaceString>> prepareTransaction(
             OperationContext* opCtx, boost::optional<repl::OpTime> prepareOptime);
 
         /**
@@ -656,9 +688,10 @@ public:
         TransactionOperations* retrieveCompletedTransactionOperations(OperationContext* opCtx);
 
         /**
-         * Returns an object containing transaction-related metadata to append on responses.
+         * Returns an object containing the transaction-related metadata known by this participant
+         * to append on responses.
          */
-        TxnResponseMetadata getResponseMetadata();
+        BSONObj getResponseMetadata();
 
         /**
          * Clears the stored operations for an multi-document (non-autocommit) transaction, marking
@@ -686,6 +719,12 @@ public:
         void onWriteOpCompletedOnPrimary(OperationContext* opCtx,
                                          std::vector<StmtId> stmtIdsWritten,
                                          const SessionTxnRecord& sessionTxnRecord);
+
+        /**
+         * Called after a retryable write was completed so we can mark the given namespace
+         * as affected by the current oplog chain.
+         */
+        void addToAffectedNamespaces(OperationContext* opCtx, const NamespaceString& nss);
 
         /**
          * Called after an entry for the specified session and transaction has been written to the
@@ -806,11 +845,16 @@ public:
             return o().txnResourceStash->recoveryUnit();
         }
 
+        repl::ReadConcernArgs getTxnResourceStashReadConcernArgsForTest() const {
+            invariant(o().txnResourceStash);
+            return o().txnResourceStash->getReadConcernArgs();
+        }
+
         void transitionToPreparedforTest(OperationContext* opCtx, repl::OpTime prepareOpTime) {
             stdx::lock_guard<Client> lk(*opCtx->getClient());
             o(lk).prepareOpTime = prepareOpTime;
             o(lk).txnState.transitionTo(TransactionState::kPrepared);
-            opCtx->lockState()->unlockRSTLforPrepare();
+            shard_role_details::getLocker(opCtx)->unlockRSTLforPrepare();
         }
 
         void transitionToAbortedWithoutPrepareforTest(OperationContext* opCtx) {
@@ -972,8 +1016,10 @@ public:
         void _uassertNoConflictingInternalTransactionForRetryableWrite(
             OperationContext* opCtx, const TxnNumberAndRetryCounter& txnNumberAndRetryCounter);
 
-        // Asserts that the active transaction number can be reused. Below are the two cases where
-        // an active transaction number is allowed to be reused:
+        // Returns true if the transaction can and should be restarted at the active transaction
+        // number, or if it should be continued. Throws if the active transaction number cannot be
+        // reused with the action specified. Below are the two cases where a transaction can be
+        // restarted with the active transaction number:
         // 1. The transaction participant is in transaction mode and the transaction has been
         //    aborted and not been involved in a two phase commit. This corresponds to the case
         //    where a transaction is internally retried after failing with a transient error such a
@@ -985,8 +1031,11 @@ public:
         //    transactions, there is an additional requirement that all the internal transactions
         //    have been aborted and have not been involved in a two phase commit.
         // Assuming routers target primaries in increasing order of term and in the absence of
-        // byzantine messages, this check should never fail.
-        void _uassertCanReuseActiveTxnNumberForTransaction(OperationContext* opCtx);
+        // byzantine messages, this should never throw.
+        bool _shouldRestartTransactionOnReuseActiveTxnNumber(
+            OperationContext* opCtx,
+            TransactionActions action,
+            const TxnNumberAndRetryCounter& txnNumberAndRetryCounter);
 
         // Verifies we can begin a multi document transaction with the given txnNumber and
         // txnRetryCounter. Throws if we cannot. Returns true if this is a retry of the active
@@ -1006,7 +1055,9 @@ public:
         // Attempt to continue an in-progress multi document transaction at the given transaction
         // number and transaction retry counter.
         void _continueMultiDocumentTransaction(
-            OperationContext* opCtx, const TxnNumberAndRetryCounter& txnNumberAndRetryCounter);
+            OperationContext* opCtx,
+            const TxnNumberAndRetryCounter& txnNumberAndRetryCounter,
+            TransactionActions action);
 
         // Implementation of public refreshFromStorageIfNeeded methods.
         void _refreshFromStorageIfNeeded(OperationContext* opCtx, bool fetchOplogEntries);
@@ -1025,7 +1076,7 @@ public:
         void _invalidate(WithLock);
 
         // Helper that resets the retryable writes state.
-        void _resetRetryableWriteState();
+        void _resetRetryableWriteState(WithLock wl);
 
         // Helper that resets the transactional state. This is used when aborting a transaction,
         // invalidating a transaction, or starting a new transaction. It releases the Client lock
@@ -1063,7 +1114,8 @@ public:
          */
         void _releaseTransactionResourcesToOpCtx(OperationContext* opCtx,
                                                  MaxLockTimeout maxLockTimeout,
-                                                 AcquireTicket acquireTicket);
+                                                 AcquireTicket acquireTicket,
+                                                 bool forRecoveryPreparedTxnApplication);
 
         TransactionParticipant::PrivateState& p() {
             return _tp->_p;
@@ -1198,7 +1250,7 @@ private:
         TransactionMetricsObserver transactionMetricsObserver;
 
         // Contains a list of affected namespaces to be reported to transaction coordinator.
-        std::vector<NamespaceString> affectedNamespaces;
+        absl::flat_hash_set<NamespaceString> affectedNamespaces;
 
         // Maintains a copy of ReadConcernArgs, this allows the worker thread to perform
         // intermediate changes to its own ReadConcernArgs when fetching the transaction state or
@@ -1208,6 +1260,13 @@ private:
         // This value is set at the beginning of a transaction and reflects the user's ReadConcern
         // preferences.
         repl::ReadConcernArgs readConcernArgs;
+
+        // Specifies whether the session information needs to be refreshed from storage
+        bool isValid{false};
+
+        // Set to true if incomplete history is detected. For example, when the oplog to a write was
+        // truncated because it was too old.
+        bool hasIncompleteHistory{false};
     } _o;
 
     /**
@@ -1216,9 +1275,6 @@ private:
      * the Participant.
      */
     struct PrivateState {
-        // Specifies whether the session information needs to be refreshed from storage
-        bool isValid{false};
-
         // Only set if the server is shutting down and it has been ensured that no new requests will
         // be accepted. Ensures that any transaction resources will not be stashed from the
         // operation context onto the transaction participant when the session is checked-in so that
@@ -1236,10 +1292,6 @@ private:
         //
         // Retryable writes state
         //
-
-        // Set to true if incomplete history is detected. For example, when the oplog to a write was
-        // truncated because it was too old.
-        bool hasIncompleteHistory{false};
 
         // For the active txn, tracks which statement ids have been committed and at which oplog
         // opTime. Used for fast retryability check and retrieving the previous write's data without

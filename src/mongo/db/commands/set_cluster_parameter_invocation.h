@@ -61,18 +61,11 @@ public:
 
 class DBClientService {
 public:
-    virtual StatusWith<BatchedCommandResponse> updateParameterOnDisk(
-        OperationContext* opCtx,
+    virtual BatchedCommandResponse updateParameterOnDisk(
         BSONObj query,
         BSONObj update,
-        bool upsert,
         const WriteConcernOptions&,
-        const boost::optional<TenantId>&) = 0;
-    virtual StatusWith<BatchedCommandResponse> insertParameterOnDisk(
-        OperationContext* opCtx,
-        BSONObj update,
-        const WriteConcernOptions&,
-        const boost::optional<TenantId>&) = 0;
+        const boost::optional<auth::ValidatedTenancyScope>&) = 0;
     virtual Timestamp getUpdateClusterTime(OperationContext*) = 0;
     virtual ~DBClientService() = default;
 };
@@ -80,18 +73,11 @@ public:
 class ClusterParameterDBClientService final : public DBClientService {
 public:
     ClusterParameterDBClientService(DBDirectClient& dbDirectClient) : _dbClient(dbDirectClient) {}
-    StatusWith<BatchedCommandResponse> updateParameterOnDisk(
-        OperationContext* opCtx,
+    BatchedCommandResponse updateParameterOnDisk(
         BSONObj query,
         BSONObj update,
-        bool upsert,
         const WriteConcernOptions&,
-        const boost::optional<TenantId>&) override;
-    StatusWith<BatchedCommandResponse> insertParameterOnDisk(
-        OperationContext* opCtx,
-        BSONObj update,
-        const WriteConcernOptions&,
-        const boost::optional<TenantId>&) override;
+        const boost::optional<auth::ValidatedTenancyScope>&) override;
     Timestamp getUpdateClusterTime(OperationContext*) override;
 
 private:
@@ -103,13 +89,6 @@ public:
     SetClusterParameterInvocation(std::unique_ptr<ServerParameterService> serverParameterService,
                                   DBClientService& dbClientService)
         : _sps(std::move(serverParameterService)), _dbService(dbClientService) {}
-
-    // TODO SERVER-80534: Remove this overload once it is not used by the enterprise module.
-    bool invoke(OperationContext*,
-                const SetClusterParameter&,
-                boost::optional<Timestamp>,
-                const WriteConcernOptions&,
-                bool skipValidation = false);
 
     bool invoke(OperationContext*,
                 const SetClusterParameter&,

@@ -1,6 +1,6 @@
 // @tags: [
 //   # The test runs commands that are not allowed with security token: datasize, splitVector.
-//   not_allowed_with_security_token,
+//   not_allowed_with_signed_security_token,
 //   assumes_superuser_permissions,
 //   # Cannot implicitly shard accessed collections because the "splitVector" command cannot be run
 //   # on a sharded collection
@@ -26,6 +26,9 @@
 //        e.g. 20000
 // @param maxChunkSize is in MBs.
 //
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+
 let assertChunkSizes = function(splitVec, numDocs, maxChunkSize, msg) {
     splitVec = [{x: -1}].concat(splitVec);
     splitVec.push({x: numDocs + 1});
@@ -111,7 +114,6 @@ assert.eq(
 
 // -------------------------
 // Case 3: empty collection
-
 f.createIndex({x: 1});
 assert.eq(
     [],
@@ -145,6 +147,7 @@ var case4 = function() {
     let factor = 0.5;
 
     assert.eq(true, res.ok, "4b");
+
     assert.close(
         numDocs * docSize / ((1 << 20) * factor), res.splitKeys.length, "num split keys", -1);
     assertChunkSizes(res.splitKeys, numDocs, (1 << 20) * factor, "4d");
@@ -269,7 +272,8 @@ var case9 = function() {
     assert.eq(1, res.splitKeys.length, "9b");
     assert.eq(2, res.splitKeys[0].x, "9c");
 
-    if (db.runCommand("hello").msg != "isdbgrid") {
+    // TODO SERVER-87574 remove !TestData.testingReplicaSetEndpoint
+    if (db.runCommand("hello").msg != "isdbgrid" && !TestData.testingReplicaSetEndpoint) {
         res = db.adminCommand(
             {splitVector: "test.jstests_splitvector", keyPattern: {x: 1}, force: true});
 

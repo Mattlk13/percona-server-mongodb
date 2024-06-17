@@ -58,7 +58,7 @@
 #include "mongo/logv2/log_component.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/s/shard_key_pattern_query_util.h"
-#include "mongo/s/sharding_router_test_fixture.h"
+#include "mongo/s/sharding_mongos_test_fixture.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/unittest/framework.h"
 #include "mongo/util/intrusive_counter.h"
@@ -337,19 +337,20 @@ TEST_F(CMCollapseTreeTest, ArrayEquality) {
 //  Features: Regex, $where, $text, hashed key
 //
 
-// { a: /abc/ } -> a: ["", {}), [/abc/, /abc/]
+// { a: /^abc/ } -> a: ["abc", "abd"), [/^abc/, /^abc/]
 TEST_F(CMCollapseTreeTest, Regex) {
     OrderedIntervalList expected;
     expected.intervals.push_back(Interval(BSON(""
+                                               << "abc"
                                                << ""
-                                               << "" << BSONObj()),
+                                               << "abd"),
                                           true,
                                           false));
     BSONObjBuilder builder;
-    builder.appendRegex("", "abc");
-    builder.appendRegex("", "abc");
+    builder.appendRegex("", "^abc");
+    builder.appendRegex("", "^abc");
     expected.intervals.push_back(Interval(builder.obj(), true, true));
-    checkIndexBounds("{ a: /abc/ }", expected);
+    checkIndexBounds("{ a: /^abc/ }", expected);
 }
 
 // {$where: 'this.credits == this.debits' }

@@ -62,7 +62,6 @@
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
 #include "mongo/platform/decimal128.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/unittest/bson_test_util.h"
 #include "mongo/unittest/framework.h"
@@ -200,23 +199,24 @@ TEST(DocumentSerialization, CannotSerializeDocumentThatExceedsDepthLimit) {
 }
 
 TEST(DocumentGetFieldNonCaching, UncachedTopLevelFields) {
-    BSONObj bson = BSON("scalar" << 1 << "array" << BSON_ARRAY(1 << 2 << 3) << "scalar2" << true);
+    BSONObj bson = BSON("scalar" << 1 << "scalar2" << true);
     Document document = fromBson(bson);
 
     // Should be able to get all top level fields without caching.
+    const auto* storage = static_cast<const DocumentStorage*>(document.getPtr());
     for (auto&& elt : bson) {
-        auto valueVariant = document.getNestedFieldNonCaching(elt.fieldNameStringData());
-        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(valueVariant));
-        ASSERT_TRUE(stdx::get<BSONElement>(valueVariant).binaryEqual(elt));
+        auto value = document.getNestedScalarFieldNonCaching(elt.fieldNameStringData());
+        ASSERT_EQ(Value::compare(*value, Value(elt), nullptr), 0);
 
-        // Get the field again to be sure it wasn't cached during the access above.
-        auto valueVariantAfterAccess = document.getNestedFieldNonCaching(elt.fieldNameStringData());
-        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(valueVariantAfterAccess));
+        // Verify that the cache does not contain the field.
+        auto pos = storage->findField(elt.fieldNameStringData(),
+                                      DocumentStorage::LookupPolicy::kCacheOnly);
+        ASSERT_FALSE(pos.found());
     }
 
     // Try to get a top level field which doesn't exist.
-    auto nonExistentFieldVariant = document.getNestedFieldNonCaching("doesnotexist");
-    ASSERT_TRUE(stdx::holds_alternative<stdx::monostate>(nonExistentFieldVariant));
+    auto nonExistentField = document.getNestedScalarFieldNonCaching("doesnotexist");
+    ASSERT_TRUE(nonExistentField->missing());
 
     assertRoundTrips(document);
 }
@@ -230,27 +230,8 @@ TEST(DocumentGetFieldNonCaching, CachedTopLevelFields) {
 
     // Attempt to access scalar2 with the non caching accessor. It should be cached already.
     {
-        auto valueVariant = document.getNestedFieldNonCaching("scalar2");
-        ASSERT_TRUE(stdx::holds_alternative<Value>(valueVariant));
-        ASSERT_EQ(stdx::get<Value>(valueVariant).getBool(), true);
-    }
-
-    // Attempt to access 'array' with the non caching accessor. It should not be cached.
-    {
-        auto valueVariant = document.getNestedFieldNonCaching("array");
-        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(valueVariant));
-        auto elt = stdx::get<BSONElement>(valueVariant);
-        ASSERT_TRUE(bson["array"].binaryEqual(elt));
-    }
-
-    // Force 'array' to be cached.
-    ASSERT_FALSE(document["array"].missing());
-
-    // Check that 'array' is cached and that we can read it with the non caching accessor.
-    {
-        auto valueVariant = document.getNestedFieldNonCaching("array");
-        ASSERT_TRUE(stdx::holds_alternative<Value>(valueVariant));
-        ASSERT_EQ(stdx::get<Value>(valueVariant).getArrayLength(), 3);
+        auto value = document.getNestedScalarFieldNonCaching("scalar2");
+        ASSERT_EQ(value->getBool(), true);
     }
 }
 
@@ -259,33 +240,38 @@ TEST(DocumentGetFieldNonCaching, NonArrayDottedPaths) {
                                                 << "foo"));
     Document document = fromBson(bson);
 
+    auto isFieldCached = [&](StringData field) {
+        const DocumentStorage* storage = static_cast<const DocumentStorage*>(document.getPtr());
+        auto pos = storage->findField(field, DocumentStorage::LookupPolicy::kCacheOnly);
+        return pos.found();
+    };
+
     // With no fields cached.
     {
         // Get a nested field without caching.
-        auto zipVariant = document.getNestedFieldNonCaching("address.zip");
-        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(zipVariant));
-        ASSERT_EQ(stdx::get<BSONElement>(zipVariant).numberInt(), 123);
+        auto zip = document.getNestedScalarFieldNonCaching("address.zip");
+        ASSERT_EQ(zip->getInt(), 123);
 
         // Check that it was not cached.
-        auto zipVariantAfterAccess = document.getNestedFieldNonCaching("address.zip");
-        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(zipVariantAfterAccess));
+        auto zipAfterAccess = document.getNestedScalarFieldNonCaching("address.zip");
+        ASSERT_FALSE(isFieldCached("address.zip"));
 
         // Check that the top level field isn't cached after accessing one of its children.
-        auto addressVariant = document.getNestedFieldNonCaching("address");
-        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(addressVariant));
+        auto address = document.getNestedScalarFieldNonCaching("address");
+        ASSERT_FALSE(isFieldCached("address"));
 
         // Get a dotted field which does not exist.
-        auto nonExistentVariant = document.getNestedFieldNonCaching("address.doesnotexist");
-        ASSERT_TRUE(stdx::holds_alternative<stdx::monostate>(nonExistentVariant));
+        auto nonExistent = document.getNestedScalarFieldNonCaching("address.doesnotexist");
+        ASSERT_TRUE(nonExistent->missing());
 
         // Check that the top level field isn't cached after a failed attempt to access one of its
         // children.
-        addressVariant = document.getNestedFieldNonCaching("address");
-        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(addressVariant));
+        address = document.getNestedScalarFieldNonCaching("address");
+        ASSERT_FALSE(isFieldCached("address"));
 
         // Get a dotted field which extends past a scalar.
-        auto pathPastScalarVariant = document.getNestedFieldNonCaching("address.zip.doesnotexist");
-        ASSERT_TRUE(stdx::holds_alternative<stdx::monostate>(pathPastScalarVariant));
+        auto pathPastScalar = document.getNestedScalarFieldNonCaching("address.zip.doesnotexist");
+        ASSERT_TRUE(pathPastScalar->missing());
     }
 
     // Now force 'address.street' to be cached.
@@ -294,24 +280,23 @@ TEST(DocumentGetFieldNonCaching, NonArrayDottedPaths) {
     // Check that we get the right value when accessing it with the non caching accessor.
     {
         // The top level field should be cached.
-        auto topLevelVariant = document.getNestedFieldNonCaching("address");
-        ASSERT_TRUE(stdx::holds_alternative<Value>(topLevelVariant));
+        auto topLevel = document.getNestedScalarFieldNonCaching("address");
+        ASSERT_TRUE(topLevel.has_value());
 
-        auto variant = document.getNestedFieldNonCaching("address.street");
-        ASSERT_TRUE(stdx::holds_alternative<Value>(variant));
-        ASSERT_EQ(stdx::get<Value>(variant).getString(), "foo");
+        auto street = document.getNestedScalarFieldNonCaching("address.street");
+        ASSERT_EQ(street->getString(), "foo");
     }
 
     // Check that the other subfield, 'zip' is not cached.
     {
-        auto variant = document.getNestedFieldNonCaching("address.zip");
-        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(variant));
+        auto zip = document.getNestedScalarFieldNonCaching("address.zip");
+        ASSERT_FALSE(isFieldCached("address.zip"));
     }
 
-    // Check that attempting to get a subfield of 'address.street' returns monostate.
+    // Check that attempting to get a subfield of 'address.street' returns an empty Value.
     {
-        auto variant = document.getNestedFieldNonCaching("address.street.doesnotexist");
-        ASSERT_TRUE(stdx::holds_alternative<stdx::monostate>(variant));
+        auto nonExistent = document.getNestedScalarFieldNonCaching("address.street.doesnotexist");
+        ASSERT_TRUE(nonExistent->missing());
     }
 }
 
@@ -321,9 +306,8 @@ TEST(DocumentGetFieldNonCaching, NonArrayLongDottedPath) {
 
     // Not cached.
     {
-        auto variant = document.getNestedFieldNonCaching("a.b.c.d.e");
-        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(variant));
-        ASSERT_EQ(stdx::get<BSONElement>(variant).numberInt(), 1);
+        auto value = document.getNestedScalarFieldNonCaching("a.b.c.d.e");
+        ASSERT_EQ(value->getInt(), 1);
     }
 
     // Force part of the path to get cached.
@@ -331,18 +315,16 @@ TEST(DocumentGetFieldNonCaching, NonArrayLongDottedPath) {
 
     // The function should be able to traverse a path which is part Value and part BSONElement.
     {
-        auto variant = document.getNestedFieldNonCaching("a.b.c.d.e");
-        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(variant));
-        ASSERT_EQ(stdx::get<BSONElement>(variant).numberInt(), 1);
+        auto value = document.getNestedScalarFieldNonCaching("a.b.c.d.e");
+        ASSERT_EQ(value->getInt(), 1);
     }
 
     // Force the entire path to be cached.
     ASSERT_FALSE(document.getNestedField("a.b.c.d.e").missing());
 
     {
-        auto variant = document.getNestedFieldNonCaching("a.b.c.d.e");
-        ASSERT_TRUE(stdx::holds_alternative<Value>(variant));
-        ASSERT_EQ(stdx::get<Value>(variant).getInt(), 1);
+        auto value = document.getNestedScalarFieldNonCaching("a.b.c.d.e");
+        ASSERT_EQ(value->getInt(), 1);
     }
 }
 
@@ -352,30 +334,37 @@ TEST(DocumentGetFieldNonCaching, TraverseArray) {
                              << "subObj" << BSON("subArray" << BSON_ARRAY(1 << 2)));
     Document document = fromBson(bson);
 
-    auto checkArrayTagIsReturned = [&document]() {
-        auto topLevelArrayVariant = document.getNestedFieldNonCaching("topLevelArray.foo");
-        ASSERT_TRUE(stdx::holds_alternative<Document::TraversesArrayTag>(topLevelArrayVariant));
+    auto checkBoostNoneIsReturned = [&document]() {
+        auto topLevelArray = document.getNestedScalarFieldNonCaching("topLevelArray.foo");
+        ASSERT_EQ(topLevelArray, boost::none);
 
-        // Attempting to traverse an uncached nested array results in TraversesArrayTag being
+        // Attempting to traverse an uncached nested array results in boost::none being
         // returned.
-        auto subArrayVariant = document.getNestedFieldNonCaching("subObj.subArray.foobar");
-        ASSERT_TRUE(stdx::holds_alternative<Document::TraversesArrayTag>(subArrayVariant));
+        auto subArray = document.getNestedScalarFieldNonCaching("subObj.subArray.foobar");
+        ASSERT_EQ(subArray, boost::none);
+
+        // Landing on either array field should return boost::none.
+        topLevelArray = document.getNestedScalarFieldNonCaching("topLevelArray");
+        ASSERT_EQ(topLevelArray, boost::none);
+
+        subArray = document.getNestedScalarFieldNonCaching("subObj.subArray");
+        ASSERT_EQ(subArray, boost::none);
     };
 
     // Check with no fields cached.
-    checkArrayTagIsReturned();
+    checkBoostNoneIsReturned();
 
     // Force the top level array to be cached.
     ASSERT_FALSE(document["topLevelArray"].missing());
 
     // Check with one field cached.
-    checkArrayTagIsReturned();
+    checkBoostNoneIsReturned();
 
     // Force the array that's in a sub object to be cached.
     ASSERT_FALSE(document.getNestedField("subObj.subArray").missing());
 
     // Check it works with both fields (and the full sub object) cached.
-    checkArrayTagIsReturned();
+    checkBoostNoneIsReturned();
 }
 
 TEST(DocumentSize, ApproximateSizeIsSnapshotted) {
@@ -448,6 +437,17 @@ TEST(ShredDocument, HandlesModifiedDocuments) {
 
     ASSERT(!shredded["b"].missing());
     ASSERT(!shredded["subObj"]["b"].missing());
+}
+
+TEST(ShredDocument, HandlesMetadata) {
+    BSONObj bson = BSON("a" << 1 << "subObj" << BSON("a" << 1));
+    Document original = fromBson(bson);
+    MutableDocument md(original);
+    DocumentMetadataFields meta;
+    meta.setSearchScore(6);
+    md.setMetadata(std::move(meta));
+    Document shredded = md.freeze().shred();
+    ASSERT_EQ(6, shredded.metadata().getSearchScore());
 }
 
 /** Add Document fields. */
@@ -942,6 +942,15 @@ TEST(MetaFields, FromBsonWithMetadataAcceptsIndexKeyMetadata) {
     ASSERT_BSONOBJ_EQ(doc.metadata().getIndexKey(), BSON("b" << 1));
     auto bsonWithoutMetadata = doc.toBson();
     ASSERT_BSONOBJ_EQ(bsonWithoutMetadata, BSON("a" << 1));
+}
+
+TEST(MetaFields, FromBsonWithMetadataHandlesEmptyFieldName) {
+    auto bson = BSON("" << 1 << "$indexKey" << BSON("b" << 1));
+    auto doc = Document::fromBsonWithMetaData(bson);
+    ASSERT_TRUE(doc.metadata().hasIndexKey());
+    ASSERT_BSONOBJ_EQ(doc.metadata().getIndexKey(), BSON("b" << 1));
+    auto bsonWithoutMetadata = doc.toBson();
+    ASSERT_BSONOBJ_EQ(bsonWithoutMetadata, BSON("" << 1));
 }
 
 TEST(MetaFields, CopyMetadataFromCopiesAllMetadata) {
@@ -1598,118 +1607,118 @@ protected:
 };
 
 class ToBoolTrue : public ToBoolBase {
-    bool expected() {
+    bool expected() override {
         return true;
     }
 };
 
 class ToBoolFalse : public ToBoolBase {
-    bool expected() {
+    bool expected() override {
         return false;
     }
 };
 
 /** Coerce 0 to bool. */
 class ZeroIntToBool : public ToBoolFalse {
-    Value value() {
+    Value value() override {
         return Value(0);
     }
 };
 
 /** Coerce -1 to bool. */
 class NonZeroIntToBool : public ToBoolTrue {
-    Value value() {
+    Value value() override {
         return Value(-1);
     }
 };
 
 /** Coerce 0LL to bool. */
 class ZeroLongToBool : public ToBoolFalse {
-    Value value() {
+    Value value() override {
         return Value(0LL);
     }
 };
 
 /** Coerce 5LL to bool. */
 class NonZeroLongToBool : public ToBoolTrue {
-    Value value() {
+    Value value() override {
         return Value(5LL);
     }
 };
 
 /** Coerce 0.0 to bool. */
 class ZeroDoubleToBool : public ToBoolFalse {
-    Value value() {
+    Value value() override {
         return Value(0);
     }
 };
 
 /** Coerce -1.3 to bool. */
 class NonZeroDoubleToBool : public ToBoolTrue {
-    Value value() {
+    Value value() override {
         return Value(-1.3);
     }
 };
 
 /** Coerce "" to bool. */
 class StringToBool : public ToBoolTrue {
-    Value value() {
+    Value value() override {
         return Value(StringData());
     }
 };
 
 /** Coerce {} to bool. */
 class ObjectToBool : public ToBoolTrue {
-    Value value() {
+    Value value() override {
         return Value(mongo::Document());
     }
 };
 
 /** Coerce [] to bool. */
 class ArrayToBool : public ToBoolTrue {
-    Value value() {
+    Value value() override {
         return Value(std::vector<Value>());
     }
 };
 
 /** Coerce Date(0) to bool. */
 class DateToBool : public ToBoolTrue {
-    Value value() {
+    Value value() override {
         return Value(Date_t{});
     }
 };
 
 /** Coerce js literal regex to bool. */
 class RegexToBool : public ToBoolTrue {
-    Value value() {
+    Value value() override {
         return fromBson(fromjson("{''://}"));
     }
 };
 
 /** Coerce true to bool. */
 class TrueToBool : public ToBoolTrue {
-    Value value() {
+    Value value() override {
         return fromBson(BSON("" << true));
     }
 };
 
 /** Coerce false to bool. */
 class FalseToBool : public ToBoolFalse {
-    Value value() {
+    Value value() override {
         return fromBson(BSON("" << false));
     }
 };
 
 /** Coerce null to bool. */
 class NullToBool : public ToBoolFalse {
-    Value value() {
+    Value value() override {
         return Value(BSONNULL);
     }
 };
 
 /** Coerce undefined to bool. */
 class UndefinedToBool : public ToBoolFalse {
-    Value value() {
+    Value value() override {
         return Value(BSONUndefined);
     }
 };
@@ -1736,50 +1745,50 @@ protected:
 
 /** Coerce -5 to int. */
 class IntToInt : public ToIntBase {
-    Value value() {
+    Value value() override {
         return Value(-5);
     }
-    int expected() {
+    int expected() override {
         return -5;
     }
 };
 
 /** Coerce long to int. */
 class LongToInt : public ToIntBase {
-    Value value() {
+    Value value() override {
         return Value(0xff00000007LL);
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
 
 /** Coerce 9.8 to int. */
 class DoubleToInt : public ToIntBase {
-    Value value() {
+    Value value() override {
         return Value(9.8);
     }
-    int expected() {
+    int expected() override {
         return 9;
     }
 };
 
 /** Coerce null to int. */
 class NullToInt : public ToIntBase {
-    Value value() {
+    Value value() override {
         return Value(BSONNULL);
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
 
 /** Coerce undefined to int. */
 class UndefinedToInt : public ToIntBase {
-    Value value() {
+    Value value() override {
         return Value(BSONUndefined);
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
@@ -1794,40 +1803,40 @@ public:
 
 /** Coerce maxInt to int */
 class MaxIntToInt : public ToIntBase {
-    Value value() {
+    Value value() override {
         return Value((double)std::numeric_limits<int>::max());
     }
-    int expected() {
+    int expected() override {
         return std::numeric_limits<int>::max();
     }
 };
 
 /** Coerce minInt to int */
 class MinIntToInt : public ToIntBase {
-    Value value() {
+    Value value() override {
         return Value((double)std::numeric_limits<int>::min());
     }
-    int expected() {
+    int expected() override {
         return std::numeric_limits<int>::min();
     }
 };
 
 /** Coerce maxInt + 1 to int */
 class TooLargeToInt : public ToIntBase {
-    Value value() {
+    Value value() override {
         return Value((double)std::numeric_limits<int>::max() + 1);
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
 
 /** Coerce minInt - 1 to int */
 class TooLargeNegativeToInt : public ToIntBase {
-    Value value() {
+    Value value() override {
         return Value((double)std::numeric_limits<int>::min() - 1);
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
@@ -1854,101 +1863,101 @@ protected:
 
 /** Coerce -5 to long. */
 class IntToLong : public ToLongBase {
-    Value value() {
+    Value value() override {
         return Value(-5);
     }
-    long long expected() {
+    long long expected() override {
         return -5;
     }
 };
 
 /** Coerce long to long. */
 class LongToLong : public ToLongBase {
-    Value value() {
+    Value value() override {
         return Value(0xff00000007LL);
     }
-    long long expected() {
+    long long expected() override {
         return 0xff00000007LL;
     }
 };
 
 /** Coerce 9.8 to long. */
 class DoubleToLong : public ToLongBase {
-    Value value() {
+    Value value() override {
         return Value(9.8);
     }
-    long long expected() {
+    long long expected() override {
         return 9;
     }
 };
 
 /** Coerce infinity to long. */
 class InfToLong : public ToLongBase {
-    Value value() {
+    Value value() override {
         return Value(std::numeric_limits<double>::infinity());
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
 
 /** Coerce negative infinity to long. **/
 class NegInfToLong : public ToLongBase {
-    Value value() {
+    Value value() override {
         return Value(std::numeric_limits<double>::infinity() * -1);
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
 
 /** Coerce large to long. **/
 class InvalidLargeToLong : public ToLongBase {
-    Value value() {
+    Value value() override {
         return Value(pow(2, 63));
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
 
 /** Coerce lowest double to long. **/
 class LowestDoubleToLong : public ToLongBase {
-    Value value() {
+    Value value() override {
         return Value(static_cast<double>(std::numeric_limits<long long>::lowest()));
     }
-    long long expected() {
+    long long expected() override {
         return std::numeric_limits<long long>::lowest();
     }
 };
 
 /** Coerce 'towards infinity' to long **/
 class TowardsInfinityToLong : public ToLongBase {
-    Value value() {
+    Value value() override {
         return Value(static_cast<double>(std::nextafter(std::numeric_limits<long long>::lowest(),
                                                         std::numeric_limits<double>::lowest())));
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
 
 /** Coerce null to long. */
 class NullToLong : public ToLongBase {
-    Value value() {
+    Value value() override {
         return Value(BSONNULL);
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
 
 /** Coerce undefined to long. */
 class UndefinedToLong : public ToLongBase {
-    Value value() {
+    Value value() override {
         return Value(BSONUndefined);
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
@@ -1983,51 +1992,51 @@ protected:
 
 /** Coerce -5 to double. */
 class IntToDouble : public ToDoubleBase {
-    Value value() {
+    Value value() override {
         return Value(-5);
     }
-    double expected() {
+    double expected() override {
         return -5;
     }
 };
 
 /** Coerce long to double. */
 class LongToDouble : public ToDoubleBase {
-    Value value() {
+    Value value() override {
         // A long that cannot be exactly represented as a double.
         return Value(static_cast<double>(0x8fffffffffffffffLL));
     }
-    double expected() {
+    double expected() override {
         return static_cast<double>(0x8fffffffffffffffLL);
     }
 };
 
 /** Coerce double to double. */
 class DoubleToDouble : public ToDoubleBase {
-    Value value() {
+    Value value() override {
         return Value(9.8);
     }
-    double expected() {
+    double expected() override {
         return 9.8;
     }
 };
 
 /** Coerce null to double. */
 class NullToDouble : public ToDoubleBase {
-    Value value() {
+    Value value() override {
         return Value(BSONNULL);
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
 
 /** Coerce undefined to double. */
 class UndefinedToDouble : public ToDoubleBase {
-    Value value() {
+    Value value() override {
         return Value(BSONUndefined);
     }
-    bool asserts() {
+    bool asserts() override {
         return true;
     }
 };
@@ -2054,10 +2063,10 @@ protected:
 
 /** Coerce date to date. */
 class DateToDate : public ToDateBase {
-    Value value() {
+    Value value() override {
         return Value(Date_t::fromMillisSinceEpoch(888));
     }
-    long long expected() {
+    long long expected() override {
         return 888;
     }
 };
@@ -2067,10 +2076,10 @@ class DateToDate : public ToDateBase {
  * is different from BSON behavior of interpreting all bytes as a date.
  */
 class TimestampToDate : public ToDateBase {
-    Value value() {
+    Value value() override {
         return Value(Timestamp(777, 666));
     }
-    long long expected() {
+    long long expected() override {
         return 777 * 1000;
     }
 };
@@ -2099,74 +2108,74 @@ protected:
 
 /** Coerce -0.2 to string. */
 class DoubleToString : public ToStringBase {
-    Value value() {
+    Value value() override {
         return Value(-0.2);
     }
-    std::string expected() {
+    std::string expected() override {
         return "-0.2";
     }
 };
 
 /** Coerce -4 to string. */
 class IntToString : public ToStringBase {
-    Value value() {
+    Value value() override {
         return Value(-4);
     }
-    std::string expected() {
+    std::string expected() override {
         return "-4";
     }
 };
 
 /** Coerce 10000LL to string. */
 class LongToString : public ToStringBase {
-    Value value() {
+    Value value() override {
         return Value(10000LL);
     }
-    std::string expected() {
+    std::string expected() override {
         return "10000";
     }
 };
 
 /** Coerce string to string. */
 class StringToString : public ToStringBase {
-    Value value() {
+    Value value() override {
         return Value("fO_o"_sd);
     }
-    std::string expected() {
+    std::string expected() override {
         return "fO_o";
     }
 };
 
 /** Coerce timestamp to string. */
 class TimestampToString : public ToStringBase {
-    Value value() {
+    Value value() override {
         return Value(Timestamp(1, 2));
     }
-    std::string expected() {
+    std::string expected() override {
         return Timestamp(1, 2).toStringPretty();
     }
 };
 
 /** Coerce date to string. */
 class DateToString : public ToStringBase {
-    Value value() {
+    Value value() override {
         return Value(Date_t::fromMillisSinceEpoch(1234567890123LL));
     }
-    std::string expected() {
+    std::string expected() override {
         return "2009-02-13T23:31:30.123Z";
     }  // from js
 };
 
 /** Coerce null to string. */
 class NullToString : public ToStringBase {
-    Value value() {
+    Value value() override {
         return Value(BSONNULL);
     }
 };
 
 /** Coerce undefined to string. */
 class UndefinedToString : public ToStringBase {
-    Value value() {
+    Value value() override {
         return Value(BSONUndefined);
     }
 };
@@ -2568,7 +2577,7 @@ class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("document") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<Document::AddField>();
         add<Document::GetValue>();
         add<Document::SetField>();

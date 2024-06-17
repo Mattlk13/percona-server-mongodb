@@ -5,7 +5,7 @@
  *
  * @tags: [
  *   # The test runs commands that are not allowed with security token: bulkWrite.
- *   not_allowed_with_security_token,
+ *   not_allowed_with_signed_security_token,
  *   command_not_supported_in_serverless,
  *   does_not_support_retryable_writes,
  *   requires_non_retryable_writes,
@@ -13,11 +13,14 @@
  *   requires_getmore,
  *   # Contains commands that fail which will fail the entire transaction
  *   does_not_support_transactions,
- *   # TODO SERVER-52419 Remove this tag.
- *   featureFlagBulkWriteCommand,
+ *   requires_fcv_80
  * ]
  */
-import {cursorEntryValidator, cursorSizeValidator} from "jstests/libs/bulk_write_utils.js";
+import {
+    cursorEntryValidator,
+    cursorSizeValidator,
+    summaryFieldsValidator
+} from "jstests/libs/bulk_write_utils.js";
 
 var coll = db.getCollection("coll");
 var coll1 = db.getCollection("coll1");
@@ -38,7 +41,8 @@ var res = db.adminCommand({
 
 assert.commandWorked(res);
 cursorSizeValidator(res, 1);
-assert.eq(res.numErrors, 0, "bulkWrite command response: " + tojson(res));
+summaryFieldsValidator(
+    res, {nErrors: 0, nInserted: 2, nDeleted: 0, nMatched: 0, nModified: 0, nUpserted: 0});
 
 assert(res.cursor.id != 0,
        "Unexpectedly found cursor ID 0 in bulkWrite command response: " + tojson(res));

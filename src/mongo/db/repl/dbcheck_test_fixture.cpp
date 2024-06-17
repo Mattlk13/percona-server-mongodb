@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#include "mongo/bson/bson_validate_gen.h"
+#include "mongo/util/fail_point.h"
 #include <boost/optional/optional.hpp>
 
 #include "mongo/bson/bsonobj.h"
@@ -42,10 +44,11 @@
 #include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/op_observer/op_observer_impl.h"
 #include "mongo/db/op_observer/op_observer_registry.h"
-#include "mongo/db/op_observer/oplog_writer_mock.h"
+#include "mongo/db/op_observer/operation_logger_mock.h"
 #include "mongo/db/repl/dbcheck_test_fixture.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/storage/snapshot_manager.h"
+#include "mongo/db/transaction_resources.h"
 
 namespace mongo {
 
@@ -63,7 +66,7 @@ void DbCheckTest::setUp() {
     // repl::logOp(). This supports index builds that have to look up the last oplog entry.
     auto opObserverRegistry = dynamic_cast<OpObserverRegistry*>(service->getOpObserver());
     opObserverRegistry->addObserver(
-        std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterMock>()));
+        std::make_unique<OpObserverImpl>(std::make_unique<OperationLoggerMock>()));
 
     // Index builds expect a non-empty oplog and a valid committed snapshot.
     auto opCtx = operationContext();
@@ -86,7 +89,8 @@ void DbCheckTest::setUp() {
 void DbCheckTest::insertDocs(OperationContext* opCtx,
                              int startIDNum,
                              int numDocs,
-                             const std::vector<std::string>& fieldNames) {
+                             const std::vector<std::string>& fieldNames,
+                             bool duplicateFieldNames) {
     const AutoGetCollection coll(opCtx, kNss, MODE_IX);
     std::vector<InsertStatement> inserts;
     for (int i = 0; i < numDocs; ++i) {
@@ -96,9 +100,37 @@ void DbCheckTest::insertDocs(OperationContext* opCtx,
             bsonBuilder << name << i + startIDNum;
         }
 
+        // If `duplicateFieldNames` is true, the inserted doc will have a duplicated field name so
+        // that it fails the kExtended mode of BSON validate check.
+        if (duplicateFieldNames && !fieldNames.empty()) {
+            bsonBuilder << fieldNames[0] << i + startIDNum + 1;
+        }
+
         const auto obj = bsonBuilder.obj();
         inserts.push_back(InsertStatement(obj));
     }
+
+    {
+        WriteUnitOfWork wuow(opCtx);
+        ASSERT_OK(collection_internal::insertDocuments(
+            opCtx, *coll, inserts.begin(), inserts.end(), nullptr, false));
+        wuow.commit();
+    }
+}
+
+void DbCheckTest::insertInvalidUuid(OperationContext* opCtx,
+                                    int startIDNum,
+                                    const std::vector<std::string>& fieldNames) {
+    const AutoGetCollection coll(opCtx, kNss, MODE_IX);
+    std::vector<InsertStatement> inserts;
+
+    BSONObjBuilder bsonBuilder;
+    bsonBuilder << "_id" << startIDNum;
+    uint8_t uuidBytes[] = {0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 0};
+    // The UUID is invalid because its length is 10 instead of 16.
+    bsonBuilder << "invalid uuid" << BSONBinData(uuidBytes, 10, newUUID);
+    const auto obj = bsonBuilder.obj();
+    inserts.push_back(InsertStatement(obj));
 
     {
         WriteUnitOfWork wuow(opCtx);
@@ -182,7 +214,7 @@ void DbCheckTest::dropIndex(OperationContext* opCtx, const std::string& indexNam
     ASSERT_OK(writableCollection->getIndexCatalog()->dropIndexEntry(
         opCtx, collection.getWritableCollection(opCtx), writableEntry));
 
-    ASSERT_OK(opCtx->recoveryUnit()->setTimestamp(
+    ASSERT_OK(shard_role_details::getRecoveryUnit(opCtx)->setTimestamp(
         repl::ReplicationCoordinator::get(opCtx)->getMyLastAppliedOpTime().getTimestamp() + 1));
 
     wuow.commit();
@@ -195,13 +227,17 @@ void DbCheckTest::runHashForCollectionCheck(
     boost::optional<SecondaryIndexCheckParameters> secondaryIndexCheckParams,
     int64_t maxCount,
     int64_t maxBytes) {
-    AutoGetCollection coll(opCtx, kNss, MODE_IS);
-    const auto& collection = coll.getCollection();
+    const DbCheckAcquisition acquisition(
+        opCtx, kNss, {RecoveryUnit::ReadSource::kNoTimestamp}, PrepareConflictBehavior::kEnforce);
+    const auto& collection = acquisition.coll.getCollectionPtr();
+    // Disable throttling for testing.
+    DataThrottle dataThrottle(opCtx, []() { return 0; });
     auto hasher = DbCheckHasher(opCtx,
-                                collection,
+                                acquisition,
                                 start,
                                 end,
                                 secondaryIndexCheckParams,
+                                &dataThrottle,
                                 boost::none /* indexName */,
                                 maxCount,
                                 maxBytes);
@@ -211,11 +247,13 @@ void DbCheckTest::runHashForCollectionCheck(
 SecondaryIndexCheckParameters DbCheckTest::createSecondaryIndexCheckParams(
     DbCheckValidationModeEnum validateMode,
     StringData secondaryIndex,
-    bool skipLookupForExtraKeys) {
+    bool skipLookupForExtraKeys,
+    BSONValidateModeEnum bsonValidateMode) {
     auto params = SecondaryIndexCheckParameters();
     params.setValidateMode(validateMode);
     params.setSecondaryIndex(secondaryIndex);
     params.setSkipLookupForExtraKeys(skipLookupForExtraKeys);
+    params.setBsonValidateMode(bsonValidateMode);
     return params;
 }
 
@@ -234,14 +272,11 @@ DbCheckCollectionInfo DbCheckTest::createDbCheckCollectionInfo(
         .end = end,
         .maxCount = kDefaultMaxCount,
         .maxSize = kDefaultMaxSize,
-        .maxRate = kDefaultMaxRate,
         .maxDocsPerBatch = kDefaultMaxDocsPerBatch,
-        .maxBytesPerBatch = kDefaultMaxBytesPerBatch,
-        .maxDocsPerSec = kDefaultMaxDocsPerSec,
-        .maxBytesPerSec = kDefaultMaxBytesPerSec,
         .maxBatchTimeMillis = kDefaultMaxBatchTimeMillis,
         .writeConcern = WriteConcernOptions(),
         .secondaryIndexCheckParameters = params,
+        .dataThrottle = DataThrottle(opCtx, []() { return 0; }),
     };
     return info;
 }

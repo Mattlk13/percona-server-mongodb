@@ -442,6 +442,94 @@ int comparePartialSchemaRequirementsExpr(const PSRExpr::Node& n1, const PSRExpr:
     return PSRExprComparator{}.comparePSRExpr(n1, n2);
 }
 
+namespace {
+
+/**
+ * Returns true if the given ABT is NaN, otherwise returns false.
+ */
+bool isNaN(const ABT& abt) {
+    // Only perform NaN check if the ABT is a Constant.
+    auto c = abt.cast<Constant>();
+    if (!c)
+        return false;
+
+    auto [tag, val] = c->get();
+    return sbe::value::isNaN(tag, val);
+}
+
+// Returns true if the given ABT represent a query parameter, otherwise returns false.
+bool isParameter(const ABT& abt) {
+    auto p = abt.cast<FunctionCall>();
+    if (!p) {
+        return false;
+    }
+    return p->name() == kParameterFunctionName;
+}
+
+// Given an ABT representing a query parameter, return the type tag of the parameter.
+sbe::value::TypeTags parameterType(const ABT& abt) {
+    // See defintion of 'kParameterFunctionName' for details about representation of query
+    // parameters in ABT.
+    return static_cast<sbe::value::TypeTags>(
+        abt.cast<FunctionCall>()->nodes()[1].cast<Constant>()->get().second);
+}
+
+/**
+ * Compare a numeric, non-NaN FunctionCall[getParam] node to NaN. NaN will always be smaller.
+ */
+CmpResult cmpNumericParamToNaN(Operations op, const ABT& lhs) {
+    auto lhsIsNaN = isNaN(lhs);
+    switch (op) {
+        case Operations::Lt:
+        case Operations::Lte:
+            return lhsIsNaN ? CmpResult::kTrue : CmpResult::kFalse;
+        case Operations::Gt:
+        case Operations::Gte:
+            return lhsIsNaN ? CmpResult::kFalse : CmpResult::kTrue;
+        case Operations::Cmp3w:
+            return lhsIsNaN ? CmpResult::kLt : CmpResult::kGt;
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
+// Compare two type tags for the purposes of constant evaluation of FunctionCall[getParam]
+// expressions which are guarenteed to evaluate to the specified SBE type.
+// This function returns kIncomparable if the given type tags are of the same canonical BSON type.
+// This is becuase we cannot determine anything about two expressions that are of the same type.
+// If the two tags are of different canonical BSON types, this function will compare them according
+// to the specified operation. For example, in the BSON order, integers are always less than
+// strings.
+// For comparisons between the Constant NaN and a FunctionCall[getParam] node of a different
+// canonical type, cmpTags will handle constant folding because NaN falls under the numeric type
+// bucket.
+CmpResult cmpTags(Operations op, sbe::value::TypeTags lhsTag, sbe::value::TypeTags rhsTag) {
+    auto lhsBsonType = tagToType(lhsTag);
+    auto rhsBsonType = tagToType(rhsTag);
+    auto result = canonicalizeBSONType(lhsBsonType) - canonicalizeBSONType(rhsBsonType);
+    // If the lhs and rhs have the same type, return incomparable since we have no information about
+    // their values.
+    if (result == 0) {
+        return CmpResult::kIncomparable;
+    }
+    // By this point, there is no difference betwen Lt/Lte and Gt/Gte since we know the types
+    // are different.
+    switch (op) {
+        case Operations::Lt:
+        case Operations::Lte:
+            return (result < 0) ? CmpResult::kTrue : CmpResult::kFalse;
+        case Operations::Gt:
+        case Operations::Gte:
+            return (result > 0) ? CmpResult::kTrue : CmpResult::kFalse;
+        case Operations::Cmp3w:
+            return (result > 0) ? CmpResult::kGt : CmpResult::kLt;
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
+}  // namespace
+
 CmpResult cmpEqFast(const ABT& lhs, const ABT& rhs) {
     if (lhs == rhs) {
         // If the subtrees are equal, we can conclude that their result is equal because we
@@ -450,6 +538,9 @@ CmpResult cmpEqFast(const ABT& lhs, const ABT& rhs) {
     } else if (lhs.is<Constant>() && rhs.is<Constant>()) {
         // We have two constants which are not equal.
         return CmpResult::kFalse;
+    } else if ((isParameter(lhs) && isNaN(rhs)) || (isParameter(rhs) && isNaN(lhs))) {
+        // We are comparing FunctionCall[getParam] with a NaN Constant - they will never be equal.
+        return CmpResult::kFalse;
     }
     return CmpResult::kIncomparable;
 }
@@ -457,6 +548,8 @@ CmpResult cmpEqFast(const ABT& lhs, const ABT& rhs) {
 CmpResult cmp3wFast(Operations op, const ABT& lhs, const ABT& rhs) {
     const auto lhsConst = lhs.cast<Constant>();
     const auto rhsConst = rhs.cast<Constant>();
+    const bool isLhsParam = isParameter(lhs);
+    const bool isRhsParam = isParameter(rhs);
 
     if (lhsConst) {
         const auto [lhsTag, lhsVal] = lhsConst->get();
@@ -486,6 +579,12 @@ CmpResult cmp3wFast(Operations op, const ABT& lhs, const ABT& rhs) {
                 default:
                     MONGO_UNREACHABLE;
             }
+        } else if (isRhsParam) {
+            auto rhsType = parameterType(rhs);
+            if (isNaN(lhs) && isNumber(rhsType)) {
+                return cmpNumericParamToNaN(op, lhs);
+            }
+            return cmpTags(op, lhsTag, rhsType);
         } else {
             if (lhsTag == sbe::value::TypeTags::MinKey) {
                 switch (op) {
@@ -510,6 +609,14 @@ CmpResult cmp3wFast(Operations op, const ABT& lhs, const ABT& rhs) {
     } else if (rhsConst) {
         const auto [rhsTag, rhsVal] = rhsConst->get();
 
+        if (isLhsParam) {
+            auto lhsType = parameterType(lhs);
+            if (isNumber(lhsType) && isNaN(rhs)) {
+                return cmpNumericParamToNaN(op, lhs);
+            }
+            return cmpTags(op, parameterType(lhs), rhsTag);
+        }
+
         if (rhsTag == sbe::value::TypeTags::MinKey) {
             switch (op) {
                 case Operations::Lt:
@@ -529,6 +636,10 @@ CmpResult cmp3wFast(Operations op, const ABT& lhs, const ABT& rhs) {
                     break;
             }
         }
+    }
+
+    if (isLhsParam && isRhsParam) {
+        return cmpTags(op, parameterType(lhs), parameterType(rhs));
     }
 
     return CmpResult::kIncomparable;

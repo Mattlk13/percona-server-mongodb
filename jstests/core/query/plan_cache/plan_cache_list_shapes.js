@@ -13,12 +13,10 @@
 //   assumes_unsharded_collection,
 //   # Plan cache state is node-local and will not get migrated alongside tenant data.
 //   tenant_migration_incompatible,
-//   # TODO SERVER-67607: Test plan cache with CQF enabled.
-//   cqf_experimental_incompatible,
 // ]
-import {checkSBEEnabled} from "jstests/libs/sbe_util.js";
+import {checkSbeFullyEnabled} from "jstests/libs/sbe_util.js";
 
-if (checkSBEEnabled(db)) {
+if (checkSbeFullyEnabled(db)) {
     jsTest.log("Skipping test because SBE is enabled.");
     quit();
 }
@@ -42,7 +40,7 @@ assert.commandWorked(coll.insert({a: 2, b: 2}));
 
 // We need two indices so that the MultiPlanRunner is executed.
 assert.commandWorked(coll.createIndex({a: 1}));
-assert.commandWorked(coll.createIndex({a: 1, b: 1}));
+assert.commandWorked(coll.createIndex({a: -1, b: 1}));
 
 // Run a query.
 assert.eq(1, coll.find({a: 1, b: 1}, {_id: 1, a: 1}).sort({a: -1}).itcount());

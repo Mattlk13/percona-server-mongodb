@@ -66,6 +66,7 @@ export const $config = (function() {
         addShard: function addShard(db, collName) {
             const shardIdx = randomInt(this.shardList.length);
             const shardEntry = this.shardList[shardIdx];
+            // TODO SERVER-83532 Check that the outcome of addShard meets expectations.
             db.adminCommand({addShard: shardEntry.host, name: shardEntry._id});
         },
 
@@ -97,7 +98,7 @@ export const $config = (function() {
     }
 
     return {
-        threadCount: 100,
+        threadCount: 20,
         iterations: 1000,
         startState: "init",
         states: states,

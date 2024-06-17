@@ -6,16 +6,16 @@ Percona Server for MongoDB is a free, enhanced, fully compatible, open source, d
 
 ## Components
 
-  - `mongod` - The database server.
-  - `mongos` - Sharding router.
-  - `mongo`  - The database shell (uses interactive javascript).
-  - tools
-    - `bsondump`
-    - `mongodump`
-    - `mongorestore`
-    - `mongoexport`
-    - `mongostat`
-    - `perconadecrypt`
+- `mongod` - The database server.
+- `mongos` - Sharding router.
+- `mongo` - The database shell (uses interactive javascript).
+- tools
+  - `bsondump`
+  - `mongodump`
+  - `mongorestore`
+  - `mongoexport`
+  - `mongostat`
+  - `perconadecrypt`
 
 ## Documentation
 
@@ -28,38 +28,38 @@ Use [Installing Percona Server for MongoDB](https://docs.percona.com/percona-ser
 
 ## Running
 
-  For command line options invoke:
+For command line options invoke:
 
-  ```bash
-  $ ./mongod --help
-  ```
+```bash
+$ ./mongod --help
+```
 
-  To run a single server database:
+To run a single server database:
 
-  ```bash
-  $ sudo mkdir -p /data/db
-  $ ./mongod
-  $
-  $ # The mongo javascript shell connects to localhost and test database by default:
-  $ ./mongo
-  > help
-  ```
+```bash
+$ sudo mkdir -p /data/db
+$ ./mongod
+$
+$ # The mongo javascript shell connects to localhost and test database by default:
+$ ./mongo
+> help
+```
 
 ## Drivers
 
-  Client drivers for most programming languages are available at
-  https://docs.mongodb.com/manual/applications/drivers/. Use the shell
-  (`mongo`) for administrative tasks.
+Client drivers for most programming languages are available at
+https://docs.mongodb.com/manual/applications/drivers/. Use the shell
+(`mongo`) for administrative tasks.
 
 ## Packaging
 
-  Packages for Percona Server for MongoDB are created by Percona team and are available at [Percona website](https://www.percona.com/downloads).
+Packages for Percona Server for MongoDB are created by Percona team and are available at [Percona website](https://www.percona.com/downloads).
 
 ## Community
 
-  Find answers to MongoDB-related questions on [Percona Server for MongoDB Forum](https://forums.percona.com/categories/percona-server-for-mongodb).
+Find answers to MongoDB-related questions on [Percona Server for MongoDB Forum](https://forums.percona.com/categories/percona-server-for-mongodb).
 
-  Get insights about MongoDB from experts in the industry on [Percona Database Performance Blog](https://www.percona.com/blog/category/mongodb/).
+Get insights about MongoDB from experts in the industry on [Percona Database Performance Blog](https://www.percona.com/blog/category/mongodb/).
 
 ## Submitting bug reports or feature requests
 

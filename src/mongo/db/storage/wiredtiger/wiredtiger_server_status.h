@@ -38,14 +38,12 @@ namespace mongo {
 
 class WiredTigerKVEngine;
 
-extern const std::string kWiredTigerEngineName;
-
 /**
  * Adds "wiredTiger" to the results of db.serverStatus().
  */
 class WiredTigerServerStatusSection : public ServerStatusSection {
 public:
-    WiredTigerServerStatusSection(const std::string& sectionName = kWiredTigerEngineName);
+    using ServerStatusSection::ServerStatusSection;
     bool includeByDefault() const override;
     BSONObj generateSection(OperationContext* opCtx,
                             const BSONElement& configElement) const override;

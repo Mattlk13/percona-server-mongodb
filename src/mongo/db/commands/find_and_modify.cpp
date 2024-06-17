@@ -83,7 +83,7 @@
 #include "mongo/db/query/find_command_gen.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_yield_policy.h"
-#include "mongo/db/query/query_settings_gen.h"
+#include "mongo/db/query/query_settings/query_settings_gen.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
@@ -259,8 +259,8 @@ public:
         return true;
     }
 
-    static void collectMetrics(const Request& request) {
-        CmdFindAndModify::_updateMetrics.collectMetrics(request);
+    void collectMetrics(const Request& request) const {
+        _updateMetrics->collectMetrics(request);
     }
 
     bool supportsRetryableWrite() const final {
@@ -287,6 +287,10 @@ public:
             return true;
         }
 
+        bool isSubjectToIngressAdmissionControl() const override {
+            return true;
+        }
+
         NamespaceString ns() const final {
             return this->request().getNamespace();
         }
@@ -302,13 +306,17 @@ public:
         void appendMirrorableRequest(BSONObjBuilder* bob) const final;
     };
 
+protected:
+    void doInitializeClusterRole(ClusterRole role) override {
+        write_ops::FindAndModifyCmdVersion1Gen<CmdFindAndModify>::doInitializeClusterRole(role);
+        _updateMetrics.emplace(getName(), role);
+    }
+
 private:
     // Update related command execution metrics.
-    static UpdateMetrics _updateMetrics;
+    mutable boost::optional<UpdateMetrics> _updateMetrics;
 };
 MONGO_REGISTER_COMMAND(CmdFindAndModify).forShard();
-
-UpdateMetrics CmdFindAndModify::_updateMetrics{"findAndModify"};
 
 void CmdFindAndModify::Invocation::doCheckAuthorization(OperationContext* opCtx) const {
     std::vector<Privilege> privileges;
@@ -486,8 +494,7 @@ write_ops::FindAndModifyCommandReply CmdFindAndModify::Invocation::typedRun(
     const NamespaceString& nsString = req.getNamespace();
     uassertStatusOK(userAllowedWriteNS(opCtx, nsString));
 
-    // Collect metrics.
-    CmdFindAndModify::collectMetrics(req);
+    static_cast<const CmdFindAndModify*>(definition())->collectMetrics(req);
 
     auto disableDocumentValidation = req.getBypassDocumentValidation().value_or(false);
     auto fleCrudProcessed = write_ops_exec::getFleCrudProcessed(
@@ -529,7 +536,7 @@ write_ops::FindAndModifyCommandReply CmdFindAndModify::Invocation::typedRun(
     // Initialize curOp information.
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
-        if (req.getIsTimeseriesNamespace()) {
+        if (req.getIsTimeseriesNamespace() && nsString.isTimeseriesBucketsCollection()) {
             auto viewNss = nsString.getTimeseriesViewNamespace();
             curOp.setNS_inlock(viewNss);
             curOp.setOpDescription_inlock(timeseries::timeseriesViewCommand(
@@ -554,10 +561,7 @@ write_ops::FindAndModifyCommandReply CmdFindAndModify::Invocation::typedRun(
 
     const bool inTransaction = opCtx->inMultiDocumentTransaction();
 
-    // Although usually the PlanExecutor handles WCE internally, it will throw WCEs when it
-    // is executing a findAndModify. This is done to ensure that we can always match,
-    // modify, and return the document under concurrency, if a matching document exists.
-    return writeConflictRetry(opCtx, "findAndModify", nsString, [&] {
+    auto doWork = [&] {
         if (req.getRemove().value_or(false)) {
             DeleteRequest deleteRequest;
             makeDeleteRequest(opCtx, req, false, &deleteRequest);
@@ -648,7 +652,17 @@ write_ops::FindAndModifyCommandReply CmdFindAndModify::Invocation::typedRun(
                 }
             }
         }
-    });
+    };
+
+    // No need to call writeConflictRetry() since it does not retry if in a transaction,
+    // but calling it can cause WCE to be double counted.
+    if (inTransaction) {
+        return doWork();
+    }
+    // Although usually the PlanExecutor handles WCE internally, it will throw WCEs when it
+    // is executing a findAndModify. This is done to ensure that we can always match,
+    // modify, and return the document under concurrency, if a matching document exists.
+    return writeConflictRetry(opCtx, "findAndModify", nsString, doWork);
 }
 
 void CmdFindAndModify::Invocation::appendMirrorableRequest(BSONObjBuilder* bob) const {

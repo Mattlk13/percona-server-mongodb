@@ -183,6 +183,15 @@ class Fixture(object, metaclass=registry.make_registry_metaclass(_FIXTURES)):  #
         raise NotImplementedError(
             "get_internal_connection_string must be implemented by Fixture subclasses")
 
+    def get_shell_connection_url(self):
+        """Return the connection string to be used by the mongo shell process executing a jstest.
+
+        Defaults to returning the driver connection url, but can be overriden to provide 
+        shell-specific options (such as using a gRPC port).
+        https://docs.mongodb.com/manual/reference/connection-string/
+        """
+        return self.get_driver_connection_url()
+
     def get_driver_connection_url(self):
         """Return the mongodb connection string as defined below.
 
@@ -204,6 +213,18 @@ class Fixture(object, metaclass=registry.make_registry_metaclass(_FIXTURES)):  #
             kwargs["serverSelectionTimeoutMS"] = timeout_millis
             kwargs["connect"] = True
 
+        if self.config.TLS_MODE == "requireTLS":
+            # When server is in 'tlsMode == requireTLS`,
+            # the client would be unable to connect
+            # without local TLS being explicitly turned on.
+            # Other modes, such as 'allowTLS' permit both tls and non-tls clients.
+            kwargs["tls"] = True
+            kwargs["tlsAllowInvalidHostnames"] = True
+            if self.config.TLS_CA_FILE:
+                kwargs["tlsCAFile"] = self.config.TLS_CA_FILE
+            if self.config.SHELL_TLS_CERTIFICATE_KEY_FILE:
+                kwargs["tlsCertificateKeyFile"] = self.config.SHELL_TLS_CERTIFICATE_KEY_FILE
+
         return pymongo.MongoClient(host=self.get_driver_connection_url(),
                                    read_preference=read_preference, **kwargs)
 
@@ -222,27 +243,27 @@ class DockerComposeException(Exception):
 
 class _DockerComposeInterface:
     """
-    Implement the `_all_mongo_d_s_instances` method which returns all `mongo{d,s}` instances.
+    Implement the `_all_mongo_d_s_t_instances` method which returns all `mongo{d,s,t}` instances.
 
     Fixtures that use this interface can programmatically generate `docker-compose.yml` configurations
     by leveraging the `all_processes` method to access the startup args.
     """
 
-    def _all_mongo_d_s(self) -> List[Fixture]:
+    def _all_mongo_d_s_t(self) -> List[Fixture]:
         """
-        Return a list of all mongo{d,s} `Fixture` instances in this fixture.
+        Return a list of all mongo{d,s,t} `Fixture` instances in this fixture.
 
-        :return: A list of `mongo{d,s}` `Fixture` instances.
+        :return: A list of `mongo{d,s,t}` `Fixture` instances.
         """
         raise NotImplementedError(
-            "_all_mongo_d_s_instances must be implemented by Fixture subclasses that support `docker-compose.yml` generation."
+            "_all_mongo_d_s_t_instances must be implemented by Fixture subclasses that support `docker-compose.yml` generation."
         )
 
     def all_processes(self) -> List['Process']:
         """
-        Return a list of all `mongo{d,s}` `Process` instances in the fixture.
+        Return a list of all `mongo{d,s,t}` `Process` instances in the fixture.
 
-        :return: A list of mongo{d,s} processes for the current fixture.
+        :return: A list of mongo{d,s,t} processes for the current fixture.
         """
         if not self.config.DOCKER_COMPOSE_BUILD_IMAGES:
             raise DockerComposeException(
@@ -252,7 +273,7 @@ class _DockerComposeInterface:
 
         # If `mongo_d_s.NOOP_MONGO_D_S_PROCESSES=True`, `mongo_d_s.setup()` will setup a dummy process
         # to extract args from instead of a real `mongo{d,s}`.
-        for mongo_d_s in self._all_mongo_d_s():
+        for mongo_d_s in self._all_mongo_d_s_t():
             if mongo_d_s.__class__.__name__ == "MongoDFixture":
                 mongo_d_s.setup()
                 processes += [mongo_d_s.mongod]

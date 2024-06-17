@@ -3,9 +3,10 @@
  * then after failover the result is available to retries.
  *
  * @tags: [
- *   uses_atclustertime,
- *   requires_fcv_72,
  *   featureFlagReshardingImprovements,
+ *   requires_fcv_72,
+ *   temp_disabled_embedded_router_uncategorized,
+ *   uses_atclustertime,
  * ]
  */
 import {DiscoverTopology} from "jstests/libs/discover_topology.js";
@@ -14,6 +15,9 @@ import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
 import {Thread} from "jstests/libs/parallelTester.js";
 import {getUUIDFromConfigCollections, getUUIDFromListCollections} from "jstests/libs/uuid_util.js";
 import {ReshardingTest} from "jstests/sharding/libs/resharding_test_fixture.js";
+
+// TODO SERVER-88620 Re-enable the check.
+TestData.skipCheckRoutingTableConsistency = true;
 
 const enterAbortFailpointName = "reshardingPauseCoordinatorBeforeStartingErrorFlow";
 const originalReshardingUUID = UUID();

@@ -4,8 +4,7 @@
 // for details.
 // To install trusted-ca.pem for local testing on OSX, invoke the following at a console:
 //   security add-trusted-cert -d jstests/libs/trusted-ca.pem
-// TODO BUILD-17503 Remove this tag
-// @tags: [incompatible_with_macos]
+
 const HOST_TYPE = getBuildInfo().buildEnvironment.target_os;
 if (HOST_TYPE == "windows") {
     // OpenSSL backed imports Root CA and intermediate CA
@@ -17,16 +16,16 @@ if (HOST_TYPE == "windows") {
 }
 try {
     const x509Options = {
-        sslMode: 'requireSSL',
-        sslPEMKeyFile: 'jstests/libs/trusted-server.pem',
-        sslCAFile: 'jstests/libs/trusted-ca.pem',
-        sslAllowInvalidCertificates: '',
-        sslWeakCertificateValidation: '',
+        tlsMode: 'requireTLS',
+        tlsCertificateKeyFile: 'jstests/libs/trusted-server.pem',
+        tlsCAFile: 'jstests/libs/trusted-ca.pem',
+        tlsAllowInvalidCertificates: '',
+        tlsWeakCertificateValidation: '',
     };
 
     const rst = new ReplSetTest({
         nodes: 2,
-        name: "sslSet",
+        name: "tlsSet",
         useHostName: false,
         nodeOptions: x509Options,
         waitForKeys: false
@@ -38,7 +37,7 @@ try {
         var Ms = [];
         for (let i = 0; i < 10; i++) {
             Ms.push(new Mongo("mongodb://" + hosts[0] + "," + hosts[1] +
-                              "/?ssl=true&replicaSet=sslSet"));
+                              "/?ssl=true&replicaSet=tlsSet"));
         }
 
         for (let i = 0; i < 10; i++) {
@@ -77,7 +76,8 @@ try {
     rst.stopSet();
 } finally {
     if (HOST_TYPE == "windows") {
-        const trusted_ca_thumbprint = cat('jstests/libs/ca.pem.digest.sha1');
+        const trusted_ca_thumbprint = cat('jstests/libs/trusted-ca.pem.digest.sha1');
         runProgram("certutil.exe", "-delstore", "-f", "Root", trusted_ca_thumbprint);
+        runProgram("certutil.exe", "-delstore", "-user", "-f", "CA", trusted_ca_thumbprint);
     }
 }

@@ -62,7 +62,6 @@
 #include "mongo/db/catalog/validate_results.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/concurrency/exception_util.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/index/2d_access_method.h"
 #include "mongo/db/index/btree_access_method.h"
@@ -89,6 +88,7 @@
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -172,7 +172,7 @@ namespace {
  */
 class IndexBulkBuilderSSS : public ServerStatusSection {
 public:
-    IndexBulkBuilderSSS() : ServerStatusSection("indexBulkBuilder") {}
+    using ServerStatusSection::ServerStatusSection;
 
     bool includeByDefault() const final {
         return true;
@@ -209,8 +209,10 @@ public:
     // the external sorter and may be useful in diagnosing situations where the process is
     // close to exhausting this finite resource.
     SorterFileStats sorterFileStats = {&sorterTracker};
+};
 
-} indexBulkBuilderSSS;
+auto& indexBulkBuilderSSS =
+    *ServerStatusSectionBuilder<IndexBulkBuilderSSS>("indexBulkBuilder").forShard();
 
 /**
  * Returns true if at least one prefix of any of the indexed fields causes the index to be
@@ -272,7 +274,7 @@ Status SortedDataIndexAccessMethod::insert(OperationContext* opCtx,
         invariant(bsonRecord.id != RecordId());
 
         if (!bsonRecord.ts.isNull()) {
-            Status status = opCtx->recoveryUnit()->setTimestamp(bsonRecord.ts);
+            Status status = shard_role_details::getRecoveryUnit(opCtx)->setTimestamp(bsonRecord.ts);
             if (!status.isOK())
                 return status;
         }
@@ -731,8 +733,9 @@ Status SortedDataIndexAccessMethod::doUpdate(OperationContext* opCtx,
     return Status::OK();
 }
 
-Status SortedDataIndexAccessMethod::compact(OperationContext* opCtx) {
-    return this->_newInterface->compact(opCtx);
+StatusWith<int64_t> SortedDataIndexAccessMethod::compact(OperationContext* opCtx,
+                                                         const CompactOptions& options) {
+    return this->_newInterface->compact(opCtx, options);
 }
 
 std::shared_ptr<Ident> SortedDataIndexAccessMethod::getSharedIdent() const {
@@ -788,7 +791,7 @@ Status SortedDataIndexAccessMethod::applyIndexBuildSideWrite(OperationContext* o
         }
 
         *keysInserted += numInserted;
-        opCtx->recoveryUnit()->onRollback(
+        shard_role_details::getRecoveryUnit(opCtx)->onRollback(
             [keysInserted, numInserted](OperationContext*) { *keysInserted -= numInserted; });
     } else {
         invariant(opType == IndexBuildInterceptor::Op::kDelete);
@@ -799,7 +802,7 @@ Status SortedDataIndexAccessMethod::applyIndexBuildSideWrite(OperationContext* o
         }
 
         *keysDeleted += numDeleted;
-        opCtx->recoveryUnit()->onRollback(
+        shard_role_details::getRecoveryUnit(opCtx)->onRollback(
             [keysDeleted, numDeleted](OperationContext*) { *keysDeleted -= numDeleted; });
     }
     return Status::OK();
@@ -829,10 +832,10 @@ const IndexCatalogEntry* IndexAccessMethod::BulkBuilder::yield(OperationContext*
     const std::string indexIdent = entry->getIdent();
 
     // Releasing locks means a new snapshot should be acquired when restored.
-    opCtx->recoveryUnit()->abandonSnapshot();
+    shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
     collection.yield();
 
-    auto locker = opCtx->lockState();
+    auto locker = shard_role_details::getLocker(opCtx);
     Locker::LockSnapshot snapshot;
     locker->saveLockStateAndUnlock(&snapshot);
 

@@ -48,7 +48,7 @@ public:
     using Request = GetClusterParameter;
     using Reply = GetClusterParameter::Reply;
     using Map = ServerParameterSet::Map;
-    using CmdBody = stdx::variant<std::string, std::vector<std::string>>;
+    using CmdBody = std::variant<std::string, std::vector<std::string>>;
 
     GetClusterParameterInvocation() = default;
 
@@ -61,6 +61,7 @@ private:
     std::pair<std::vector<std::string>, std::vector<BSONObj>> retrieveRequestedParameters(
         OperationContext* opCtx,
         const CmdBody& cmdBody,
+        bool shouldOmitInFTDC,
         const boost::optional<TenantId>& tenantId,
         bool excludeClusterParameterTime);
 };

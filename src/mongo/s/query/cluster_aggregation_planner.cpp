@@ -58,6 +58,7 @@
 #include "mongo/db/basic_types_gen.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/cursor_id.h"
 #include "mongo/db/exec/document_value/value.h"
@@ -68,18 +69,20 @@
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_limit.h"
 #include "mongo/db/pipeline/document_source_skip.h"
-#include "mongo/db/pipeline/search_helper.h"
+#include "mongo/db/pipeline/search/search_helper.h"
 #include "mongo/db/pipeline/stage_constraints.h"
 #include "mongo/db/pipeline/variables.h"
 #include "mongo/db/query/collation/collation_spec.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/find_common.h"
+#include "mongo/db/query/query_stats/query_stats.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/session/logical_session_id_gen.h"
 #include "mongo/db/shard_id.h"
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/executor/task_executor_pool.h"
+#include "mongo/idl/generic_argument_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -117,6 +120,7 @@
 #include "mongo/s/query_analysis_sampler_util.h"
 #include "mongo/s/shard_version.h"
 #include "mongo/s/shard_version_factory.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
 #include "mongo/s/sharding_index_catalog_cache.h"
 #include "mongo/s/transaction_router.h"
 #include "mongo/util/assert_util.h"
@@ -176,28 +180,66 @@ AsyncRequestsSender::Response establishMergingShardCursor(OperationContext* opCt
     return response;
 }
 
+/**
+ * Contacts the primary shard for the collection default collation.
+ *
+ * TODO SERVER-79159: This function can be deleted once all unsharded collections are tracked in the
+ * sharding catalog (at this point, it wont't be necessary to contact the primary shard for
+ * collation information).
+ */
+BSONObj getUntrackedCollectionCollation(OperationContext* opCtx,
+                                        const ChunkManager& cm,
+                                        const NamespaceString& nss) {
+    auto shard =
+        uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, cm.dbPrimary()));
+    ScopedDbConnection conn(shard->getConnString());
+    std::list<BSONObj> all = conn->getCollectionInfos(nss.dbName(), BSON("name" << nss.coll()));
+
+    // Collection or collection info does not exist; return an empty collation object.
+    if (all.empty() || all.front().isEmpty()) {
+        return BSONObj();
+    }
+
+    auto collectionInfo = all.front();
+
+    // We inspect 'info' to infer the collection default collation.
+    BSONObj collationToReturn = CollationSpec::kSimpleSpec;
+    if (collectionInfo["options"].type() == BSONType::Object) {
+        BSONObj collectionOptions = collectionInfo["options"].Obj();
+        BSONElement collationElement;
+        auto status = bsonExtractTypedField(
+            collectionOptions, "collation", BSONType::Object, &collationElement);
+        if (status.isOK()) {
+            collationToReturn = collationElement.Obj().getOwned();
+            uassert(ErrorCodes::BadValue,
+                    "Default collation in collection metadata cannot be empty.",
+                    !collationToReturn.isEmpty());
+        } else if (status != ErrorCodes::NoSuchKey) {
+            uassertStatusOK(status);
+        }
+    }
+    return collationToReturn;
+}
+
 ShardId pickMergingShard(OperationContext* opCtx,
-                         bool needsPrimaryShardMerge,
                          const boost::optional<ShardId>& pipelineMergeShardId,
-                         const std::vector<ShardId>& targetedShards,
-                         ShardId primaryShard) {
-    auto& prng = opCtx->getClient()->getPrng();
+                         const std::vector<ShardId>& targetedShards) {
     // If we cannot merge on mongoS, establish the merge cursor on a shard. Perform the merging
     // command on random shard, unless the pipeline dictates that it needs to be run on a specific
     // shard for the database.
-    if (needsPrimaryShardMerge) {
-        return primaryShard;
-    } else if (pipelineMergeShardId) {
-        return *pipelineMergeShardId;
-    } else {
-        return targetedShards[prng.nextInt32(targetedShards.size())];
-    }
+    return pipelineMergeShardId
+        ? *pipelineMergeShardId
+        : targetedShards[opCtx->getClient()->getPrng().nextInt32(targetedShards.size())];
 }
 
 BSONObj createCommandForMergingShard(Document serializedCommand,
                                      const boost::intrusive_ptr<ExpressionContext>& mergeCtx,
+                                     const NamespaceString& nss,
                                      const ShardId& shardId,
-                                     const boost::optional<ShardingIndexesCatalogCache> sii,
+                                     const std::vector<ShardId>& targetedShards,
+                                     bool hasSpecificMergeShard,
+                                     const ChunkManager& cm,
+                                     const boost::optional<ShardingIndexesCatalogCache>& sii,
                                      bool mergingShardContributesData,
                                      const Pipeline* pipelineForMerging) {
     MutableDocument mergeCmd(serializedCommand);
@@ -208,12 +250,47 @@ BSONObj createCommandForMergingShard(Document serializedCommand,
     mergeCmd[AggregateCommandRequest::kLetFieldName] =
         Value(mergeCtx->variablesParseState.serialize(mergeCtx->variables));
 
+    if (query_stats::shouldRequestRemoteMetrics(CurOp::get(mergeCtx->opCtx)->debug())) {
+        mergeCmd[AggregateCommandRequest::kIncludeQueryStatsMetricsFieldName] = Value(true);
+    }
+
     // If the user didn't specify a collation already, make sure there's a collation attached to
     // the merge command, since the merging shard may not have the collection metadata.
     if (mergeCmd.peek()["collation"].missing()) {
-        mergeCmd["collation"] = mergeCtx->getCollator()
-            ? Value(mergeCtx->getCollator()->getSpec().toBSON())
-            : Value(Document{CollationSpec::kSimpleSpec});
+        mergeCmd["collation"] = [&]() {
+            if (mergeCtx->getCollator()) {
+                return Value(mergeCtx->getCollator()->getSpec().toBSON());
+            } else if (!cm.hasRoutingTable() && !nss.isCollectionlessAggregateNS()) {
+                // If we are dispatching a merging pipeline to a specific shard, and the main
+                // namespace is untracked, we must contact the primary shard to determine whether or
+                // not there exists a collection default collation. This is unfortunate, but
+                // necessary, because while the shards part of the pipeline will discover the
+                // collection default collation upon dispatch to the shard which owns the untracked
+                // collection. The same is not true for the merging pipeline, however, because the
+                // merging shard has no knowledge of the collection default collator.
+                //
+                // Note also that, unlike tracked collections, which do have information about any
+                // collection default collations in the routing information, the same is not true
+                // for untracked collections.
+                //
+                // TODO SERVER-79159: Once all unsharded collections are tracked in the sharding
+                // catalog, this 'else' block can be deleted.
+
+                // We should only be contacting the primary shard if the only shard that we are
+                // targeting is the primary shard and a stage has designated a specific merging
+                // shard.
+                tassert(8596500,
+                        "Contacting primary shard for collation in unexpected case",
+                        targetedShards.size() == 1 && targetedShards[0] == cm.dbPrimary() &&
+                            hasSpecificMergeShard);
+                if (auto untrackedDefaultCollation =
+                        getUntrackedCollectionCollation(mergeCtx->opCtx, cm, nss);
+                    !untrackedDefaultCollation.isEmpty()) {
+                    return Value(untrackedDefaultCollation);
+                }
+            }
+            return Value(Document{CollationSpec::kSimpleSpec});
+        }();
     }
 
     const auto txnRouter = TransactionRouter::get(mergeCtx->opCtx);
@@ -223,6 +300,33 @@ BSONObj createCommandForMergingShard(Document serializedCommand,
         // participant, it will already have received another 'aggregate' command earlier which
         // contained a readConcern.
         mergeCmd.remove("readConcern");
+    }
+
+    // Request the merging shard to gossip back the routing metadata versions for the collections
+    // involved in the decision of the merging shard. For the merging part of the pipeline, only the
+    // first stage that involves secondary collections can have effect on the merging decision, so
+    // just request gossiping for these.
+    if (feature_flags::gShardedAggregationCatalogCacheGossiping.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+        stdx::unordered_set<NamespaceString> collectionsInvolvedInMergingShardChoice;
+        for (const auto& source : pipelineForMerging->getSources()) {
+            source->addInvolvedCollections(&collectionsInvolvedInMergingShardChoice);
+            if (!collectionsInvolvedInMergingShardChoice.empty()) {
+                // Only consider the first stage that involves secondary collections.
+                break;
+            }
+        }
+
+        BSONArrayBuilder arrayBuilder;
+        for (const auto& nss : collectionsInvolvedInMergingShardChoice) {
+            arrayBuilder.append(
+                NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()));
+        }
+
+        if (arrayBuilder.arrSize() > 0) {
+            mergeCmd[Generic_args_unstable_v1::kRequestGossipRoutingCacheFieldName] =
+                Value(arrayBuilder.arr());
+        }
     }
 
     // Attach the IGNORED chunk version to the command. On the shard, this will skip the actual
@@ -273,7 +377,8 @@ Status dispatchMergingPipeline(const boost::intrusive_ptr<ExpressionContext>& ex
     // First, check whether we can merge on the mongoS. If the merge pipeline MUST run on mongoS,
     // then ignore the internalQueryProhibitMergingOnMongoS parameter.
     if (mergePipeline->requiredToRunOnMongos() ||
-        (!internalQueryProhibitMergingOnMongoS.load() && mergePipeline->canRunOnMongos())) {
+        (!internalQueryProhibitMergingOnMongoS.load() && mergePipeline->canRunOnMongos().isOK() &&
+         !shardDispatchResults.mergeShardId)) {
         return runPipelineOnMongoS(namespaces,
                                    batchSize,
                                    std::move(shardDispatchResults.splitPipeline->mergePipeline),
@@ -285,18 +390,19 @@ Status dispatchMergingPipeline(const boost::intrusive_ptr<ExpressionContext>& ex
     // therefore must have a valid routing table.
     invariant(cri);
 
-    const ShardId mergingShardId = pickMergingShard(opCtx,
-                                                    shardDispatchResults.needsPrimaryShardMerge,
-                                                    mergePipeline->needsSpecificShardMerger(),
-                                                    targetedShards,
-                                                    cri->cm.dbPrimary());
+    const ShardId mergingShardId =
+        pickMergingShard(opCtx, shardDispatchResults.mergeShardId, targetedShards);
     const bool mergingShardContributesData =
         std::find(targetedShards.begin(), targetedShards.end(), mergingShardId) !=
         targetedShards.end();
 
     auto mergeCmdObj = createCommandForMergingShard(serializedCommand,
                                                     expCtx,
+                                                    namespaces.requestedNss,
                                                     mergingShardId,
+                                                    targetedShards,
+                                                    shardDispatchResults.mergeShardId.has_value(),
+                                                    cri->cm,
                                                     cri->sii,
                                                     mergingShardContributesData,
                                                     mergePipeline);
@@ -304,7 +410,8 @@ Status dispatchMergingPipeline(const boost::intrusive_ptr<ExpressionContext>& ex
     LOGV2_DEBUG(22835,
                 1,
                 "Dispatching merge pipeline to designated shard",
-                "command"_attr = redact(mergeCmdObj));
+                "command"_attr = redact(mergeCmdObj),
+                "mergingShardId"_attr = mergingShardId);
 
     // Dispatch $mergeCursors to the chosen shard, store the resulting cursor, and return.
     auto mergeResponse =
@@ -363,6 +470,8 @@ BSONObj establishMergingMongosCursor(OperationContext* opCtx,
     // had a batch size of 0.
     params.batchSize = batchSize == 0 ? boost::none : boost::make_optional(batchSize);
     params.originatingPrivileges = privileges;
+    params.requestQueryStatsFromRemotes =
+        query_stats::shouldRequestRemoteMetrics(CurOp::get(opCtx)->debug());
 
     auto ccc = cluster_aggregation_planner::buildClusterCursor(
         opCtx, std::move(pipelineForMerging), std::move(params));
@@ -444,7 +553,9 @@ BSONObj establishMergingMongosCursor(OperationContext* opCtx,
     opDebug.cursorExhausted = exhausted;
     opDebug.additiveMetrics.nBatches = 1;
     CurOp::get(opCtx)->setEndOfOpMetrics(responseBuilder.numDocs());
+
     if (exhausted) {
+        opDebug.additiveMetrics.aggregateDataBearingNodeMetrics(ccc->takeRemoteMetrics());
         collectQueryStatsMongos(opCtx, ccc->getKey());
     } else {
         collectQueryStatsMongos(opCtx, ccc);
@@ -491,12 +602,15 @@ DispatchShardPipelineResults dispatchExchangeConsumerPipeline(
     }
 
     // For all consumers construct a request with appropriate cursor ids and send to shards.
-    std::vector<std::pair<ShardId, BSONObj>> requests;
-    auto numConsumers = shardDispatchResults->exchangeSpec->consumerShards.size();
+    std::vector<AsyncRequestsSender::Request> requests;
     std::vector<SplitPipeline> consumerPipelines;
+    auto numConsumers = shardDispatchResults->exchangeSpec->consumerShards.size();
+    requests.reserve(numConsumers);
+    consumerPipelines.reserve(numConsumers);
     for (size_t idx = 0; idx < numConsumers; ++idx) {
         // Pick this consumer's cursors from producers.
         std::vector<OwnedRemoteCursor> producers;
+        producers.reserve(shardDispatchResults->numProducers);
         for (size_t p = 0; p < shardDispatchResults->numProducers; ++p) {
             producers.emplace_back(
                 std::move(shardDispatchResults->remoteCursors[p * numConsumers + idx]));
@@ -555,7 +669,7 @@ DispatchShardPipelineResults dispatchExchangeConsumerPipeline(
             static_cast<DocumentSourceMergeCursors*>(pipeline.shardsPipeline->peekFront());
         mergeCursors->dismissCursorOwnership();
     }
-    return DispatchShardPipelineResults{false,
+    return DispatchShardPipelineResults{boost::none /* mergeShardId  */,
                                         std::move(ownedCursors),
                                         {},
                                         std::move(splitPipeline),
@@ -596,42 +710,6 @@ ClusterClientCursorGuard convertPipelineToRouterStages(
         std::make_unique<RouterStageRemoveMetadataFields>(
             opCtx, std::move(root), Document::allMetadataFieldNames),
         std::move(cursorParams));
-}
-
-/**
- * Contacts the primary shard for the collection default collation.
- */
-BSONObj getUntrackedCollectionCollation(OperationContext* opCtx,
-                                        const ShardId& shardId,
-                                        const NamespaceString& nss) {
-    auto shard = uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardId));
-    ScopedDbConnection conn(shard->getConnString());
-    std::list<BSONObj> all = conn->getCollectionInfos(nss.dbName(), BSON("name" << nss.coll()));
-
-    // Collection or collection info does not exist; return an empty collation object.
-    if (all.empty() || all.front().isEmpty()) {
-        return BSONObj();
-    }
-
-    auto collectionInfo = all.front();
-
-    // We inspect 'info' to infer the collection default collation.
-    BSONObj collationToReturn = CollationSpec::kSimpleSpec;
-    if (collectionInfo["options"].type() == BSONType::Object) {
-        BSONObj collectionOptions = collectionInfo["options"].Obj();
-        BSONElement collationElement;
-        auto status = bsonExtractTypedField(
-            collectionOptions, "collation", BSONType::Object, &collationElement);
-        if (status.isOK()) {
-            collationToReturn = collationElement.Obj().getOwned();
-            uassert(ErrorCodes::BadValue,
-                    "Default collation in collection metadata cannot be empty.",
-                    !collationToReturn.isEmpty());
-        } else if (status != ErrorCodes::NoSuchKey) {
-            uassertStatusOK(status);
-        }
-    }
-    return collationToReturn;
 }
 
 bool isMergeSkipOrLimit(const boost::intrusive_ptr<DocumentSource>& stage) {
@@ -695,7 +773,9 @@ Status runPipelineOnMongoS(const ClusterAggregate::Namespaces& namespaces,
 
     // We should never receive a pipeline which cannot run on mongoS.
     invariant(!expCtx->explain);
-    invariant(pipeline->canRunOnMongos());
+    uassertStatusOKWithContext(pipeline->canRunOnMongos(),
+                               "pipeline is required to run on mongoS, but cannot");
+
 
     // Verify that the first stage can produce input for the remainder of the pipeline.
     uassert(ErrorCodes::IllegalOperation,
@@ -731,7 +811,8 @@ Status dispatchPipelineAndMerge(OperationContext* opCtx,
                                                    pipelineDataSource,
                                                    eligibleForSampling,
                                                    std::move(targeter.pipeline),
-                                                   expCtx->explain);
+                                                   expCtx->explain,
+                                                   targeter.cri);
 
     // Check for valid usage of SEARCH_META. We wait until after we've dispatched pipelines to the
     // shards in the event that we need to resolve any views.
@@ -739,13 +820,13 @@ Status dispatchPipelineAndMerge(OperationContext* opCtx,
     auto svcCtx = opCtx->getServiceContext();
     if (svcCtx) {
         if (shardDispatchResults.pipelineForSingleShard) {
-            getSearchHelpers(svcCtx)->assertSearchMetaAccessValid(
+            search_helpers::assertSearchMetaAccessValid(
                 shardDispatchResults.pipelineForSingleShard->getSources(), expCtx.get());
         } else {
             tassert(7972499,
                     "Must have split pipeline if 'pipelineForSingleShard' not present",
                     shardDispatchResults.splitPipeline);
-            getSearchHelpers(svcCtx)->assertSearchMetaAccessValid(
+            search_helpers::assertSearchMetaAccessValid(
                 shardDispatchResults.splitPipeline->shardsPipeline->getSources(),
                 shardDispatchResults.splitPipeline->mergePipeline->getSources(),
                 expCtx.get());
@@ -815,7 +896,7 @@ BSONObj getCollation(OperationContext* opCtx,
     // the command is executed on the primary shard.
     if (!cm->hasRoutingTable()) {
         return requiresCollationForParsingUnshardedAggregate
-            ? getUntrackedCollectionCollation(opCtx, cm->dbPrimary(), nss)
+            ? getUntrackedCollectionCollation(opCtx, *cm, nss)
             : BSONObj();
     }
 

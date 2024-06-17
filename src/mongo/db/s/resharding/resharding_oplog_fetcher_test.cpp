@@ -58,7 +58,6 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/db_raii.h"
@@ -89,6 +88,7 @@
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/db/tenant_id.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/executor/network_test_env.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
@@ -119,17 +119,20 @@ namespace {
 class OneOffRead {
 public:
     OneOffRead(OperationContext* opCtx, const Timestamp& ts) : _opCtx(opCtx) {
-        _opCtx->recoveryUnit()->abandonSnapshot();
+        shard_role_details::getRecoveryUnit(_opCtx)->abandonSnapshot();
         if (ts.isNull()) {
-            _opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+            shard_role_details::getRecoveryUnit(_opCtx)->setTimestampReadSource(
+                RecoveryUnit::ReadSource::kNoTimestamp);
         } else {
-            _opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided, ts);
+            shard_role_details::getRecoveryUnit(_opCtx)->setTimestampReadSource(
+                RecoveryUnit::ReadSource::kProvided, ts);
         }
     }
 
     ~OneOffRead() {
-        _opCtx->recoveryUnit()->abandonSnapshot();
-        _opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+        shard_role_details::getRecoveryUnit(_opCtx)->abandonSnapshot();
+        shard_role_details::getRecoveryUnit(_opCtx)->setTimestampReadSource(
+            RecoveryUnit::ReadSource::kNoTimestamp);
     }
 
 private:
@@ -191,14 +194,16 @@ public:
      * ShardRegistry reload is done over DBClient, not the NetworkInterface, and there is no
      * DBClientMock analogous to the NetworkInterfaceMock.
      */
-    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient() {
+    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient() override {
 
         class StaticCatalogClient final : public ShardingCatalogClientMock {
         public:
             StaticCatalogClient(std::vector<ShardId> shardIds) : _shardIds(std::move(shardIds)) {}
 
             StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
-                OperationContext* opCtx, repl::ReadConcernLevel readConcern) override {
+                OperationContext* opCtx,
+                repl::ReadConcernLevel readConcern,
+                bool excludeDraining) override {
                 std::vector<ShardType> shardTypes;
                 for (const auto& shardId : _shardIds) {
                     const ConnectionString cs = ConnectionString::forReplicaSet(
@@ -266,11 +271,13 @@ public:
 
     void create(NamespaceString nss) {
         writeConflictRetry(_opCtx, "create", nss, [&] {
-            AllowLockAcquisitionOnTimestampedUnitOfWork allowLockAcquisition(_opCtx->lockState());
+            AllowLockAcquisitionOnTimestampedUnitOfWork allowLockAcquisition(
+                shard_role_details::getLocker(_opCtx));
             AutoGetDb autoDb(_opCtx, nss.dbName(), LockMode::MODE_X);
             WriteUnitOfWork wunit(_opCtx);
-            if (_opCtx->recoveryUnit()->getCommitTimestamp().isNull()) {
-                ASSERT_OK(_opCtx->recoveryUnit()->setTimestamp(Timestamp(1, 1)));
+            if (shard_role_details::getRecoveryUnit(_opCtx)->getCommitTimestamp().isNull()) {
+                ASSERT_OK(
+                    shard_role_details::getRecoveryUnit(_opCtx)->setTimestamp(Timestamp(1, 1)));
             }
 
             OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE

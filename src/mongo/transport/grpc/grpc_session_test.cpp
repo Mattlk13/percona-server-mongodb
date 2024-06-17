@@ -61,22 +61,30 @@ public:
         ServiceContextWithClockSourceMockTest::tearDown();
     }
 
+    std::unique_ptr<IngressSession> makeIngressSession(boost::optional<UUID> remoteClientId) {
+        return std::make_unique<IngressSession>(nullptr,
+                                                _streamFixtures->rpc->serverCtx.get(),
+                                                _streamFixtures->rpc->serverStream.get(),
+                                                std::move(remoteClientId),
+                                                /* auth token */ boost::none,
+                                                /* client metadata */ boost::none);
+    }
+
+    std::unique_ptr<EgressSession> makeEgressSession(UUID clientId) {
+        return std::make_unique<EgressSession>(nullptr,
+                                               _streamFixtures->clientCtx,
+                                               _streamFixtures->clientStream,
+                                               std::move(clientId),
+                                               /* shared state */ nullptr);
+    }
+
     template <class SessionType>
-    auto makeSession(boost::optional<UUID> clientId) {
+    auto makeSession(UUID clientId) {
         if constexpr (std::is_same<SessionType, IngressSession>::value) {
-            return std::make_unique<IngressSession>(nullptr,
-                                                    _streamFixtures->rpc->serverCtx.get(),
-                                                    _streamFixtures->rpc->serverStream.get(),
-                                                    std::move(clientId),
-                                                    /* auth token */ boost::none,
-                                                    /* client metadata */ boost::none);
+            return makeIngressSession(clientId);
         } else {
             static_assert(std::is_same<SessionType, EgressSession>::value == true);
-            return std::make_unique<EgressSession>(nullptr,
-                                                   _streamFixtures->clientCtx,
-                                                   _streamFixtures->clientStream,
-                                                   std::move(clientId),
-                                                   /* shared state */ nullptr);
+            return makeEgressSession(clientId);
         }
     }
 
@@ -160,24 +168,22 @@ private:
 };
 
 TEST_F(GRPCSessionTest, NoClientId) {
-    {
-        auto session = makeSession<IngressSession>(boost::none);
-        ASSERT_FALSE(session->clientId());
-        session->end();
-    }
-
-    {
-        auto session = makeSession<EgressSession>(boost::none);
-        ASSERT_FALSE(session->clientId());
-        session->end();
-    }
+    auto session = makeIngressSession(boost::none);
+    ASSERT_FALSE(session->getRemoteClientId());
+    session->end();
 }
 
 TEST_F(GRPCSessionTest, GetClientId) {
-    runWithBoth([&](auto&, auto& session) {
-        ASSERT_TRUE(session.clientId());
-        ASSERT_EQ(session.clientId()->toString(), kClientId);
-    });
+    {
+        auto session = makeSession<IngressSession>();
+        ASSERT_TRUE(session->getRemoteClientId());
+        ASSERT_EQ(session->getRemoteClientId()->toString(), kClientId);
+    }
+
+    {
+        auto session = makeSession<EgressSession>();
+        ASSERT_EQ(session->getClientId().toString(), kClientId);
+    }
 }
 
 TEST_F(GRPCSessionTest, GetRemote) {
@@ -206,8 +212,8 @@ TEST_F(GRPCSessionTest, End) {
         session.end();
         ASSERT_FALSE(session.isConnected());
         ASSERT_TRUE(session.terminationStatus());
-        ASSERT_OK(session.terminationStatus());
-        ASSERT_FALSE(rpc.serverCtx->isCancelled());
+        ASSERT_EQ(session.terminationStatus()->code(), ErrorCodes::CallbackCanceled);
+        ASSERT_TRUE(rpc.serverCtx->isCancelled());
     });
 }
 
@@ -218,8 +224,8 @@ TEST_F(GRPCSessionTest, CancelWithReason) {
         ASSERT_FALSE(session.isConnected());
         ASSERT_TRUE(session.terminationStatus());
         ASSERT_EQ(session.terminationStatus(), kExpectedReason);
-        ASSERT_EQ(session.sourceMessage().getStatus(), ErrorCodes::StreamTerminated);
-        ASSERT_EQ(session.sinkMessage(makeUniqueMessage()), ErrorCodes::StreamTerminated);
+        ASSERT_EQ(session.sourceMessage().getStatus(), kExpectedReason.code());
+        ASSERT_EQ(session.sinkMessage(makeUniqueMessage()), kExpectedReason.code());
         ASSERT_TRUE(rpc.serverCtx->isCancelled());
     });
 }
@@ -243,7 +249,7 @@ TEST_F(GRPCSessionTest, TerminationStatusIsNotOverridden) {
             ASSERT_EQ(finishStatus, kExpectedReason);
         } else if (auto ingressSession = dynamic_cast<IngressSession*>(&session)) {
             // Recording the status should not overwrite the prior cancellation status.
-            ingressSession->terminate(Status::OK());
+            ingressSession->setTerminationStatus(Status::OK());
             ASSERT_EQ(session.terminationStatus(), kExpectedReason);
         }
     });
@@ -282,7 +288,7 @@ TEST_F(GRPCSessionTest, ReadAndWriteFromClosedStream) {
     for (auto op : {Operation::kSink, Operation::kSource}) {
         runWithBoth([&](auto&, auto& session) {
             session.end();
-            ASSERT_EQ(runDummyOperationOnSession(session, op), ErrorCodes::StreamTerminated);
+            ASSERT_EQ(runDummyOperationOnSession(session, op), ErrorCodes::CallbackCanceled);
         });
     }
 }
@@ -291,11 +297,13 @@ TEST_F(GRPCSessionTest, ReadAndWriteTimesOut) {
     for (auto op : {Operation::kSink, Operation::kSource}) {
         runWithBoth([&](auto&, auto& session) {
             clockSource().advance(2 * kStreamTimeout);
-            ASSERT_EQ(runDummyOperationOnSession(session, op), ErrorCodes::StreamTerminated);
 
             if (auto egressSession = dynamic_cast<EgressSession*>(&session)) {
                 // Verify that the right `ErrorCode` is delivered on the client-side.
+                ASSERT_EQ(runDummyOperationOnSession(session, op), ErrorCodes::ExceededTimeLimit);
                 ASSERT_TRUE(ErrorCodes::isExceededTimeLimitError(egressSession->finish()));
+            } else {
+                ASSERT_EQ(runDummyOperationOnSession(session, op), ErrorCodes::CallbackCanceled);
             }
         });
     }

@@ -147,40 +147,40 @@ public:
                     const IndexDescriptor* desc,
                     bool isLogged);
 
-    virtual Status insert(
-        OperationContext* opCtx,
-        const key_string::Value& keyString,
-        bool dupsAllowed,
-        IncludeDuplicateRecordId includeDuplicateRecordId = IncludeDuplicateRecordId::kOff);
+    Status insert(OperationContext* opCtx,
+                  const key_string::Value& keyString,
+                  bool dupsAllowed,
+                  IncludeDuplicateRecordId includeDuplicateRecordId =
+                      IncludeDuplicateRecordId::kOff) override;
 
-    virtual void unindex(OperationContext* opCtx,
-                         const key_string::Value& keyString,
-                         bool dupsAllowed);
+    void unindex(OperationContext* opCtx,
+                 const key_string::Value& keyString,
+                 bool dupsAllowed) override;
 
-    virtual boost::optional<RecordId> findLoc(OperationContext* opCtx,
-                                              const key_string::Value& keyString) const override;
+    boost::optional<RecordId> findLoc(OperationContext* opCtx,
+                                      const key_string::Value& keyString) const override;
 
-    virtual IndexValidateResults validate(OperationContext* opCtx, bool full) const;
+    IndexValidateResults validate(OperationContext* opCtx, bool full) const override;
 
-    virtual bool appendCustomStats(OperationContext* opCtx,
-                                   BSONObjBuilder* output,
-                                   double scale) const;
-    virtual Status dupKeyCheck(OperationContext* opCtx, const key_string::Value& keyString);
+    bool appendCustomStats(OperationContext* opCtx,
+                           BSONObjBuilder* output,
+                           double scale) const override;
+    Status dupKeyCheck(OperationContext* opCtx, const key_string::Value& keyString) override;
 
-    virtual bool isEmpty(OperationContext* opCtx);
+    bool isEmpty(OperationContext* opCtx) override;
 
-    virtual int64_t numEntries(OperationContext* opCtx) const;
+    int64_t numEntries(OperationContext* opCtx) const override;
 
-    virtual long long getSpaceUsedBytes(OperationContext* opCtx) const;
+    long long getSpaceUsedBytes(OperationContext* opCtx) const override;
 
-    virtual long long getFreeStorageBytes(OperationContext* opCtx) const;
+    long long getFreeStorageBytes(OperationContext* opCtx) const override;
 
-    virtual Status initAsEmpty(OperationContext* opCtx);
+    Status initAsEmpty(OperationContext* opCtx) override;
 
-    virtual void printIndexEntryMetadata(OperationContext* opCtx,
-                                         const key_string::Value& keyString) const;
+    void printIndexEntryMetadata(OperationContext* opCtx,
+                                 const key_string::Value& keyString) const override;
 
-    Status compact(OperationContext* opCtx) override;
+    StatusWith<int64_t> compact(OperationContext* opCtx, const CompactOptions& options) override;
 
     const std::string& uri() const {
         return _uri;
@@ -215,10 +215,10 @@ public:
                        const key_string::Value& keyString) = 0;
     virtual bool unique() const = 0;
     virtual bool isTimestampSafeUniqueIdx() const = 0;
-    void insertWithRecordIdInValue_forTest(OperationContext* opCtx,
-                                           const key_string::Value& keyString,
-                                           RecordId rid) override {
-        MONGO_UNREACHABLE;
+
+    bool hasOldFormatVersion() const {
+        return _dataFormatVersion == kDataFormatV3KeyStringV0UniqueIndexVersionV1 ||
+            _dataFormatVersion == kDataFormatV4KeyStringV1UniqueIndexVersionV2;
     }
 
 protected:
@@ -235,33 +235,30 @@ protected:
                           bool dupsAllowed) = 0;
 
     void setKey(WT_CURSOR* cursor, const WT_ITEM* item);
-    void getKey(OperationContext* opCtx, WT_CURSOR* cursor, WT_ITEM* key);
 
     /**
-     * Checks whether the prefix key defined by 'buffer' and 'size' is in the index. If it is,
-     * returns the RecordId of the first matching key and positions the cursor 'c' on that key.
+     * Load the key positioned by this cursor into 'key'. When metrics is provided, count the
+     * size towards resource consumption metrics.
      */
-    boost::optional<RecordId> _keyExists(OperationContext* opCtx,
-                                         WT_CURSOR* c,
-                                         const char* buffer,
-                                         size_t size);
+    void getKey(WT_CURSOR* cursor, WT_ITEM* key, ResourceConsumption::MetricsCollector* metrics);
 
     /**
      * Checks whether the prefix key defined by 'keyString' and 'sizeWithoutRecordId' is in the
      * index. If it is, returns the RecordId of the first matching key and positions the cursor 'c'
      * on that key.
      */
-    boost::optional<RecordId> _keyExistsBounded(OperationContext* opCtx,
-                                                WT_CURSOR* c,
-                                                const key_string::Value& keyString,
-                                                size_t sizeWithoutRecordId);
+    boost::optional<RecordId> _keyExists(OperationContext* opCtx,
+                                         WT_CURSOR* c,
+                                         const key_string::Value& keyString,
+                                         size_t sizeWithoutRecordId);
 
     /**
      * Sets the upper bound on the passed in cursor to be the maximum value of the KeyString prefix.
+     * Used when checking if a specific key prefix exists.
      */
-    void _setUpperBound(WT_CURSOR* c,
-                        const key_string::Value& keyString,
-                        size_t sizeWithoutRecordId);
+    void _setUpperBoundForKeyExists(WT_CURSOR* c,
+                                    const key_string::Value& keyString,
+                                    size_t sizeWithoutRecordId);
 
     /**
      * Returns a DuplicateKey error if the prefix key exists in the index with a different RecordId.
@@ -305,7 +302,7 @@ protected:
      * constructed.
      */
     int _dataFormatVersion;
-    std::string _uri;
+    const std::string _uri;
     uint64_t _tableId;
     const UUID _collectionUUID;
     const std::string _indexName;
@@ -338,9 +335,6 @@ public:
 
     bool isDup(OperationContext* opCtx, WT_CURSOR* c, const key_string::Value& keyString) override;
 
-    void insertWithRecordIdInValue_forTest(OperationContext* opCtx,
-                                           const key_string::Value& keyString,
-                                           RecordId rid) override;
 
 protected:
     Status _insert(OperationContext* opCtx,
@@ -356,9 +350,9 @@ protected:
                   bool dupsAllowed) override;
 
     /**
-     * This function continues to exist in order to support v4.0 unique partial index format: the
-     * format changed in v4.2 and onward. _unindex will call this if an index entry in the new
-     * format cannot be found, and this function will check for the old format.
+     * This function continues to exist in order to support v4.0 unique index format: the format
+     * changed in v4.2 and onward. _unindex will call this if an index entry in the new format
+     * cannot be found, and this function will check for the old format.
      */
     void _unindexTimestampUnsafe(OperationContext* opCtx,
                                  WT_CURSOR* c,
@@ -366,7 +360,9 @@ protected:
                                  bool dupsAllowed);
 
 private:
-    bool _partial;
+    Status _insertOldFormatKey(OperationContext* opCtx,
+                               WT_CURSOR* c,
+                               const key_string::Value& keyString);
 };
 
 class WiredTigerIdIndex : public WiredTigerIndex {

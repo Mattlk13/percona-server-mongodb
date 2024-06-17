@@ -55,8 +55,8 @@
 #include "mongo/db/record_id_helpers.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/duration.h"
@@ -77,11 +77,11 @@ namespace {
 // not 'off', boost::none otherwise.
 boost::optional<std::int64_t> getExpireAfterSecondsFromChangeStreamOptions(
     ChangeStreamOptions& changeStreamOptions) {
-    const stdx::variant<std::string, std::int64_t>& expireAfterSeconds =
+    const std::variant<std::string, std::int64_t>& expireAfterSeconds =
         changeStreamOptions.getPreAndPostImages().getExpireAfterSeconds();
 
-    if (!stdx::holds_alternative<std::string>(expireAfterSeconds)) {
-        return stdx::get<std::int64_t>(expireAfterSeconds);
+    if (!holds_alternative<std::string>(expireAfterSeconds)) {
+        return get<std::int64_t>(expireAfterSeconds);
     }
 
     return boost::none;
@@ -154,10 +154,6 @@ void truncateRange(OperationContext* opCtx,
                    const RecordId& maxRecordId,
                    int64_t bytesDeleted,
                    int64_t docsDeleted) {
-    // Exclusively truncate based on the most recent WT snapshot.
-    opCtx->recoveryUnit()->abandonSnapshot();
-    opCtx->recoveryUnit()->allowOneUntimestampedWrite();
-
     WriteUnitOfWork wuow(opCtx);
     auto rs = preImagesColl->getRecordStore();
     auto status = rs->rangeTruncate(opCtx, minRecordId, maxRecordId, -bytesDeleted, -docsDeleted);
@@ -167,21 +163,12 @@ void truncateRange(OperationContext* opCtx,
 
 void truncatePreImagesByTimestampExpirationApproximation(
     OperationContext* opCtx,
-    const CollectionPtr& preImagesColl,
+    const CollectionAcquisition& preImagesCollection,
     Timestamp expirationTimestampApproximation) {
 
-    stdx::unordered_set<UUID, UUID::Hash> nsUUIDs;
+    const auto nsUUIDs = change_stream_pre_image_util::getNsUUIDs(opCtx, preImagesCollection);
 
-    // Placeholder for the wall time of the first document of the current pre-images internal
-    // collection being examined.
-    Date_t firstDocWallTime{};
-    boost::optional<UUID> currentNsUUID = boost::none;
-    while ((currentNsUUID = change_stream_pre_image_util::findNextCollectionUUID(
-                opCtx, &preImagesColl, currentNsUUID, firstDocWallTime))) {
-        nsUUIDs.emplace(*currentNsUUID);
-    }
-
-    for (auto nsUUID : nsUUIDs) {
+    for (const auto& nsUUID : nsUUIDs) {
         RecordId minRecordId =
             change_stream_pre_image_util::getAbsoluteMinPreImageRecordIdBoundForNs(nsUUID)
                 .recordId();
@@ -192,16 +179,15 @@ void truncatePreImagesByTimestampExpirationApproximation(
                     nsUUID, expirationTimestampApproximation, std::numeric_limits<int64_t>::max())))
                 .recordId();
 
-        writeConflictRetry(
-            opCtx,
-            "truncate pre-images by approximate timestamp expiration",
-            preImagesColl->ns(),
-            [&] {
-                // Truncation is based on Timestamp expiration approximation -
-                // meaning there isn't a good estimate of the number of bytes and
-                // documents to be truncated, so default to 0.
-                truncateRange(opCtx, preImagesColl, minRecordId, maxRecordIdApproximation, 0, 0);
-            });
+        // Truncation is based on Timestamp expiration approximation -
+        // meaning there isn't a good estimate of the number of bytes and
+        // documents to be truncated, so default to 0.
+        truncateRange(opCtx,
+                      preImagesCollection.getCollectionPtr(),
+                      minRecordId,
+                      maxRecordIdApproximation,
+                      0,
+                      0);
     }
 }
 
@@ -238,6 +224,21 @@ boost::optional<UUID> findNextCollectionUUID(OperationContext* opCtx,
 
     firstDocWallTime = preImageObj[ChangeStreamPreImage::kOperationTimeFieldName].date();
     return getPreImageNsUUID(preImageObj);
+}
+
+stdx::unordered_set<UUID, UUID::Hash> getNsUUIDs(OperationContext* opCtx,
+                                                 const CollectionAcquisition& preImagesCollection) {
+    stdx::unordered_set<UUID, UUID::Hash> nsUUIDs;
+    boost::optional<UUID> currentCollectionUUID = boost::none;
+    Date_t firstWallTime{};
+    while ((currentCollectionUUID = change_stream_pre_image_util::findNextCollectionUUID(
+                opCtx,
+                &preImagesCollection.getCollectionPtr(),
+                currentCollectionUUID,
+                firstWallTime))) {
+        nsUUIDs.emplace(*currentCollectionUUID);
+    }
+    return nsUUIDs;
 }
 
 Date_t getCurrentTimeForPreImageRemoval(OperationContext* opCtx) {

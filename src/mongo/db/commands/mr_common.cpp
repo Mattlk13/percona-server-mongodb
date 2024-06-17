@@ -88,14 +88,15 @@
 namespace mongo::map_reduce_common {
 
 namespace {
-
 using namespace std::string_literals;
 
 Status interpretTranslationError(DBException* ex, const MapReduceCommandRequest& parsedMr) {
+    using namespace fmt::literals;
+
     auto status = ex->toStatus();
     auto outOptions = parsedMr.getOutOptions();
     const auto outNss = outOptions.getDatabaseName()
-        ? NamespaceStringUtil::deserialize(parsedMr.getDollarTenant(),
+        ? NamespaceStringUtil::deserialize(parsedMr.getDbName().tenantId(),
                                            *outOptions.getDatabaseName(),
                                            ""_sd,
                                            SerializationContext::stateDefault())
@@ -439,7 +440,7 @@ bool mrSupportsWriteConcern(const BSONObj& cmd) {
 std::unique_ptr<Pipeline, PipelineDeleter> translateFromMR(
     MapReduceCommandRequest parsedMr, boost::intrusive_ptr<ExpressionContext> expCtx) {
     const auto outNss = parsedMr.getOutOptions().getDatabaseName()
-        ? (NamespaceStringUtil::deserialize(parsedMr.getDollarTenant(),
+        ? (NamespaceStringUtil::deserialize(parsedMr.getDbName().tenantId(),
                                             *parsedMr.getOutOptions().getDatabaseName(),
                                             parsedMr.getOutOptions().getCollectionName(),
                                             SerializationContext::stateDefault()))

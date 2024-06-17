@@ -169,9 +169,9 @@ BaseCloner::AfterStageBehavior AllDatabaseCloner::getInitialSyncIdStage() {
 
 BaseCloner::AfterStageBehavior AllDatabaseCloner::listDatabasesStage() {
     std::vector<mongo::BSONObj> databasesArray;
+    const auto fcvSnapshot = serverGlobalParams.featureCompatibility.acquireFCVSnapshot();
     const bool multiTenancyAndRequireTenantIdEnabled = gMultitenancySupport &&
-        serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-        gFeatureFlagRequireTenantID.isEnabled(serverGlobalParams.featureCompatibility);
+        fcvSnapshot.isVersionInitialized() && gFeatureFlagRequireTenantID.isEnabled(fcvSnapshot);
 
     databasesArray = getClient()->getDatabaseInfos(
         BSONObj(),
@@ -247,11 +247,6 @@ void AllDatabaseCloner::postStage() {
 
             BSONObj cmdObj = BSON("dbStats" << 1);
             BSONObjBuilder b(cmdObj);
-            if (gMultitenancySupport &&
-                gFeatureFlagRequireTenantID.isEnabled(serverGlobalParams.featureCompatibility) &&
-                dbName.tenantId()) {
-                dbName.tenantId()->serializeToBSON("$tenant", &b);
-            }
 
             BSONObj res;
             getClient()->runCommand(dbName, b.obj(), res);
@@ -312,7 +307,7 @@ void AllDatabaseCloner::postStage() {
                     opCtxPtr = cc().makeOperationContext();
                     opCtx = opCtxPtr.get();
                 }
-                auto authzManager = AuthorizationManager::get(opCtx->getServiceContext());
+                auto authzManager = AuthorizationManager::get(opCtx->getService());
 
                 // Check if global admin has a valid auth schema version document.
                 if (!dbName.tenantId() && !foundAuthSchemaDoc) {

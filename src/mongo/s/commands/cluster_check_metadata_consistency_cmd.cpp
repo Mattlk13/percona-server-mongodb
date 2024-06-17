@@ -54,7 +54,6 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/database_name.h"
-#include "mongo/db/feature_flag.h"
 #include "mongo/db/metadata_consistency_types_gen.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
@@ -171,14 +170,18 @@ public:
                                   << nss.coll(),
                     nss.isCollectionlessCursorNamespace());
 
-            std::vector<std::pair<ShardId, BSONObj>> requests;
+            std::vector<AsyncRequestsSender::Request> requests;
             ShardsvrCheckMetadataConsistency shardsvrRequest{nss};
             shardsvrRequest.setCommonFields(request().getCommonFields());
             shardsvrRequest.setCursor(request().getCursor());
 
             // Send a request to all shards that are primaries for at least one database
             const auto shardOpKey = UUID::gen();
-            auto shardRequestWithOpKey = appendOpKey(shardOpKey, shardsvrRequest.toBSON({}));
+            BSONObjBuilder shardRequestBob;
+            shardsvrRequest.serialize(BSONObj(), &shardRequestBob);
+            appendOpKey(shardOpKey, &shardRequestBob);
+            auto shardRequestWithOpKey = shardRequestBob.obj();
+
             for (auto&& shardId : getAllDbPrimaryShards(opCtx)) {
                 requests.emplace_back(std::move(shardId), shardRequestWithOpKey.getOwned());
             }
@@ -188,8 +191,11 @@ public:
             ConfigsvrCheckClusterMetadataConsistency configsvrRequest;
             configsvrRequest.setDbName(DatabaseName::kAdmin);
             configsvrRequest.setCursor(request().getCursor());
-            requests.emplace_back(ShardId::kConfigServerId,
-                                  appendOpKey(configOpKey, configsvrRequest.toBSON({})));
+
+            BSONObjBuilder configRequestBob;
+            configsvrRequest.serialize(BSONObj(), &configRequestBob);
+            appendOpKey(configOpKey, &configRequestBob);
+            requests.emplace_back(ShardId::kConfigServerId, configRequestBob.obj());
 
             auto ccc = _establishCursors(opCtx, nss, requests, {shardOpKey, configOpKey});
             return _createInitialCursorReply(opCtx, nss, std::move(ccc));
@@ -224,7 +230,7 @@ public:
         ClusterClientCursorGuard _establishCursors(
             OperationContext* opCtx,
             const NamespaceString& nss,
-            const std::vector<std::pair<ShardId, BSONObj>>& requests,
+            const std::vector<AsyncRequestsSender::Request>& requests,
             std::vector<OperationKey> opKeys = {}) {
 
             ClusterClientCursorParams params(
@@ -385,9 +391,7 @@ public:
     };
 };
 
-MONGO_REGISTER_COMMAND(CheckMetadataConsistencyCmd)
-    .requiresFeatureFlag(&feature_flags::gCheckMetadataConsistency)
-    .forRouter();
+MONGO_REGISTER_COMMAND(CheckMetadataConsistencyCmd).forRouter();
 
 }  // namespace
 }  // namespace mongo

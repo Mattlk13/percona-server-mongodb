@@ -40,13 +40,13 @@
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/concurrency/lock_stats.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/prepare_conflict_tracker.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_prepare_conflict.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -90,7 +90,7 @@ void wiredTigerPrepareConflictOplogResourceLog() {
 }
 
 int wiredTigerPrepareConflictRetrySlow(OperationContext* opCtx, std::function<int()> func) {
-    if (opCtx->recoveryUnit()->isTimestamped()) {
+    if (shard_role_details::getRecoveryUnit(opCtx)->isTimestamped()) {
         // This transaction is holding a resource in the form of an oplog slot. Committed
         // transactions that get a later oplog slot will be unable to replicate until this resource
         // is released (in the form of this transaction committing or aborting). For this case, we
@@ -129,9 +129,8 @@ int wiredTigerPrepareConflictRetrySlow(OperationContext* opCtx, std::function<in
     CurOp::get(opCtx)->debug().additiveMetrics.incrementPrepareReadConflicts(1);
     wiredTigerPrepareConflictLog(attempts);
 
-    const auto lockerInfo = opCtx->lockState()->getLockerInfo(boost::none);
-    invariant(lockerInfo);
-    for (const auto& lock : lockerInfo->locks) {
+    const auto lockerInfo = shard_role_details::getLocker(opCtx)->getLockerInfo(boost::none);
+    for (const auto& lock : lockerInfo.locks) {
         const auto type = lock.resourceId.getType();
         // If a user operation on secondaries acquires a lock in MODE_S and then blocks on a prepare
         // conflict with a prepared transaction, deadlock will occur at the commit time of the
@@ -169,7 +168,7 @@ int wiredTigerPrepareConflictRetrySlow(OperationContext* opCtx, std::function<in
         wiredTigerPrepareConflictLog(attempts);
 
         // Wait on the session cache to signal that a unit of work has been committed or aborted.
-        recoveryUnit->getSessionCache()->waitUntilPreparedUnitOfWorkCommitsOrAborts(opCtx,
+        recoveryUnit->getSessionCache()->waitUntilPreparedUnitOfWorkCommitsOrAborts(*opCtx,
                                                                                     lastCount);
     }
 }

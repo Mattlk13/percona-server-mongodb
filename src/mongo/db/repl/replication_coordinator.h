@@ -46,6 +46,7 @@
 #include "mongo/bson/oid.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/client/connection_string.h"
+#include "mongo/db/common_request_args_gen.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
@@ -141,7 +142,7 @@ public:
         StatusAndDuration(const Status& stat, Milliseconds ms) : status(stat), duration(ms) {}
     };
 
-    virtual ~ReplicationCoordinator();
+    ~ReplicationCoordinator() override;
 
     /**
      * Does any initial bookkeeping needed to start replication, and instructs the other
@@ -370,61 +371,56 @@ public:
                                              const NamespaceString& ns) = 0;
 
     /**
-     * Updates our internal tracking of the last OpTime applied to this node. Also updates our
-     * internal tracking of the wall clock time corresponding to that operation.
-     *
-     * The new value of "opTime" must be no less than any prior value passed to this method, and
-     * it is the caller's job to properly synchronize this behavior.  The exception to this rule
-     * is that after calls to resetLastOpTimesFromOplog(), the minimum acceptable value for
-     * "opTime" is reset based on the contents of the oplog, and may go backwards due to
-     * rollback. Additionally, the optime given MUST represent a consistent database state.
+     * Updates our internal tracking of the last OpTime that an oplog entry is written into memory
+     * on this node if the supplied optime is later than the current lastWritten OpTime.
      */
-    virtual void setMyLastAppliedOpTimeAndWallTime(const OpTimeAndWallTime& opTimeAndWallTime) = 0;
+    virtual void setMyLastWrittenOpTimeAndWallTimeForward(
+        const OpTimeAndWallTime& opTimeAndWallTime) = 0;
 
     /**
-     * Updates our internal tracking of the last OpTime durable to this node. Also updates our
-     * internal tracking of the wall clock time corresponding to that operation.
-     *
-     * The new value of "opTime" must be no less than any prior value passed to this method, and
-     * it is the caller's job to properly synchronize this behavior.  The exception to this rule
-     * is that after calls to resetLastOpTimesFromOplog(), the minimum acceptable value for
-     * "opTime" is reset based on the contents of the oplog, and may go backwards due to
-     * rollback.
-     */
-    virtual void setMyLastDurableOpTimeAndWallTime(const OpTimeAndWallTime& opTimeAndWallTime) = 0;
-
-    /**
-     * Updates our internal tracking of the last OpTime applied to this node, but only
-     * if the supplied optime is later than the current last OpTime known to the replication
+     * Updates our internal tracking of the last OpTime applied to this node, but only if the
+     * supplied optime is later than the current lastApplied OpTime known to the replication
      * coordinator.
      *
-     * This function is used by logOp() on a primary, since the ops in the oplog do not
-     * necessarily commit in sequential order. It is also used when we finish oplog batch
-     * application on secondaries, to avoid any potential race conditions around setting the
-     * applied optime from more than one thread.
+     * This function is only used on secondary and the caller needs to make sure the input opTime is
+     * not greater than the current lastWritten timestamp.
      *
      * Since the last applied op time and wall time might not be visible (i.e. there may be
      * "oplog holes" from oplog entries with earlier timestamps which commit after this one)
      * this method does not notify oplog waiters.  Callers which know the new lastApplied is at
      * a no-holes point should call signalOplogWaiters after calling this method.
-     *
-     * If advanceGlobalTimestamp is false, we will not advance the global OpTime. The caller takes
-     * responsibility for doing this instead.
      */
     virtual void setMyLastAppliedOpTimeAndWallTimeForward(
-        const OpTimeAndWallTime& opTimeAndWallTime, bool advanceGlobalTimestamp = true) = 0;
+        const OpTimeAndWallTime& opTimeAndWallTime) = 0;
 
     /**
-     * Updates our internal tracking of the last OpTime durable to this node, but only
-     * if the supplied optime is later than the current last OpTime known to the replication
+     * Updates our internal tracking of the last OpTime durable to this node, but only if the
+     * supplied optime is later than the current lastDurable OpTime known to the replication
      * coordinator. Also updates the wall clock time corresponding to that operation.
      *
-     * This function is used by logOp() on a primary, since the ops in the oplog do not
-     * necessarily commit in sequential order.
+     * This function is used by onDurable() hook on secondary, while primary should use
+     * setMyLastDurableAndLastWrittenOpTimeAndWallTimeForward() instead. The caller needs to make
+     * sure the input opTime is not greater than the current lastWritten timestamp.
      */
     virtual void setMyLastDurableOpTimeAndWallTimeForward(
         const OpTimeAndWallTime& opTimeAndWallTime) = 0;
-    // virtual void setMyLastDurableOpTimeForward(const OpTimeAndWallTime& opTimeAndWallTime) = 0;
+
+    /**
+     * Update lastApplied and lastWritten under the same lock guard. This is used by the oplog
+     * onCommit() hook on the primary.
+     */
+    virtual void setMyLastAppliedAndLastWrittenOpTimeAndWallTimeForward(
+        const OpTimeAndWallTime& opTimeAndWallTime) = 0;
+
+    /**
+     * Update lastDurable and lastWritten under the same lock guard. This should only be used on
+     * primary due to an edge case that the onCommit() hook is stuck at somewhere and lastWritten
+     * has not been updated yet. On secondary, we always write oplog into in-memory collection first
+     * before journal flush, which means that lastWritten should already be updated, so we should
+     * use setMyLastDurableOpTimeAndWallTimeForward() instead.
+     */
+    virtual void setMyLastDurableAndLastWrittenOpTimeAndWallTimeForward(
+        const OpTimeAndWallTime& opTimeAndWallTime) = 0;
 
     /**
      * Same as above, but used during places we need to zero our last optime.
@@ -437,6 +433,22 @@ public:
     virtual void setMyHeartbeatMessage(const std::string& msg) = 0;
 
     /**
+     * Returns the last optime recorded by setMyLastWrittenOpTimeAndWallTimeForward.
+     */
+    virtual OpTime getMyLastWrittenOpTime() const = 0;
+
+    /*
+     * Returns the same as getMyLastWrittenOpTime() and additionally returns the wall clock time
+     * corresponding to that OpTime.
+     *
+     * When rollbackSafe is true, this returns an empty OpTimeAndWallTime if the node is in ROLLBACK
+     * state. The lastWrittenOpTime during ROLLBACK might be temporarily pointing to an oplog entry
+     * in the divergent branch of history which would become invalid after the rollback finishes.
+     */
+    virtual OpTimeAndWallTime getMyLastWrittenOpTimeAndWallTime(
+        bool rollbackSafe = false) const = 0;
+
+    /**
      * Returns the last optime recorded by setMyLastAppliedOpTime.
      */
     virtual OpTime getMyLastAppliedOpTime() const = 0;
@@ -444,13 +456,8 @@ public:
     /*
      * Returns the same as getMyLastAppliedOpTime() and additionally returns the wall clock time
      * corresponding to that OpTime.
-     *
-     * When rollbackSafe is true, this returns an empty OpTimeAndWallTime if the node is in ROLLBACK
-     * state. The lastAppliedOpTime during ROLLBACK might be temporarily pointing to an oplog entry
-     * in the divergent branch of history which would become invalid after the rollback finishes.
      */
-    virtual OpTimeAndWallTime getMyLastAppliedOpTimeAndWallTime(
-        bool rollbackSafe = false) const = 0;
+    virtual OpTimeAndWallTime getMyLastAppliedOpTimeAndWallTime() const = 0;
 
     /**
      * Returns the last optime recorded by setMyLastDurableOpTime.
@@ -486,6 +493,9 @@ public:
      */
     virtual Status waitUntilOpTimeForReadUntil(OperationContext* opCtx,
                                                const ReadConcernArgs& settings,
+                                               boost::optional<Date_t> deadline) = 0;
+    virtual Status waitUntilOpTimeWrittenUntil(OperationContext* opCtx,
+                                               LogicalTime clusterTime,
                                                boost::optional<Date_t> deadline) = 0;
 
     /**
@@ -719,10 +729,16 @@ public:
     virtual Status validateWriteConcern(const WriteConcernOptions& writeConcern) const = 0;
 
     /**
-     * Returns a pointer to the MemberConfig corresponding to the member with the given
-     * HostAndPort in the current ReplSetConfig, or NULL if there is no member with that address.
+     * Returns a copy of the MemberConfig corresponding to the member with the given
+     * HostAndPort in the current ReplSetConfig, or boost::none if there is no member with that
+     * address.
+     *
+     * This is deprecated because the previous version of this method returned a pointer to an
+     * internal structure that could change at any time, and getting member information is
+     * inherently racy; member configuration can change at any time.
      */
-    virtual const MemberConfig* findConfigMemberByHostAndPort(const HostAndPort& hap) const = 0;
+    virtual boost::optional<MemberConfig> findConfigMemberByHostAndPort_deprecated(
+        const HostAndPort& hap) const = 0;
 
     /**
      * Returns whether all members of the current ReplSetConfig set have hostname localhost.
@@ -952,7 +968,7 @@ public:
      * Prepares a metadata object with the ReplSetMetadata and the OplogQueryMetadata depending
      * on what has been requested.
      */
-    virtual void prepareReplMetadata(const BSONObj& metadataRequestObj,
+    virtual void prepareReplMetadata(const CommonRequestArgs& requestArgs,
                                      const OpTime& lastOpTimeFromClient,
                                      BSONObjBuilder* builder) const = 0;
 
@@ -1048,11 +1064,6 @@ public:
      * mode.
      */
     virtual void incrementNumCatchUpOpsIfCatchingUp(long numOps) = 0;
-
-    /**
-     * Signals that drop pending collections have been removed from storage.
-     */
-    virtual void signalDropPendingCollectionsRemovedFromStorage() = 0;
 
     /**
      * Returns true if logOp() should not append an entry to the oplog for this operation.

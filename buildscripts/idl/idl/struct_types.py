@@ -329,7 +329,7 @@ class _StructTypeInfo(StructTypeInfoBase):
         # type: () -> MethodInfo
         args = ['BSONObjBuilder* builder']
         if self._struct.query_shape_component:
-            args.append("SerializationOptions options = {}")
+            args.append("const SerializationOptions& options = {}")
         return MethodInfo(
             common.title_case(self._struct.cpp_name), 'serialize', args, 'void', const=True)
 
@@ -337,7 +337,7 @@ class _StructTypeInfo(StructTypeInfoBase):
         # type: () -> MethodInfo
         args = []
         if self._struct.query_shape_component:
-            args.append("SerializationOptions options = {}")
+            args.append("const SerializationOptions& options = {}")
         return MethodInfo(
             common.title_case(self._struct.cpp_name), 'toBSON', args, 'BSONObj', const=True)
 
@@ -666,7 +666,7 @@ class _CommandWithUUIDNamespaceTypeInfo(_CommandBaseTypeInfo):
         indented_writer.write_line(
             'auto collOrUUID = ctxt.checkAndAssertCollectionNameOrUUID(%s);' % (element))
         indented_writer.write_line(
-            '_nssOrUUID = stdx::holds_alternative<StringData>(collOrUUID) ? NamespaceStringUtil::deserialize(%s, stdx::get<StringData>(collOrUUID)) : NamespaceStringOrUUID(%s, stdx::get<UUID>(collOrUUID));'
+            '_nssOrUUID = std::holds_alternative<StringData>(collOrUUID) ? NamespaceStringUtil::deserialize(%s, get<StringData>(collOrUUID)) : NamespaceStringOrUUID(%s, get<UUID>(collOrUUID));'
             % (db_name, db_name))
         indented_writer.write_line(
             'uassert(ErrorCodes::InvalidNamespace, str::stream() << "Invalid namespace specified: "'

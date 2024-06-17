@@ -125,9 +125,7 @@ public:
 
     void popOldestMarker();
 
-    void createNewMarkerIfNeeded(OperationContext* opCtx,
-                                 const RecordId& lastRecord,
-                                 Date_t wallTime);
+    void createNewMarkerIfNeeded(const RecordId& lastRecord, Date_t wallTime);
 
     // Updates the current marker with the inserted value if the operation commits the WUOW.
     virtual void updateCurrentMarkerAfterInsertOnCommit(OperationContext* opCtx,
@@ -361,11 +359,11 @@ public:
     // the partial marker and whether the implementation's '_hasPartialMarkerExpired' returns true.
     void createPartialMarkerIfNecessary(OperationContext* opCtx);
 
-    virtual void updateCurrentMarkerAfterInsertOnCommit(OperationContext* opCtx,
-                                                        int64_t bytesInserted,
-                                                        const RecordId& highestInsertedRecordId,
-                                                        Date_t wallTime,
-                                                        int64_t countInserted) final;
+    void updateCurrentMarkerAfterInsertOnCommit(OperationContext* opCtx,
+                                                int64_t bytesInserted,
+                                                const RecordId& highestInsertedRecordId,
+                                                Date_t wallTime,
+                                                int64_t countInserted) final;
 
     std::pair<const RecordId&, const Date_t&> getPartialMarker_forTest() const {
         return {_lastHighestRecordId, _lastHighestWallTime};
@@ -398,8 +396,7 @@ protected:
         return fn(_lastHighestRecordId, _lastHighestWallTime);
     }
 
-    void updateCurrentMarker(OperationContext* opCtx,
-                             int64_t bytesAdded,
+    void updateCurrentMarker(int64_t bytesAdded,
                              const RecordId& highestRecordId,
                              Date_t highestWallTime,
                              int64_t numRecordsAdded);
@@ -418,7 +415,7 @@ public:
         reset(opCtx);
     }
 
-    virtual boost::optional<std::pair<RecordId, BSONObj>> getNext() final {
+    boost::optional<std::pair<RecordId, BSONObj>> getNext() final {
         auto record = _directionalCursor->next();
         if (!record) {
             return boost::none;
@@ -426,7 +423,7 @@ public:
         return std::make_pair(std::move(record->id), record->data.releaseToBson());
     }
 
-    virtual boost::optional<std::pair<RecordId, BSONObj>> getNextRandom() final {
+    boost::optional<std::pair<RecordId, BSONObj>> getNextRandom() final {
         auto record = _randomCursor->next();
         if (!record) {
             return boost::none;
@@ -434,11 +431,11 @@ public:
         return std::make_pair(std::move(record->id), record->data.releaseToBson());
     }
 
-    virtual RecordStore* getRecordStore() const final {
+    RecordStore* getRecordStore() const final {
         return _rs;
     }
 
-    virtual void reset(OperationContext* opCtx) final {
+    void reset(OperationContext* opCtx) final {
         _directionalCursor = _rs->getCursor(opCtx);
         _randomCursor = _rs->getRandomCursor(opCtx);
     }
@@ -459,7 +456,7 @@ public:
         reset(opCtx);
     }
 
-    virtual boost::optional<std::pair<RecordId, BSONObj>> getNext() final {
+    boost::optional<std::pair<RecordId, BSONObj>> getNext() final {
         RecordId rId;
         BSONObj doc;
         if (_collScanExecutor->getNext(&doc, &rId) == PlanExecutor::IS_EOF) {
@@ -468,7 +465,7 @@ public:
         return std::make_pair(std::move(rId), std::move(doc));
     }
 
-    virtual boost::optional<std::pair<RecordId, BSONObj>> getNextRandom() final {
+    boost::optional<std::pair<RecordId, BSONObj>> getNextRandom() final {
         RecordId rId;
         BSONObj doc;
         if (_sampleExecutor->getNext(&doc, &rId) == PlanExecutor::IS_EOF) {
@@ -477,11 +474,11 @@ public:
         return std::make_pair(std::move(rId), std::move(doc));
     }
 
-    virtual RecordStore* getRecordStore() const final {
+    RecordStore* getRecordStore() const final {
         return _collection.getCollectionPtr()->getRecordStore();
     }
 
-    virtual void reset(OperationContext* opCtx) final {
+    void reset(OperationContext* opCtx) final {
         _collScanExecutor =
             InternalPlanner::collectionScan(opCtx,
                                             _collection,

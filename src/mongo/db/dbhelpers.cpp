@@ -137,11 +137,10 @@ RecordId Helpers::findOne(OperationContext* opCtx,
             .allowedFeatures = MatchExpressionParser::kAllowAllSpecialFeatures}});
     cq->setForceGenerateRecordId(true);
 
-    auto exec = uassertStatusOK(getExecutor(opCtx,
-                                            &collection,
-                                            std::move(cq),
-                                            nullptr /* extractAndAttachPipelineStages */,
-                                            PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY));
+    auto exec = uassertStatusOK(getExecutorFind(opCtx,
+                                                MultipleCollectionAccessor{collection},
+                                                std::move(cq),
+                                                PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY));
 
     PlanExecutor::ExecState state;
     BSONObj obj;
@@ -155,29 +154,18 @@ RecordId Helpers::findOne(OperationContext* opCtx,
 bool Helpers::findById(OperationContext* opCtx,
                        const NamespaceString& nss,
                        BSONObj query,
-                       BSONObj& result,
-                       bool* nsFound,
-                       bool* indexFound) {
+                       BSONObj& result) {
     auto collCatalog = CollectionCatalog::get(opCtx);
     const Collection* collection = collCatalog->lookupCollectionByNamespace(opCtx, nss);
     if (!collection) {
         return false;
     }
 
-    if (nsFound)
-        *nsFound = true;
-
     const IndexCatalog* catalog = collection->getIndexCatalog();
     const IndexDescriptor* desc = catalog->findIdIndex(opCtx);
 
     if (!desc) {
         if (clustered_util::isClusteredOnId(collection->getClusteredInfo())) {
-            if (indexFound) {
-                // A collection clustered on _id implicitly has an _id index but no explicit
-                // IndexDescriptor tied to it.
-                *indexFound = 1;
-            }
-
             Snapshotted<BSONObj> doc;
             if (collection->findDoc(opCtx,
                                     record_id_helpers::keyForObj(IndexBoundsBuilder::objFromElement(
@@ -190,9 +178,6 @@ bool Helpers::findById(OperationContext* opCtx,
 
         return false;
     }
-
-    if (indexFound)
-        *indexFound = 1;
 
     const IndexCatalogEntry* entry = catalog->getEntry(desc);
     auto recordId = entry->accessMethod()->asSortedData()->findSingle(
@@ -223,12 +208,12 @@ RecordId Helpers::findById(OperationContext* opCtx,
 }
 
 // Acquires necessary locks to read the collection with the given namespace. If this is an oplog
-// read, use AutoGetOplog for simplified locking.
+// read, use AutoGetOplogFastPath for simplified locking.
 const CollectionPtr& getCollectionForRead(
     OperationContext* opCtx,
     const NamespaceString& ns,
     boost::optional<AutoGetCollectionForReadCommand>& autoColl,
-    boost::optional<AutoGetOplog>& autoOplog) {
+    boost::optional<AutoGetOplogFastPath>& autoOplog) {
     if (ns.isOplog()) {
         // Simplify locking rules for oplog collection.
         autoOplog.emplace(opCtx, OplogAccessMode::kRead);
@@ -241,7 +226,7 @@ const CollectionPtr& getCollectionForRead(
 
 bool Helpers::getSingleton(OperationContext* opCtx, const NamespaceString& nss, BSONObj& result) {
     boost::optional<AutoGetCollectionForReadCommand> autoColl;
-    boost::optional<AutoGetOplog> autoOplog;
+    boost::optional<AutoGetOplogFastPath> autoOplog;
     const auto& collection = getCollectionForRead(opCtx, nss, autoColl, autoOplog);
     if (!collection) {
         return false;
@@ -266,7 +251,7 @@ bool Helpers::getSingleton(OperationContext* opCtx, const NamespaceString& nss, 
 
 bool Helpers::getLast(OperationContext* opCtx, const NamespaceString& nss, BSONObj& result) {
     boost::optional<AutoGetCollectionForReadCommand> autoColl;
-    boost::optional<AutoGetOplog> autoOplog;
+    boost::optional<AutoGetOplogFastPath> autoOplog;
     const auto& collection = getCollectionForRead(opCtx, nss, autoColl, autoOplog);
     if (!collection) {
         return false;

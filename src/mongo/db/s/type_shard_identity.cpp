@@ -83,12 +83,9 @@ Status ShardIdentityType::validate(bool fassert) const {
                               << ConnectionString::typeToString(configsvrConnStr.type())};
     }
 
-    // (Ignore FCV check): Auto-bootstrapping happens irrespective of the FCV when
-    // gFeatureFlagAllMongodsAreSharded is enabled.
-    if (gFeatureFlagAllMongodsAreSharded.isEnabledAndIgnoreFCVUnsafe() && fassert) {
-        // With auto-bootstrapping, we rely on detecting a discrepancy between a server's cluster
-        // role and the shard identity document to prevent a replica set from running with mixed
-        // cluster roles. See SERVER-80249 for more information.
+    if (fassert) {
+        // We rely on detecting a discrepancy between a server's cluster role and the shard identity
+        // document to prevent a replica set from running with mixed cluster roles.
         const bool isShardIdConfigServer = getShardName() == ShardId::kConfigServerId;
         if (!isShardIdConfigServer &&
             serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
@@ -96,8 +93,7 @@ Status ShardIdentityType::validate(bool fassert) const {
                                 "Shard identity document for a shard server was detected, but the "
                                 "server is not a dedicated shard server. To fix this, restart this "
                                 "server with --shardsvr.");
-        } else if (isShardIdConfigServer &&
-                   serverGlobalParams.clusterRole.hasExclusively(ClusterRole::ShardServer)) {
+        } else if (isShardIdConfigServer && serverGlobalParams.clusterRole.isShardOnly()) {
             LOGV2_FATAL_NOTRACE(8024902,
                                 "Shard identity document for a config server was detected, but the "
                                 "server is not a config server. To fix this, restart this server "

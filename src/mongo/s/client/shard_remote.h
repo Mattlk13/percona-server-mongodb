@@ -72,9 +72,9 @@ public:
                 const ConnectionString& connString,
                 std::unique_ptr<RemoteCommandTargeter> targeter);
 
-    ~ShardRemote();
+    ~ShardRemote() override;
 
-    ConnectionString getConnString() const override {
+    const ConnectionString& getConnString() const override {
         return _connString;
     }
 
@@ -94,11 +94,17 @@ public:
                                  const DatabaseName& dbName,
                                  const BSONObj& cmdObj) final;
 
-    Status runAggregation(
-        OperationContext* opCtx,
-        const AggregateCommandRequest& aggRequest,
-        std::function<bool(const std::vector<BSONObj>& batch,
-                           const boost::optional<BSONObj>& postBatchResumeToken)> callback);
+    Status runAggregation(OperationContext* opCtx,
+                          const AggregateCommandRequest& aggRequest,
+                          std::function<bool(const std::vector<BSONObj>& batch,
+                                             const boost::optional<BSONObj>& postBatchResumeToken)>
+                              callback) override;
+
+    BatchedCommandResponse runBatchWriteCommand(OperationContext* opCtx,
+                                                Milliseconds maxTimeMS,
+                                                const BatchedCommandRequest& batchRequest,
+                                                const WriteConcernOptions& writeConcern,
+                                                RetryPolicy retryPolicy) final;
 
 private:
     struct AsyncCmdHandle {

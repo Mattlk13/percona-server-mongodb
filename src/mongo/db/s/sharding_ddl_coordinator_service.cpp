@@ -55,6 +55,7 @@
 #include "mongo/db/s/cleanup_structured_encryption_data_coordinator.h"
 #include "mongo/db/s/collmod_coordinator.h"
 #include "mongo/db/s/compact_structured_encryption_data_coordinator.h"
+#include "mongo/db/s/convert_to_capped_coordinator.h"
 #include "mongo/db/s/create_collection_coordinator.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/ddl_lock_manager.h"
@@ -69,6 +70,7 @@
 #include "mongo/db/s/reshard_collection_coordinator.h"
 #include "mongo/db/s/set_allow_migrations_coordinator.h"
 #include "mongo/db/s/sharding_ddl_coordinator.h"
+#include "mongo/db/s/untrack_unsplittable_collection_coordinator.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -95,52 +97,44 @@ std::shared_ptr<ShardingDDLCoordinator> constructShardingDDLCoordinatorInstance(
     switch (op.getId().getOperationType()) {
         case DDLCoordinatorTypeEnum::kMovePrimary:
             return std::make_shared<MovePrimaryCoordinator>(service, std::move(initialState));
-            break;
         case DDLCoordinatorTypeEnum::kDropDatabase:
             return std::make_shared<DropDatabaseCoordinator>(service, std::move(initialState));
-            break;
         case DDLCoordinatorTypeEnum::kDropCollection:
             return std::make_shared<DropCollectionCoordinator>(service, std::move(initialState));
-            break;
         case DDLCoordinatorTypeEnum::kRenameCollection:
             return std::make_shared<RenameCollectionCoordinator>(service, std::move(initialState));
-            break;
         case DDLCoordinatorTypeEnum::kCreateCollection:
             return std::make_shared<CreateCollectionCoordinator>(service, std::move(initialState));
-            break;
         case DDLCoordinatorTypeEnum::kRefineCollectionShardKeyPre71Compatible:
             return std::make_shared<RefineCollectionShardKeyCoordinatorPre71Compatible>(
                 service, std::move(initialState));
-            break;
-        case DDLCoordinatorTypeEnum::kCreateCollectionPre71Compatible:
+        case DDLCoordinatorTypeEnum::kCreateCollectionPre80Compatible:
             return std::make_shared<CreateCollectionCoordinatorLegacy>(service,
                                                                        std::move(initialState));
-            break;
         case DDLCoordinatorTypeEnum::kRefineCollectionShardKey:
             return std::make_shared<RefineCollectionShardKeyCoordinator>(service,
                                                                          std::move(initialState));
-            break;
         case DDLCoordinatorTypeEnum::kSetAllowMigrations:
             return std::make_shared<SetAllowMigrationsCoordinator>(service,
                                                                    std::move(initialState));
-            break;
         case DDLCoordinatorTypeEnum::kCollMod:
             return std::make_shared<CollModCoordinator>(service, std::move(initialState));
-            break;
         case DDLCoordinatorTypeEnum::kReshardCollection:
             return std::make_shared<ReshardCollectionCoordinator>(service, std::move(initialState));
-            break;
         case DDLCoordinatorTypeEnum::kCompactStructuredEncryptionData:
             return std::make_shared<CompactStructuredEncryptionDataCoordinator>(
                 service, std::move(initialState));
-            break;
         case DDLCoordinatorTypeEnum::kCleanupStructuredEncryptionData:
             return std::make_shared<CleanupStructuredEncryptionDataCoordinator>(
                 service, std::move(initialState));
-            break;
         case DDLCoordinatorTypeEnum::kMigrationBlockingOperation:
             return std::make_shared<MigrationBlockingOperationCoordinator>(service,
                                                                            std::move(initialState));
+        case DDLCoordinatorTypeEnum::kConvertToCapped:
+            return std::make_shared<ConvertToCappedCoordinator>(service, std::move(initialState));
+        case DDLCoordinatorTypeEnum::kUntrackUnsplittableCollection:
+            return std::make_shared<UntrackUnsplittableCollectionCoordinator>(
+                service, std::move(initialState));
         default:
             uasserted(ErrorCodes::BadValue,
                       str::stream()
@@ -202,7 +196,7 @@ ShardingDDLCoordinatorService::constructInstance(BSONObj initialState) {
     return coord;
 }
 
-std::unique_ptr<ShardingDDLCoordinatorExternalState>
+std::shared_ptr<ShardingDDLCoordinatorExternalState>
 ShardingDDLCoordinatorService::createExternalState() const {
     return _externalStateFactory->create();
 }
@@ -234,7 +228,7 @@ void ShardingDDLCoordinatorService::waitForOngoingCoordinatorsToFinish(
     }
 }
 
-void ShardingDDLCoordinatorService::_afterStepDown() {
+void ShardingDDLCoordinatorService::_onServiceTermination() {
     stdx::lock_guard lg(_mutex);
     _state = State::kPaused;
     _numCoordinatorsToWait = 0;
@@ -300,7 +294,9 @@ ExecutorFuture<void> ShardingDDLCoordinatorService::_rebuildService(
 }
 
 std::shared_ptr<ShardingDDLCoordinatorService::Instance>
-ShardingDDLCoordinatorService::getOrCreateInstance(OperationContext* opCtx, BSONObj coorDoc) {
+ShardingDDLCoordinatorService::getOrCreateInstance(OperationContext* opCtx,
+                                                   BSONObj coorDoc,
+                                                   bool checkOptions) {
 
     // Wait for all coordinators to be recovered before to allow the creation of new ones.
     waitForRecoveryCompletion(opCtx);
@@ -329,7 +325,7 @@ ShardingDDLCoordinatorService::getOrCreateInstance(OperationContext* opCtx, BSON
     auto [coordinator, created] = [&] {
         try {
             auto [coordinator, created] =
-                PrimaryOnlyService::getOrCreateInstance(opCtx, patchedCoorDoc);
+                PrimaryOnlyService::getOrCreateInstance(opCtx, patchedCoorDoc, checkOptions);
             return std::make_pair(
                 checked_pointer_cast<ShardingDDLCoordinator>(std::move(coordinator)),
                 std::move(created));

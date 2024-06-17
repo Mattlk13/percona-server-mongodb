@@ -70,8 +70,10 @@
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/explain_common.h"
 #include "mongo/db/query/explain_options.h"
-#include "mongo/db/query/query_stats/agg_key_generator.h"
-#include "mongo/db/query/query_stats/key_generator.h"
+#include "mongo/db/query/query_settings/query_settings_utils.h"
+#include "mongo/db/query/query_shape/agg_cmd_shape.h"
+#include "mongo/db/query/query_stats/agg_key.h"
+#include "mongo/db/query/query_stats/key.h"
 #include "mongo/db/query/query_stats/query_stats.h"
 #include "mongo/db/query/tailable_mode_gen.h"
 #include "mongo/db/server_options.h"
@@ -88,6 +90,7 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_aggregate.h"
 #include "mongo/s/query/cluster_aggregation_planner.h"
+#include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/transaction_router.h"
 #include "mongo/s/type_collection_common_types_gen.h"
 #include "mongo/stdx/unordered_set.h"
@@ -176,19 +179,25 @@ void appendEmptyResultSetWithStatus(OperationContext* opCtx,
     if (status == ErrorCodes::ShardNotFound) {
         status = {ErrorCodes::NamespaceNotFound, status.reason()};
     }
+    collectQueryStatsMongos(opCtx, std::move(CurOp::get(opCtx)->debug().queryStatsInfo.key));
     appendEmptyResultSet(opCtx, *result, status, nss);
 }
 
 void updateHostsTargetedMetrics(OperationContext* opCtx,
                                 const NamespaceString& executionNss,
                                 const boost::optional<ChunkManager>& cm,
-                                stdx::unordered_set<NamespaceString> involvedNamespaces) {
+                                const stdx::unordered_set<NamespaceString>& involvedNamespaces) {
     if (!cm)
         return;
 
     // Create a set of ShardIds that own a chunk belonging to any of the collections involved in
     // this pipeline. This will be used to determine whether the pipeline targeted all of the shards
     // that own chunks for any collection involved or not.
+    //
+    // Note that this will only take into account collections that are sharded. If the namespace is
+    // an unsharded collection we will not track which shard owns it here. This is to preserve
+    // semantics of the tracked host metrics since unsharded collections are tracked separately on
+    // its own value.
     std::set<ShardId> shardsOwningChunks = [&]() {
         std::set<ShardId> shardsIds;
 
@@ -220,8 +229,11 @@ void updateHostsTargetedMetrics(OperationContext* opCtx,
 
     auto nShardsTargeted = CurOp::get(opCtx)->debug().nShards;
     if (nShardsTargeted > 0) {
+        // shardsOwningChunks will only contain something if we targeted a sharded collection in the
+        // pipeline.
+        bool hasTargetedShardedCollection = !shardsOwningChunks.empty();
         auto targetType = NumHostsTargetedMetrics::get(opCtx).parseTargetType(
-            opCtx, nShardsTargeted, shardsOwningChunks.size());
+            opCtx, nShardsTargeted, shardsOwningChunks.size(), hasTargetedShardedCollection);
         NumHostsTargetedMetrics::get(opCtx).addNumHostsTargeted(
             NumHostsTargetedMetrics::QueryType::kAggregateCmd, targetType);
     }
@@ -332,6 +344,11 @@ std::unique_ptr<Pipeline, PipelineDeleter> parsePipelineAndRegisterQueryStats(
                 request, *pipeline, expCtx, involvedNamespaces, executionNss);
         });
     }
+
+    // Perform the query settings lookup and attach it to the ExpressionContext.
+    expCtx->setQuerySettings(query_settings::lookupQuerySettingsForAgg(
+        expCtx, request, *pipeline, involvedNamespaces, executionNss));
+
     return pipeline;
 }
 
@@ -381,15 +398,23 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
             !request.getRequestResumeToken() && !request.getResumeAfter());
 
     const auto isSharded = [](OperationContext* opCtx, const NamespaceString& nss) {
-        const auto [resolvedNsCM, _] =
-            uassertStatusOK(getCollectionRoutingInfoForTxnCmd(opCtx, nss));
+        auto criSW = getCollectionRoutingInfoForTxnCmd(opCtx, nss);
+
+        // If the ns is not found we assume its unsharded. It might be implicitly created as
+        // unsharded if this query does writes. An existing collection could also be concurrently
+        // sharded in between here and lock acquisition elsewhere reguardless so shardedness still
+        // needs to be checked after parsing too.
+        if (criSW.getStatus().code() == ErrorCodes::NamespaceNotFound) {
+            return false;
+        }
+        const auto [resolvedNsCM, _] = uassertStatusOK(criSW);
         return resolvedNsCM.isSharded();
     };
 
     liteParsedPipeline.verifyIsSupported(
         opCtx, isSharded, request.getExplain(), serverGlobalParams.enableMajorityReadConcern);
     auto hasChangeStream = liteParsedPipeline.hasChangeStream();
-    auto involvedNamespaces = liteParsedPipeline.getInvolvedNamespaces();
+    const auto& involvedNamespaces = liteParsedPipeline.getInvolvedNamespaces();
     auto shouldDoFLERewrite = ::mongo::shouldDoFLERewrite(request);
     auto startsWithQueue = liteParsedPipeline.startsWithQueue();
     auto requiresCollationForParsingUnshardedAggregate =
@@ -442,7 +467,11 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
                     shouldDoFLERewrite,
                     requiresCollationForParsingUnshardedAggregate);
                 pipeline->validateCommon(false);
-            } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+            } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>& ex) {
+                LOGV2_DEBUG(8396400,
+                            4,
+                            "Skipping query stats due to NamespaceNotFound",
+                            "status"_attr = ex.toStatus());
                 // ignore redundant NamespaceNotFound errors.
             }
 
@@ -479,6 +508,8 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
             stdx::lock_guard<Client> lk(*opCtx->getClient());
             CurOp::get(opCtx)->setShouldOmitDiagnosticInformation_inlock(lk, true);
         }
+
+        expCtx->initializeReferencedSystemVariables();
 
         // Optimize the pipeline if:
         // - We have a valid routing table.
@@ -552,77 +583,99 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
 
     if (request.getExplain()) {
         explain_common::generateServerInfo(result);
-        explain_common::generateServerParameters(opCtx, result);
+        explain_common::generateServerParameters(expCtx, result);
+    }
+
+    // Here we modify the original 'request' object by copying the query settings from 'expCtx' into
+    // it.
+    //
+    // In case when the original 'request' fails with the 'CommandOnShardedViewNotSupportedOnMongod'
+    // exception, we retrieve the view definition and run the resolved/expanded request. The
+    // resolved/expanded request must use the query settings matching the original request.
+    //
+    // By attaching the query settings to the original request object we can re-use the query
+    // settings even though the original 'expCtx' object has been already destroyed.
+    const auto& querySettings = expCtx->getQuerySettings();
+    if (!query_settings::utils::isDefault(querySettings)) {
+        request.setQuerySettings(querySettings);
     }
 
     auto status = [&]() {
-        switch (targeter.policy) {
-            case cluster_aggregation_planner::AggregationTargeter::TargetingPolicy::
-                kMongosRequired: {
-                // If this is an explain write the explain output and return.
-                auto expCtx = targeter.pipeline->getContext();
-                if (expCtx->explain) {
-                    auto opts = SerializationOptions{.verbosity = boost::make_optional(
-                                                         ExplainOptions::Verbosity::kQueryPlanner)};
-                    *result << "splitPipeline" << BSONNULL << "mongos"
-                            << Document{{"host", getHostNameCachedAndPort()},
-                                        {"stages", targeter.pipeline->writeExplainOps(opts)}};
-                    return Status::OK();
+        try {
+            switch (targeter.policy) {
+                case cluster_aggregation_planner::AggregationTargeter::TargetingPolicy::
+                    kMongosRequired: {
+                    // If this is an explain write the explain output and return.
+                    auto expCtx = targeter.pipeline->getContext();
+                    if (expCtx->explain) {
+                        auto opts =
+                            SerializationOptions{.verbosity = boost::make_optional(
+                                                     ExplainOptions::Verbosity::kQueryPlanner)};
+                        *result << "splitPipeline" << BSONNULL << "mongos"
+                                << Document{{"host",
+                                             prettyHostNameAndPort(
+                                                 expCtx->opCtx->getClient()->getLocalPort())},
+                                            {"stages", targeter.pipeline->writeExplainOps(opts)}};
+                        return Status::OK();
+                    }
+
+                    return cluster_aggregation_planner::runPipelineOnMongoS(
+                        namespaces,
+                        request.getCursor().getBatchSize().value_or(
+                            aggregation_request_helper::kDefaultBatchSize),
+                        std::move(targeter.pipeline),
+                        result,
+                        privileges);
                 }
 
-                return cluster_aggregation_planner::runPipelineOnMongoS(
-                    namespaces,
-                    request.getCursor().getBatchSize().value_or(
-                        aggregation_request_helper::kDefaultBatchSize),
-                    std::move(targeter.pipeline),
-                    result,
-                    privileges);
+                case cluster_aggregation_planner::AggregationTargeter::TargetingPolicy::kAnyShard: {
+                    const bool eligibleForSampling = !request.getExplain();
+                    return cluster_aggregation_planner::dispatchPipelineAndMerge(
+                        opCtx,
+                        std::move(targeter),
+                        aggregation_request_helper::serializeToCommandDoc(request),
+                        request.getCursor().getBatchSize().value_or(
+                            aggregation_request_helper::kDefaultBatchSize),
+                        namespaces,
+                        privileges,
+                        result,
+                        pipelineDataSource,
+                        eligibleForSampling);
+                }
+                case cluster_aggregation_planner::AggregationTargeter::TargetingPolicy::
+                    kSpecificShardOnly: {
+                    // Mark expCtx as tailable and await data so CCC behaves accordingly.
+                    expCtx->tailableMode = TailableModeEnum::kTailableAndAwaitData;
+
+                    uassert(6273801,
+                            "per shard cursor pipeline must contain $changeStream",
+                            hasChangeStream);
+
+                    ShardId shardId(std::string(request.getPassthroughToShard()->getShard()));
+
+                    // This is an aggregation pipeline started internally, so it is not eligible for
+                    // sampling.
+                    const bool eligibleForSampling = false;
+
+                    return cluster_aggregation_planner::runPipelineOnSpecificShardOnly(
+                        expCtx,
+                        namespaces,
+                        request.getExplain(),
+                        aggregation_request_helper::serializeToCommandDoc(request),
+                        privileges,
+                        shardId,
+                        eligibleForSampling,
+                        result);
+                }
+
+                    MONGO_UNREACHABLE;
             }
-
-            case cluster_aggregation_planner::AggregationTargeter::TargetingPolicy::kAnyShard: {
-                const bool eligibleForSampling = !request.getExplain();
-                return cluster_aggregation_planner::dispatchPipelineAndMerge(
-                    opCtx,
-                    std::move(targeter),
-                    aggregation_request_helper::serializeToCommandDoc(request),
-                    request.getCursor().getBatchSize().value_or(
-                        aggregation_request_helper::kDefaultBatchSize),
-                    namespaces,
-                    privileges,
-                    result,
-                    pipelineDataSource,
-                    eligibleForSampling);
-            }
-            case cluster_aggregation_planner::AggregationTargeter::TargetingPolicy::
-                kSpecificShardOnly: {
-                // Mark expCtx as tailable and await data so CCC behaves accordingly.
-                expCtx->tailableMode = TailableModeEnum::kTailableAndAwaitData;
-
-                uassert(6273801,
-                        "per shard cursor pipeline must contain $changeStream",
-                        hasChangeStream);
-
-                ShardId shardId(std::string(request.getPassthroughToShard()->getShard()));
-
-                // This is an aggregation pipeline started internally, so it is not eligible for
-                // sampling.
-                const bool eligibleForSampling = false;
-
-                return cluster_aggregation_planner::runPipelineOnSpecificShardOnly(
-                    expCtx,
-                    namespaces,
-                    request.getExplain(),
-                    aggregation_request_helper::serializeToCommandDoc(request),
-                    privileges,
-                    shardId,
-                    eligibleForSampling,
-                    result);
-            }
-
-                MONGO_UNREACHABLE;
+            MONGO_UNREACHABLE;
+        } catch (const DBException& dbe) {
+            return dbe.toStatus();
         }
-        MONGO_UNREACHABLE;
     }();
+
 
     if (status.isOK()) {
         updateHostsTargetedMetrics(opCtx,
@@ -636,6 +689,12 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
             explain_common::appendIfRoom(
                 aggregation_request_helper::serializeToCommandObj(request), "command", result);
         }
+    } else if (status.code() != ErrorCodes::CommandOnShardedViewNotSupportedOnMongod) {
+        // Increment counters even in case of failed aggregate commands.
+        // But for views on a sharded cluster, aggregation runs twice. First execution fails
+        // because the namespace is a view, and then it is re-run with resolved view pipeline
+        // and namespace.
+        liteParsedPipeline.tickGlobalStageCounters();
     }
     return status;
 }

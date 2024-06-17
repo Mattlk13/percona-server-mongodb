@@ -98,6 +98,12 @@ public:
     virtual SemiFuture<NumMergedChunks> requestMergeAllChunksOnShard(OperationContext* opCtx,
                                                                      const NamespaceString& nss,
                                                                      const ShardId& shardId) = 0;
+
+    virtual SemiFuture<void> requestMoveCollection(OperationContext* opCtx,
+                                                   const NamespaceString& nss,
+                                                   const ShardId& toShardId,
+                                                   const ShardId& dbPrimaryShardId,
+                                                   const DatabaseVersion& dbVersion) = 0;
 };
 
 }  // namespace mongo

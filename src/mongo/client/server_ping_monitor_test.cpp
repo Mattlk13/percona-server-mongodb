@@ -147,7 +147,7 @@ protected:
         node->setCommandReply("ping", BSON("ok" << 1));
 
         if (node->isRunning()) {
-            const auto opmsg = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+            const auto opmsg = static_cast<OpMsgRequest>(request);
             const auto reply = node->runCommand(request.id, opmsg)->getCommandReply();
             _net->scheduleSuccessfulResponse(noi, RemoteCommandResponse(reply, Milliseconds(0)));
         } else {
@@ -245,14 +245,14 @@ private:
 
 class SingleServerPingMonitorTest : public ServerPingMonitorTestFixture {
 protected:
-    void setUp() {
+    void setUp() override {
         ServerPingMonitorTestFixture::setUp();
         _replSet.reset(new MockReplicaSet(
             "test", 1, /* hasPrimary = */ false, /* dollarPrefixHosts = */ false));
         _hostAndPort = HostAndPort(_replSet->getSecondaries()[0]);
     }
 
-    void tearDown() {
+    void tearDown() override {
         _replSet.reset();
         ServerPingMonitorTestFixture::tearDown();
     }

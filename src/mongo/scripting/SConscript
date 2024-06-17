@@ -26,10 +26,13 @@ scripting_common_env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/client/clientdriver_minimal',
-        '$BUILD_DIR/mongo/db/server_base',
         '$BUILD_DIR/mongo/shell/mongojs',
         '$BUILD_DIR/mongo/util/md5',
         'bson_template_evaluator',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/server_base',
+        '$BUILD_DIR/mongo/util/fail_point',
     ],
 )
 
@@ -128,14 +131,18 @@ if jsEngine:
         ],
         LIBDEPS_PRIVATE=[
             '$BUILD_DIR/mongo/client/clientdriver_network',
+            '$BUILD_DIR/mongo/db/auth/security_token_auth',
             '$BUILD_DIR/mongo/db/service_context',
+            '$BUILD_DIR/mongo/util/concurrency/spin_lock',
             '$BUILD_DIR/third_party/mozjs/mozjs',
         ],
     )
 
     scriptingEnv.CppUnitTest(
         target='scripting_mozjs_test',
-        source=['mozjs/module_loader_test.cpp'],
+        source=[
+            'mozjs/module_loader_test.cpp',
+        ],
         LIBDEPS=[
             'bson_template_evaluator',
             'scripting',
@@ -172,6 +179,7 @@ env.CppUnitTest(
         'deadline_monitor_test.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         'scripting_common',
     ],
 )

@@ -40,12 +40,12 @@
 #include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/memory_usage_tracker.h"
 #include "mongo/db/query/stage_types.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/sorter/sorter.h"
 #include "mongo/db/sorter/sorter_stats.h"
 #include "mongo/logv2/log_attr.h"
+#include "mongo/util/memory_usage_tracker.h"
 
 namespace mongo {
 
@@ -64,20 +64,20 @@ public:
 
     SpoolStage(ExpressionContext* expCtx, WorkingSet* ws, std::unique_ptr<PlanStage> child);
 
-    StageType stageType() const {
+    StageType stageType() const override {
         return STAGE_SPOOL;
     }
 
     bool isEOF() final;
 
-    std::unique_ptr<PlanStageStats> getStats();
+    std::unique_ptr<PlanStageStats> getStats() override;
 
-    const SpecificStats* getSpecificStats() const {
+    const SpecificStats* getSpecificStats() const override {
         return &_specificStats;
     }
 
 protected:
-    PlanStage::StageState doWork(WorkingSetID* id);
+    PlanStage::StageState doWork(WorkingSetID* id) override;
 
 private:
     void spill();

@@ -52,10 +52,11 @@
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
-#include "mongo/stdx/unordered_set.h"
 #include "mongo/transport/session.h"
 #include "mongo/util/clock_source.h"
+#include "mongo/util/concurrency/lock_free_read_list.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/decorable.h"
 #include "mongo/util/hierarchical_acquisition.h"
@@ -69,70 +70,14 @@ namespace mongo {
 class AbstractMessagingPort;
 class Client;
 class OperationContext;
-
 class OpObserver;
+class Service;
+class ServiceContext;
 class ServiceEntryPoint;
 
 namespace transport {
 class TransportLayerManager;
 }  // namespace transport
-
-/**
- * Classes that implement this interface can receive notification on killOp.
- *
- * See registerKillOpListener() for more information,
- * including limitations on the lifetime of registered listeners.
- */
-class KillOpListenerInterface {
-    KillOpListenerInterface(const KillOpListenerInterface&) = delete;
-    KillOpListenerInterface& operator=(const KillOpListenerInterface&) = delete;
-
-public:
-    /**
-     * Will be called *after* ops have been told they should die.
-     * Callback must not fail.
-     */
-    virtual void interrupt(unsigned opId) = 0;
-    virtual void interruptAll() = 0;
-
-protected:
-    KillOpListenerInterface() = default;
-
-    // Should not delete through a pointer of this type
-    virtual ~KillOpListenerInterface() = default;
-};
-
-/**
- * A simple container type to pass around a client and a lock on said client
- */
-class LockedClient {
-public:
-    LockedClient() = default;
-    explicit LockedClient(Client* client);
-
-    Client* client() const noexcept {
-        return _client;
-    }
-
-    Client* operator->() const noexcept {
-        return client();
-    }
-
-    explicit operator bool() const noexcept {
-        return client();
-    }
-
-    operator WithLock() const noexcept {
-        return WithLock(_lk);
-    }
-
-private:
-    // Technically speaking, _lk holds a Client* and _client is a superfluous variable. That said,
-    // LockedClients will likely be optimized away and the extra variable is a cheap price to pay
-    // for better developer comprehension.
-    stdx::unique_lock<Client> _lk;
-    Client* _client = nullptr;
-};
 
 /**
  * Users may provide an OperationKey when sending a command request as a stable token by which to
@@ -142,7 +87,6 @@ private:
  */
 using OperationKey = UUID;
 
-class Service;
 namespace service_context_detail {
 /**
  * A synchronized owning pointer to avoid setters racing with getters.
@@ -191,7 +135,177 @@ public:
 private:
     AtomicWord<T*> _ptr{nullptr};
 };
+
+template <typename T>
+auto makeLockHandleForObjectLock(T* object) {
+    return stdx::unique_lock(*object);
+}
+
+/**
+ * Wraps a lockable object of type `T`, locking it at construction and releasing the lock when
+ * destroyed.
+ */
+template <typename T, typename MutexType = T>
+class ObjectLock {
+public:
+    ObjectLock() = default;
+    explicit ObjectLock(T* obj) : _lk(makeLockHandleForObjectLock(obj)), _object(obj) {}
+
+    T& operator*() const noexcept {
+        invariant(_object);
+        return *_object;
+    }
+
+    T* operator->() const noexcept {
+        return _object;
+    }
+
+    explicit operator bool() const noexcept {
+        return !!_object;
+    }
+
+    explicit(false) operator WithLock() const noexcept {
+        return WithLock(_lk);
+    }
+
+private:
+    stdx::unique_lock<MutexType> _lk;
+    T* _object{};
+};
 }  // namespace service_context_detail
+
+class ClientLock : public service_context_detail::ObjectLock<Client> {
+public:
+    ClientLock() = default;
+    explicit ClientLock(Client* client);
+};
+
+/**
+ * This is for internal use by `ServiceContext`. Avoid using it to lock `ServiceContext` as it will
+ * block normal server operations.
+ */
+using ServiceContextLock = service_context_detail::ObjectLock<ServiceContext, Mutex>;
+
+/**
+ * Classes that implement this interface can receive notification on killOp.
+ *
+ * See registerKillOpListener() for more information,
+ * including limitations on the lifetime of registered listeners.
+ */
+class KillOpListenerInterface {
+public:
+    KillOpListenerInterface(const KillOpListenerInterface&) = delete;
+    KillOpListenerInterface& operator=(const KillOpListenerInterface&) = delete;
+
+    /**
+     * Will be called *after* the operation (i.e. `opCtx`) has been killed, while holding its client
+     * lock. Must not fail.
+     */
+    virtual void interrupt(ClientLock&, OperationContext*) = 0;
+
+    /**
+     * Will be called *after* all operations have been killed and provided with an error code, while
+     * holding the lock for `ServiceContext`. Must not fail.
+     */
+    virtual void interruptAll(ServiceContextLock&) = 0;
+
+protected:
+    KillOpListenerInterface() = default;
+
+    // Should not delete through a pointer of this type
+    virtual ~KillOpListenerInterface() = default;
+};
+
+/**
+ * Registers a function to execute on new ServiceContexts or Services when they are
+ * created and optionally also register a function to execute before those contexts are
+ * destroyed. Choose Service or ServiceContext depending on the template argument.
+ *
+ * Construct instances of this type during static initialization only, as they register
+ * MONGO_INITIALIZERS.
+ */
+template <typename T>
+class ConstructorActionRegistererType {
+
+public:
+    using ConstructorAction = std::function<void(T*)>;
+    using DestructorAction = std::function<void(T*)>;
+
+    /**
+     * Register functions of type ConstructorAction and DestructorAction using an
+     * instance of ConstructorActionRegisterer, called on construction of objects
+     * Type T.
+     */
+    class ConstructorDestructorActions {
+    public:
+        ConstructorDestructorActions(ConstructorAction constructor, DestructorAction destructor)
+            : _constructor(std::move(constructor)), _destructor(std::move(destructor)) {}
+
+        void onCreate(T* service) const {
+            _constructor(service);
+        }
+        void onDestroy(T* service) const {
+            _destructor(service);
+        }
+
+    private:
+        ConstructorAction _constructor;
+        DestructorAction _destructor;
+    };
+
+    /**
+     * Accessor function to get the global list of ServiceContext constructor and destructor
+     * functions.
+     */
+    static std::list<ConstructorDestructorActions>& registeredConstructorActions() {
+        static std::list<ConstructorDestructorActions> cal;
+        return cal;
+    }
+
+    /**
+     * This constructor registers a constructor and optional destructor with the given
+     * "name" and no prerequisite constructors or mongo initializers.
+     */
+    ConstructorActionRegistererType(std::string name,
+                                    ConstructorAction constructor,
+                                    DestructorAction destructor = {});
+
+    /**
+     * This constructor registers a constructor and optional destructor with the given
+     * "name", and a list of names of prerequisites, "prereqs".
+     *
+     * The named constructor will run after all of its prereqs successfully complete,
+     * and the corresponding destructor, if provided, will run before any of its
+     * prerequisites execute.
+     */
+    ConstructorActionRegistererType(std::string name,
+                                    std::vector<std::string> prereqs,
+                                    ConstructorAction constructor,
+                                    DestructorAction destructor = {});
+
+    /**
+     * This constructor registers a constructor and optional destructor with the given
+     * "name", a list of names of prerequisites, "prereqs", and a list of names of dependents,
+     * "dependents".
+     *
+     * The named constructor will run after all of its prereqs successfully complete,
+     * and the corresponding destructor, if provided, will run before any of its
+     * prerequisites execute. The dependents will run after this constructor and
+     * the corresponding destructor, if provided, will run after any of its
+     * dependents execute.
+     */
+    ConstructorActionRegistererType(std::string name,
+                                    std::vector<std::string> prereqs,
+                                    std::vector<std::string> dependents,
+                                    ConstructorAction constructor,
+                                    DestructorAction destructor = {});
+
+private:
+    using ConstructorActionListIterator =
+        typename std::list<ConstructorDestructorActions>::iterator;
+    ConstructorActionListIterator _iter;
+    boost::optional<GlobalInitializerRegisterer> _registerer;
+};
 
 /**
  * Class representing the context of a service, such as a MongoD database service or
@@ -254,30 +368,35 @@ public:
         virtual void onDestroyOperationContext(OperationContext* opCtx) = 0;
     };
 
-    using ClientSet = stdx::unordered_set<Client*>;
+    using ClientList = LockFreeReadList<Client*>;
+    using ClientMap = stdx::unordered_map<Client*, typename ClientList::Entry*>;
 
     /**
      * Cursor for enumerating the live Client objects belonging to a ServiceContext.
-     *
-     * Lifetimes of this type are synchronized with client creation and destruction.
+     * This is just a wrapper, so prefer using `makeClientsCursor` instead.
      */
     class LockedClientsCursor {
     public:
         /**
          * Constructs a cursor for enumerating the clients of "service", blocking "service" from
-         * creating or destroying Client objects until this instance is destroyed.
+         * destroying the Client object actively referenced by the cursor.
          */
-        explicit LockedClientsCursor(ServiceContext* service);
+        explicit LockedClientsCursor(ServiceContext* svcCtx)
+            : _cursor(svcCtx->makeClientsCursor()) {}
 
         /**
          * Returns the next client in the enumeration, or nullptr if there are no more clients.
          */
-        Client* next();
+        Client* next() {
+            if (std::exchange(_mustGetNext, true)) {
+                _cursor.next();
+            }
+            return _cursor ? _cursor.value() : nullptr;
+        }
 
     private:
-        stdx::unique_lock<Latch> _lock;
-        ClientSet::const_iterator _curr;
-        ClientSet::const_iterator _end;
+        ClientList::Cursor _cursor;
+        bool _mustGetNext = false;
     };
 
     /**
@@ -286,10 +405,11 @@ public:
      */
     class ServiceContextDeleter {
     public:
-        void operator()(ServiceContext* service) const;
+        void operator()(ServiceContext* sc) const;
     };
 
     using UniqueServiceContext = std::unique_ptr<ServiceContext, ServiceContextDeleter>;
+    using ConstructorActionRegisterer = ConstructorActionRegistererType<ServiceContext>;
 
     /**
      * Special deleter used for cleaning up Client objects owned by a ServiceContext.
@@ -333,86 +453,13 @@ public:
     using DestructorAction = std::function<void(ServiceContext*)>;
 
     /**
-     * Representation of a paired ConstructorAction and DestructorAction.
-     */
-    class ConstructorDestructorActions {
-    public:
-        ConstructorDestructorActions(ConstructorAction constructor, DestructorAction destructor)
-            : _constructor(std::move(constructor)), _destructor(std::move(destructor)) {}
-
-        void onCreate(ServiceContext* service) const {
-            _constructor(service);
-        }
-        void onDestroy(ServiceContext* service) const {
-            _destructor(service);
-        }
-
-    private:
-        ConstructorAction _constructor;
-        DestructorAction _destructor;
-    };
-
-    /**
-     * Registers a function to execute on new service contexts when they are created, and optionally
-     * also register a function to execute before those contexts are destroyed.
-     *
-     * Construct instances of this type during static initialization only, as they register
-     * MONGO_INITIALIZERS.
-     */
-    class ConstructorActionRegisterer {
-    public:
-        /**
-         * This constructor registers a constructor and optional destructor with the given
-         * "name" and no prerequisite constructors or mongo initializers.
-         */
-        ConstructorActionRegisterer(std::string name,
-                                    ConstructorAction constructor,
-                                    DestructorAction destructor = {});
-
-        /**
-         * This constructor registers a constructor and optional destructor with the given
-         * "name", and a list of names of prerequisites, "prereqs".
-         *
-         * The named constructor will run after all of its prereqs successfully complete,
-         * and the corresponding destructor, if provided, will run before any of its
-         * prerequisites execute.
-         */
-        ConstructorActionRegisterer(std::string name,
-                                    std::vector<std::string> prereqs,
-                                    ConstructorAction constructor,
-                                    DestructorAction destructor = {});
-
-        /**
-         * This constructor registers a constructor and optional destructor with the given
-         * "name", a list of names of prerequisites, "prereqs", and a list of names of dependents,
-         * "dependents".
-         *
-         * The named constructor will run after all of its prereqs successfully complete,
-         * and the corresponding destructor, if provided, will run before any of its
-         * prerequisites execute. The dependents will run after this constructor and
-         * the corresponding destructor, if provided, will run after any of its
-         * dependents execute.
-         */
-        ConstructorActionRegisterer(std::string name,
-                                    std::vector<std::string> prereqs,
-                                    std::vector<std::string> dependents,
-                                    ConstructorAction constructor,
-                                    DestructorAction destructor = {});
-
-    private:
-        using ConstructorActionListIterator = std::list<ConstructorDestructorActions>::iterator;
-        ConstructorActionListIterator _iter;
-        boost::optional<GlobalInitializerRegisterer> _registerer;
-    };
-
-    /**
      * Factory function for making instances of ServiceContext. It is the only means by which they
      * should be created.
      */
     static UniqueServiceContext make();
 
     ServiceContext();
-    ~ServiceContext();
+    ~ServiceContext() override;
 
     /**
      * Registers an observer of lifecycle events on Clients created by this ServiceContext.
@@ -450,6 +497,21 @@ public:
     void setStorageEngine(std::unique_ptr<StorageEngine> engine);
 
     /**
+     * Takes a function and applies it to all service objects associated with the service context.
+     * The function must accept a service as an argument.
+     */
+    template <typename F>
+    void applyToAllServices(F fn) {
+        if (auto service = getService(ClusterRole::RouterServer); service) {
+            fn(service);
+        }
+
+        if (auto service = getService(ClusterRole::ShardServer); service) {
+            fn(service);
+        }
+    }
+
+    /**
      * Return the storage engine instance we're using.
      */
     StorageEngine* getStorageEngine() {
@@ -467,11 +529,12 @@ public:
         _storageEngine = nullptr;
     }
 
-    /**
-     * Return the storage change lock.
-     */
-    StorageChangeLock& getStorageChangeLock() {
-        return _storageChangeLk;
+    // TODO SERVER-86656: replace this with the reader-optimized `rwmutex`. Also, remove source
+    // files and the build target for `StorageChangeLock`.
+    using StorageChangeMutexType = StorageChangeLock;
+
+    StorageChangeMutexType& getStorageChangeMutex() {
+        return _storageChangeMutex;
     }
 
     //
@@ -503,12 +566,12 @@ public:
      * Caller must own the lock on opCtx->getClient, and opCtx->getServiceContext() must be the same
      * as this service context. WithLock expects that the client lock be passed in.
      **/
-    void killOperation(WithLock,
+    void killOperation(ClientLock& clientLock,
                        OperationContext* opCtx,
                        ErrorCodes::Error killCode = ErrorCodes::Interrupted);
 
     /**
-     * Delists the operation by removing it from "_clientByOperationId" and its client. Both
+     * Delists the operation by removing it from its client. Both
      * "opCtx->getClient()->getServiceContext()" and "this" must point to the same instance of
      * ServiceContext. Also, "opCtx" should never be deleted before this method returns. Finally,
      * the thread invoking this method must not hold the client and the service context locks.
@@ -517,7 +580,7 @@ public:
 
     /**
      * Kills the operation "opCtx" with the code "killCode", if opCtx has not already been killed,
-     * and delists the operation by removing it from "_clientByOperationId" and its client. Both
+     * and delists the operation by removing it from its client. Both
      * "opCtx->getClient()->getServiceContext()" and "this" must point to the same instance of
      * service context. Also, "opCtx" should never be deleted before this method returns. Finally,
      * the thread invoking this method must not hold (own) the client and the service context locks.
@@ -576,12 +639,7 @@ public:
     /*
      * Marks initialization as complete and all transport layers as started.
      */
-    void notifyStartupComplete();
-
-    /*
-     * Returns the number of active client operations
-     */
-    int getActiveClientOperations();
+    void notifyStorageStartupRecoveryComplete();
 
     /**
      * Set the OpObserver.
@@ -681,7 +739,7 @@ public:
         return _userWritesAllowed.load();
     }
 
-    LockedClient getLockedClient(OperationId id);
+    ClientLock getLockedClient(OperationId id);
 
     /** The `role` must be ShardServer or RouterServer exactly. */
     Service* getService(ClusterRole role) const;
@@ -695,6 +753,18 @@ public:
      * Service they get.
      */
     Service* getService() const;
+
+    ClientList::Cursor makeClientsCursor() const {
+        return _clientsList.getCursor();
+    }
+
+    /**
+     * This is for internal use by `ServiceContextLock`. Avoid using it directly to lock
+     * `ServiceContext` as it will block normal server operations.
+     */
+    friend auto makeLockHandleForObjectLock(ServiceContext* svcCtx) {
+        return stdx::unique_lock(svcCtx->_mutex);
+    }
 
 private:
     class ClientObserverHolder {
@@ -721,10 +791,10 @@ private:
     struct ServiceSet;
 
     /**
-     * Removes the operation from its client and the `_clientByOperationId` of its service context.
-     * It will acquire both client and service context locks, and should only be used internally by
-     * other ServiceContext methods. To ensure delisted operations are shortly deleted, this method
-     * should only be called after killing an operation or in its destructor.
+     * Removes the operation from its client. It will acquire both client and service context locks,
+     * and should only be used internally by other ServiceContext methods. To ensure delisted
+     * operations are shortly deleted, this method should only be called after killing an operation
+     * or in its destructor.
      */
     void _delistOperation(OperationContext* opCtx) noexcept;
 
@@ -746,22 +816,16 @@ private:
     SyncUnique<StorageEngine> _storageEngine;
 
     /**
-     * The lock that protects changing out the storage engine.
+     * The mutex that protects changing out the storage engine.
      */
-    StorageChangeLock _storageChangeLk;
+    StorageChangeMutexType _storageChangeMutex;
 
     /**
      * Vector of registered observers.
      */
     std::vector<ClientObserverHolder> _clientObservers;
-    ClientSet _clients;
-
-    /**
-     * Managing classes for our issued operation IDs.
-     */
-    Mutex _clientByOpIdMutex = MONGO_MAKE_LATCH("ServiceContext::_clientByOpIdMutex");
-    std::shared_ptr<UniqueOperationIdRegistry> _opIdRegistry;
-    stdx::unordered_map<OperationId, Client*> _clientByOperationId;
+    ClientMap _clients;
+    ClientList _clientsList;
 
     /**
      * The registered OpObserver.
@@ -817,8 +881,19 @@ class Service : public Decorable<Service> {
     using SyncUnique = service_context_detail::SyncUnique<T>;
 
 public:
-    Service(ServiceContext* sc, ClusterRole role);
-    ~Service();
+    /**
+     * Special deleter used for cleaning up Service objects.
+     * See UniqueService, below.
+     */
+    class ServiceDeleter {
+    public:
+        void operator()(Service* service) const;
+    };
+
+    using UniqueService = std::unique_ptr<Service, ServiceDeleter>;
+    using ConstructorActionRegisterer = ConstructorActionRegistererType<Service>;
+
+    ~Service() override;
 
     /**
      * Creates a new Client object representing a client session associated with this
@@ -832,6 +907,8 @@ public:
                                             std::shared_ptr<transport::Session> session = nullptr) {
         return _sc->makeClientForService(std::move(desc), std::move(session), this);
     }
+
+    static UniqueService make(ServiceContext* sc, ClusterRole role);
 
     ClusterRole role() const {
         return _role;
@@ -847,7 +924,33 @@ public:
         return _serviceEntryPoint.get();
     }
 
+    /**
+     * Cursor for enumerating the live Client objects belonging to a Service.
+     *
+     * Lifetimes of this type are synchronized with client creation and destruction.
+     */
+    class LockedClientsCursor {
+    public:
+        explicit LockedClientsCursor(Service* service)
+            : _service(service), _cursor(service->getServiceContext()) {}
+
+        /**
+         * Returns the next client in the enumeration, or nullptr if there are no more clients.
+         */
+        ClientLock next();
+
+    private:
+        Service* _service;
+        ServiceContext::LockedClientsCursor _cursor;
+    };
+
 private:
+    /**
+     * Private constructor. If intending to make a Service object, use the
+     * make function instead defined below.
+     */
+    Service(ServiceContext* sc, ClusterRole role);
+
     ServiceContext* _sc;
     ClusterRole _role;
     SyncUnique<ServiceEntryPoint> _serviceEntryPoint;

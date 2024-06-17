@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <shared_mutex>
+
 #include "mongo/db/operation_context.h"
 
 namespace mongo {
@@ -39,30 +41,54 @@ class ReplicaSetEndpointShardingState {
     ReplicaSetEndpointShardingState& operator=(const ReplicaSetEndpointShardingState&) = delete;
 
 public:
-    ReplicaSetEndpointShardingState();
-    ~ReplicaSetEndpointShardingState();
+    ReplicaSetEndpointShardingState() = default;
+    ~ReplicaSetEndpointShardingState() = default;
 
     static ReplicaSetEndpointShardingState* get(ServiceContext* serviceContext);
     static ReplicaSetEndpointShardingState* get(OperationContext* opCtx);
 
     /**
-     * Sets '_isConfigShard' to true or false. Can only be invoked on a node with the configsvr
+     * Sets '_isConfigShard' to true or false. Can only be invoked on a mongod with the configsvr
      * role.
      */
     void setIsConfigShard(bool value);
 
     /**
-     * Returns true if this node belongs to a config shard.
+     * Returns true if this mongod belongs to a config shard.
      */
     bool isConfigShardForTest();
 
-private:
-    Mutex _mutex =
-        MONGO_MAKE_LATCH("replica_set_endpoint::ReplicaSetEndpointShardingState::_mutex");
+    /**
+     * Sets '_isReplicaSetMember' to true or false.
+     */
+    void setIsReplicaSetMember(bool value);
 
-    // Set to true if this node belongs to a config shard.
-    bool _isConfigShard;
+    /**
+     * Returns true if this mongod supports replica set endpoint, meaning it is part of
+     * a single-shard cluster consisting of config shard with router role.
+     */
+    bool supportsReplicaSetEndpoint();
+
+private:
+    mutable std::shared_mutex _mutex;  // NOLINT
+
+    // Set to true if this mongod belongs to a config shard.
+    bool _isConfigShard = false;
+
+    // Set to true if this mongod is part of a replica set.
+    bool _isReplicaSetMember = false;
 };
+
+/**
+ * Returns true if the feature flag is enabled, not ignoring the feature compatibility version.
+ */
+bool isFeatureFlagEnabled();
+
+/**
+ * Returns true if the feature flag is enabled, ignoring the feature compatibility version.
+ * To be used only by the machinery for maintaining the ReplicaSetEndpointShardingState.
+ */
+bool isFeatureFlagEnabledIgnoreFCV();
 
 }  // namespace replica_set_endpoint
 }  // namespace mongo

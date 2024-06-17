@@ -53,6 +53,7 @@
 #include "mongo/db/query/find_command.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -95,10 +96,7 @@ static std::unique_ptr<ScriptEngine> globalScriptEngine;
 
 }  // namespace
 
-ScriptEngine::ScriptEngine(bool disableLoadStored)
-    : _disableLoadStored(disableLoadStored), _scopeInitCallback() {}
-
-ScriptEngine::~ScriptEngine() {}
+ScriptEngine::ScriptEngine() : _scopeInitCallback() {}
 
 Scope::Scope()
     : _localDBName(DatabaseName::kEmpty),
@@ -243,7 +241,7 @@ bool Scope::execFile(const string& filename, bool printResult, bool reportError,
 }
 
 void Scope::storedFuncMod(OperationContext* opCtx) {
-    opCtx->recoveryUnit()->onCommit(
+    shard_role_details::getRecoveryUnit(opCtx)->onCommit(
         [](OperationContext*, boost::optional<Timestamp>) { _lastVersion.fetchAndAdd(1); });
 }
 
@@ -256,8 +254,6 @@ void Scope::validateObjectIdString(const string& str) {
 }
 
 void Scope::loadStored(OperationContext* opCtx, bool ignoreNotConnected) {
-    if (!getGlobalScriptEngine()->_disableLoadStored)
-        return;
     if (_localDBName.isEmpty()) {
         if (ignoreNotConnected)
             return;
@@ -472,7 +468,7 @@ public:
     PooledScope(const ScopeCache::PoolName& pool, const std::shared_ptr<Scope>& real)
         : _pool(pool), _real(real) {}
 
-    virtual ~PooledScope() {
+    ~PooledScope() override {
         // SERVER-53671: Sometimes, ScopeCache::release() will generate an 'InterruptedAtShutdown'
         // exception. We catch and ignore such exceptions here to prevent them from crashing the
         // server while it is shutting down.
@@ -484,110 +480,111 @@ public:
     }
 
     // wrappers for the derived (_real) scope
-    void reset() {
+    void reset() override {
         _real->reset();
     }
-    void registerOperation(OperationContext* opCtx) {
+    void registerOperation(OperationContext* opCtx) override {
         _real->registerOperation(opCtx);
     }
-    void unregisterOperation() {
+    void unregisterOperation() override {
         _real->unregisterOperation();
     }
-    void init(const BSONObj* data) {
+    void init(const BSONObj* data) override {
         _real->init(data);
     }
-    void setLocalDB(const DatabaseName& dbName) {
+    void setLocalDB(const DatabaseName& dbName) override {
         _real->setLocalDB(dbName);
     }
-    void loadStored(OperationContext* opCtx, bool ignoreNotConnected = false) {
+    void loadStored(OperationContext* opCtx, bool ignoreNotConnected = false) override {
         _real->loadStored(opCtx, ignoreNotConnected);
     }
-    void externalSetup() {
+    void externalSetup() override {
         _real->externalSetup();
     }
-    void gc() {
+    void gc() override {
         _real->gc();
     }
-    void advanceGeneration() {
+    void advanceGeneration() override {
         _real->advanceGeneration();
     }
     void requireOwnedObjects() override {
         _real->requireOwnedObjects();
     }
-    void kill() {
+    void kill() override {
         _real->kill();
     }
-    bool isKillPending() const {
+    bool isKillPending() const override {
         return _real->isKillPending();
     }
-    int type(const char* field) {
+    int type(const char* field) override {
         return _real->type(field);
     }
-    string getError() {
+    string getError() override {
         return _real->getError();
     }
-    bool hasOutOfMemoryException() {
+    bool hasOutOfMemoryException() override {
         return _real->hasOutOfMemoryException();
     }
-    void rename(const char* from, const char* to) {
+    void rename(const char* from, const char* to) override {
         _real->rename(from, to);
     }
-    double getNumber(const char* field) {
+    double getNumber(const char* field) override {
         return _real->getNumber(field);
     }
-    int getNumberInt(const char* field) {
+    int getNumberInt(const char* field) override {
         return _real->getNumberInt(field);
     }
-    long long getNumberLongLong(const char* field) {
+    long long getNumberLongLong(const char* field) override {
         return _real->getNumberLongLong(field);
     }
-    Decimal128 getNumberDecimal(const char* field) {
+    Decimal128 getNumberDecimal(const char* field) override {
         return _real->getNumberDecimal(field);
     }
-    string getString(const char* field) {
+    string getString(const char* field) override {
         return _real->getString(field);
     }
-    bool getBoolean(const char* field) {
+    bool getBoolean(const char* field) override {
         return _real->getBoolean(field);
     }
-    BSONObj getObject(const char* field) {
+    BSONObj getObject(const char* field) override {
         return _real->getObject(field);
     }
-    OID getOID(const char* field) {
+    OID getOID(const char* field) override {
         return _real->getOID(field);
     };
-    void getBinData(const char* field, std::function<void(const BSONBinData&)> withBinData) {
+    void getBinData(const char* field,
+                    std::function<void(const BSONBinData&)> withBinData) override {
         _real->getBinData(field, std::move(withBinData));
     }
-    Timestamp getTimestamp(const char* field) {
+    Timestamp getTimestamp(const char* field) override {
         return _real->getTimestamp(field);
     };
-    JSRegEx getRegEx(const char* field) {
+    JSRegEx getRegEx(const char* field) override {
         return _real->getRegEx(field);
     };
-    void setNumber(const char* field, double val) {
+    void setNumber(const char* field, double val) override {
         _real->setNumber(field, val);
     }
-    void setString(const char* field, StringData val) {
+    void setString(const char* field, StringData val) override {
         _real->setString(field, val);
     }
-    void setElement(const char* field, const BSONElement& val, const BSONObj& parent) {
+    void setElement(const char* field, const BSONElement& val, const BSONObj& parent) override {
         _real->setElement(field, val, parent);
     }
-    void setObject(const char* field, const BSONObj& obj, bool readOnly = true) {
+    void setObject(const char* field, const BSONObj& obj, bool readOnly = true) override {
         _real->setObject(field, obj, readOnly);
     }
-    bool isLastRetNativeCode() {
+    bool isLastRetNativeCode() override {
         return _real->isLastRetNativeCode();
     }
 
-    void setBoolean(const char* field, bool val) {
+    void setBoolean(const char* field, bool val) override {
         _real->setBoolean(field, val);
     }
-    void setFunction(const char* field, const char* code) {
+    void setFunction(const char* field, const char* code) override {
         _real->setFunction(field, code);
     }
-    ScriptingFunction createFunction(const char* code) {
+    ScriptingFunction createFunction(const char* code) override {
         return _real->createFunction(code);
     }
     int invoke(ScriptingFunction func,
@@ -596,7 +593,7 @@ public:
                int timeoutMs,
                bool ignoreReturn,
                bool readOnlyArgs,
-               bool readOnlyRecv) {
+               bool readOnlyRecv) override {
         return _real->invoke(func, args, recv, timeoutMs, ignoreReturn, readOnlyArgs, readOnlyRecv);
     }
     bool exec(StringData code,
@@ -604,21 +601,24 @@ public:
               bool printResult,
               bool reportError,
               bool assertOnError,
-              int timeoutMs = 0) {
+              int timeoutMs = 0) override {
         return _real->exec(code, name, printResult, reportError, assertOnError, timeoutMs);
     }
-    bool execFile(const string& filename, bool printResult, bool reportError, int timeoutMs = 0) {
+    bool execFile(const string& filename,
+                  bool printResult,
+                  bool reportError,
+                  int timeoutMs = 0) override {
         return _real->execFile(filename, printResult, reportError, timeoutMs);
     }
-    void injectNative(const char* field, NativeFunction func, void* data) {
+    void injectNative(const char* field, NativeFunction func, void* data) override {
         _real->injectNative(field, func, data);
     }
-    void append(BSONObjBuilder& builder, const char* fieldName, const char* scopeName) {
+    void append(BSONObjBuilder& builder, const char* fieldName, const char* scopeName) override {
         _real->append(builder, fieldName, scopeName);
     }
 
 protected:
-    ScriptingFunction _createFunction(const char* code) {
+    ScriptingFunction _createFunction(const char* code) override {
         return _real->_createFunction(code);
     }
 

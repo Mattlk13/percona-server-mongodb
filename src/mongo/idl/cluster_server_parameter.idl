@@ -100,6 +100,8 @@ server_parameters:
         cpp_vartype: TestIntClusterParameterStorage
         cpp_varname: intStorage
         test_only: true
+        redact: false
+        omit_in_ftdc: false
 
     testStrClusterParameter:
         set_at: cluster
@@ -107,13 +109,17 @@ server_parameters:
         cpp_vartype: TestStrClusterParameterStorage
         cpp_varname: strStorage
         test_only: true
+        redact: false
+        omit_in_ftdc: false
 
     testBoolClusterParameter:
         set_at: cluster
         description: "Test cluster parameter that is only usable if enableTestCommands=true"
         cpp_vartype: TestBoolClusterParameterStorage
         cpp_varname: boolStorage
+        omit_in_ftdc: true
         test_only: true
+        redact: false
 
     cwspTestNeedsFeatureFlagClusterWideToaster:
         description: "Server Parameter gated on featureFlagClusterWideToaster"
@@ -123,3 +129,5 @@ server_parameters:
         test_only: true
         condition:
             feature_flag: gFeatureFlagClusterWideToaster
+        redact: false
+        omit_in_ftdc: false

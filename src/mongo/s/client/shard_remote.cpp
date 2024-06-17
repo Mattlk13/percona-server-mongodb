@@ -70,9 +70,7 @@
 #include "mongo/platform/atomic_word.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
-#include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/client/shard_remote_gen.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/decorable.h"
@@ -86,7 +84,6 @@ namespace mongo {
 using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
 using executor::TaskExecutor;
-using rpc::TrackingMetadata;
 using RemoteCommandCallbackArgs = TaskExecutor::RemoteCommandCallbackArgs;
 
 namespace {
@@ -143,24 +140,6 @@ std::string ShardRemote::toString() const {
 BSONObj ShardRemote::_appendMetadataForCommand(OperationContext* opCtx,
                                                const ReadPreferenceSetting& readPref) {
     BSONObjBuilder builder;
-    if (shouldLog(logv2::LogComponent::kTracking,
-                  logv2::LogSeverity::Debug(1))) {  // avoid performance overhead if not logging
-        if (!TrackingMetadata::get(opCtx).getIsLogged()) {
-            if (!TrackingMetadata::get(opCtx).getOperId()) {
-                TrackingMetadata::get(opCtx).initWithOperName("NotSet");
-            }
-            LOGV2_DEBUG_OPTIONS(20164,
-                                1,
-                                logv2::LogOptions{logv2::LogComponent::kTracking},
-                                "{trackingMetadata}",
-                                "trackingMetadata"_attr = TrackingMetadata::get(opCtx));
-            TrackingMetadata::get(opCtx).setIsLogged(true);
-        }
-
-        TrackingMetadata metadata = TrackingMetadata::get(opCtx).constructChildMetadata();
-        metadata.writeToMetadata(&builder);
-    }
-
     readPref.toContainingBSON(&builder);
 
     if (isConfig())
@@ -339,8 +318,9 @@ Milliseconds getExhaustiveFindOnConfigMaxTimeMS(OperationContext* opCtx,
     }
 
     return std::min(opCtx->getRemainingMaxTimeMillis(),
-                    nss == ChunkType::ConfigNS ? Milliseconds(gFindChunksOnConfigTimeoutMS.load())
-                                               : Shard::kDefaultConfigCommandTimeout);
+                    nss == ChunkType::ConfigNS
+                        ? Milliseconds(gFindChunksOnConfigTimeoutMS.load())
+                        : Milliseconds(defaultConfigCommandTimeoutMS.load()));
 }
 
 StatusWith<Shard::QueryResponse> ShardRemote::_exhaustiveFindOnConfig(
@@ -367,10 +347,16 @@ StatusWith<Shard::QueryResponse> ShardRemote::_exhaustiveFindOnConfig(
     }();
 
     BSONObj readConcernObj = [&] {
-        invariant(readConcernLevel == repl::ReadConcernLevel::kMajorityReadConcern);
-        repl::OpTime configOpTime{configTime.asTimestamp(),
-                                  mongo::repl::OpTime::kUninitializedTerm};
-        repl::ReadConcernArgs readConcern{configOpTime, readConcernLevel};
+        auto readConcern = [&] {
+            if (readConcernLevel == repl::ReadConcernLevel::kMajorityReadConcern) {
+                repl::OpTime configOpTime{configTime.asTimestamp(),
+                                          mongo::repl::OpTime::kUninitializedTerm};
+                return repl::ReadConcernArgs{configOpTime, readConcernLevel};
+            } else {
+                invariant(readConcernLevel == repl::ReadConcernLevel::kSnapshotReadConcern);
+                return repl::ReadConcernArgs{configTime, readConcernLevel};
+            }
+        }();
         BSONObjBuilder bob;
         readConcern.appendInfo(&bob);
         return bob.done().getObjectField(repl::ReadConcernArgs::kReadConcernFieldName).getOwned();
@@ -510,6 +496,23 @@ Status ShardRemote::runAggregation(
     updateReplSetMonitor(host, status);
 
     return status;
+}
+
+
+BatchedCommandResponse ShardRemote::runBatchWriteCommand(OperationContext* opCtx,
+                                                         const Milliseconds maxTimeMS,
+                                                         const BatchedCommandRequest& batchRequest,
+                                                         const WriteConcernOptions& writeConcern,
+                                                         RetryPolicy retryPolicy) {
+    const DatabaseName dbName = batchRequest.getNS().dbName();
+    const BSONObj cmdObj = [&] {
+        BSONObjBuilder cmdObjBuilder;
+        batchRequest.serialize(&cmdObjBuilder);
+        cmdObjBuilder.append(WriteConcernOptions::kWriteConcernField, writeConcern.toBSON());
+        return cmdObjBuilder.obj();
+    }();
+
+    return _submitBatchWriteCommand(opCtx, cmdObj, dbName, maxTimeMS, retryPolicy);
 }
 
 

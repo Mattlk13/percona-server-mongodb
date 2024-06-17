@@ -4,10 +4,10 @@
  *
  * @tags: [
  *   uses_atclustertime,
- *   requires_fcv_72,
+ *   requires_fcv_80,
  *   featureFlagReshardingImprovements,
  *   featureFlagMoveCollection,
- *   featureFlagTrackUnshardedCollectionsOnShardingCatalog,
+ *  # TODO (SERVER-87812) Remove multiversion_incompatible tag
  *   multiversion_incompatible,
  *   assumes_balancer_off,
  * ]
@@ -30,6 +30,17 @@ const sourceCollection =
 const mongos = sourceCollection.getMongo();
 const topology = DiscoverTopology.findConnectedNodes(mongos);
 const configsvr = new Mongo(topology.configsvr.nodes[0]);
+const donorShard = new Mongo(topology.shards[donorShardNames[0]].nodes[0]);
+
+const dbVersion = mongos.getDB('config')['databases'].findOne({_id: dbName}).version;
+// Register collection in the sharding catalog because invoking directly _configvrReshardCollection
+assert.commandWorked(donorShard.getDB(dbName).runCommand({
+    _shardsvrCreateCollection: collName,
+    unsplittable: true,
+    registerExistingCollectionInGlobalCatalog: true,
+    writeConcern: {w: "majority"},
+    databaseVersion: dbVersion
+}));
 
 assert.commandWorked(configsvr.adminCommand({
     _configsvrReshardCollection: ns,

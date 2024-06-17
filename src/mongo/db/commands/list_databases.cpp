@@ -110,23 +110,24 @@ public:
             // {nameOnly: bool} - default false.
             const bool nameOnly = cmd.getNameOnly();
 
+            const auto& tenantId = cmd.getDbName().tenantId();
+
             // {authorizedDatabases: bool} - Dynamic default based on permissions.
-            const bool authorizedDatabases =
-                ([as, tenantId = cmd.getDbName().tenantId()](const boost::optional<bool>& authDB) {
-                    const bool mayListAllDatabases = as->isAuthorizedForActionsOnResource(
-                        ResourcePattern::forClusterResource(tenantId), ActionType::listDatabases);
+            const bool authorizedDatabases = ([as, tenantId](const boost::optional<bool>& authDB) {
+                const bool mayListAllDatabases = as->isAuthorizedForActionsOnResource(
+                    ResourcePattern::forClusterResource(tenantId), ActionType::listDatabases);
 
-                    if (authDB) {
-                        uassert(ErrorCodes::Unauthorized,
-                                "Insufficient permissions to list all databases",
-                                authDB.value() || mayListAllDatabases);
-                        return authDB.value();
-                    }
+                if (authDB) {
+                    uassert(ErrorCodes::Unauthorized,
+                            "Insufficient permissions to list all databases",
+                            authDB.value() || mayListAllDatabases);
+                    return authDB.value();
+                }
 
-                    // By default, list all databases if we can, otherwise
-                    // only those we're allowed to find on.
-                    return !mayListAllDatabases;
-                })(cmd.getAuthorizedDatabases());
+                // By default, list all databases if we can, otherwise
+                // only those we're allowed to find on.
+                return !mayListAllDatabases;
+            })(cmd.getAuthorizedDatabases());
 
             // {filter: matchExpression}.
             std::unique_ptr<MatchExpression> filter = list_databases::getFilter(cmd, opCtx, ns());
@@ -137,12 +138,16 @@ public:
                 Lock::GlobalLock lk(opCtx, MODE_IS);
                 CurOpFailpointHelpers::waitWhileFailPointEnabled(
                     &hangBeforeListDatabases, opCtx, "hangBeforeListDatabases", []() {});
-
-                dbNames = storageEngine->listDatabases(cmd.getDbName().tenantId());
+                dbNames = storageEngine->listDatabases(tenantId);
             }
             std::vector<ListDatabasesReplyItem> items;
             SerializationContext scReply =
                 SerializationContext::stateCommandReply(cmd.getSerializationContext());
+            if (gMultitenancySupport && !tenantId) {
+                // During the multitenancy upgrade process a mongod might receive listDatabases from
+                // a non-multitenant node (with prefix and without token) during initial sync.
+                scReply.setPrefixState(true);
+            }
             int64_t totalSize = list_databases::setReplyItems(opCtx,
                                                               dbNames,
                                                               items,

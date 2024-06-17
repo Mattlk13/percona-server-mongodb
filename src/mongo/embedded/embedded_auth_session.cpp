@@ -269,7 +269,7 @@ public:
     }
 
 protected:
-    std::tuple<boost::optional<UserName>*, std::vector<RoleName>*> _getImpersonations() override {
+    std::tuple<std::shared_ptr<UserName>*, std::vector<RoleName>*> _getImpersonations() override {
         UASSERT_NOT_IMPLEMENTED;
     }
 
@@ -279,17 +279,5 @@ private:
 
 }  // namespace
 }  // namespace embedded
-
-namespace {
-
-std::unique_ptr<AuthorizationSession> authorizationSessionCreateImpl(
-    AuthorizationManager* authzManager) {
-    return std::make_unique<embedded::AuthorizationSession>(authzManager);
-}
-
-auto authorizationSessionCreateRegistration =
-    MONGO_WEAK_FUNCTION_REGISTRATION(AuthorizationSession::create, authorizationSessionCreateImpl);
-
-}  // namespace
 
 }  // namespace mongo

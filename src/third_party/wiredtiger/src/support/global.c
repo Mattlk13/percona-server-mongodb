@@ -31,6 +31,7 @@ const WT_NAME_FLAG __wt_stress_types[] = {
   {"checkpoint_handle", WT_TIMING_STRESS_CHECKPOINT_HANDLE},
   {"checkpoint_slow", WT_TIMING_STRESS_CHECKPOINT_SLOW},
   {"checkpoint_stop", WT_TIMING_STRESS_CHECKPOINT_STOP},
+  {"commit_transaction_slow", WT_TIMING_STRESS_COMMIT_TRANSACTION_SLOW},
   {"compact_slow", WT_TIMING_STRESS_COMPACT_SLOW},
   {"evict_reposition", WT_TIMING_STRESS_EVICT_REPOSITION},
   {"failpoint_eviction_split", WT_TIMING_STRESS_FAILPOINT_EVICTION_SPLIT},
@@ -160,6 +161,7 @@ __global_once(void)
      * doesn't have to check if it's set or not.
      */
     __wt_process.checksum = wiredtiger_crc32c_func();
+    __wt_process.checksum_with_seed = wiredtiger_crc32c_with_seed_func();
 
     __global_calibrate_ticks();
 

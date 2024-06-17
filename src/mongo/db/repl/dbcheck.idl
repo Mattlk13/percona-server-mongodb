@@ -37,6 +37,7 @@ imports:
   - "mongo/db/basic_types.idl"
   - "mongo/db/write_concern_options.idl"
   - "mongo/db/record_id.idl"
+  - "mongo/bson/bson_validate.idl"
 
 server_parameters:
     dbCheckHealthLogEveryNBatches:
@@ -48,6 +49,18 @@ server_parameters:
         validator:
           gte: 1
           lte: 10000
+        redact: false
+
+    maxDbCheckMBperSec:
+        description: "Max MB per second that a single dbCheck process running in the background will
+                      process in order to limit I/O and CPU usage.
+                      Setting it to 0 turns off throttling."
+        set_at: [ startup, runtime ]
+        cpp_varname: gMaxDbCheckMBperSec
+        cpp_vartype: AtomicWord<int>
+        validator: { gte: 0 }
+        default: 1
+        redact: false
 
 # TODO SERVER-78399: Remove once secondaryIndexChecksInDbCheck feature flag is removed.
 types:
@@ -57,6 +70,7 @@ types:
     cpp_type: "mongo::BSONKey"
     serializer: "mongo::BSONKey::serializeToBSON"
     deserializer: "mongo::BSONKey::parseFromBSON"
+    is_view: false
 
 enums:
   OplogEntries:
@@ -97,6 +111,9 @@ structs:
       skipLookupForExtraKeys:
         type: safeBool
         default: false
+      bsonValidateMode:
+        type: BSONValidateMode
+        default: kDefault
 
   DbCheckSingleInvocation:
     description: "Command object for dbCheck invocation"
@@ -129,33 +146,13 @@ structs:
       maxSize:
         type: safeInt64
         default: "std::numeric_limits<int64_t>::max()"
-      maxCountPerSecond:
-        type: safeInt64
-        default: "std::numeric_limits<int64_t>::max()"
       maxDocsPerBatch:
+        description: Controls the number of records and index entries checked in a batch.
         type: safeInt64
         default: 5000
         validator:
           gte: 1
           lte: 10000
-      maxBytesPerBatch:
-        type: safeInt64
-        default: 20 * 1024 * 1024
-        validator:
-          gte: 102400
-          lte: 268435456
-      maxDocsPerSec:
-        type: safeInt64
-        default: 5000
-        validator:
-          gte: 1
-          lte: 80000
-      maxBytesPerSec:
-        type: safeInt64
-        default: 20 * 1024 * 1024
-        validator:
-          gte: 102400
-          lte: 268435456
       maxBatchTimeMillis:
         type: safeInt64
         default: 1000
@@ -166,9 +163,10 @@ structs:
         type: safeBool
         default: true
       batchWriteConcern:
-        description: Wait for this writeConcern at the end of every batch. Default is w:1 with no timeout.
+        description: Wait for this writeConcern at the end of every batch.
         type: WriteConcern
-        default: WriteConcernOptions()
+        # Set to default write concern if not set.
+        optional: true
       validateMode:
         description: The type of consistency checks that dbCheck will run.
         type: DbCheckValidationMode
@@ -181,6 +179,10 @@ structs:
         description: Controls whether or not to run the reverse lookup portion of the extra index keys check.
         type: safeBool
         default: false
+      bsonValidateMode:
+        description: The validate mode that dbCheck will run for BSON consistency checks
+        type: BSONValidateMode
+        optional: true
 
   DbCheckAllInvocation:
     description: "Command object for database-wide form of dbCheck invocation"
@@ -188,33 +190,13 @@ structs:
       dbCheck:
         type: safeInt64
         cpp_name: tag
-      maxCountPerSecond:
-        type: safeInt64
-        default: "std::numeric_limits<int64_t>::max()"
       maxDocsPerBatch:
+        description: Controls the number of records and index entries checked in a batch.
         type: safeInt64
         default: 5000
         validator:
           gte: 1
           lte: 10000
-      maxBytesPerBatch:
-        type: safeInt64
-        default: 20 * 1024 * 1024
-        validator:
-          gte: 102400
-          lte: 268435456
-      maxDocsPerSec:
-        type: safeInt64
-        default: 5000
-        validator:
-          gte: 1
-          lte: 80000
-      maxBytesPerSec:
-        type: safeInt64
-        default: 20 * 1024 * 1024
-        validator:
-          gte: 102400
-          lte: 268435456
       maxBatchTimeMillis:
         type: safeInt64
         default: 1000
@@ -225,9 +207,10 @@ structs:
         type: safeBool
         default: true
       batchWriteConcern:
-        description: Wait for this writeConcern at the end of every batch. Default is w:1 with no timeout.
+        description: Wait for this writeConcern at the end of every batch.
         type: WriteConcern
-        default: WriteConcernOptions()
+        # Set to default write concern if not set.
+        optional: true
 
   DbCheckOplogBatch:
     description: "Oplog entry for a dbCheck batch"
@@ -264,9 +247,6 @@ structs:
       batchEnd:
         type: object
         cpp_name: batchEnd
-        optional: true
-      maxRate:
-        type: safeInt64
         optional: true
       readTimestamp:
         type: timestamp

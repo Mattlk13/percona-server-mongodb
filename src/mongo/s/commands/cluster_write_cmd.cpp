@@ -95,11 +95,11 @@
 
 
 namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(hangAfterThrowWouldChangeOwningShardRetryableWrite);
 namespace {
 
 using QuerySamplingOptions = OperationContext::QuerySamplingOptions;
-
-MONGO_FAIL_POINT_DEFINE(hangAfterThrowWouldChangeOwningShardRetryableWrite);
 
 void batchErrorToNotPrimaryErrorTracker(const BatchedCommandRequest& request,
                                         const BatchedCommandResponse& response,
@@ -183,11 +183,6 @@ boost::optional<WouldChangeOwningShardInfo> getWouldChangeOwningShardErrorInfo(
 void handleWouldChangeOwningShardErrorNonTransaction(OperationContext* opCtx,
                                                      BatchedCommandRequest* request,
                                                      BatchedCommandResponse* response) {
-    // Strip write concern because this command will be sent as part of a
-    // transaction and the write concern has already been loaded onto the opCtx and
-    // will be picked up by the transaction API.
-    request->unsetWriteConcern();
-
     // Strip runtime constants because they will be added again when the API sends this command
     // through the service entry point.
     request->unsetLegacyRuntimeConstants();
@@ -282,10 +277,10 @@ UpdateShardKeyResult handleWouldChangeOwningShardErrorTransaction(
 
     try {
         txn.run(opCtx,
-                [sharedBlock](const txn_api::TransactionClient& txnClient,
-                              ExecutorPtr txnExec) -> SemiFuture<void> {
+                [sharedBlock, opCtx](const txn_api::TransactionClient& txnClient,
+                                     ExecutorPtr txnExec) -> SemiFuture<void> {
                     return documentShardKeyUpdateUtil::updateShardKeyForDocument(
-                               txnClient, txnExec, sharedBlock->nss, sharedBlock->changeInfo)
+                               txnClient, opCtx, txnExec, sharedBlock->nss, sharedBlock->changeInfo)
                         .thenRunOn(txnExec)
                         .then([sharedBlock](bool updatedShardKey) {
                             sharedBlock->updatedShardKey = updatedShardKey;
@@ -307,30 +302,6 @@ UpdateShardKeyResult handleWouldChangeOwningShardErrorTransaction(
     return UpdateShardKeyResult{sharedBlock->updatedShardKey, std::move(upsertedId)};
 }
 
-void updateHostsTargetedMetrics(OperationContext* opCtx,
-                                BatchedCommandRequest::BatchType batchType,
-                                int nShardsOwningChunks,
-                                int nShardsTargeted) {
-    NumHostsTargetedMetrics::QueryType writeType;
-    switch (batchType) {
-        case BatchedCommandRequest::BatchType_Insert:
-            writeType = NumHostsTargetedMetrics::QueryType::kInsertCmd;
-            break;
-        case BatchedCommandRequest::BatchType_Update:
-            writeType = NumHostsTargetedMetrics::QueryType::kUpdateCmd;
-            break;
-        case BatchedCommandRequest::BatchType_Delete:
-            writeType = NumHostsTargetedMetrics::QueryType::kDeleteCmd;
-            break;
-
-            MONGO_UNREACHABLE;
-    }
-
-    auto targetType = NumHostsTargetedMetrics::get(opCtx).parseTargetType(
-        opCtx, nShardsTargeted, nShardsOwningChunks);
-    NumHostsTargetedMetrics::get(opCtx).addNumHostsTargeted(writeType, targetType);
-}
-
 }  // namespace
 
 bool ClusterWriteCmd::handleWouldChangeOwningShardError(OperationContext* opCtx,
@@ -350,7 +321,7 @@ bool ClusterWriteCmd::handleWouldChangeOwningShardError(OperationContext* opCtx,
     boost::optional<BSONObj> upsertedId;
 
     if (feature_flags::gFeatureFlagUpdateDocumentShardKeyUsingTransactionApi.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
         if (txnRouter) {
             auto updateResult = handleWouldChangeOwningShardErrorTransaction(
                 opCtx, request, nss, response, *wouldChangeOwningShardErrorInfo);
@@ -375,117 +346,42 @@ bool ClusterWriteCmd::handleWouldChangeOwningShardError(OperationContext* opCtx,
         opCtx->setQuerySamplingOptions(QuerySamplingOptions::kOptOut);
 
         if (isRetryableWrite) {
-            if (MONGO_unlikely(hangAfterThrowWouldChangeOwningShardRetryableWrite.shouldFail())) {
-                LOGV2(22759, "Hit hangAfterThrowWouldChangeOwningShardRetryableWrite failpoint");
-                hangAfterThrowWouldChangeOwningShardRetryableWrite.pauseWhileSet(opCtx);
-            }
-            RouterOperationContextSession routerSession(opCtx);
-            try {
-                // Start transaction and re-run the original update command
-                auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-                readConcernArgs = repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
-
-                // Ensure the retried operation does not include WC inside the transaction.  The
-                // transaction commit will still use the WC, because it uses the WC from the opCtx
-                // (which has been set previously in Strategy).
-                request->unsetWriteConcern();
-
-                documentShardKeyUpdateUtil::startTransactionForShardKeyUpdate(opCtx);
-                // Clear the error details from the response object before sending the write again
-                response->unsetErrDetails();
-
-                cluster::write(opCtx, *request, nullptr /* nss */, &stats, response);
-                wouldChangeOwningShardErrorInfo = getWouldChangeOwningShardErrorInfo(
-                    opCtx, *request, response, !isRetryableWrite);
-                if (!wouldChangeOwningShardErrorInfo)
-                    uassertStatusOK(response->toStatus());
-
-                // If we do not get WouldChangeOwningShard when re-running the update, the document
-                // has been modified or deleted concurrently and we do not need to delete it and
-                // insert a new one.
-                updatedShardKey = wouldChangeOwningShardErrorInfo &&
-                    documentShardKeyUpdateUtil::updateShardKeyForDocumentLegacy(
-                                      opCtx,
-                                      nss,
-                                      *wouldChangeOwningShardErrorInfo,
-                                      nss.isTimeseriesBucketsCollection());
-
-                // If the operation was an upsert, record the _id of the new document.
-                if (updatedShardKey && wouldChangeOwningShardErrorInfo->getShouldUpsert()) {
-                    // For timeseries collections, the 'userPostImage' is returned back
-                    // through WouldChangeOwningShardInfo from the old shard as well and it should
-                    // be returned to the user instead of the post-image.
-                    auto postImage = [&] {
-                        return wouldChangeOwningShardErrorInfo->getUserPostImage()
-                            ? *wouldChangeOwningShardErrorInfo->getUserPostImage()
-                            : wouldChangeOwningShardErrorInfo->getPostImage();
-                    }();
-                    upsertedId = postImage["_id"].wrap();
-                }
-
-                // Commit the transaction
-                auto commitResponse =
-                    documentShardKeyUpdateUtil::commitShardKeyUpdateTransaction(opCtx);
-
-                uassertStatusOK(getStatusFromCommandResult(commitResponse));
-
-                auto writeConcernDetail = getWriteConcernErrorDetailFromBSONObj(commitResponse);
-                if (writeConcernDetail && !writeConcernDetail->toStatus().isOK())
-                    response->setWriteConcernError(writeConcernDetail.release());
-            } catch (DBException& e) {
-                if (e.code() == ErrorCodes::DuplicateKey &&
-                    e.extraInfo<DuplicateKeyErrorInfo>()->getKeyPattern().hasField("_id")) {
-                    e.addContext(documentShardKeyUpdateUtil::kDuplicateKeyErrorContext);
-                } else {
-                    e.addContext(documentShardKeyUpdateUtil::kNonDuplicateKeyErrorContext);
-                }
-
-                if (!response->isErrDetailsSet()) {
-                    response->addToErrDetails(
-                        {0,
-                         Status(ErrorCodes::InternalError, "Will be replaced by the code below")});
-                }
-
-                // Set the error status to the status of the failed command and abort the
-                // transaction
-                auto status = e.toStatus();
-                response->getErrDetails().back().setStatus(status);
-
-                auto txnRouterForAbort = TransactionRouter::get(opCtx);
-                if (txnRouterForAbort)
-                    txnRouterForAbort.implicitlyAbortTransaction(opCtx, status);
-
-                return false;
-            }
-        } else {
-            try {
-                // Delete the original document and insert the new one
-                updatedShardKey = documentShardKeyUpdateUtil::updateShardKeyForDocumentLegacy(
+            std::tie(updatedShardKey, upsertedId) =
+                documentShardKeyUpdateUtil::handleWouldChangeOwningShardErrorRetryableWriteLegacy(
                     opCtx,
                     nss,
-                    *wouldChangeOwningShardErrorInfo,
-                    nss.isTimeseriesBucketsCollection());
-
-                // If the operation was an upsert, record the _id of the new document.
-                if (updatedShardKey && wouldChangeOwningShardErrorInfo->getShouldUpsert()) {
-                    // For timeseries collections, the 'userPostImage' is returned back
-                    // through WouldChangeOwningShardInfo from the old shard as well and it should
-                    // be returned to the user instead of the post-image.
-                    auto postImage = [&] {
-                        return wouldChangeOwningShardErrorInfo->getUserPostImage()
-                            ? *wouldChangeOwningShardErrorInfo->getUserPostImage()
-                            : wouldChangeOwningShardErrorInfo->getPostImage();
-                    }();
-
-                    upsertedId = postImage["_id"].wrap();
-                }
-            } catch (const ExceptionFor<ErrorCodes::DuplicateKey>& ex) {
-                Status status = ex->getKeyPattern().hasField("_id")
-                    ? ex.toStatus().withContext(
-                          documentShardKeyUpdateUtil::kDuplicateKeyErrorContext)
-                    : ex.toStatus();
-                uassertStatusOK(status);
-            }
+                    // RerunOriginalWriteFn:
+                    [&]() {
+                        // Clear the error details from the response object before sending the write
+                        // again
+                        response->unsetErrDetails();
+                        cluster::write(opCtx, *request, nullptr /* nss */, &stats, response);
+                        wouldChangeOwningShardErrorInfo = getWouldChangeOwningShardErrorInfo(
+                            opCtx, *request, response, !isRetryableWrite);
+                        if (!wouldChangeOwningShardErrorInfo)
+                            uassertStatusOK(response->toStatus());
+                        return wouldChangeOwningShardErrorInfo;
+                    },
+                    // ProcessWCEFn:
+                    [&](std::unique_ptr<WriteConcernErrorDetail> wce) {
+                        response->setWriteConcernError(wce.release());
+                    },
+                    // ProcessWriteErrorFn:
+                    [&](DBException& e) {
+                        if (!response->isErrDetailsSet()) {
+                            response->addToErrDetails(
+                                {0,
+                                 Status(ErrorCodes::InternalError,
+                                        "Will be replaced by the code below")});
+                        }
+                        // Set the error status to the status of the failed command.
+                        auto status = e.toStatus();
+                        response->getErrDetails().back().setStatus(status);
+                    });
+        } else {
+            std::tie(updatedShardKey, upsertedId) =
+                documentShardKeyUpdateUtil::handleWouldChangeOwningShardErrorTransactionLegacy(
+                    opCtx, nss, *wouldChangeOwningShardErrorInfo);
         }
     }
 
@@ -508,11 +404,11 @@ bool ClusterWriteCmd::handleWouldChangeOwningShardError(OperationContext* opCtx,
     return updatedShardKey;
 }
 
-void ClusterWriteCmd::_commandOpWrite(OperationContext* opCtx,
-                                      const NamespaceString& nss,
-                                      const BSONObj& command,
-                                      BatchItemRef targetingBatchItem,
-                                      std::vector<AsyncRequestsSender::Response>* results) {
+void ClusterWriteCmd::commandOpWrite(OperationContext* opCtx,
+                                     const NamespaceString& nss,
+                                     const BSONObj& command,
+                                     BatchItemRef targetingBatchItem,
+                                     std::vector<AsyncRequestsSender::Response>* results) {
     auto endpoints = [&] {
         // Note that this implementation will not handle targeting retries and does not
         // completely emulate write behavior
@@ -564,6 +460,121 @@ void ClusterWriteCmd::_commandOpWrite(OperationContext* opCtx,
     }
 }
 
+bool ClusterWriteCmd::runExplainWithoutShardKey(OperationContext* opCtx,
+                                                const BatchedCommandRequest& req,
+                                                const NamespaceString& nss,
+                                                ExplainOptions::Verbosity verbosity,
+                                                BSONObjBuilder* result) {
+    if (req.getBatchType() == BatchedCommandRequest::BatchType_Delete ||
+        req.getBatchType() == BatchedCommandRequest::BatchType_Update) {
+        bool isMultiWrite = false;
+        BSONObj query;
+        BSONObj collation;
+        bool isUpsert = false;
+        if (req.getBatchType() == BatchedCommandRequest::BatchType_Update) {
+            auto updateOp = req.getUpdateRequest().getUpdates().begin();
+            isMultiWrite = updateOp->getMulti();
+            query = updateOp->getQ();
+            collation = updateOp->getCollation().value_or(BSONObj());
+            isUpsert = updateOp->getUpsert();
+        } else {
+            auto deleteOp = req.getDeleteRequest().getDeletes().begin();
+            isMultiWrite = deleteOp->getMulti();
+            query = deleteOp->getQ();
+            collation = deleteOp->getCollation().value_or(BSONObj());
+        }
+
+        if (!isMultiWrite &&
+            write_without_shard_key::useTwoPhaseProtocol(opCtx,
+                                                         nss,
+                                                         true /* isUpdateOrDelete */,
+                                                         isUpsert,
+                                                         query,
+                                                         collation,
+                                                         req.getLet(),
+                                                         req.getLegacyRuntimeConstants(),
+                                                         false /* isTimeseriesViewRequest */)) {
+            // Explain currently cannot be run within a transaction, so each command is instead run
+            // separately outside of a transaction, and we compose the results at the end.
+            auto vts = auth::ValidatedTenancyScope::get(opCtx);
+            auto clusterQueryWithoutShardKeyExplainRes = [&] {
+                ClusterQueryWithoutShardKey clusterQueryWithoutShardKeyCommand(
+                    ClusterExplain::wrapAsExplain(req.toBSON(), verbosity));
+                const auto explainClusterQueryWithoutShardKeyCmd = ClusterExplain::wrapAsExplain(
+                    clusterQueryWithoutShardKeyCommand.toBSON({}), verbosity);
+                auto opMsg = OpMsgRequestBuilder::create(
+                    vts, nss.dbName(), explainClusterQueryWithoutShardKeyCmd);
+                return CommandHelpers::runCommandDirectly(opCtx, opMsg).getOwned();
+            }();
+
+            // Since 'explain' does not return the results of the query, we do not have an _id
+            // document to target by from the 'Read Phase'. We instead will use a dummy _id target
+            // document 'Write Phase'.
+            auto clusterWriteWithoutShardKeyExplainRes = [&] {
+                ClusterWriteWithoutShardKey clusterWriteWithoutShardKeyCommand(
+                    ClusterExplain::wrapAsExplain(req.toBSON(), verbosity),
+                    clusterQueryWithoutShardKeyExplainRes.getStringField("targetShardId")
+                        .toString(),
+                    write_without_shard_key::targetDocForExplain);
+                const auto explainClusterWriteWithoutShardKeyCmd = ClusterExplain::wrapAsExplain(
+                    clusterWriteWithoutShardKeyCommand.toBSON({}), verbosity);
+
+                auto opMsg = OpMsgRequestBuilder::create(
+                    vts, nss.dbName(), explainClusterWriteWithoutShardKeyCmd);
+                return CommandHelpers::runCommandDirectly(opCtx, opMsg).getOwned();
+            }();
+
+            auto output = write_without_shard_key::generateExplainResponseForTwoPhaseWriteProtocol(
+                clusterQueryWithoutShardKeyExplainRes, clusterWriteWithoutShardKeyExplainRes);
+            result->appendElementsUnique(output);
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+void ClusterWriteCmd::executeWriteOpExplain(OperationContext* opCtx,
+                                            const BatchedCommandRequest& batchedRequest,
+                                            const BSONObj& requestObj,
+                                            ExplainOptions::Verbosity verbosity,
+                                            rpc::ReplyBuilderInterface* result) {
+    std::unique_ptr<BatchedCommandRequest> req;
+    if (batchedRequest.hasEncryptionInformation() &&
+        (batchedRequest.getBatchType() == BatchedCommandRequest::BatchType_Delete ||
+         batchedRequest.getBatchType() == BatchedCommandRequest::BatchType_Update)) {
+        req = processFLEBatchExplain(opCtx, batchedRequest);
+    }
+
+    auto nss = req ? req->getNS() : batchedRequest.getNS();
+    auto requestBSON = req ? req->toBSON() : requestObj;
+    auto requestPtr = req ? req.get() : &batchedRequest;
+    auto bodyBuilder = result->getBodyBuilder();
+
+    // If we aren't running an explain for updateOne or deleteOne without shard key, continue and
+    // run the original explain path.
+    if (runExplainWithoutShardKey(opCtx, batchedRequest, nss, verbosity, &bodyBuilder)) {
+        return;
+    }
+
+    const auto explainCmd = ClusterExplain::wrapAsExplain(requestBSON, verbosity);
+
+    // We will time how long it takes to run the commands on the shards.
+    Timer timer;
+
+    // Target the command to the shards based on the singleton batch item.
+    BatchItemRef targetingBatchItem(requestPtr, 0);
+    std::vector<AsyncRequestsSender::Response> shardResponses;
+    commandOpWrite(opCtx, nss, explainCmd, targetingBatchItem, &shardResponses);
+    uassertStatusOK(ClusterExplain::buildExplainResult(
+        ExpressionContext::makeBlankExpressionContext(opCtx, nss),
+        shardResponses,
+        ClusterExplain::kWriteOnShards,
+        timer.millis(),
+        requestBSON,
+        &bodyBuilder));
+}
+
 bool ClusterWriteCmd::InvocationBase::runImpl(OperationContext* opCtx,
                                               const OpMsgRequest& request,
                                               BatchedCommandRequest& batchedRequest,
@@ -571,21 +582,16 @@ bool ClusterWriteCmd::InvocationBase::runImpl(OperationContext* opCtx,
     BatchWriteExecStats stats;
     BatchedCommandResponse response;
 
-    // The batched request will only have WC if it was supplied by the client. Otherwise, the
-    // batched request should use the WC from the opCtx.
-    if (!batchedRequest.hasWriteConcern()) {
-        batchedRequest.setWriteConcern(opCtx->getWriteConcern().toBSON());
-    }
+    // If 'batchedRequest' has any let parameters, evaluate them and stash them back on the original
+    // request.
+    batchedRequest.evaluateAndReplaceLetParams(opCtx);
 
-    // Write ops are never allowed to have writeConcern inside transactions. Normally
-    // disallowing WC on non-terminal commands in a transaction is handled earlier, during
-    // command dispatch. However, if this is a regular write operation being automatically
-    // retried inside a transaction (such as changing a document's shard key across shards),
-    // then batchedRequest will have a writeConcern (added by the if() above) from when it was
-    // initially run outside a transaction. Thus it's necessary to unconditionally clear the
-    // writeConcern when in a transaction.
-    if (TransactionRouter::get(opCtx)) {
-        batchedRequest.unsetWriteConcern();
+    // "Fire and forget" batch writes requested by the external clients need to be upgraded
+    // to w: 1 for potential writeErrors to be properly managed.
+    if (auto wc = opCtx->getWriteConcern();
+        !wc.requiresWriteAcknowledgement() && !opCtx->inMultiDocumentTransaction()) {
+        wc.w = 1;
+        opCtx->setWriteConcern(wc);
     }
 
     // Record the namespace that the write must be run on. It may differ from the request if this is
@@ -637,11 +643,10 @@ bool ClusterWriteCmd::InvocationBase::runImpl(OperationContext* opCtx,
             }
             debug.additiveMetrics.nModified = response.getNModified();
 
-            invariant(_updateMetrics);
             for (auto&& update : _batchedRequest.getUpdateRequest().getUpdates()) {
                 incrementUpdateMetrics(update.getU(),
                                        _batchedRequest.getNS(),
-                                       *_updateMetrics,
+                                       *const_cast<ClusterWriteCmd*>(command())->getUpdateMetrics(),
                                        update.getArrayFilters());
             }
             break;
@@ -653,15 +658,24 @@ bool ClusterWriteCmd::InvocationBase::runImpl(OperationContext* opCtx,
             break;
     }
 
-    // Record the number of shards targeted by this write.
-    CurOp::get(opCtx)->debug().nShards =
-        stats.getTargetedShards().size() + (updatedShardKey ? 1 : 0);
+    int nShards = stats.getTargetedShards().size();
 
-    if (stats.getNumShardsOwningChunks().has_value())
+    // If we have no information on the shards targeted, ignore updatedShardKey,
+    // updateHostsTargetedMetrics will report this as TargetType::kManyShards.
+    if (nShards != 0 && updatedShardKey) {
+        nShards += 1;
+    }
+
+    // Record the number of shards targeted by this write.
+    CurOp::get(opCtx)->debug().nShards = nShards;
+
+    if (stats.getNumShardsOwningChunks().has_value()) {
         updateHostsTargetedMetrics(opCtx,
                                    _batchedRequest.getBatchType(),
                                    stats.getNumShardsOwningChunks().value(),
-                                   stats.getTargetedShards().size() + (updatedShardKey ? 1 : 0));
+                                   nShards,
+                                   stats.hasTargetedShardedCollection());
+    }
 
     if (auto txnRouter = TransactionRouter::get(opCtx)) {
         auto writeCmdStatus = response.toStatus();
@@ -684,79 +698,6 @@ void ClusterWriteCmd::InvocationBase::run(OperationContext* opCtx,
         CommandHelpers::appendSimpleCommandStatus(bob, ok);
 }
 
-bool ClusterWriteCmd::InvocationBase::_runExplainWithoutShardKey(
-    OperationContext* opCtx,
-    const NamespaceString& nss,
-    ExplainOptions::Verbosity verbosity,
-    BSONObjBuilder* result) {
-    if (_batchedRequest.getBatchType() == BatchedCommandRequest::BatchType_Delete ||
-        _batchedRequest.getBatchType() == BatchedCommandRequest::BatchType_Update) {
-        bool isMultiWrite = false;
-        BSONObj query;
-        BSONObj collation;
-        bool isUpsert = false;
-        if (_batchedRequest.getBatchType() == BatchedCommandRequest::BatchType_Update) {
-            auto updateOp = _batchedRequest.getUpdateRequest().getUpdates().begin();
-            isMultiWrite = updateOp->getMulti();
-            query = updateOp->getQ();
-            collation = updateOp->getCollation().value_or(BSONObj());
-            isUpsert = updateOp->getUpsert();
-        } else {
-            auto deleteOp = _batchedRequest.getDeleteRequest().getDeletes().begin();
-            isMultiWrite = deleteOp->getMulti();
-            query = deleteOp->getQ();
-            collation = deleteOp->getCollation().value_or(BSONObj());
-        }
-
-        if (!isMultiWrite &&
-            write_without_shard_key::useTwoPhaseProtocol(
-                opCtx,
-                nss,
-                true /* isUpdateOrDelete */,
-                isUpsert,
-                query,
-                collation,
-                _batchedRequest.getLet(),
-                _batchedRequest.getLegacyRuntimeConstants(),
-                false /* isTimeseriesViewRequest */)) {
-            // Explain currently cannot be run within a transaction, so each command is instead run
-            // separately outside of a transaction, and we compose the results at the end.
-            auto clusterQueryWithoutShardKeyExplainRes = [&] {
-                ClusterQueryWithoutShardKey clusterQueryWithoutShardKeyCommand(
-                    ClusterExplain::wrapAsExplain(_batchedRequest.toBSON(), verbosity));
-                const auto explainClusterQueryWithoutShardKeyCmd = ClusterExplain::wrapAsExplain(
-                    clusterQueryWithoutShardKeyCommand.toBSON({}), verbosity);
-                auto opMsg = OpMsgRequest::fromDBAndBody(nss.dbName(),
-                                                         explainClusterQueryWithoutShardKeyCmd);
-                return CommandHelpers::runCommandDirectly(opCtx, opMsg).getOwned();
-            }();
-
-            // Since 'explain' does not return the results of the query, we do not have an _id
-            // document to target by from the 'Read Phase'. We instead will use a dummy _id target
-            // document 'Write Phase'.
-            auto clusterWriteWithoutShardKeyExplainRes = [&] {
-                ClusterWriteWithoutShardKey clusterWriteWithoutShardKeyCommand(
-                    ClusterExplain::wrapAsExplain(_batchedRequest.toBSON(), verbosity),
-                    clusterQueryWithoutShardKeyExplainRes.getStringField("targetShardId")
-                        .toString(),
-                    write_without_shard_key::targetDocForExplain);
-                const auto explainClusterWriteWithoutShardKeyCmd = ClusterExplain::wrapAsExplain(
-                    clusterWriteWithoutShardKeyCommand.toBSON({}), verbosity);
-                auto opMsg = OpMsgRequest::fromDBAndBody(nss.dbName(),
-                                                         explainClusterWriteWithoutShardKeyCmd);
-                return CommandHelpers::runCommandDirectly(opCtx, opMsg).getOwned();
-            }();
-
-            auto output = write_without_shard_key::generateExplainResponseForTwoPhaseWriteProtocol(
-                clusterQueryWithoutShardKeyExplainRes, clusterWriteWithoutShardKeyExplainRes);
-            result->appendElementsUnique(output);
-            return true;
-        }
-        return false;
-    }
-    return false;
-}
-
 void ClusterWriteCmd::InvocationBase::explain(OperationContext* opCtx,
                                               ExplainOptions::Verbosity verbosity,
                                               rpc::ReplyBuilderInterface* result) {
@@ -766,40 +707,7 @@ void ClusterWriteCmd::InvocationBase::explain(OperationContext* opCtx,
             "explained write batches must be of size 1",
             _batchedRequest.sizeWriteOps() == 1U);
 
-
-    std::unique_ptr<BatchedCommandRequest> req;
-    if (_batchedRequest.hasEncryptionInformation() &&
-        (_batchedRequest.getBatchType() == BatchedCommandRequest::BatchType_Delete ||
-         _batchedRequest.getBatchType() == BatchedCommandRequest::BatchType_Update)) {
-        req = processFLEBatchExplain(opCtx, _batchedRequest);
-    }
-
-    auto nss = req ? req->getNS() : _batchedRequest.getNS();
-    auto requestBSON = req ? req->toBSON() : _request->body;
-    auto requestPtr = req ? req.get() : &_batchedRequest;
-    auto bodyBuilder = result->getBodyBuilder();
-
-    // If we aren't running an explain for updateOne or deleteOne without shard key, continue and
-    // run the original explain path.
-    if (_runExplainWithoutShardKey(opCtx, nss, verbosity, &bodyBuilder)) {
-        return;
-    }
-
-    const auto explainCmd = ClusterExplain::wrapAsExplain(requestBSON, verbosity);
-
-    // We will time how long it takes to run the commands on the shards.
-    Timer timer;
-
-    // Target the command to the shards based on the singleton batch item.
-    BatchItemRef targetingBatchItem(requestPtr, 0);
-    std::vector<AsyncRequestsSender::Response> shardResponses;
-    _commandOpWrite(opCtx, nss, explainCmd, targetingBatchItem, &shardResponses);
-    uassertStatusOK(ClusterExplain::buildExplainResult(opCtx,
-                                                       shardResponses,
-                                                       ClusterExplain::kWriteOnShards,
-                                                       timer.millis(),
-                                                       requestBSON,
-                                                       &bodyBuilder));
+    executeWriteOpExplain(opCtx, _batchedRequest, _request->body, verbosity, result);
 }
 
 }  // namespace mongo

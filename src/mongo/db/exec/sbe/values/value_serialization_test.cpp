@@ -134,6 +134,17 @@ TEST(ValueSerializeForSorter, Serialize) {
     auto [oidTag, oidVal] = value::makeCopyObjectId({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
     testData->push_back(oidTag, oidVal);
 
+    auto [arrayMultiSetTag, arrayMultiSetVal] = value::makeNewArrayMultiSet();
+    object->push_back("mset", arrayMultiSetTag, arrayMultiSetVal);
+
+    value::ArrayMultiSet* arrayMultiSet = value::getArrayMultiSetView(arrayMultiSetVal);
+    arrayMultiSet->push_back(value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(6));
+    arrayMultiSet->push_back(value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(6));
+    arrayMultiSet->push_back(value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(7));
+
+    auto [msetTag, msetVal] = value::makeCopyArrayMultiSet(*arrayMultiSet);
+    testData->push_back(msetTag, msetVal);
+
     uint8_t byteArray[] = {8, 7, 6, 5, 4, 3, 2, 1};
     auto bson =
         BSON("obj" << BSON("a" << 1 << "b" << 2) << "arr" << BSON_ARRAY(1 << 2 << 3)  //
@@ -201,6 +212,15 @@ TEST(ValueSerializeForSorter, Serialize) {
     auto [cwsTag3, cwsVal3] =
         value::makeNewBsonCodeWScope("", BSON("b" << 2 << "c" << BSON_ARRAY(3 << 4)).objdata());
     testData->push_back(cwsTag3, cwsVal3);
+
+    value::MultiMap map{};
+    map.insert({value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(1)},
+               {value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(2)});
+    map.insert({value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(3)},
+               {value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(4)});
+
+    auto [mapTag, mapVal] = value::makeCopyMultiMap(map);
+    testData->push_back(mapTag, mapVal);
 
     value::MaterializedRow originalRow{testData->size()};
     for (size_t i = 0; i < testData->size(); i++) {
@@ -294,6 +314,18 @@ TEST_F(ValueSerializeForKeyString, ArraySet) {
     arraySet->push_back(value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(1));
     arraySet->push_back(value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(2));
     arraySet->push_back(value::TypeTags::NumberDouble, value::bitcastFrom<double>(3.0));
+
+    runTest({{tag, val}});
+}
+
+TEST_F(ValueSerializeForKeyString, ArrayMultiSet) {
+    auto [tag, val] = sbe::value::makeNewArrayMultiSet();
+    sbe::value::ValueGuard guard{tag, val};
+    auto* arrayMultiSet = sbe::value::getArrayMultiSetView(val);
+
+    arrayMultiSet->push_back(value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(1));
+    arrayMultiSet->push_back(value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(1));
+    arrayMultiSet->push_back(value::TypeTags::NumberDouble, value::bitcastFrom<double>(2.0));
 
     runTest({{tag, val}});
 }

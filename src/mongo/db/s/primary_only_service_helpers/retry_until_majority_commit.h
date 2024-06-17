@@ -56,9 +56,9 @@ public:
      * PrimaryOnlyService. Returns an executor future.
      */
     template <typename Function>
-    auto untilStepdownOrMajorityCommit(const std::string& operationName, Function&& function) {
-        return untilMajorityCommit(
-            operationName, std::forward<Function>(function), _retryUntilStepdown);
+    auto untilStepdownOrSuccess(const std::string& operationName, Function&& function) {
+        return _retryUntilStepdown.untilSuccessOrCancel(operationName,
+                                                        std::forward<Function>(function));
     }
 
     /**
@@ -69,9 +69,54 @@ public:
      * and use a future continuation to handle this failure. Returns an executor future.
      */
     template <typename Function>
+    auto untilAbortOrSuccess(const std::string& operationName, Function&& function) {
+        return _retryUntilAbort.untilSuccessOrCancel(operationName,
+                                                     std::forward<Function>(function));
+    }
+
+    /**
+     * Same as untilStepdownOrSuccess, except will also wait for the most recent opTime to be
+     * majority committed after the operation succeeds.
+     */
+    template <typename Function>
+    auto untilStepdownOrMajorityCommit(const std::string& operationName, Function&& function) {
+        return untilMajorityCommit(
+            operationName, std::forward<Function>(function), _retryUntilStepdown);
+    }
+
+    /**
+     * Same as untilAbortOrSuccess, except will also wait for the most recent opTime to be
+     * majority committed after the operation succeeds.
+     */
+    template <typename Function>
     auto untilAbortOrMajorityCommit(const std::string& operationName, Function&& function) {
         return untilMajorityCommit(
             operationName, std::forward<Function>(function), _retryUntilAbort);
+    }
+
+    enum Event { kAbort, kStepdown };
+
+    template <typename Function>
+    auto untilSuccessOr(Event event, const std::string& operationName, Function&& function) {
+        switch (event) {
+            case Event::kAbort:
+                return untilAbortOrSuccess(operationName, std::forward<Function>(function));
+            case Event::kStepdown:
+                return untilStepdownOrSuccess(operationName, std::forward<Function>(function));
+        }
+        MONGO_UNREACHABLE;
+    }
+
+    template <typename Function>
+    auto untilMajorityCommitOr(Event event, const std::string& operationName, Function&& function) {
+        switch (event) {
+            case Event::kAbort:
+                return untilAbortOrMajorityCommit(operationName, std::forward<Function>(function));
+            case Event::kStepdown:
+                return untilStepdownOrMajorityCommit(operationName,
+                                                     std::forward<Function>(function));
+        }
+        MONGO_UNREACHABLE;
     }
 
 private:

@@ -71,18 +71,33 @@ public:
     class Options {
     public:
         Options() = delete;
+
         explicit Options(OplogApplication::Mode inputMode)
             : mode(inputMode),
               allowNamespaceNotFoundErrorsOnCrudOps(inputMode ==
                                                         OplogApplication::Mode::kInitialSync ||
                                                     OplogApplication::inRecovering(inputMode)),
-              skipWritesToOplog(OplogApplication::inRecovering(inputMode)) {}
-        explicit Options(OplogApplication::Mode mode,
-                         bool allowNamespaceNotFoundErrorsOnCrudOps,
-                         bool skipWritesToOplog)
+              skipWritesToOplog(OplogApplication::inRecovering(inputMode)),
+              skipWritesToChangeCollection(false) {}
+
+        Options(OplogApplication::Mode inputMode,
+                bool skipWritesToOplog,
+                bool skipWritesToChangeCollection)
+            : mode(inputMode),
+              allowNamespaceNotFoundErrorsOnCrudOps(inputMode ==
+                                                        OplogApplication::Mode::kInitialSync ||
+                                                    OplogApplication::inRecovering(inputMode)),
+              skipWritesToOplog(skipWritesToOplog),
+              skipWritesToChangeCollection(skipWritesToChangeCollection) {}
+
+        Options(OplogApplication::Mode mode,
+                bool allowNamespaceNotFoundErrorsOnCrudOps,
+                bool skipWritesToOplog,
+                bool skipWritesToChangeCollection)
             : mode(mode),
               allowNamespaceNotFoundErrorsOnCrudOps(allowNamespaceNotFoundErrorsOnCrudOps),
-              skipWritesToOplog(skipWritesToOplog) {}
+              skipWritesToOplog(skipWritesToOplog),
+              skipWritesToChangeCollection(skipWritesToChangeCollection) {}
 
         // Used to determine which operations should be applied. Only initial sync will set this to
         // be something other than the null optime.
@@ -91,6 +106,7 @@ public:
         const OplogApplication::Mode mode;
         const bool allowNamespaceNotFoundErrorsOnCrudOps;
         const bool skipWritesToOplog;
+        const bool skipWritesToChangeCollection;
     };
 
     // Used to report oplog application progress.
@@ -116,7 +132,7 @@ public:
     virtual ~OplogApplier() = default;
 
     /**
-     * Returns this applier's buffer.
+     * Returns this applier's input buffer.
      */
     OplogBuffer* getBuffer() const;
 
@@ -128,12 +144,12 @@ public:
 
     /**
      * Starts the shutdown process for this OplogApplier.
-     * It is safe to call shutdown() multiplie times.
+     * It is safe to call shutdown() multiple times.
      */
     void shutdown();
 
     /**
-     * Returns true if we are shutting down.
+     * Returns true if this OplogApplier is shutting down.
      */
     bool inShutdown() const;
 
@@ -150,10 +166,12 @@ public:
      */
     void enqueue(OperationContext* opCtx,
                  std::vector<OplogEntry>::const_iterator begin,
-                 std::vector<OplogEntry>::const_iterator end);
+                 std::vector<OplogEntry>::const_iterator end,
+                 boost::optional<std::size_t> bytes = boost::none);
     void enqueue(OperationContext* opCtx,
                  OplogBuffer::Batch::const_iterator begin,
-                 OplogBuffer::Batch::const_iterator end);
+                 OplogBuffer::Batch::const_iterator end,
+                 boost::optional<std::size_t> bytes = boost::none);
     /**
      * Applies a batch of oplog entries by writing the oplog entries to the local oplog and then
      * using a set of threads to apply the operations.
@@ -168,10 +186,16 @@ public:
      */
     StatusWith<OpTime> applyOplogBatch(OperationContext* opCtx, std::vector<OplogEntry> ops);
 
+    virtual void scheduleWritesToOplogAndChangeCollection(OperationContext* opCtx,
+                                                          StorageInterface* storageInterface,
+                                                          ThreadPool* writerPool,
+                                                          const std::vector<OplogEntry>& ops,
+                                                          bool skipWritesToOplog) = 0;
+
     /**
      * Calls the OplogBatcher's getNextApplierBatch.
      */
-    StatusWith<std::vector<OplogEntry>> getNextApplierBatch(
+    StatusWith<OplogApplierBatch> getNextApplierBatch(
         OperationContext* opCtx,
         const BatchLimits& batchLimits,
         Milliseconds waitToFillBatch = Milliseconds(0));

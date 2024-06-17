@@ -108,6 +108,10 @@ void RuntimeEnvironment::resetSlot(value::SlotId slot,
     tasserted(4946300, str::stream() << "undefined slot accessor:" << slot);
 }
 
+bool RuntimeEnvironment::isSlotRegistered(value::SlotId slot) const {
+    return _accessors.count(slot);
+}
+
 RuntimeEnvironment::Accessor* RuntimeEnvironment::getAccessor(value::SlotId slot) {
     if (auto it = _accessors.find(slot); it != _accessors.end()) {
         return &it->second;
@@ -134,7 +138,7 @@ std::unique_ptr<RuntimeEnvironment> RuntimeEnvironment::makeDeepCopy() const {
     env->_state = _state->makeCopyWithoutValues();
     for (auto&& [slotId, index] : _state->slots) {
         // Copy the slot value.
-        auto [tag, val] = _accessors.at(slotId).copyOrMoveValue();
+        auto [tag, val] = _accessors.at(slotId).getCopyOfValue();
 
         env->emplaceAccessor(slotId, index);
         env->resetSlot(slotId, tag, val, true /* owned */);
@@ -186,6 +190,12 @@ void RuntimeEnvironment::debugString(StringBuilder* builder) const {
         }
     }
     *builder << " }";
+}
+
+std::string RuntimeEnvironment::toDebugString() const {
+    StringBuilder builder;
+    debugString(&builder);
+    return builder.str();
 }
 
 }  // namespace mongo::sbe

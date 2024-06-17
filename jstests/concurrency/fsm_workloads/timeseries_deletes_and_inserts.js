@@ -14,6 +14,7 @@
  *   requires_fcv_70,
  * ]
  */
+
 export const $config = (function() {
     const data = {
         logColl: "deletes_and_inserts_log",

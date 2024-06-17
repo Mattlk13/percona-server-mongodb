@@ -48,13 +48,11 @@
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/feature_flag.h"
 #include "mongo/db/pipeline/document_source_add_fields.h"
-#include "mongo/db/pipeline/document_source_fill_gen.h"
 #include "mongo/db/pipeline/document_source_set_window_fields.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/query/allowed_contexts.h"
 #include "mongo/idl/idl_parser.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/intrusive_counter.h"
 #include "mongo/util/overloaded_visitor.h"  // IWYU pragma: keep
@@ -137,10 +135,10 @@ std::list<boost::intrusive_ptr<DocumentSource>> createFromBson(
                 "Maximum one of 'partitionBy' and 'partitionByFields can be specified in '$fill'",
                 !spec.getPartitionByFields());
         auto partitionByField = partitionByUnparsedExpr.value();
-        if (std::string* partitionByString = stdx::get_if<std::string>(&partitionByField)) {
+        if (std::string* partitionByString = get_if<std::string>(&partitionByField)) {
             setWindowFieldsSpec.append("partitionBy", *partitionByString);
         } else
-            setWindowFieldsSpec.append("partitionBy", stdx::get<BSONObj>(partitionByField));
+            setWindowFieldsSpec.append("partitionBy", get<BSONObj>(partitionByField));
     }
 
     if (auto&& partitionByFields = spec.getPartitionByFields()) {

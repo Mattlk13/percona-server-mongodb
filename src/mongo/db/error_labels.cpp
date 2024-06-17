@@ -104,6 +104,12 @@ bool ErrorLabelBuilder::isRetryableWriteError() const {
             return true;
         }
 
+        // StaleConfig error for a direct shard operation is retryable because StaleConfig triggers
+        // a sharding metadata refresh. As a result, a subsequent retry will probably succeed.
+        if (!_isComingFromRouter && _code && _code.value() == ErrorCodes::StaleConfig) {
+            return true;
+        }
+
         // mongos should not attach RetryableWriteError label to retryable errors thrown by the
         // config server or targeted shards.
         return !_isMongos &&
@@ -140,8 +146,10 @@ bool ErrorLabelBuilder::isResumableChangeStreamError() const {
 
     // Get the namespace string from CurOp. We will need it to build the LiteParsedPipeline.
     const auto& nss = CurOp::get(_opCtx)->getNSS();
-    auto sc = SerializationContext::stateCommandRequest();
-    sc.setTenantIdSource(auth::ValidatedTenancyScope::get(_opCtx) != boost::none);
+    const auto vts = auth::ValidatedTenancyScope::get(_opCtx);
+    auto sc = vts != boost::none
+        ? SerializationContext::stateCommandRequest(vts->hasTenantId(), vts->isFromAtlasProxy())
+        : SerializationContext::stateCommandRequest();
 
     bool apiStrict = APIParameters::get(_opCtx).getAPIStrict().value_or(false);
     // Do enough parsing to confirm that this is a well-formed pipeline with a $changeStream.
@@ -215,11 +223,12 @@ BSONObj getErrorLabels(OperationContext* opCtx,
                        boost::optional<ErrorCodes::Error> wcCode,
                        bool isInternalClient,
                        bool isMongos,
+                       bool isComingFromRouter,
                        const repl::OpTime& lastOpBeforeRun,
                        const repl::OpTime& lastOpAfterRun) {
     if (MONGO_unlikely(errorLabelsOverride(opCtx))) {
         // This command was failed by a failCommand failpoint. Thus, we return the errorLabels
-        // specified in the failpoint to supress any other error labels that would otherwise be
+        // specified in the failpoint to suppress any other error labels that would otherwise be
         // returned by the ErrorLabelBuilder.
         if (errorLabelsOverride(opCtx).value().isEmpty()) {
             return BSONObj();
@@ -236,6 +245,7 @@ BSONObj getErrorLabels(OperationContext* opCtx,
                                    wcCode,
                                    isInternalClient,
                                    isMongos,
+                                   isComingFromRouter,
                                    lastOpBeforeRun,
                                    lastOpAfterRun);
     labelBuilder.build(labelArray);
@@ -264,7 +274,6 @@ bool isTransientTransactionError(ErrorCodes::Error code,
         case ErrorCodes::LockTimeout:
         case ErrorCodes::PreparedTransactionInProgress:
         case ErrorCodes::ShardCannotRefreshDueToLocksHeld:
-        case ErrorCodes::ShardInvalidatedForTargeting:
         case ErrorCodes::StaleDbVersion:
         case ErrorCodes::TenantMigrationAborted:
         case ErrorCodes::TenantMigrationCommitted:

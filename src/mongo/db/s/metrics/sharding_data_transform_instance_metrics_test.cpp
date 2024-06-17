@@ -115,7 +115,7 @@ public:
                                                std::move(observer)},
           _scopedObserver(registerInstanceMetrics()) {}
 
-    boost::optional<Milliseconds> getRecipientHighEstimateRemainingTimeMillis() const {
+    boost::optional<Milliseconds> getRecipientHighEstimateRemainingTimeMillis() const override {
         return boost::none;
     }
 
@@ -178,7 +178,7 @@ public:
     void createMetricsAndAssertIncrementsCumulativeMetricsField(
         const std::function<void(ShardingDataTransformInstanceMetrics*)>& mutate,
         Section section,
-        const StringData& fieldName) {
+        StringData fieldName) {
         auto metrics = createInstanceMetrics(UUID::gen(), Role::kCoordinator);
         assertIncrementsCumulativeMetricsField(metrics.get(), mutate, section, fieldName);
     }

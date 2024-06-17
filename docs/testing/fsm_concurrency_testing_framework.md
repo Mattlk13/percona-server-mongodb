@@ -1,7 +1,7 @@
 # FSM-based Concurrency Testing Framework
 
-
 ## Overview
+
 The FSM tests are meant to exercise concurrency within MongoDB. The suite
 consists of workloads, which define discrete units of work as states in a FSM,
 and runners, which define which tests to run and how they should be run. Each
@@ -21,13 +21,11 @@ function.
 
 ![fsm.png](../images/testing/fsm.png)
 
-The runner provides three modes of execution for workloads: serial, parallel,
-and composed. Serial mode runs the provided workloads one after the other,
+The runner provides two modes of execution for workloads: serial and parallel.
+Serial mode runs the provided workloads one after the other,
 waiting for all threads of a workload to complete before moving on to the next
 workload. Parallel mode runs subsets of the provided workloads in separate
-threads simultaneously. Composed mode runs subsets of the provided workloads in
-the same threads simultaneously, with each thread moving between the states of
-multiple workloads.
+threads simultaneously.
 
 New methods were added to allow for finer-grained assertions under different
 situations. For example, a test that inserts a document into a collection, and
@@ -44,19 +42,19 @@ some assertions, even when running a mixture of different workloads together.
 There are three assertion levels: `ALWAYS`, `OWN_COLL`, and `OWN_DB`. They can
 be thought of as follows:
 
-* `ALWAYS`: A statement that remains unequivocally true, regardless of what
-  another workload might be doing to the collection I was given (hint: think
-  defensively). Examples include "1 = 1" or inserting a document into a
-  collection (disregarding any unique indices).
+-   `ALWAYS`: A statement that remains unequivocally true, regardless of what
+    another workload might be doing to the collection I was given (hint: think
+    defensively). Examples include "1 = 1" or inserting a document into a
+    collection (disregarding any unique indices).
 
-* `OWN_COLL`: A statement that is true only if I am the only workload operating
-  on the collection I was given. Examples include counting the number of
-  documents in a collection or updating a previously inserted document.
+-   `OWN_COLL`: A statement that is true only if I am the only workload operating
+    on the collection I was given. Examples include counting the number of
+    documents in a collection or updating a previously inserted document.
 
-* `OWN_DB`: A statement that is true only if I am the only workload operating on
-  the database I was given. Examples include renaming a collection or verifying
-  that a collection is capped. The workload typically relies on the use of
-  another collection aside from the one given.
+-   `OWN_DB`: A statement that is true only if I am the only workload operating on
+    the database I was given. Examples include renaming a collection or verifying
+    that a collection is capped. The workload typically relies on the use of
+    another collection aside from the one given.
 
 ## Creating your own workload
 
@@ -99,20 +97,20 @@ When finished executing, `$config` must return an object containing the properti
 above (some of which are optional, see below).
 
 ### Defining states
+
 It's best to also declare states within its own closure so as not to interfere
 with the scope of $config. Each state takes two arguments, the db object and the
 collection name. For later, note that this db and collection are the only one
 that you can be guaranteed to "own" when asserting. Try to make each state a
-discrete unit of work that can stand alone without the other states (in fact, an
-FSM that requires another state to run before it will probably not work in
-Composed mode). Additionally, try to define each function that makes up a state
+discrete unit of work that can stand alone without the other states.
+Additionally, try to define each function that makes up a state
 with a name as opposed to anonymously - this makes easier to read backtraces
 when things go wrong.
 
 ```javascript
-$config = (function() {
+$config = (function () {
     /* ... */
-    var states = (function() {
+    var states = (function () {
         function getRand() {
             return Random.randInt(10);
         }
@@ -122,18 +120,17 @@ $config = (function() {
         }
 
         function scanGT(db, collName) {
-            db[collName].find({ _id: { $gt: this.start } }).itcount();
+            db[collName].find({_id: {$gt: this.start}}).itcount();
         }
 
         function scanLTE(db, collName) {
-            db[collName].find({ _id: { $lte: this.start } }).itcount();
+            db[collName].find({_id: {$lte: this.start}}).itcount();
         }
-
 
         return {
             init: init,
             scanGT: scanGT,
-            scanLTE: scanLTE
+            scanLTE: scanLTE,
         };
     })();
 
@@ -159,13 +156,12 @@ example below, we're denoting an equal probability of moving to either of the
 scan states from the init state:
 
 ```javascript
-
-$config = (function() {
+$config = (function () {
     /* ... */
     var transitions = {
-        init:    { scanGT: 0.5, scanLTE: 0.5 },
-        scanGT:  { scanGT: 0.8, scanLTE: 0.2 },
-        scanLTE: { scanGT: 0.2, scanLTE: 0.8 }
+        init: {scanGT: 0.5, scanLTE: 0.5},
+        scanGT: {scanGT: 0.8, scanLTE: 0.2},
+        scanLTE: {scanGT: 0.2, scanLTE: 0.8},
     };
     /* ... */
     return {
@@ -189,25 +185,31 @@ against the provided `db` you should use the provided
 `cluster.executeOnMongodNodes` and `cluster.executeOnMongosNodes` functionality.
 
 ```javascript
-$config = (function() {
+$config = (function () {
     /* ... */
     function setup(db, collName, cluster) {
         // Workloads should NOT drop the collection db[collName], as doing so
         // is handled by jstests/concurrency/fsm_libs/runner.js before 'setup' is called.
         for (var i = 0; i < 1000; ++i) {
-            db[collName].insert({ _id: i });
+            db[collName].insert({_id: i});
         }
-        cluster.executeOnMongodNodes(function(db) {
-            db.adminCommand({ setParameter: 1, internalQueryExecYieldIterations: 5 });
+        cluster.executeOnMongodNodes(function (db) {
+            db.adminCommand({
+                setParameter: 1,
+                internalQueryExecYieldIterations: 5,
+            });
         });
-        cluster.executeOnMongosNodes(function(db) {
+        cluster.executeOnMongosNodes(function (db) {
             printjson(db.serverCmdLineOpts());
         });
     }
 
     function teardown(db, collName, cluster) {
-        cluster.executeOnMongodNodes(function(db) {
-            db.adminCommand({ setParameter: 1, internalQueryExecYieldIterations: 128 });
+        cluster.executeOnMongodNodes(function (db) {
+            db.adminCommand({
+                setParameter: 1,
+                internalQueryExecYieldIterations: 128,
+            });
         });
     }
     /* ... */
@@ -236,9 +238,9 @@ composition, each workload has its own data, meaning you don't have to worry
 about properties being overridden by workloads other than the current one.
 
 ```javascript
-$config = (function() {
+$config = (function () {
     var data = {
-        start: 0
+        start: 0,
     };
     /* ... */
     return {
@@ -265,7 +267,7 @@ number of threads available due to system or performance constraints.
 #### `iterations`
 
 This is just the number of states the FSM will go through before exiting. NOTE:
-it is *not* the number of times each state will be executed.
+it is _not_ the number of times each state will be executed.
 
 #### `startState` (optional)
 
@@ -301,8 +303,8 @@ workload you are extending has a function in its data object called
 
 ```javascript
 import {extendWorkload} from "jstests/concurrency/fsm_libs/extend_workload.js";
-load('jstests/concurrency/fsm_workload_modifiers/indexed_noindex.js'); // for indexedNoindex
-import {$config as $baseConfig} from 'jstests/concurrency/fsm_workloads/workload_with_index.js';
+load("jstests/concurrency/fsm_workload_modifiers/indexed_noindex.js"); // for indexedNoindex
+import {$config as $baseConfig} from "jstests/concurrency/fsm_workloads/workload_with_index.js";
 
 export const $config = extendWorkload($baseConfig, indexedNoIndex);
 ```
@@ -316,7 +318,6 @@ to be dropped. Prefixing the items in any of these categories you create with a
 prefix defined by your workload name is a good idea since the workload file name
 can be assumed unique and will allow you to only affect your workload in these
 cases.
-
 
 ## Test runners
 
@@ -348,7 +349,6 @@ all complete, all threads have their teardown function run.
 
 ![fsm_simultaneous_example.png](../images/testing/fsm_simultaneous_example.png)
 
-
 ### Existing runners
 
 The existing runners all use `jstests/concurrency/fsm_libs/runner.js` to
@@ -361,12 +361,10 @@ is explained in the other components section below. Execution options for
 runWorkloads functions, the third argument, can contain the following options
 (some depend on the run mode):
 
-* `numSubsets` - Not available in serial mode, determines how many subsets of
-  workloads to execute in parallel or composed mode
-* `subsetSize` - Not available in serial mode, determines how large each subset of
-  workloads executed is
-* `iterations` - Only available in composed mode, determines how many transitions
-  to perform between states in a single thread of composition.
+-   `numSubsets` - Not available in serial mode, determines how many subsets of
+    workloads to execute in parallel mode
+-   `subsetSize` - Not available in serial mode, determines how large each subset of
+    workloads executed is
 
 #### fsm_all.js
 
@@ -385,8 +383,8 @@ settings in `$config`.
 
 #### fsm_all_replication.js
 
-Sets up a replica set (with 3 mongods by default) and runs workloads serially,
-in parallel, or in composed mode. For example,
+Sets up a replica set (with 3 mongods by default) and runs workloads serially or
+in parallel. For example,
 
 `runWorkloadsSerially([<workload1>, <workload2>, ...], { replication: true } )`
 
@@ -396,7 +394,7 @@ primary.
 #### fsm_all_sharded.js
 
 Sets up a sharded cluster (with 2 shards and 1 mongos by default) and runs
-workloads serially, in parallel, or in composed mode. For example,
+workloads serially or in parallel. For example,
 
 `runWorkloadsInParallel([<workload1>, <workload2>, ...], { sharded: true } )`
 
@@ -405,8 +403,7 @@ creates a sharded cluster and runs workloads in parallel.
 #### fsm_all_sharded_replication.js
 
 Sets up a sharded cluster (with 2 shards, each having 3 replica set members, and
-1 mongos by default) and runs workloads serially, in parallel, or in composed
-mode.
+1 mongos by default) and runs workloads serially or in parallel.
 
 ### Excluding a workload
 
@@ -449,16 +446,16 @@ use of the shell's built-in cluster test helpers like `ShardingTest` and
 `ReplSetTest`. clusterOptions are passed to cluster.js for initialization.
 clusterOptions include:
 
-* `replication`: boolean, whether or not to use replication in the cluster
-* `sameCollection`: boolean, whether or not all workloads are passed the same
-  collection
-* `sameDB`: boolean, whether or not all workloads are passed the same DB
-* `setupFunctions`: object, containing at most two functions under the keys
-  'mongod' and 'mongos'. This allows you to run a function against all mongod or
-  mongos nodes in the cluster as part of the cluster initialization. Each
-  function takes a single argument, the db object against which configuration
-  can be run (will be set for each mongod/mongos)
-* `sharded`: boolean, whether or not to use sharding in the cluster
+-   `replication`: boolean, whether or not to use replication in the cluster
+-   `sameCollection`: boolean, whether or not all workloads are passed the same
+    collection
+-   `sameDB`: boolean, whether or not all workloads are passed the same DB
+-   `setupFunctions`: object, containing at most two functions under the keys
+    'mongod' and 'mongos'. This allows you to run a function against all mongod or
+    mongos nodes in the cluster as part of the cluster initialization. Each
+    function takes a single argument, the db object against which configuration
+    can be run (will be set for each mongod/mongos)
+-   `sharded`: boolean, whether or not to use sharding in the cluster
 
 Note that sameCollection and sameDB can increase contention for a resource, but
 will also decrease the strength of the assertions by ruling out the use of OwnDB
@@ -466,12 +463,12 @@ and OwnColl assertions.
 
 ### Miscellaneous Execution Notes
 
-* A `CountDownLatch` (exposed through the v8-based mongo shell, as of MongoDB 3.0)
-  is used as a synchronization primitive by the ThreadManager to wait until all
-  spawned threads have finished being spawned before starting workload
-  execution.
-* If more than 20% of the threads fail while spawning, we abort the test.  If
-  fewer than 20% of the threads fail while spawning we allow the non-failed
-  threads to continue with the test.  The 20% threshold is somewhat arbitrary;
-  the goal is to abort if "mostly all" of the threads failed but to tolerate "a
-  few" threads failing.
+-   A `CountDownLatch` (exposed through the v8-based mongo shell, as of MongoDB 3.0)
+    is used as a synchronization primitive by the ThreadManager to wait until all
+    spawned threads have finished being spawned before starting workload
+    execution.
+-   If more than 20% of the threads fail while spawning, we abort the test. If
+    fewer than 20% of the threads fail while spawning we allow the non-failed
+    threads to continue with the test. The 20% threshold is somewhat arbitrary;
+    the goal is to abort if "mostly all" of the threads failed but to tolerate "a
+    few" threads failing.

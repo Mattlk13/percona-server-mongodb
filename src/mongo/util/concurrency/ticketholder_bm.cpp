@@ -31,8 +31,9 @@
 // IWYU pragma: no_include "cxxabi.h"
 #include <map>
 #include <memory>
-#include <ratio>
 
+#include "mongo/db/admission/execution_admission_context.h"
+#include "mongo/db/client.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
@@ -43,7 +44,6 @@
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/latency_distribution.h"
-#include "mongo/util/tick_source.h"
 #include "mongo/util/tick_source_mock.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
@@ -74,10 +74,13 @@ public:
 
     TicketHolderFixture(int threads, ServiceContext* serviceContext) {
         if constexpr (std::is_same_v<PriorityTicketHolder, TicketHolderImpl>) {
-            ticketHolder = std::make_unique<TicketHolderImpl>(
-                kTickets, kLowPriorityAdmissionBypassThreshold, serviceContext);
+            ticketHolder = std::make_unique<TicketHolderImpl>(serviceContext,
+                                                              kTickets,
+                                                              kLowPriorityAdmissionBypassThreshold,
+                                                              true /* track peakUsed */);
         } else {
-            ticketHolder = std::make_unique<TicketHolderImpl>(kTickets, serviceContext);
+            ticketHolder = std::make_unique<TicketHolderImpl>(
+                serviceContext, kTickets, true /* track peakUsed */);
         }
     }
 };
@@ -111,7 +114,12 @@ void BM_acquireAndRelease(benchmark::State& state) {
     }
     double acquired = 0;
 
-    AdmissionContext::Priority priority = [&] {
+    ServiceContext::UniqueClient client = serviceContext->getService()->makeClient(
+        str::stream() << "test client for thread " << state.thread_index);
+    ServiceContext::UniqueOperationContext opCtx = client->makeOperationContext();
+
+    boost::optional<ScopedAdmissionPriority<ExecutionAdmissionContext>> admissionPriority;
+    admissionPriority.emplace(opCtx.get(), [&] {
         switch (admissionsPriority) {
             case AdmissionsPriority::kNormal:
                 return AdmissionContext::Priority::kNormal;
@@ -124,7 +132,7 @@ void BM_acquireAndRelease(benchmark::State& state) {
             default:
                 MONGO_UNREACHABLE;
         }
-    }();
+    }());
 
     TicketHolderFixture<TicketHolderImpl>* fixture = ticketHolder.get();
     // We build the latency distribution locally in order to avoid synchronizing with other threads.
@@ -134,11 +142,10 @@ void BM_acquireAndRelease(benchmark::State& state) {
     for (auto _ : state) {
         Timer timer;
         Microseconds timeForAcquire;
-        AdmissionContext admCtx;
-        admCtx.setPriority(priority);
         {
-            auto ticket =
-                fixture->ticketHolder->waitForTicketUntil(nullptr, &admCtx, Date_t::max());
+            auto& admCtx = ExecutionAdmissionContext::get(opCtx.get());
+            auto ticket = fixture->ticketHolder->waitForTicketUntil(
+                *Interruptible::notInterruptible(), &admCtx, Date_t::max());
             timeForAcquire = timer.elapsed();
             state.PauseTiming();
             sleepmicros(1);
@@ -157,6 +164,9 @@ void BM_acquireAndRelease(benchmark::State& state) {
     // Merge all latency distributions in order to get the full view of all threads.
     {
         stdx::unique_lock lk(isReadyMutex);
+        admissionPriority.reset();
+        opCtx.reset();
+        client.reset();
         resultingDistribution = resultingDistribution.mergeWith(localDistribution);
         numRemainingToMerge--;
         if (numRemainingToMerge > 0) {

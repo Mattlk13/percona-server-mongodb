@@ -41,9 +41,9 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/admission/execution_admission_context.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/repl/hello_response.h"
@@ -61,6 +61,7 @@
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_mock.h"
@@ -291,6 +292,8 @@ void ReplCoordTest::simulateEnoughHeartbeatsForAllNodesUp() {
             hbResp.setConfigVersion(rsConfig.getConfigVersion());
             hbResp.setAppliedOpTimeAndWallTime(
                 {OpTime(Timestamp(100, 2), 0), Date_t() + Seconds(100)});
+            hbResp.setWrittenOpTimeAndWallTime(
+                {OpTime(Timestamp(100, 2), 0), Date_t() + Seconds(100)});
             hbResp.setDurableOpTimeAndWallTime(
                 {OpTime(Timestamp(100, 2), 0), Date_t() + Seconds(100)});
             BSONObjBuilder respObj;
@@ -418,6 +421,7 @@ void ReplCoordTest::simulateSuccessfulV1ElectionWithoutExitingDrainMode(Date_t e
             // The smallest valid optime in PV1.
             OpTime opTime(Timestamp(), 0);
             hbResp.setAppliedOpTimeAndWallTime({opTime, Date_t() + Seconds(opTime.getSecs())});
+            hbResp.setWrittenOpTimeAndWallTime({opTime, Date_t() + Seconds(opTime.getSecs())});
             hbResp.setDurableOpTimeAndWallTime({opTime, Date_t() + Seconds(opTime.getSecs())});
             hbResp.setConfigVersion(rsConfig.getConfigVersion());
             net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
@@ -465,15 +469,15 @@ void ReplCoordTest::simulateSuccessfulV1ElectionAt(OperationContext* opCtx, Date
 void ReplCoordTest::signalDrainComplete(OperationContext* opCtx) noexcept {
     // Writes that occur in code paths that call signalDrainComplete are expected to have Immediate
     // priority.
-    ScopedAdmissionPriorityForLock priority(opCtx->lockState(),
-                                            AdmissionContext::Priority::kImmediate);
+    ScopedAdmissionPriority<ExecutionAdmissionContext> priority(
+        opCtx, AdmissionContext::Priority::kExempt);
     getExternalState()->setFirstOpTimeOfMyTerm(OpTime(Timestamp(1, 1), getReplCoord()->getTerm()));
     getReplCoord()->signalDrainComplete(opCtx, getReplCoord()->getTerm());
 }
 
 void ReplCoordTest::runSingleNodeElection(OperationContext* opCtx) {
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(1, 1), 0), Date_t() + Seconds(1));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(1, 1), 0), Date_t() + Seconds(1));
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0),
+                                                        Date_t() + Seconds(1));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
     getReplCoord()->waitForElectionFinish_forTest();
 
@@ -515,6 +519,7 @@ bool ReplCoordTest::consumeHeartbeatV1(const NetworkInterfaceMock::NetworkOperat
     hbResp.setConfigVersion(rsConfig.getConfigVersion());
     hbResp.setConfigTerm(rsConfig.getConfigTerm());
     hbResp.setAppliedOpTimeAndWallTime({lastApplied, Date_t() + Seconds(lastApplied.getSecs())});
+    hbResp.setWrittenOpTimeAndWallTime({lastApplied, Date_t() + Seconds(lastApplied.getSecs())});
     hbResp.setDurableOpTimeAndWallTime({lastApplied, Date_t() + Seconds(lastApplied.getSecs())});
     BSONObjBuilder respObj;
     net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));

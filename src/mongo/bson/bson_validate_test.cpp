@@ -50,6 +50,7 @@
 #include "mongo/bson/bsontypes_util.h"
 #include "mongo/bson/oid.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/bson/util/bsoncolumn.h"
 #include "mongo/bson/util/bsoncolumnbuilder.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/crypto/fle_field_schema_gen.h"
@@ -63,6 +64,7 @@
 #include "mongo/unittest/assert.h"
 #include "mongo/unittest/framework.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/base64.h"
 #include "mongo/util/time_support.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
@@ -229,15 +231,15 @@ TEST(BSONValidateExtended, MD5Size) {
     // 16 byte string.
     auto properSizeMD5 = "aaaaaaaaaaaaaaaa";
     BSONObj x1 = BSON("md5" << BSONBinData(properSizeMD5, 16, MD5Type));
-    ASSERT_OK(validateBSON(x1, mongo::BSONValidateMode::kExtended));
-    ASSERT_OK(validateBSON(x1, mongo::BSONValidateMode::kFull));
+    ASSERT_OK(validateBSON(x1, mongo::BSONValidateModeEnum::kExtended));
+    ASSERT_OK(validateBSON(x1, mongo::BSONValidateModeEnum::kFull));
 
     // 15 byte string.
     auto improperSizeMD5 = "aaaaaaaaaaaaaaa";
     BSONObj x2 = BSON("md5" << BSONBinData(improperSizeMD5, 15, MD5Type));
-    Status status = validateBSON(x2, mongo::BSONValidateMode::kExtended);
+    Status status = validateBSON(x2, mongo::BSONValidateModeEnum::kExtended);
     ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
-    status = validateBSON(x2, mongo::BSONValidateMode::kFull);
+    status = validateBSON(x2, mongo::BSONValidateModeEnum::kFull);
     ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
 }
 
@@ -247,15 +249,16 @@ TEST(BSONValidateExtended, BSONArrayIndexes) {
                        << "1"
                        << "b");
     BSONObj x1 = BSON("arr" << BSONArray(arr));
-    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kExtended));
-    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kFull));
+    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kExtended));
+    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kFull));
 
 
     arr = BSON("a" << 1 << "b" << 2);
     x1 = BSON("nonNumericalArray" << BSONArray(arr));
-    Status status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kExtended);
+    Status status =
+        validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kExtended);
     ASSERT_EQ(status, ErrorCodes::NonConformantBSON);
-    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kFull);
+    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kFull);
     ASSERT_EQ(status, ErrorCodes::NonConformantBSON);
 
     arr = BSON("1"
@@ -263,9 +266,9 @@ TEST(BSONValidateExtended, BSONArrayIndexes) {
                << "2"
                << "b");
     x1 = BSON("nonSequentialArray" << BSONArray(arr));
-    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kExtended);
+    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kExtended);
     ASSERT_EQ(status, ErrorCodes::NonConformantBSON);
-    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kFull);
+    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kFull);
     ASSERT_EQ(status, ErrorCodes::NonConformantBSON);
 
     x1 = BSON("nestedArraysAndObjects" << BSONArray(BSON("0"
@@ -277,9 +280,9 @@ TEST(BSONValidateExtended, BSONArrayIndexes) {
                                                                            << "b"))
                                                          << "2"
                                                          << "b")));
-    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kExtended);
+    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kExtended);
     ASSERT_EQ(status, ErrorCodes::NonConformantBSON);
-    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kFull);
+    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kFull);
     ASSERT_EQ(status, ErrorCodes::NonConformantBSON);
 
     x1 = BSON("longArray" << BSONArray(BSON("0"
@@ -304,8 +307,8 @@ TEST(BSONValidateExtended, BSONArrayIndexes) {
                                             << "j"
                                             << "10"
                                             << "k")));
-    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kExtended));
-    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kFull));
+    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kExtended));
+    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kFull));
 
     x1 = BSON("longNonSequentialArray" << BSONArray(BSON("0"
                                                          << "a"
@@ -329,9 +332,9 @@ TEST(BSONValidateExtended, BSONArrayIndexes) {
                                                          << "j"
                                                          << "11"
                                                          << "k")));
-    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kExtended);
+    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kExtended);
     ASSERT_EQ(status, ErrorCodes::NonConformantBSON);
-    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kFull);
+    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kFull);
     ASSERT_EQ(status, ErrorCodes::NonConformantBSON);
 
     x1 = BSON("validNestedArraysAndObjects"
@@ -342,8 +345,8 @@ TEST(BSONValidateExtended, BSONArrayIndexes) {
                                                                                 << "b"))
                                                               << "4"
                                                               << "b")))));
-    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kExtended));
-    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kFull));
+    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kExtended));
+    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kFull));
 
     x1 = BSON("invalidNestedArraysAndObjects"
               << BSON("arr" << BSONArray(BSON("0" << BSON("2" << 1 << "1" << 0 << "1"
@@ -353,9 +356,9 @@ TEST(BSONValidateExtended, BSONArrayIndexes) {
                                                                                 << "b"))
                                                               << "1"
                                                               << "b")))));
-    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kExtended);
+    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kExtended);
     ASSERT_EQ(status, ErrorCodes::NonConformantBSON);
-    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kFull);
+    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kFull);
     ASSERT_EQ(status, ErrorCodes::NonConformantBSON);
 }
 
@@ -364,55 +367,55 @@ TEST(BSONValidateExtended, BSONUTF8) {
                    << "\x00"
                    << "ValidString2"
                    << "str");
-    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kExtended));
-    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kFull));
+    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kExtended));
+    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kFull));
 
     // Invalid UTF-8 - 10000000; leading bit cannot be set for single byte UTF-8.
     x1 = BSON("InvalidOneByteString"
               << "\x80");
-    auto status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kExtended);
+    auto status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kExtended);
     ASSERT_OK(status);
-    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kFull);
+    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kFull);
     ASSERT_EQ(status, ErrorCodes::NonConformantBSON);
 
     x1 = BSON("ValidTwoByteString"
               << "\x40\x40");
-    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kExtended));
-    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kFull));
+    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kExtended));
+    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kFull));
 
     // Invalid UTF-8 - 11011111 11001111; second bit of second byte cannot be set.
     x1 = BSON("InvalidTwoByteString"
               << "\xDF\xCF");
-    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kExtended);
+    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kExtended);
     ASSERT_OK(status);
-    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kFull);
+    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kFull);
     ASSERT_EQ(status, ErrorCodes::NonConformantBSON);
 
     x1 = BSON("ValidThreeByteString"
               << "\x40\x40\x40");
-    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kExtended));
-    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kFull));
+    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kExtended));
+    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kFull));
 
     // Invalid UTF-8 - 11101111 10111111 11111111 - second bit of third byte cannot be set.
     x1 = BSON("InvalidThreeByteString"
               << "\xEF\xBF\xFF");
-    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kExtended);
+    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kExtended);
     ASSERT_OK(status);
-    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kFull);
+    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kFull);
     ASSERT_EQ(status, ErrorCodes::NonConformantBSON);
 
     x1 = BSON("ValidFourByteString"
               << "\x40\x40\x40\x40");
-    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kExtended));
-    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kFull));
+    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kExtended));
+    ASSERT_OK(validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kFull));
 
     // Invalid UTF-8 - 11110000 10011000 10011010 11111111 - second bit of fourth byte cannot be
     // set.
     x1 = BSON("InvalidFourByteString"
               << "\xF0\x98\x9A\xFF");
-    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kExtended);
+    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kExtended);
     ASSERT_OK(status);
-    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateMode::kFull);
+    status = validateBSON(x1.objdata(), x1.objsize(), mongo::BSONValidateModeEnum::kFull);
     ASSERT_EQ(status, ErrorCodes::NonConformantBSON);
 }
 
@@ -662,13 +665,27 @@ TEST(BSONValidateFast, MaxNestingDepth) {
     ASSERT_EQ(status.code(), ErrorCodes::Overflow);
 }
 
+TEST(BSONValidateFast, ErrorTooShort) {
+    BSONObj x;
+    x = BSON("foo" << 17 << "bar"
+                   << "eliot");
+    ASSERT_OK(validateBSON(x));
+    ASSERT_NOT_OK(validateBSON(x.objdata(), x.objsize() - 1));
+    // Check if previous byte looks like EOO
+    char badCopy[16384];
+    memcpy(badCopy, x.objdata(), x.objsize() - 1);
+    badCopy[x.objsize() - 2] = 0;
+    ASSERT_NOT_OK(validateBSON(badCopy, x.objsize() - 1));
+}
+
 TEST(BSONValidateExtended, RegexOptions) {
     // Checks that RegEx with invalid options strings (either an unknown flag or not in alphabetical
     // order) throws a warning.
     std::pair<Status, Status> stats{Status::OK(), Status::OK()};
     auto fullyValidate = [&](BSONObj obj) {
-        return std::pair{validateBSON(obj.objdata(), obj.objsize(), BSONValidateMode::kExtended),
-                         validateBSON(obj.objdata(), obj.objsize(), BSONValidateMode::kFull)};
+        return std::pair{
+            validateBSON(obj.objdata(), obj.objsize(), BSONValidateModeEnum::kExtended),
+            validateBSON(obj.objdata(), obj.objsize(), BSONValidateModeEnum::kFull)};
     };
     BSONObj obj = BSON("a" << BSONRegEx("a*.conn", "ilmsux"));
     stats = fullyValidate(obj);
@@ -695,8 +712,8 @@ TEST(BSONValidateExtended, UUIDLength) {
     // Checks that an invalid UUID length (!= 16 bytes) throws a warning.
     std::pair<Status, Status> stats{Status::OK(), Status::OK()};
     auto fullyValidate = [&](BSONObj obj) {
-        return std::pair{validateBSON(obj, BSONValidateMode::kExtended),
-                         validateBSON(obj, BSONValidateMode::kFull)};
+        return std::pair{validateBSON(obj, BSONValidateModeEnum::kExtended),
+                         validateBSON(obj, BSONValidateModeEnum::kFull)};
     };
     BSONObj x = BSON("u" << BSONBinData("de", 2, BinDataType::newUUID));
     stats = fullyValidate(x);
@@ -716,47 +733,48 @@ TEST(BSONValidateExtended, UUIDLength) {
 
 TEST(BSONValidateExtended, DeprecatedTypes) {
     BSONObj obj = BSON("a" << BSONUndefined);
-    Status status = validateBSON(obj, BSONValidateMode::kExtended);
+    Status status = validateBSON(obj, BSONValidateModeEnum::kExtended);
     ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
-    status = validateBSON(obj, BSONValidateMode::kFull);
+    status = validateBSON(obj, BSONValidateModeEnum::kFull);
     ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
 
     obj = BSON("b" << BSONDBRef("db", OID("dbdbdbdbdbdbdbdbdbdbdbdb")));
-    status = validateBSON(obj, BSONValidateMode::kExtended);
+    status = validateBSON(obj, BSONValidateModeEnum::kExtended);
     ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
-    status = validateBSON(obj, BSONValidateMode::kFull);
+    status = validateBSON(obj, BSONValidateModeEnum::kFull);
     ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
 
     obj = BSON("c" << BSONSymbol("symbol"));
-    status = validateBSON(obj, BSONValidateMode::kExtended);
+    status = validateBSON(obj, BSONValidateModeEnum::kExtended);
     ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
-    status = validateBSON(obj, BSONValidateMode::kFull);
+    status = validateBSON(obj, BSONValidateModeEnum::kFull);
     ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
 
     obj = BSON("d" << BSONCodeWScope("(function(){})();", BSON("a" << 1)));
-    status = validateBSON(obj, BSONValidateMode::kExtended);
+    status = validateBSON(obj, BSONValidateModeEnum::kExtended);
     ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
-    status = validateBSON(obj, BSONValidateMode::kFull);
+    status = validateBSON(obj, BSONValidateModeEnum::kFull);
     ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
 
     obj = BSON("e" << BSONBinData("", 0, ByteArrayDeprecated));
-    status = validateBSON(obj, BSONValidateMode::kExtended);
+    status = validateBSON(obj, BSONValidateModeEnum::kExtended);
     ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
-    status = validateBSON(obj, BSONValidateMode::kFull);
+    status = validateBSON(obj, BSONValidateModeEnum::kFull);
     ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
 
     obj = BSON("f" << BSONBinData("", 0, bdtUUID));
-    status = validateBSON(obj, BSONValidateMode::kExtended);
+    status = validateBSON(obj, BSONValidateModeEnum::kExtended);
     ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
-    status = validateBSON(obj, BSONValidateMode::kFull);
+    status = validateBSON(obj, BSONValidateModeEnum::kFull);
     ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
 }
 
 TEST(BSONValidateExtended, DuplicateFieldNames) {
     std::pair<Status, Status> stats{Status::OK(), Status::OK()};
     auto fullyValidate = [&](BSONObj obj) {
-        return std::pair{validateBSON(obj.objdata(), obj.objsize(), BSONValidateMode::kExtended),
-                         validateBSON(obj.objdata(), obj.objsize(), BSONValidateMode::kFull)};
+        return std::pair{
+            validateBSON(obj.objdata(), obj.objsize(), BSONValidateModeEnum::kExtended),
+            validateBSON(obj.objdata(), obj.objsize(), BSONValidateModeEnum::kFull)};
     };
     BSONObj x = BSON("a" << 1 << "b" << 2);
     stats = fullyValidate(x);
@@ -774,25 +792,6 @@ TEST(BSONValidateExtended, DuplicateFieldNames) {
     ASSERT_EQ(stats.second, ErrorCodes::NonConformantBSON);
 }
 
-TEST(BSONValidateExtended, BSONColumn) {
-    BSONColumnBuilder cb;
-    cb.append(BSON("a"
-                   << "deadbeef")
-                  .getField("a"));
-    BSONBinData columnData = cb.finalize();
-    BSONObj obj = BSON("a" << columnData);
-    Status status = validateBSON(obj, BSONValidateMode::kFull);
-    ASSERT_OK(status);
-
-    // Change one important byte.
-    ((char*)columnData.data)[0] = '0';
-    obj = BSON("a" << columnData);
-    status = validateBSON(obj, BSONValidateMode::kExtended);
-    ASSERT_OK(status);
-    status = validateBSON(obj, BSONValidateMode::kFull);
-    ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
-}
-
 TEST(BSONValidateExtended, BSONEncryptedValue) {
     BSONObj obj;
     Status status = Status::OK();
@@ -808,7 +807,7 @@ TEST(BSONValidateExtended, BSONEncryptedValue) {
         fle = BSONBinData(
             reinterpret_cast<const void*>(&blob), sizeof(FleBlobHeader), BinDataType::Encrypt);
         obj = BSON("a" << fle);
-        status = validateBSON(obj, BSONValidateMode::kExtended);
+        status = validateBSON(obj, BSONValidateModeEnum::kExtended);
         ASSERT_OK(status);
     }
 
@@ -820,7 +819,7 @@ TEST(BSONValidateExtended, BSONEncryptedValue) {
         fle = BSONBinData(
             reinterpret_cast<const void*>(&blob), sizeof(FleBlobHeader), BinDataType::Encrypt);
         obj = BSON("a" << fle);
-        status = validateBSON(obj, BSONValidateMode::kExtended);
+        status = validateBSON(obj, BSONValidateModeEnum::kExtended);
         ASSERT_OK(status);
     }
 
@@ -832,7 +831,7 @@ TEST(BSONValidateExtended, BSONEncryptedValue) {
         fle = BSONBinData(
             reinterpret_cast<const void*>(&blob), sizeof(FleBlobHeader), BinDataType::Encrypt);
         obj = BSON("a" << fle);
-        status = validateBSON(obj, BSONValidateMode::kExtended);
+        status = validateBSON(obj, BSONValidateModeEnum::kExtended);
         ASSERT_OK(status);
     }
 
@@ -845,7 +844,7 @@ TEST(BSONValidateExtended, BSONEncryptedValue) {
         fle = BSONBinData(
             reinterpret_cast<const void*>(&blob), sizeof(FleBlobHeader), BinDataType::Encrypt);
         obj = BSON("a" << fle);
-        status = validateBSON(obj, BSONValidateMode::kExtended);
+        status = validateBSON(obj, BSONValidateModeEnum::kExtended);
         ASSERT_OK(status);
     }
 
@@ -857,7 +856,7 @@ TEST(BSONValidateExtended, BSONEncryptedValue) {
         fle = BSONBinData(
             reinterpret_cast<const void*>(&blob), sizeof(FleBlobHeader), BinDataType::Encrypt);
         obj = BSON("a" << fle);
-        status = validateBSON(obj, BSONValidateMode::kExtended);
+        status = validateBSON(obj, BSONValidateModeEnum::kExtended);
         ASSERT_OK(status);
     }
 
@@ -870,7 +869,7 @@ TEST(BSONValidateExtended, BSONEncryptedValue) {
         fle = BSONBinData(
             reinterpret_cast<const void*>(&blob), sizeof(FleBlobHeader), BinDataType::Encrypt);
         obj = BSON("a" << fle);
-        status = validateBSON(obj, BSONValidateMode::kExtended);
+        status = validateBSON(obj, BSONValidateModeEnum::kExtended);
         ASSERT_OK(status);
     }
 
@@ -878,9 +877,9 @@ TEST(BSONValidateExtended, BSONEncryptedValue) {
         // Empty Encrypted BSON Value.
         auto emptyBinData = "";
         obj = BSON("a" << BSONBinData(emptyBinData, 0, Encrypt));
-        status = validateBSON(obj, mongo::BSONValidateMode::kExtended);
+        status = validateBSON(obj, mongo::BSONValidateModeEnum::kExtended);
         ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
-        status = validateBSON(obj, mongo::BSONValidateMode::kFull);
+        status = validateBSON(obj, mongo::BSONValidateModeEnum::kFull);
         ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
     }
 
@@ -891,9 +890,9 @@ TEST(BSONValidateExtended, BSONEncryptedValue) {
         fle = BSONBinData(
             reinterpret_cast<const void*>(&blob), sizeof(FleBlobHeader), BinDataType::Encrypt);
         obj = BSON("a" << fle);
-        status = validateBSON(obj, mongo::BSONValidateMode::kExtended);
+        status = validateBSON(obj, mongo::BSONValidateModeEnum::kExtended);
         ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
-        status = validateBSON(obj, mongo::BSONValidateMode::kFull);
+        status = validateBSON(obj, mongo::BSONValidateModeEnum::kFull);
         ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
     }
 
@@ -905,9 +904,9 @@ TEST(BSONValidateExtended, BSONEncryptedValue) {
         fle = BSONBinData(
             reinterpret_cast<const void*>(&blob), sizeof(FleBlobHeader) - 1, BinDataType::Encrypt);
         obj = BSON("a" << fle);
-        status = validateBSON(obj, mongo::BSONValidateMode::kExtended);
+        status = validateBSON(obj, mongo::BSONValidateModeEnum::kExtended);
         ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
-        status = validateBSON(obj, mongo::BSONValidateMode::kFull);
+        status = validateBSON(obj, mongo::BSONValidateModeEnum::kFull);
         ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
     }
 
@@ -919,9 +918,9 @@ TEST(BSONValidateExtended, BSONEncryptedValue) {
         fle = BSONBinData(
             reinterpret_cast<const void*>(&blob), sizeof(FleBlobHeader), BinDataType::Encrypt);
         obj = BSON("a" << fle);
-        status = validateBSON(obj, mongo::BSONValidateMode::kExtended);
+        status = validateBSON(obj, mongo::BSONValidateModeEnum::kExtended);
         ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
-        status = validateBSON(obj, mongo::BSONValidateMode::kFull);
+        status = validateBSON(obj, mongo::BSONValidateModeEnum::kFull);
         ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
     }
 }
@@ -929,10 +928,334 @@ TEST(BSONValidateExtended, BSONEncryptedValue) {
 TEST(BSONValidateExtended, UnknownBinDataType) {
     BSONObj obj = BSON("unknownBinData" << BSONBinData("", 0, static_cast<BinDataType>(42)));
 
-    Status status = validateBSON(obj, BSONValidateMode::kExtended);
+    Status status = validateBSON(obj, BSONValidateModeEnum::kExtended);
     ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
-    status = validateBSON(obj, BSONValidateMode::kFull);
+    status = validateBSON(obj, BSONValidateModeEnum::kFull);
     ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
+}
+
+TEST(BSONValidateColumn, BSONColumnInBSON) {
+    BSONColumnBuilder cb;
+    cb.append(BSON("a"
+                   << "deadbeef")
+                  .getField("a"));
+    cb.append(BSON("a" << 1).getField("a"));
+    cb.append(BSON("a" << 2).getField("a"));
+    cb.append(BSON("a" << 1).getField("a"));
+    BSONBinData columnData = cb.finalize();
+    BSONObj obj = BSON("a" << columnData);
+    Status status = validateBSON(obj, BSONValidateModeEnum::kDefault);
+    ASSERT_OK(status);
+    status = validateBSON(obj, BSONValidateModeEnum::kExtended);
+    ASSERT_OK(status);
+    status = validateBSON(obj, BSONValidateModeEnum::kFull);
+    ASSERT_OK(status);
+
+    // Change one important byte.
+    ((char*)columnData.data)[0] = '0';
+    obj = BSON("a" << columnData);
+    status = validateBSON(obj, BSONValidateModeEnum::kDefault);
+    ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
+    status = validateBSON(obj, BSONValidateModeEnum::kExtended);
+    ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
+    status = validateBSON(obj, BSONValidateModeEnum::kFull);
+    ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
+}
+
+TEST(BSONValidateColumn, BSONColumnInBSONRespectsVersion) {
+    BSONColumnBuilder cb;
+    cb.append(BSON("a"
+                   << "deadbeef")
+                  .getField("a"));
+    cb.append(BSON("a" << 1).getField("a"));
+    cb.append(BSON("a" << 2).getField("a"));
+    cb.append(BSON("a" << 1).getField("a"));
+    BSONBinData columnData = cb.finalize();
+    BSONObj obj = BSON("a" << columnData);
+
+    // Change one important byte.
+    ((char*)columnData.data)[0] = '0';
+    obj = BSON("a" << columnData);
+
+    // Default refuses bad column
+    Status status = validateBSON(obj, BSONValidateModeEnum::kDefault);
+    ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
+    status = validateBSON(obj, BSONValidateModeEnum::kExtended);
+    ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
+    status = validateBSON(obj, BSONValidateModeEnum::kFull);
+    ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
+
+    // V2 refuses bad column
+    status = validateBSON(obj, BSONValidateModeEnum::kDefault, mongo::V2_Column);
+    ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
+    status = validateBSON(obj, BSONValidateModeEnum::kExtended, mongo::V2_Column);
+    ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
+    status = validateBSON(obj, BSONValidateModeEnum::kFull, mongo::V2_Column);
+    ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
+
+    // V1 passes bad column on default/extended, refuses on full
+    status = validateBSON(obj, BSONValidateModeEnum::kDefault, mongo::V1_Original);
+    ASSERT_OK(status);
+    status = validateBSON(obj, BSONValidateModeEnum::kExtended, mongo::V1_Original);
+    ASSERT_OK(status);
+    status = validateBSON(obj, BSONValidateModeEnum::kFull, mongo::V1_Original);
+    ASSERT_EQ(status.code(), ErrorCodes::NonConformantBSON);
+}
+
+TEST(BSONValidateColumn, BSONColumnMissingEOO) {
+    BSONColumnBuilder cb;
+    cb.append(BSON("a"
+                   << "deadbeef")
+                  .getField("a"));
+    BSONBinData columnData = cb.finalize();
+    ASSERT_OK(validateBSONColumn((char*)columnData.data, columnData.length));
+
+    // Remove final EOO
+    ASSERT_EQ(validateBSONColumn((char*)columnData.data, columnData.length - 1).code(),
+              ErrorCodes::InvalidBSON);
+    // Remove final EOO and 0 previous byte (check no overflow)
+    ((char*)columnData.data)[columnData.length - 2] = 0;
+    ASSERT_EQ(validateBSONColumn((char*)columnData.data, columnData.length - 1).code(),
+              ErrorCodes::InvalidBSON);
+}
+
+TEST(BSONValidateColumn, BSONColumnFieldnameNotEmpty) {
+    BSONColumnBuilder cb;
+    cb.append(BSON("a"
+                   << "deadbeef")
+                  .getField("a"));
+    BSONBinData columnData = cb.finalize();
+    ASSERT_OK(validateBSONColumn((char*)columnData.data, columnData.length));
+
+    char buf[1024];
+    buf[0] = ((const char*)columnData.data)[0];
+    buf[1] = 'f';
+    buf[2] = 'o';
+    buf[3] = 'o';
+    memcpy(buf + 4, ((const char*)columnData.data) + 1, columnData.length - 1);
+
+    ASSERT_EQ(validateBSONColumn(buf, columnData.length + 3).code(), ErrorCodes::NonConformantBSON);
+}
+
+TEST(BSONValidateColumn, BSONColumnNoOverflowMissingAllEOOInColumn) {
+    BSONColumnBuilder cb;
+    cb.append(BSON("a"
+                   << "deadbeef")
+                  .getField("a"));
+    BSONBinData columnData = cb.finalize();
+    for (int i = 0; i < columnData.length; ++i)
+        if (((char*)columnData.data)[i] == 0)
+            ((char*)columnData.data)[i] = 1;
+    BSONObj obj = BSON("a" << columnData);
+    ASSERT_EQ(validateBSON(obj, BSONValidateModeEnum::kDefault).code(),
+              ErrorCodes::NonConformantBSON);
+}
+
+TEST(BSONValidateColumn, BSONColumnTrailingGarbage) {
+    BSONColumnBuilder cb;
+    cb.append(BSON("a"
+                   << "deadbeef")
+                  .getField("a"));
+    BSONBinData columnData = cb.finalize();
+    ASSERT_OK(validateBSONColumn((char*)columnData.data, columnData.length));
+    char badData[4096];
+    memcpy(badData, columnData.data, columnData.length);
+    badData[columnData.length] = 1;
+
+    ASSERT_EQ(validateBSONColumn(badData, columnData.length + 1).code(),
+              ErrorCodes::NonConformantBSON);
+}
+
+TEST(BSONValidateColumn, BSONColumnNoOverflowBadContent) {
+    BSONColumnBuilder cb;
+    cb.append(BSON("a"
+                   << "deadbeef")
+                  .getField("a"));
+    BSONBinData columnData = cb.finalize();
+    ASSERT_OK(validateBSONColumn((char*)columnData.data, columnData.length));
+
+    // Remove all string null terminators, expect failure but not overflow
+    for (int i = 0; i < columnData.length; ++i)
+        if (((char*)columnData.data)[i] == 0)
+            ((char*)columnData.data)[i] = 1;
+    ASSERT_EQ(validateBSONColumn((char*)columnData.data, columnData.length).code(),
+              ErrorCodes::NonConformantBSON);
+}
+
+TEST(BSONValidateColumn, BSONColumnNoOverflowMissingFieldname) {
+    BSONColumnBuilder cb;
+    cb.append(BSON("a"
+                   << "deadbeef"));
+    BSONBinData columnData = cb.finalize();
+    ASSERT_OK(validateBSONColumn((char*)columnData.data, columnData.length));
+
+    ASSERT_EQ(validateBSONColumn((char*)columnData.data, 6 /* start of "a" */).code(),
+              ErrorCodes::NonConformantBSON);
+}
+
+TEST(BSONValidateColumn, BSONColumnNoOverflowBadFieldname) {
+    BSONColumnBuilder cb;
+    cb.append(BSON("a"
+                   << "deadbeef"));
+    BSONBinData columnData = cb.finalize();
+    ASSERT_OK(validateBSONColumn((char*)columnData.data, columnData.length));
+
+    for (int i = 6 /* start of "a" string */; i < columnData.length; ++i)
+        if (((char*)columnData.data)[i] == 0)
+            ((char*)columnData.data)[i] = 1;
+    ASSERT_EQ(validateBSONColumn((char*)columnData.data, columnData.length).code(),
+              ErrorCodes::NonConformantBSON);
+}
+
+TEST(BSONValidateColumn, BSONColumnNoOverflowBadLiteral) {
+    BSONColumnBuilder cb;
+    cb.append(BSON("a"
+                   << "deadbeef")
+                  .getField("a"));
+    BSONBinData columnData = cb.finalize();
+    ASSERT_OK(validateBSONColumn((char*)columnData.data, columnData.length));
+
+    // Remove all string null terminators after string start, expect failure but not overflow
+    for (int i = 6 /* start of "deadbeef" string */; i < columnData.length; ++i)
+        if (((char*)columnData.data)[i] == 0)
+            ((char*)columnData.data)[i] = 1;
+    ASSERT_EQ(validateBSONColumn((char*)columnData.data, columnData.length).code(),
+              ErrorCodes::NonConformantBSON);
+}
+
+TEST(BSONValidateColumn, BSONColumnInterleavedObjectPasses) {
+    BSONColumnBuilder cb;
+    cb.append(BSON("a"
+                   << "deadbeef")
+                  .getField("a"));
+    BSONObj subObj1 = BSON("b"
+                           << "inside");
+    cb.append(subObj1);
+    BSONObj subObj2 = BSON("b"
+                           << "outside");
+    cb.append(subObj2);
+    BSONObj subObj3 = BSON("b"
+                           << "gone");
+    cb.append(subObj3);
+    cb.append(BSON("c"
+                   << "foobar")
+                  .getField("c"));
+    BSONBinData columnData = cb.finalize();
+    ASSERT_OK(validateBSONColumn((char*)columnData.data, columnData.length));
+}
+
+TEST(BSONValidateColumn, BSONColumnInterleavedArrayPasses) {
+    BSONColumnBuilder cb;
+    cb.append(BSON("a"
+                   << "deadbeef")
+                  .getField("a"));
+
+    BSONArrayBuilder array;
+    for (int i = 0; i < 10; i++) {
+        array.append(i);
+    }
+    array.done();
+    cb.append(array.arr());
+    cb.append(BSON("c"
+                   << "foobar")
+                  .getField("c"));
+    BSONBinData columnData = cb.finalize();
+    ASSERT_OK(validateBSONColumn((char*)columnData.data, columnData.length));
+}
+
+TEST(BSONValidateColumn, BSONColumnInterleavedNestedObjectPasses) {
+    BSONColumnBuilder cb;
+    cb.append(BSON("a"
+                   << "deadbeef")
+                  .getField("a"));
+    BSONObj subObj1 = BSON("d"
+                           << "inside");
+    BSONObj subObj2 = BSON("c" << subObj1);
+    BSONObj subObj3 = BSON("b" << subObj2);
+    cb.append(subObj3);
+    cb.append(BSON("c"
+                   << "foobar")
+                  .getField("c"));
+    BSONBinData columnData = cb.finalize();
+    ASSERT_OK(validateBSONColumn((char*)columnData.data, columnData.length));
+}
+
+TEST(BSONValidateColumn, BSONColumnInterleavedEmptyObjectPasses) {
+    BSONColumnBuilder cb;
+    BSONObj subObj1;
+    cb.append(subObj1);
+    cb.append(BSON("c"
+                   << "foobar")
+                  .getField("c"));
+    BSONBinData columnData = cb.finalize();
+    ASSERT_OK(validateBSONColumn((char*)columnData.data, columnData.length));
+}
+
+TEST(BSONValidateColumn, BSONColumnInterleavedNestedInterleaved) {
+    BufBuilder buffer;
+    BSONObj ref = BSON("c" << 1);
+
+    buffer.appendChar(bsoncolumn::kInterleavedStartControlByteLegacy);
+    buffer.appendBuf(ref.objdata(), ref.objsize());
+    buffer.appendChar(bsoncolumn::kInterleavedStartControlByteLegacy);
+    buffer.appendBuf(ref.objdata(), ref.objsize());
+    buffer.appendChar(0);
+    buffer.appendChar(0);
+
+    ASSERT_EQ(validateBSONColumn(buffer.buf(), buffer.len()), ErrorCodes::NonConformantBSON);
+}
+
+TEST(BSONValidateColumn, BSONColumnNoOverflowBlocksShort) {
+    BSONColumnBuilder cb;
+    for (int i = 0; i < 100; ++i)
+        cb.append(BSON("a" << i).getField("a"));
+
+    BSONBinData columnData = cb.finalize();
+    ASSERT_OK(validateBSONColumn((char*)columnData.data, columnData.length));
+    /* Remove EOO and one block */
+    ASSERT_EQ(validateBSONColumn((char*)columnData.data, columnData.length - 1 - 8).code(),
+              ErrorCodes::NonConformantBSON);
+}
+
+TEST(BSONValidateColumn, BSONColumnBadExtendedSelector) {
+    BSONColumnBuilder cb;
+    for (int i = 0; i < 100; ++i)
+        cb.append(BSON("a" << i).getField("a"));
+
+    BSONBinData columnData = cb.finalize();
+    ASSERT_OK(validateBSONColumn((char*)columnData.data, columnData.length));
+    /* Change extended selector on a 7 selector to 14 */
+    uint64_t block = ConstDataView((char*)columnData.data + 31) /* first 7 selector */
+                         .read<LittleEndian<uint64_t>>();
+    ASSERT_EQ(7, block & 15);  // Check that we found a 7 selector
+    block = (14 << 4)          /* 14 extended selector */
+        + 7                    /* original selector */
+        + ((block >> 8) << 8); /* original blocks */
+    memcpy((char*)columnData.data + 31, &block, sizeof(block));
+    ASSERT_OK(validateBSONColumn((char*)columnData.data, columnData.length));
+}
+
+TEST(BSONValidateColumn, BSONColumnInterestingFuzzerInputs) {
+    std::vector<std::string> base64s = {
+        "EI8AAAAADAA=",                  // fieldname not empty
+        "CgCwCrCwsLCwsLCwsAEAAAAAAAAA",  // non-zero delta off a jstNULL
+
+        // non-zero delta off of strlength > 16
+        "BQAjAAAAIwAAAAAAAABASHM/oaGhoaGhAAH1Tq9n//8AAAAAAABASHM/oaGhoaGhAAH1Tq9n//8AAAEA"};
+
+    for (auto& base64 : base64s) {
+        std::string data = base64::decode(base64.c_str());
+
+        // Fuzzer checks that validateBSONColumn keeps us from
+        // decoding strings with structural problems (incorrect strings
+        // that handle gracefully are not currently guaranteed
+        // to fail validation)
+        try {
+            if (validateBSONColumn(data.data(), data.size()).isOK())
+                BSONColumn(data.data(), data.size()).size();
+        } catch (...) {
+        }
+    }
 }
 
 }  // namespace

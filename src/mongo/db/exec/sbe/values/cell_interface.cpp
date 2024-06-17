@@ -35,6 +35,7 @@
 
 namespace mongo::sbe::value {
 ValueBlock& MaterializedCellBlock::getValueBlock() {
+    tassert(7953701, "Value block should be non null", _deblocked);
     return *_deblocked;
 }
 std::unique_ptr<CellBlock> MaterializedCellBlock::clone() const {
@@ -49,13 +50,13 @@ std::string pathToString(const CellBlock::Path& p) {
     std::string out;
     size_t idx = 0;
     for (auto& component : p) {
-        if (std::holds_alternative<CellBlock::Id>(component)) {
+        if (holds_alternative<CellBlock::Id>(component)) {
             out += "Id";
-        } else if (std::holds_alternative<CellBlock::Get>(component)) {
+        } else if (holds_alternative<CellBlock::Get>(component)) {
             out += "Get(";
-            out += std::get<CellBlock::Get>(component).field;
+            out += get<CellBlock::Get>(component).field;
             out += ')';
-        } else if (std::holds_alternative<CellBlock::Traverse>(component)) {
+        } else if (holds_alternative<CellBlock::Traverse>(component)) {
             out += "Traverse";
         }
         ++idx;
@@ -69,6 +70,7 @@ std::string pathToString(const CellBlock::Path& p) {
 }  // namespace
 
 std::string CellBlock::PathRequest::toString() const {
-    return pathToString(path);
+    return str::stream() << (type == kFilter ? "FilterPath" : "ProjectPath") << "("
+                         << pathToString(path) << ")";
 }
 }  // namespace mongo::sbe::value

@@ -69,6 +69,7 @@
 #include "mongo/db/pipeline/stage_constraints.h"
 #include "mongo/db/pipeline/variables.h"
 #include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/intrusive_counter.h"
@@ -89,9 +90,11 @@ public:
                                                  const BSONElement& spec);
 
 
-        Status checkShardedForeignCollAllowed(NamespaceString nss,
+        Status checkShardedForeignCollAllowed(const NamespaceString& nss,
                                               bool inMultiDocumentTransaction) const override {
-            if (!inMultiDocumentTransaction || _foreignNss != nss) {
+            const auto fcvSnapshot = serverGlobalParams.mutableFCV.acquireFCVSnapshot();
+            if (!inMultiDocumentTransaction || _foreignNss != nss ||
+                gFeatureFlagAllowAdditionalParticipants.isEnabled(fcvSnapshot)) {
                 return Status::OK();
             }
 
@@ -100,7 +103,8 @@ public:
                 "Sharded $graphLookup is not allowed within a multi-document transaction");
         }
 
-        PrivilegeVector requiredPrivileges(bool isMongos, bool bypassDocumentValidation) const {
+        PrivilegeVector requiredPrivileges(bool isMongos,
+                                           bool bypassDocumentValidation) const override {
             return {Privilege(ResourcePattern::forExactNamespace(_foreignNss), ActionType::find)};
         }
     };
@@ -141,9 +145,8 @@ public:
         _additionalFilter = additionalFilter ? additionalFilter->getOwned() : additionalFilter;
     };
 
-    void serializeToArray(
-        std::vector<Value>& array,
-        const SerializationOptions& opts = SerializationOptions{}) const final override;
+    void serializeToArray(std::vector<Value>& array,
+                          const SerializationOptions& opts = SerializationOptions{}) const final;
 
     /**
      * Returns the 'as' path, and possibly the fields modified by an absorbed $unwind.
@@ -197,6 +200,7 @@ public:
 protected:
     GetNextResult doGetNext() final;
     void doDispose() final;
+    boost::optional<ShardId> computeMergeShardId() const final;
 
     /**
      * Attempts to combine with a subsequent $unwind stage, setting the internal '_unwind' field.
@@ -217,8 +221,7 @@ private:
         boost::optional<long long> maxDepth,
         boost::optional<boost::intrusive_ptr<DocumentSourceUnwind>> unwindSrc);
 
-    Value serialize(
-        const SerializationOptions& opts = SerializationOptions{}) const final override {
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final {
         // Should not be called; use serializeToArray instead.
         MONGO_UNREACHABLE_TASSERT(7484306);
     }
@@ -277,6 +280,12 @@ private:
      */
     bool foreignShardedGraphLookupAllowed() const;
 
+    /**
+     * Sets 'querySettings' to 'expCtx' if they were not previously set.
+     */
+    void setQuerySettingsIfNeeded(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                  const query_settings::QuerySettings& querySettings);
+
     // $graphLookup options.
     NamespaceString _from;
     FieldPath _as;
@@ -328,6 +337,11 @@ private:
     // '_fromPipeline' execution.
     Variables _variables;
     VariablesParseState _variablesParseState;
+
+    // Flag, indicating if query settings were set to the '_fromExpCtx'. This is needed to avoid
+    // setting query settings multiple time, which results in assertion failure in cases when query
+    // knobs have already been initialized with the previous query settings.
+    bool _didSetQuerySettingsToPipeline = false;
 };
 
 }  // namespace mongo

@@ -233,7 +233,15 @@ public:
                                OrderedIntervalList* oil,
                                BoundsTightness* tightnessOut);
 
-    static void translateEquality(const BSONElement& data,
+
+    /**
+     * Convert the value at 'data' to an Interval. Populate the out-params, 'oil' and 'tightnessOut'
+     * accordingly. If 'holder' is specified, use that BSONObj as the '_intervalData' for the
+     * construted Interval, otherwise construct a new BSONObj from 'data'.
+     */
+    static void translateEquality(const PathMatchExpression* matchExpr,
+                                  const BSONElement& data,
+                                  const BSONObj* holder,
                                   const IndexEntry& index,
                                   bool isHashed,
                                   OrderedIntervalList* oil,
@@ -270,18 +278,6 @@ public:
                                  bool* startKeyInclusive,
                                  BSONObj* endKey,
                                  bool* endKeyInclusive);
-
-    /**
-     * Returns 'true' if the ordered intervals 'oil' represent a strict null equality predicate.
-     * Returns 'false' otherwise.
-     */
-    static bool isNullInterval(const OrderedIntervalList& oil);
-
-    /**
-     * Returns 'true' if the ordered intervals 'oil' represent a strict equality predicate matching
-     * null and the empty list. Returns 'false' otherwise.
-     */
-    static bool isNullAndEmptyArrayInterval(const OrderedIntervalList& oil);
 
     /**
      * Appends the startKey and endKey of the given "all values" 'interval' (which is either

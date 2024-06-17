@@ -80,6 +80,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/find_command.h"
+#include "mongo/db/query/query_settings/query_settings_manager.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/recovery_unit.h"
@@ -288,7 +289,9 @@ public:
 
 class ClientBase {
 public:
-    ClientBase() : _client(&_opCtx) {}
+    ClientBase() : _client(&_opCtx) {
+        query_settings::QuerySettingsManager::create(_opCtx.getServiceContext(), {});
+    }
 
 protected:
     void insert(const NamespaceString& nss, BSONObj o) {
@@ -846,8 +849,8 @@ public:
                            << "verbosity"
                            << "executionStats");
 
-        auto reply =
-            _client.runCommand(OpMsgRequest::fromDBAndBody(DatabaseName::kLocal, explainCmdObj));
+        auto reply = _client.runCommand(OpMsgRequestBuilder::create(
+            auth::ValidatedTenancyScope::kNotRequired, DatabaseName::kLocal, explainCmdObj));
         BSONObj explainCmdReplyBody = reply->getCommandReply();
         ASSERT_OK(getStatusFromCommandResult(explainCmdReplyBody));
 
@@ -2028,11 +2031,11 @@ public:
     }
 };
 
-class All : public OldStyleSuiteSpecification {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("query") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<FindingStart>();
         add<FindOneOr>();
         add<FindOneEmptyObj>();
@@ -2088,7 +2091,7 @@ public:
     }
 };
 
-OldStyleSuiteInitializer<All> myall;
+unittest::OldStyleSuiteInitializer<All> myall;
 
 }  // namespace
 }  // namespace mongo

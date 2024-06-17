@@ -2,7 +2,7 @@
 //
 // @tags: [
 //   # The test runs commands that are not allowed with security token: getDefaultRWConcern.
-//   not_allowed_with_security_token,
+//   not_allowed_with_signed_security_token,
 //   # This test attempts to perform a getMore command and find it using the currentOp command. The
 //   # former operation may be routed to a secondary in the replica set, whereas the latter must be
 //   # routed to the primary.
@@ -222,10 +222,16 @@ try {
 
         // Wait for the parent shell to start watching for the next document.
         jsTestLog("Checking getMore is being blocked...");
-        assert.soon(() => db.currentOp({
-                                op: "getmore",
-                                "cursor.originatingCommand.comment": "uniquifier_comment"
-                            }).inprog.length == 1,
+        const filter0 = {
+            op: "getmore",
+            "cursor.originatingCommand.comment": "uniquifier_comment",
+        };
+        if (TestData.testingReplicaSetEndpoint) {
+            // On the replica set endpoint, currentOp reports both router and shard operations. So
+            // filter out one of them.
+            filter0.role = "ClusterRole{router}";
+        }
+        assert.soon(() => db.currentOp(filter0).inprog.length == 1,
                     () => tojson(db.currentOp().inprog));
 
         // Now write a non-matching document to the collection.
@@ -234,11 +240,13 @@ try {
         // Make sure the getMore has not ended after a while.
         sleep(2000);
         jsTestLog("Checking getMore is still being blocked...");
-        assert.eq(
-            db.currentOp({op: "getmore", "cursor.originatingCommand.comment": "uniquifier_comment"})
-                .inprog.length,
-            1,
-            tojson(db.currentOp().inprog));
+        const filter1 = {op: "getmore", "cursor.originatingCommand.comment": "uniquifier_comment"};
+        if (TestData.testingReplicaSetEndpoint) {
+            // On the replica set endpoint, currentOp reports both router and shard operations. So
+            // filter out one of them.
+            filter1.role = "ClusterRole{router}";
+        }
+        assert.eq(db.currentOp(filter1).inprog.length, 1, tojson(db.currentOp().inprog));
 
         // Now write a matching document to wake it up.
         jsTestLog("Sending signal to getMore...");
@@ -271,3 +279,18 @@ try {
     db.setLogLevel(originalCmdLogLevel, 'command');
     db.setLogLevel(originalQueryLogLevel, 'query');
 }
+
+jsTestLog("Testing tailable cursors with trivially false conditions...");
+cmdRes = assert.commandWorked(db.runCommand(
+    {find: collName, batchSize: 2, filter: {$alwaysFalse: 1}, awaitData: true, tailable: true}));
+assert.gt(cmdRes.cursor.id, NumberLong(0));
+assert.eq(cmdRes.cursor.ns, coll.getFullName());
+assert.eq(cmdRes.cursor.firstBatch.length, 0);
+
+assert.commandWorked(coll.insert({_id: "new insertion", x: 123}));
+
+cmdRes = assert.commandWorked(
+    db.runCommand({getMore: cmdRes.cursor.id, collection: collName, batchSize: 1}));
+assert.gt(cmdRes.cursor.id, NumberLong(0));
+assert.eq(cmdRes.cursor.ns, coll.getFullName());
+assert.eq(cmdRes.cursor.nextBatch.length, 0);

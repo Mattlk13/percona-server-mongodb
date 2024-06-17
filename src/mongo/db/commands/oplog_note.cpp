@@ -42,6 +42,7 @@
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/admission/execution_admission_context.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/resource_pattern.h"
@@ -50,7 +51,6 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/namespace_string.h"
@@ -60,6 +60,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_component.h"
 #include "mongo/util/assert_util.h"
@@ -77,8 +78,8 @@ MONGO_FAIL_POINT_DEFINE(hangInAppendOplogNote);
 
 namespace {
 Status _performNoopWrite(OperationContext* opCtx, BSONObj msgObj, StringData note) {
-    ScopedAdmissionPriorityForLock priority{opCtx->lockState(),
-                                            AdmissionContext::Priority::kImmediate};
+    ScopedAdmissionPriority<ExecutionAdmissionContext> priority{
+        opCtx, AdmissionContext::Priority::kExempt};
 
     repl::ReplicationCoordinator* const replCoord = repl::ReplicationCoordinator::get(opCtx);
     // Use GlobalLock instead of DBLock to allow return when the lock is not available. It may
@@ -117,11 +118,11 @@ public:
         return AllowedOnSecondary::kNever;
     }
 
-    virtual bool adminOnly() const {
+    bool adminOnly() const override {
         return true;
     }
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
 
@@ -141,10 +142,10 @@ public:
         return Status::OK();
     }
 
-    virtual bool run(OperationContext* opCtx,
-                     const DatabaseName&,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
         hangInAppendOplogNote.pauseWhileSet();
 
         auto replCoord = repl::ReplicationCoordinator::get(opCtx);

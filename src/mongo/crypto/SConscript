@@ -80,6 +80,7 @@ env.Library(
     source=[
         'encryption_fields.idl',
         'encryption_fields_validation.cpp',
+        'fle_numeric.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/pipeline/value_idl',
@@ -101,9 +102,10 @@ fleCryptoEnv.Library(
         "encryption_fields_util.cpp",
         "fle_crypto.cpp",
         "fle_options.idl",
-        "fle_tags.cpp",
         "fle_stats.cpp",
         "fle_stats.idl",
+        "fle_tags.cpp",
+        "fle_tokens.idl",
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base/secure_allocator',
@@ -128,14 +130,16 @@ fleCryptoEnv.Library(
 )
 
 env.Library(
-    target="fle_fields",
+    target='fle_fields',
     source=[
-        "fle_field_schema.idl",
-        "fle_fields_util.cpp",
+        'fle_field_schema.idl',
+        'fle_fields_util.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/idl/idl_parser',
-        "encrypted_field_config",
+        'encrypted_field_config',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/server_base',
     ],
 )
 
@@ -176,9 +180,7 @@ env.Library(
     target='jwt_types',
     source='jwt_types.idl',
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/server_base',
-        '$BUILD_DIR/mongo/idl/idl_parser',
     ],
 )
 
@@ -211,6 +213,7 @@ if ssl_provider == 'openssl':
         ],
         LIBDEPS=[
             '$BUILD_DIR/mongo/base',
+            '$BUILD_DIR/mongo/db/concurrency/lock_manager',
             '$BUILD_DIR/mongo/util/net/openssl_init',
             'jwt',
         ],
@@ -222,6 +225,8 @@ env.Benchmark(
         'crypto_bm.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
+        '$BUILD_DIR/mongo/db/server_base',
         'fle_crypto',
         'sha_block_${MONGO_CRYPTO}',
     ],

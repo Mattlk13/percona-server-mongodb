@@ -55,16 +55,14 @@ __btcur_bounds_contains_key(WT_SESSION_IMPL *session, WT_CURSOR *cursor, WT_ITEM
  *     search near key is updated to the nearest bound.
  */
 static int
-__btcur_bounds_search_near_reposition(WT_SESSION_IMPL *session, WT_CURSOR_BTREE *cbt)
+__btcur_bounds_search_near_reposition(
+  WT_SESSION_IMPL *session, WT_CURSOR_BTREE *cbt, int *reposition_exactp)
 {
     WT_CURSOR *cursor;
     bool key_out_of_bounds, upper;
 
     cursor = &cbt->iface;
     key_out_of_bounds = upper = false;
-
-    if (!WT_CURSOR_BOUNDS_SET(cursor))
-        return (0);
 
     /*
      * Suppose a caller calls with the search key set to the lower bound but also specifies that the
@@ -79,6 +77,13 @@ __btcur_bounds_search_near_reposition(WT_SESSION_IMPL *session, WT_CURSOR_BTREE 
 
     if (key_out_of_bounds) {
         __wt_cursor_set_raw_key(cursor, upper ? &cursor->upper_bound : &cursor->lower_bound);
+        /*
+         * Given that we have positioned the cursor on either of the upper or lower bounds we can
+         * determine the "exact" return argument. If we positioned at the upper bound then any key
+         * we find must be less than or equal to that bound which is guaranteed to be less than the
+         * original search near key. The reverse holds true for the lower bound.
+         */
+        *reposition_exactp = upper ? -1 : 1;
         WT_STAT_CONN_DATA_INCR(session, cursor_bounds_search_near_repositioned_cursor);
     }
     return (0);
@@ -88,7 +93,7 @@ __btcur_bounds_search_near_reposition(WT_SESSION_IMPL *session, WT_CURSOR_BTREE 
  * __cursor_state_save --
  *     Save the cursor's external state.
  */
-static inline void
+static WT_INLINE void
 __cursor_state_save(WT_CURSOR *cursor, WT_CURFILE_STATE *state)
 {
     WT_ITEM_SET(state->key, cursor->key);
@@ -101,7 +106,7 @@ __cursor_state_save(WT_CURSOR *cursor, WT_CURFILE_STATE *state)
  * __cursor_state_restore --
  *     Restore the cursor's external state.
  */
-static inline void
+static WT_INLINE void
 __cursor_state_restore(WT_CURSOR *cursor, WT_CURFILE_STATE *state)
 {
     if (F_ISSET(state, WT_CURSTD_KEY_EXT))
@@ -117,7 +122,7 @@ __cursor_state_restore(WT_CURSOR *cursor, WT_CURFILE_STATE *state)
  * __cursor_page_pinned --
  *     Return if we have a page pinned.
  */
-static inline bool
+static WT_INLINE bool
 __cursor_page_pinned(WT_CURSOR_BTREE *cbt, bool search_operation)
 {
     WT_CURSOR *cursor;
@@ -164,7 +169,8 @@ __cursor_page_pinned(WT_CURSOR_BTREE *cbt, bool search_operation)
      * whether we correctly resolved the transaction becomes hard. It is easier to skip this check
      * in that instance.
      */
-    if (cbt->ref->page->read_gen == WT_READGEN_OLDEST && !F_ISSET(session->txn, WT_TXN_PREPARE))
+    if (__wt_atomic_load64(&cbt->ref->page->read_gen) == WT_READGEN_OLDEST &&
+      !F_ISSET(session->txn, WT_TXN_PREPARE))
         return (false);
 
     return (true);
@@ -174,7 +180,7 @@ __cursor_page_pinned(WT_CURSOR_BTREE *cbt, bool search_operation)
  * __cursor_size_chk --
  *     Return if an inserted item is too large.
  */
-static inline int
+static WT_INLINE int
 __cursor_size_chk(WT_SESSION_IMPL *session, WT_ITEM *kv)
 {
     WT_BM *bm;
@@ -219,7 +225,7 @@ __cursor_size_chk(WT_SESSION_IMPL *session, WT_ITEM *kv)
  * __cursor_fix_implicit --
  *     Return if search went past the end of the tree.
  */
-static inline bool
+static WT_INLINE bool
 __cursor_fix_implicit(WT_BTREE *btree, WT_CURSOR_BTREE *cbt)
 {
     /*
@@ -523,7 +529,7 @@ __wt_cursor_valid(WT_CURSOR_BTREE *cbt, bool *valid, bool check_bounds)
  * __cursor_col_search --
  *     Column-store search from a cursor.
  */
-static inline int
+static WT_INLINE int
 __cursor_col_search(WT_CURSOR_BTREE *cbt, WT_REF *leaf, bool *leaf_foundp)
 {
     WT_DECL_RET;
@@ -548,7 +554,7 @@ __cursor_col_search(WT_CURSOR_BTREE *cbt, WT_REF *leaf, bool *leaf_foundp)
  * __cursor_row_search --
  *     Row-store search from a cursor.
  */
-static inline int
+static WT_INLINE int
 __cursor_row_search(WT_CURSOR_BTREE *cbt, bool insert, WT_REF *leaf, bool *leaf_foundp)
 {
     WT_DECL_RET;
@@ -573,7 +579,7 @@ __cursor_row_search(WT_CURSOR_BTREE *cbt, bool insert, WT_REF *leaf, bool *leaf_
  * __cursor_col_modify --
  *     Column-store modify from a cursor.
  */
-static inline int
+static WT_INLINE int
 __cursor_col_modify(WT_CURSOR_BTREE *cbt, const WT_ITEM *value, u_int modify_type)
 {
     return (__wt_col_modify(cbt, cbt->iface.recno, value, NULL, modify_type, false, false));
@@ -583,7 +589,7 @@ __cursor_col_modify(WT_CURSOR_BTREE *cbt, const WT_ITEM *value, u_int modify_typ
  * __cursor_row_modify --
  *     Row-store modify from a cursor.
  */
-static inline int
+static WT_INLINE int
 __cursor_row_modify(WT_CURSOR_BTREE *cbt, const WT_ITEM *value, u_int modify_type)
 {
     return (__wt_row_modify(cbt, &cbt->iface.key, value, NULL, modify_type, false, false));
@@ -700,7 +706,7 @@ __wt_btcur_search_prepared(WT_CURSOR *cursor, WT_UPDATE **updp)
  * __cursor_reposition_timing_stress --
  *     Optionally reposition the cursor 10% of times
  */
-static inline bool
+static WT_INLINE bool
 __cursor_reposition_timing_stress(WT_SESSION_IMPL *session)
 {
     WT_CONNECTION_IMPL *conn;
@@ -928,7 +934,7 @@ __btcur_search_neighboring(WT_CURSOR_BTREE *cbt, WT_CURFILE_STATE *state, int *e
  * __btcur_search_near_row_pinned_page --
  *     Search a row store pinned page before searching from the root in search near.
  */
-static inline int
+static WT_INLINE int
 __btcur_search_near_row_pinned_page(WT_CURSOR_BTREE *cbt, bool *validp)
 {
     WT_SESSION_IMPL *session;
@@ -979,13 +985,13 @@ __wt_btcur_search_near(WT_CURSOR_BTREE *cbt, int *exactp)
     WT_CURSOR *cursor;
     WT_DECL_RET;
     WT_SESSION_IMPL *session;
-    int exact;
+    int bounds_reposition_exact, exact;
     bool valid;
 
+    bounds_reposition_exact = exact = 0;
     btree = CUR2BT(cbt);
     cursor = &cbt->iface;
     session = CUR2S(cbt);
-    exact = 0;
     valid = false;
 
     WT_STAT_CONN_DATA_INCR(session, cursor_search_near);
@@ -1008,7 +1014,8 @@ __wt_btcur_search_near(WT_CURSOR_BTREE *cbt, int *exactp)
      * the search key is outside the bounds. Otherwise search near should behave as normal with an
      * additional bounds check after the call to row/col search.
      */
-    WT_ERR(__btcur_bounds_search_near_reposition(session, cbt));
+    if (WT_CURSOR_BOUNDS_SET(cursor))
+        WT_ERR(__btcur_bounds_search_near_reposition(session, cbt, &bounds_reposition_exact));
 
     /*
      * For row-store search the pinned page if there is one. Unlike WT_CURSOR.search, ignore pinned
@@ -1048,20 +1055,9 @@ __wt_btcur_search_near(WT_CURSOR_BTREE *cbt, int *exactp)
      * If that fails, quit, there's no record to return.
      */
     if (valid) {
-        exact = cbt->compare;
+        /* If the bounded cursor logic repositioned the cursor override exact. */
+        exact = bounds_reposition_exact != 0 ? bounds_reposition_exact : cbt->compare;
         WT_ERR(__cursor_kv_return(cbt, cbt->upd_value));
-        /*
-         * This compare is needed for bounded cursors in the event that a valid key is found. The
-         * returned value of exact must reflect the comparison between the found key and the
-         * original search key, not the repositioned bounds key. This comparison ensures that is the
-         * case.
-         */
-        if (WT_CURSOR_BOUNDS_SET(cursor)) {
-            if (btree->type == BTREE_ROW)
-                WT_ERR(__wt_compare(session, btree->collator, &cursor->key, &state.key, &exact));
-            else
-                exact = cbt->recno < state.recno ? -1 : cbt->recno == state.recno ? 0 : 1;
-        }
     } else if (__cursor_fix_implicit(btree, cbt)) {
         cbt->recno = cursor->recno;
         cbt->v = 0;
@@ -1721,11 +1717,12 @@ done:
 }
 
 /*
- * __cursor_chain_exceeded --
- *     Return if the update chain has exceeded the limit.
+ * __cursor_chain_needs_full_upd --
+ *     Return if the update chain needs to have a full update (rather than a modify) placed at the
+ *     head.
  */
 static bool
-__cursor_chain_exceeded(WT_CURSOR_BTREE *cbt)
+__cursor_chain_needs_full_upd(WT_CURSOR_BTREE *cbt)
 {
     WT_CURSOR *cursor;
     WT_PAGE *page;
@@ -1744,6 +1741,19 @@ __cursor_chain_exceeded(WT_CURSOR_BTREE *cbt)
     else if (CUR2BT(cbt)->type == BTREE_ROW && page->modify != NULL &&
       page->modify->mod_row_update != NULL)
         upd = page->modify->mod_row_update[cbt->slot];
+
+    /*
+     * Don't put a new update on top of an aborted update or non-aborted tombstone. Anything reading
+     * the update chain cannot tell the difference between (1) an aborted set of updates from a
+     * rolled-back transaction, and (2) an in-flight, uncommitted rollback.
+     *
+     * This becomes a problem when trying to construct full values from a sequence of modifies,
+     * since the deltas are calculated using normal visibility rules - but if we can't disambiguate
+     * those two cases, we can't know which transaction the aborted entries belong to, so we can't
+     * calculate a correct delta. (This is only a problem in read-uncommitted isolation.)
+     */
+    if (upd != NULL && (upd->txnid == WT_TXN_ABORTED || upd->type == WT_UPDATE_TOMBSTONE))
+        return (true);
 
     /*
      * Step through the modify operations at the beginning of the chain.
@@ -1842,7 +1852,7 @@ __wt_btcur_modify(WT_CURSOR_BTREE *cbt, WT_MODIFY *entries, int nentries)
      */
     overwrite = F_ISSET(cursor, WT_CURSTD_OVERWRITE);
     F_CLR(cursor, WT_CURSTD_OVERWRITE);
-    if (cursor->value.size <= 64 || __cursor_chain_exceeded(cbt))
+    if (cursor->value.size <= 64 || __cursor_chain_needs_full_upd(cbt))
         ret = __btcur_update(cbt, &cursor->value, WT_UPDATE_STANDARD);
     else
         ret = __btcur_update(cbt, modify, WT_UPDATE_MODIFY);
@@ -1960,7 +1970,7 @@ __wt_btcur_compare(WT_CURSOR_BTREE *a_arg, WT_CURSOR_BTREE *b_arg, int *cmpp)
  * __cursor_equals --
  *     Return if two cursors reference the same row.
  */
-static inline bool
+static WT_INLINE bool
 __cursor_equals(WT_CURSOR_BTREE *a, WT_CURSOR_BTREE *b)
 {
     switch (CUR2BT(a)->type) {

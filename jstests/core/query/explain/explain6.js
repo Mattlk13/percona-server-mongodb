@@ -1,12 +1,14 @@
 // @tags: [
 //   assumes_balancer_off,
 //   requires_non_retryable_writes,
+//   requires_fcv_80,
 // ]
 
 // Basic test which checks the number of documents returned, keys examined, and documents
 // examined as reported by explain.
 
-let t = db.jstests_explain6;
+const colName = jsTestName();
+let t = db.getCollection(colName);
 t.drop();
 
 t.createIndex({a: 1, b: 1});
@@ -36,4 +38,4 @@ t.save({a: '0', b: '1'});
 t.save({a: '1', b: '0'});
 explain = t.find({a: /0/, b: /1/}).explain(true);
 assert.eq(1, explain.executionStats.nReturned);
-assert.eq(2, explain.executionStats.totalKeysExamined);
+assert.eq(2, explain.executionStats.totalDocsExamined);

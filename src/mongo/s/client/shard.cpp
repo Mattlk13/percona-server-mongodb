@@ -27,6 +27,7 @@
  *    it in the license file.
  */
 
+#include "mongo/s/client/shard.h"
 
 #include <boost/move/utility_core.hpp>
 #include <boost/optional/optional.hpp>
@@ -38,8 +39,6 @@
 #include "mongo/logv2/log_component.h"
 #include "mongo/logv2/redaction.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/s/client/shard.h"
-#include "mongo/s/client/shard_remote_gen.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
@@ -50,7 +49,6 @@ namespace mongo {
 namespace {
 
 const int kOnErrorNumRetries = 3;
-
 }  // namespace
 
 Status Shard::CommandResponse::getEffectiveStatus(
@@ -95,8 +93,6 @@ Status Shard::CommandResponse::processBatchWriteResponse(
 
     return status;
 }
-
-const Milliseconds Shard::kDefaultConfigCommandTimeout = Seconds{30};
 
 bool Shard::shouldErrorBePropagated(ErrorCodes::Error code) {
     return !isMongosRetriableError(code) && (code != ErrorCodes::NetworkInterfaceExceededTimeLimit);
@@ -251,34 +247,6 @@ StatusWith<Shard::QueryResponse> Shard::runExhaustiveCursorCommand(
     MONGO_UNREACHABLE;
 }
 
-BatchedCommandResponse Shard::runBatchWriteCommand(OperationContext* opCtx,
-                                                   const Milliseconds maxTimeMS,
-                                                   const BatchedCommandRequest& batchRequest,
-                                                   RetryPolicy retryPolicy) {
-    const DatabaseName dbname = batchRequest.getNS().dbName();
-    const BSONObj cmdObj = batchRequest.toBSON();
-
-    for (int retry = 1; retry <= kOnErrorNumRetries; ++retry) {
-        // Note: write commands can only be issued against a primary.
-        auto swResponse = _runCommand(
-            opCtx, ReadPreferenceSetting{ReadPreference::PrimaryOnly}, dbname, maxTimeMS, cmdObj);
-
-        BatchedCommandResponse batchResponse;
-        auto writeStatus = CommandResponse::processBatchWriteResponse(swResponse, &batchResponse);
-        if (retry < kOnErrorNumRetries && isRetriableError(writeStatus.code(), retryPolicy)) {
-            LOGV2_DEBUG(22721,
-                        2,
-                        "Batch write command failed with retryable error and will be retried",
-                        "shardId"_attr = getId(),
-                        "error"_attr = redact(writeStatus));
-            continue;
-        }
-
-        return batchResponse;
-    }
-    MONGO_UNREACHABLE;
-}
-
 StatusWith<Shard::QueryResponse> Shard::exhaustiveFindOnConfig(
     OperationContext* opCtx,
     const ReadPreferenceSetting& readPref,
@@ -304,5 +272,35 @@ StatusWith<Shard::QueryResponse> Shard::exhaustiveFindOnConfig(
     }
     MONGO_UNREACHABLE;
 }
+
+BatchedCommandResponse Shard::_submitBatchWriteCommand(OperationContext* opCtx,
+                                                       const BSONObj& serialisedBatchRequest,
+                                                       const DatabaseName& dbName,
+                                                       Milliseconds maxTimeMS,
+                                                       RetryPolicy retryPolicy) {
+    for (int retry = 1; retry <= kOnErrorNumRetries; ++retry) {
+        // Note: write commands can only be issued against a primary.
+        auto swResponse = _runCommand(opCtx,
+                                      ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                      dbName,
+                                      maxTimeMS,
+                                      serialisedBatchRequest);
+
+        BatchedCommandResponse batchResponse;
+        auto writeStatus = CommandResponse::processBatchWriteResponse(swResponse, &batchResponse);
+        if (retry < kOnErrorNumRetries && isRetriableError(writeStatus.code(), retryPolicy)) {
+            LOGV2_DEBUG(22721,
+                        2,
+                        "Batch write command failed with retryable error and will be retried",
+                        "shardId"_attr = getId(),
+                        "error"_attr = redact(writeStatus));
+            continue;
+        }
+
+        return batchResponse;
+    }
+    MONGO_UNREACHABLE;
+}
+
 
 }  // namespace mongo

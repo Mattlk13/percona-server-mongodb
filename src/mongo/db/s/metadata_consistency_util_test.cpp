@@ -30,6 +30,7 @@
 
 #include "mongo/db/s/metadata_consistency_util.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <string>
 
@@ -39,8 +40,12 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/oid.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/keypattern.h"
+#include "mongo/db/query/collation/collator_factory_icu.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
+#include "mongo/db/timeseries/timeseries_options.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -48,6 +53,7 @@
 #include "mongo/s/chunk_version.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/uuid.h"
 
@@ -84,6 +90,44 @@ TagsType generateZone(const NamespaceString& nss, const BSONObj& minKey, const B
     return tagType;
 }
 
+TimeseriesOptions generateTimeseriesOptions(
+    const std::string& timeField,
+    const boost::optional<StringData> metaField = boost::none,
+    const boost::optional<BucketGranularityEnum> granularity = boost::none,
+    const boost::optional<int32_t>& bucketMaxSpanSeconds = boost::none,
+    const boost::optional<int32_t>& bucketRoundingSeconds = boost::none) {
+    TimeseriesOptions options{timeField};
+    options.setMetaField(metaField);
+    options.setGranularity(granularity);
+    options.setBucketMaxSpanSeconds(bucketMaxSpanSeconds);
+    options.setBucketRoundingSeconds(bucketRoundingSeconds);
+    return options;
+}
+
+void createLocalCollection(OperationContext* opCtx, const CreateCommand& cmd) {
+    OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE unsafeCreateCollection(
+        opCtx);
+    uassertStatusOK(createCollection(opCtx, cmd));
+}
+
+std::vector<CollectionPtr> getLocalCatalogCollections(OperationContext* opCtx,
+                                                      const NamespaceString& nss) {
+    std::vector<CollectionPtr> localCatalogCollections;
+    auto collCatalogSnapshot = [&] {
+        AutoGetCollection coll(
+            opCtx,
+            nss,
+            MODE_IS,
+            AutoGetCollection::Options{}.viewMode(auto_get_collection::ViewMode::kViewsPermitted));
+        return CollectionCatalog::get(opCtx);
+    }();
+
+    if (auto coll = collCatalogSnapshot->lookupCollectionByNamespace(opCtx, nss)) {
+        localCatalogCollections.emplace_back(CollectionPtr(coll));
+    }
+    return localCatalogCollections;
+}
+
 class MetadataConsistencyTest : public ShardServerTestFixture {
 protected:
     std::string _shardName = "shard0000";
@@ -95,12 +139,54 @@ protected:
     const CollectionType _coll{
         _nss, OID::gen(), Timestamp(1), Date_t::now(), _collUuid, _keyPattern};
 
+    CollectionType generateCollectionType(const NamespaceString& nss,
+                                          const UUID& uuid,
+                                          const KeyPattern& keyPattern = KeyPattern(BSON("_id"
+                                                                                         << 1))) {
+        return CollectionType{nss, OID::gen(), Timestamp(1), Date_t::now(), uuid, keyPattern};
+    }
+
     void assertOneInconsistencyFound(
         const MetadataInconsistencyTypeEnum& type,
-        const NamespaceString& nss,
         const std::vector<MetadataInconsistencyItem>& inconsistencies) {
         ASSERT_EQ(1, inconsistencies.size());
         ASSERT_EQ(type, inconsistencies[0].getType());
+    }
+
+    void assertCollectionOptionsMismatchInconsistencyFound(
+        const std::vector<MetadataInconsistencyItem>& inconsistencies,
+        const BSONObj& localOptions,
+        const BSONObj& configOptions) {
+        ASSERT_GT(inconsistencies.size(), 0);
+        ASSERT_TRUE(std::any_of(
+            inconsistencies.begin(), inconsistencies.end(), [&](const auto& inconsistency) {
+                if (inconsistency.getType() !=
+                    MetadataInconsistencyTypeEnum::kCollectionOptionsMismatch) {
+                    return false;
+                }
+
+                const auto& allOptions = inconsistency.getDetails().getField("options").Array();
+                if (std::none_of(allOptions.begin(), allOptions.end(), [&](const BSONElement& o) {
+                        return localOptions.woCompare(o.Obj().getField("options").Obj()) == 0;
+                    })) {
+                    return false;
+                }
+                if (std::none_of(allOptions.begin(), allOptions.end(), [&](const BSONElement& o) {
+                        return configOptions.woCompare(o.Obj().getField("options").Obj()) == 0;
+                    })) {
+                    return false;
+                }
+                return true;
+            }));
+    }
+
+    void assertNoCollectionOptionsMismatchInconsistencyFound(
+        const std::vector<MetadataInconsistencyItem>& inconsistencies) {
+        ASSERT_TRUE(std::none_of(
+            inconsistencies.begin(), inconsistencies.end(), [](const auto& inconsistency) {
+                return inconsistency.getType() ==
+                    MetadataInconsistencyTypeEnum::kCollectionOptionsMismatch;
+            }));
     }
 };
 
@@ -117,11 +203,11 @@ TEST_F(MetadataConsistencyTest, FindRoutingTableRangeGapInconsistency) {
                                       _keyPattern.globalMax(),
                                       {ChunkHistory(Timestamp(1, 0), _shardId)});
 
-    const auto inconsistencies = metadata_consistency_util::checkChunksInconsistencies(
+    const auto inconsistencies = metadata_consistency_util::checkChunksConsistency(
         operationContext(), _coll, {chunk1, chunk2});
 
-    assertOneInconsistencyFound(
-        MetadataInconsistencyTypeEnum::kRoutingTableRangeGap, _nss, inconsistencies);
+    assertOneInconsistencyFound(MetadataInconsistencyTypeEnum::kRoutingTableRangeGap,
+                                inconsistencies);
 }
 
 TEST_F(MetadataConsistencyTest, FindMissingChunkWithMaxKeyInconsistency) {
@@ -132,10 +218,10 @@ TEST_F(MetadataConsistencyTest, FindMissingChunkWithMaxKeyInconsistency) {
                                      {ChunkHistory(Timestamp(1, 0), _shardId)});
 
     const auto inconsistencies =
-        metadata_consistency_util::checkChunksInconsistencies(operationContext(), _coll, {chunk});
+        metadata_consistency_util::checkChunksConsistency(operationContext(), _coll, {chunk});
 
-    assertOneInconsistencyFound(
-        MetadataInconsistencyTypeEnum::kRoutingTableMissingMaxKey, _nss, inconsistencies);
+    assertOneInconsistencyFound(MetadataInconsistencyTypeEnum::kRoutingTableMissingMaxKey,
+                                inconsistencies);
 }
 
 TEST_F(MetadataConsistencyTest, FindMissingChunkWithMinKeyInconsistency) {
@@ -146,10 +232,10 @@ TEST_F(MetadataConsistencyTest, FindMissingChunkWithMinKeyInconsistency) {
                                      {ChunkHistory(Timestamp(1, 0), _shardId)});
 
     const auto inconsistencies =
-        metadata_consistency_util::checkChunksInconsistencies(operationContext(), _coll, {chunk});
+        metadata_consistency_util::checkChunksConsistency(operationContext(), _coll, {chunk});
 
-    assertOneInconsistencyFound(
-        MetadataInconsistencyTypeEnum::kRoutingTableMissingMinKey, _nss, inconsistencies);
+    assertOneInconsistencyFound(MetadataInconsistencyTypeEnum::kRoutingTableMissingMinKey,
+                                inconsistencies);
 }
 
 TEST_F(MetadataConsistencyTest, FindRoutingTableRangeOverlapInconsistency) {
@@ -165,11 +251,11 @@ TEST_F(MetadataConsistencyTest, FindRoutingTableRangeOverlapInconsistency) {
                                       _keyPattern.globalMax(),
                                       {ChunkHistory(Timestamp(1, 0), _shardId)});
 
-    const auto inconsistencies = metadata_consistency_util::checkChunksInconsistencies(
+    const auto inconsistencies = metadata_consistency_util::checkChunksConsistency(
         operationContext(), _coll, {chunk1, chunk2});
 
-    assertOneInconsistencyFound(
-        MetadataInconsistencyTypeEnum::kRoutingTableRangeOverlap, _nss, inconsistencies);
+    assertOneInconsistencyFound(MetadataInconsistencyTypeEnum::kRoutingTableRangeOverlap,
+                                inconsistencies);
 }
 
 TEST_F(MetadataConsistencyTest, FindCorruptedChunkShardKeyInconsistency) {
@@ -185,7 +271,7 @@ TEST_F(MetadataConsistencyTest, FindCorruptedChunkShardKeyInconsistency) {
                                       _keyPattern.globalMax(),
                                       {ChunkHistory(Timestamp(1, 0), _shardId)});
 
-    const auto inconsistencies = metadata_consistency_util::checkChunksInconsistencies(
+    const auto inconsistencies = metadata_consistency_util::checkChunksConsistency(
         operationContext(), _coll, {chunk1, chunk2});
 
     ASSERT_EQ(2, inconsistencies.size());
@@ -198,11 +284,11 @@ TEST_F(MetadataConsistencyTest, FindCorruptedZoneShardKeyInconsistency) {
 
     const auto zone2 = generateZone(_nss, BSON("y" << 0), _keyPattern.globalMax());
 
-    const auto inconsistencies = metadata_consistency_util::checkZonesInconsistencies(
-        operationContext(), _coll, {zone1, zone2});
+    const auto inconsistencies =
+        metadata_consistency_util::checkZonesConsistency(operationContext(), _coll, {zone1, zone2});
 
-    assertOneInconsistencyFound(
-        MetadataInconsistencyTypeEnum::kCorruptedZoneShardKey, _nss, inconsistencies);
+    assertOneInconsistencyFound(MetadataInconsistencyTypeEnum::kCorruptedZoneShardKey,
+                                inconsistencies);
 }
 
 TEST_F(MetadataConsistencyTest, FindZoneRangeOverlapInconsistency) {
@@ -210,11 +296,10 @@ TEST_F(MetadataConsistencyTest, FindZoneRangeOverlapInconsistency) {
 
     const auto zone2 = generateZone(_nss, BSON("x" << -10), _keyPattern.globalMax());
 
-    const auto inconsistencies = metadata_consistency_util::checkZonesInconsistencies(
-        operationContext(), _coll, {zone1, zone2});
+    const auto inconsistencies =
+        metadata_consistency_util::checkZonesConsistency(operationContext(), _coll, {zone1, zone2});
 
-    assertOneInconsistencyFound(
-        MetadataInconsistencyTypeEnum::kZonesRangeOverlap, _nss, inconsistencies);
+    assertOneInconsistencyFound(MetadataInconsistencyTypeEnum::kZonesRangeOverlap, inconsistencies);
 }
 
 TEST_F(MetadataConsistencyTest, FindCorruptedShardKeyInconsistencyForUnsplittableCollection) {
@@ -228,9 +313,214 @@ TEST_F(MetadataConsistencyTest, FindCorruptedShardKeyInconsistencyForUnsplittabl
         metadata_consistency_util::checkCollectionShardingMetadataConsistency(operationContext(),
                                                                               coll);
     assertOneInconsistencyFound(
-        MetadataInconsistencyTypeEnum::kTrackedUnshardedCollectionHasInvalidKey,
-        _nss,
-        inconsistencies);
+        MetadataInconsistencyTypeEnum::kTrackedUnshardedCollectionHasInvalidKey, inconsistencies);
+}
+
+TEST_F(MetadataConsistencyTest, CappedAndShardedCollection) {
+    OperationContext* opCtx = operationContext();
+
+    // Create a capped local collection.
+    CreateCommand cmd(_nss);
+    cmd.getCreateCollectionRequest().setCapped(true);
+    cmd.getCreateCollectionRequest().setSize(100);
+    createLocalCollection(opCtx, cmd);
+
+    const auto localCatalogCollections = getLocalCatalogCollections(opCtx, _nss);
+    ASSERT_EQ(1, localCatalogCollections.size());
+
+    // Create a CollectionType for a non-unsplittable collection to mock the collection info
+    // fetched from the config server.
+    auto configColl = generateCollectionType(_nss, localCatalogCollections[0]->uuid());
+
+    // Catch the inconsistency.
+    const auto inconsistencies = metadata_consistency_util::checkCollectionMetadataConsistency(
+        opCtx, _shardId, _shardId, {configColl}, localCatalogCollections);
+    assertCollectionOptionsMismatchInconsistencyFound(
+        inconsistencies,
+        BSON("capped" << true),
+        BSON("capped" << false << "unsplittable" << false));
+}
+
+TEST_F(MetadataConsistencyTest, DefaultCollationMismatchBetweenLocalAndShardingCatalog) {
+    OperationContext* opCtx = operationContext();
+
+    auto convertToCatalogCollationBSON = [&opCtx](const Collation& collation) {
+        // The collation sent to the create cmd is slightly different to the one stored in the
+        // Catalog.
+        const auto collator =
+            uassertStatusOK(CollatorFactoryInterface::get(opCtx->getServiceContext())
+                                ->makeFromBSON(collation.toBSON()));
+        if (!collator) {
+            // Case when collation is {locale: 'simple'}
+            return BSONObj();
+        }
+        return collator->getSpec().toBSON();
+    };
+
+    const auto testCollationMismatch = [&](const NamespaceString& nss,
+                                           const boost::optional<Collation>& localCollation,
+                                           const boost::optional<Collation>& configCollation,
+                                           bool expectInconsistencies) {
+        // Create a local collection with the given collation.
+        CreateCommand cmd(nss);
+        if (localCollation) {
+            cmd.getCreateCollectionRequest().setCollation(*localCollation);
+        }
+        createLocalCollection(opCtx, cmd);
+
+        const auto localCatalogCollections = getLocalCatalogCollections(opCtx, nss);
+        ASSERT_EQ(1, localCatalogCollections.size());
+
+        // Create a CollectionType to mock the collection metadata fetched from the config server.
+        auto configColl = generateCollectionType(nss, localCatalogCollections[0]->uuid());
+        if (configCollation) {
+            configColl.setDefaultCollation(convertToCatalogCollationBSON(*configCollation));
+        }
+
+        // Check the inconsistencies.
+        const auto inconsistencies = metadata_consistency_util::checkCollectionMetadataConsistency(
+            opCtx, _shardId, _shardId, {configColl}, localCatalogCollections);
+
+        if (expectInconsistencies) {
+            BSONObj collationLocalCatalog =
+                localCollation ? convertToCatalogCollationBSON(*localCollation) : BSONObj();
+            assertCollectionOptionsMismatchInconsistencyFound(
+                inconsistencies,
+                BSON(CollectionType::kDefaultCollationFieldName << collationLocalCatalog),
+                BSON(CollectionType::kDefaultCollationFieldName
+                     << configColl.getDefaultCollation()));
+        } else {
+            assertNoCollectionOptionsMismatchInconsistencyFound(inconsistencies);
+        }
+    };
+
+    testCollationMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl1"),
+                          Collation("es"),
+                          Collation("ar"),
+                          true);
+    testCollationMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl2"),
+                          boost::none,
+                          Collation("ar"),
+                          true);
+    testCollationMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl3"),
+                          Collation("ca"),
+                          boost::none,
+                          true);
+    testCollationMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl4"),
+                          Collation("simple"),
+                          Collation("simple"),
+                          false);
+    testCollationMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl5"),
+                          Collation("az"),
+                          Collation("az"),
+                          false);
+    testCollationMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl6"),
+                          boost::none,
+                          boost::none,
+                          false);
+}
+
+TEST_F(MetadataConsistencyTest, TimeseriesOptionsMismatchBetweenLocalAndShardingCatalog) {
+    OperationContext* opCtx = operationContext();
+
+    const auto convertToCatalogTimeseriesOptions = [](TimeseriesOptions timeseriesOptions) {
+        // The TimeseriesOptions sent to the create cmd are slightly different to the ones stored in
+        // the Catalog.
+        uassertStatusOK(timeseries::validateAndSetBucketingParameters(timeseriesOptions));
+        return timeseriesOptions;
+    };
+
+    const auto testTimeseriesMismatch =
+        [&](const NamespaceString& nss,
+            const boost::optional<TimeseriesOptions>& localTimeseries,
+            const boost::optional<TimeseriesOptions>& configTimeseries,
+            bool expectInconsistencies) {
+            // Create a local collection with the given collation.
+            CreateCommand cmd(nss);
+            if (localTimeseries) {
+                cmd.getCreateCollectionRequest().setTimeseries(localTimeseries);
+            }
+            createLocalCollection(opCtx, cmd);
+
+            const auto& actualNss = (localTimeseries ? nss.makeTimeseriesBucketsNamespace() : nss);
+
+            const auto localCatalogCollections = getLocalCatalogCollections(opCtx, actualNss);
+            ASSERT_EQ(1, localCatalogCollections.size());
+
+            // Create a CollectionType to mock the collection metadata fetched from the config
+            // server.
+            auto configColl = generateCollectionType(actualNss, localCatalogCollections[0]->uuid());
+            if (configTimeseries) {
+                TypeCollectionTimeseriesFields timeseriesFields;
+                timeseriesFields.setTimeseriesOptions(
+                    convertToCatalogTimeseriesOptions(*configTimeseries));
+                configColl.setTimeseriesFields(std::move(timeseriesFields));
+            }
+
+            // Check the inconsistencies.
+            const auto inconsistencies =
+                metadata_consistency_util::checkCollectionMetadataConsistency(
+                    opCtx, _shardId, _shardId, {configColl}, localCatalogCollections);
+
+            if (expectInconsistencies) {
+                const BSONObj& localCatalogBSON =
+                    (localTimeseries ? convertToCatalogTimeseriesOptions(*localTimeseries).toBSON()
+                                     : BSONObj());
+                const BSONObj& configCatalogBSON = configColl.getTimeseriesFields()
+                    ? configColl.getTimeseriesFields()->toBSON()
+                    : BSONObj();
+                assertCollectionOptionsMismatchInconsistencyFound(
+                    inconsistencies,
+                    BSON(CollectionType::kTimeseriesFieldsFieldName << localCatalogBSON),
+                    BSON(CollectionType::kTimeseriesFieldsFieldName << configCatalogBSON));
+            } else {
+                assertNoCollectionOptionsMismatchInconsistencyFound(inconsistencies);
+            }
+        };
+
+    testTimeseriesMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl1"),
+                           boost::none,
+                           generateTimeseriesOptions("time"),
+                           true);
+    testTimeseriesMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl2"),
+                           generateTimeseriesOptions("time", "meta"_sd),
+                           boost::none,
+                           true);
+    testTimeseriesMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl3"),
+                           generateTimeseriesOptions("time"),
+                           generateTimeseriesOptions("x"),
+                           true);
+    testTimeseriesMismatch(
+        NamespaceString::createNamespaceString_forTest("TestDB", "TestColl4"),
+        generateTimeseriesOptions("time", "meta"_sd, BucketGranularityEnum::Minutes),
+        generateTimeseriesOptions("time", "metaDiff"_sd, BucketGranularityEnum::Minutes),
+        true);
+    testTimeseriesMismatch(
+        NamespaceString::createNamespaceString_forTest("TestDB", "TestColl5"),
+        generateTimeseriesOptions("time", "meta"_sd, BucketGranularityEnum::Minutes),
+        generateTimeseriesOptions("time", "meta"_sd, BucketGranularityEnum::Hours),
+        true);
+    testTimeseriesMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl6"),
+                           generateTimeseriesOptions("time", "meta"_sd, boost::none, 111, 111),
+                           generateTimeseriesOptions("time", "meta"_sd, boost::none, 222, 222),
+                           true);
+    testTimeseriesMismatch(
+        NamespaceString::createNamespaceString_forTest("TestDB", "TestColl7"),
+        generateTimeseriesOptions("time", "meta"_sd, BucketGranularityEnum::Hours),
+        generateTimeseriesOptions("time", "meta"_sd, BucketGranularityEnum::Hours),
+        false);
+    testTimeseriesMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl8"),
+                           generateTimeseriesOptions("time", "meta"_sd, boost::none, 3333, 3333),
+                           generateTimeseriesOptions("time", "meta"_sd, boost::none, 3333, 3333),
+                           false);
+    testTimeseriesMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl9"),
+                           boost::none,
+                           boost::none,
+                           false);
+    testTimeseriesMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl10"),
+                           generateTimeseriesOptions("x"),
+                           generateTimeseriesOptions("x"),
+                           false);
 }
 
 class MetadataConsistencyRandomRoutingTableTest : public ShardServerTestFixture {
@@ -276,7 +566,7 @@ TEST_F(MetadataConsistencyRandomRoutingTableTest, FindRoutingTableRangeGapIncons
 
     // Check that there are no inconsistencies in the routing table
     auto inconsistencies =
-        metadata_consistency_util::checkChunksInconsistencies(operationContext(), _coll, chunks);
+        metadata_consistency_util::checkChunksConsistency(operationContext(), _coll, chunks);
     ASSERT_EQ(0, inconsistencies.size());
 
     // Remove randoms chunk from the routing table
@@ -287,7 +577,7 @@ TEST_F(MetadataConsistencyRandomRoutingTableTest, FindRoutingTableRangeGapIncons
     }
 
     inconsistencies =
-        metadata_consistency_util::checkChunksInconsistencies(operationContext(), _coll, chunks);
+        metadata_consistency_util::checkChunksConsistency(operationContext(), _coll, chunks);
 
     // Assert that there is at least one gap inconsistency
     try {
@@ -318,7 +608,7 @@ TEST_F(MetadataConsistencyRandomRoutingTableTest, FindRoutingTableRangeOverlapIn
 
     // Check that there are no inconsistencies in the routing table
     auto inconsistencies =
-        metadata_consistency_util::checkChunksInconsistencies(operationContext(), _coll, chunks);
+        metadata_consistency_util::checkChunksConsistency(operationContext(), _coll, chunks);
     ASSERT_EQ(0, inconsistencies.size());
 
     // If there is only one chunk, we can't introduce an overlap
@@ -365,7 +655,7 @@ TEST_F(MetadataConsistencyRandomRoutingTableTest, FindRoutingTableRangeOverlapIn
     }
 
     inconsistencies =
-        metadata_consistency_util::checkChunksInconsistencies(operationContext(), _coll, chunks);
+        metadata_consistency_util::checkChunksConsistency(operationContext(), _coll, chunks);
 
     // Assert that there is at least one overlap inconsistency
     try {

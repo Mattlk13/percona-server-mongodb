@@ -36,6 +36,7 @@ Copyright (C) 2021-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/encryption_hooks.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_options.h"
 #include "mongo/util/fail_point.h"
@@ -128,7 +129,7 @@ BackupCursorState WiredTigerBackupCursorHooks::openBackupCursor(
     };
 
     auto filesToBackup =
-        uassertStatusOK(engine->beginNonBlockingBackup(opCtx, checkpointTimestamp, options));
+        uassertStatusOK(engine->beginNonBlockingBackup(opCtx, options));
     _state = kBackupCursorOpened;
     _openCursor = UUID::gen();
     LOGV2(29093, "Opened backup cursor", "backupId"_attr = _openCursor.get());

@@ -45,6 +45,7 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/matcher/expression_always_boolean.h"
 #include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/path.h"
 #include "mongo/db/query/collation/collator_interface.h"
@@ -104,8 +105,7 @@ bool ComparisonMatchExpressionBase::equivalent(const MatchExpression* other) con
 
     // Please, keep BSONElementComparator consistent with MatchExpressionHasher defined in
     // db/matcher/expression_hasher.cpp.
-    const StringDataComparator* stringComparator = nullptr;
-    BSONElementComparator eltCmp(BSONElementComparator::FieldNamesMode::kIgnore, stringComparator);
+    BSONElementComparator eltCmp(BSONElementComparator::FieldNamesMode::kIgnore, _collator);
     return path() == realOther->path() && eltCmp.evaluate(_rhs == realOther->_rhs);
 }
 
@@ -171,9 +171,12 @@ bool ComparisonMatchExpression::matchesSingleElement(const BSONElement& e,
             // We can't call 'compareElements' on elements of different canonical types.  Usually
             // elements with different canonical types should never match any comparison, but there
             // are a few exceptions, handled here.
-            // jstNULL and undefined are treated the same
+
+            // jstNULL and missing are treated the same.
             if (ect + rct == 5) {
-                return matchType() == EQ || matchType() == LTE || matchType() == GTE;
+                // At this point we know null (RHS) is being compared to either EOO (missing) or
+                // undefined.
+                return e.eoo() && (matchType() == EQ || matchType() == LTE || matchType() == GTE);
             }
             if (_rhs.type() == MaxKey || _rhs.type() == MinKey) {
                 switch (matchType()) {
@@ -325,9 +328,9 @@ void RegexMatchExpression::appendSerializedRightHandSide(BSONObjBuilder* bob,
 
     if (!_flags.empty()) {
         // We need to make sure the $options value can be re-parsed as legal regex options, so
-        // we'll set the representative value in this case to be the empty string rather than
+        // we'll set the representative value in this case to be the string "i" rather than
         // "?", which is the standard representative for string values.
-        opts.appendLiteral(bob, "$options", _flags, Value(""_sd));
+        opts.appendLiteral(bob, "$options", _flags, Value("i"_sd));
     }
 }
 
@@ -480,8 +483,8 @@ std::unique_ptr<MatchExpression> InMatchExpression::clone() const {
 
 bool InMatchExpression::matchesSingleElement(const BSONElement& e, MatchDetails* details) const {
     // When an $in has a null, it adopts the same semantics as {$eq:null}. Namely, in addition to
-    // matching literal null values, the $in should match missing and undefined.
-    if (hasNull() && (e.eoo() || e.type() == BSONType::Undefined)) {
+    // matching literal null values, the $in should match missing.
+    if (hasNull() && e.eoo()) {
         return true;
     }
     if (contains(e)) {
@@ -632,6 +635,9 @@ MatchExpression::ExpressionOptimizerFunc InMatchExpression::getOptimizer() const
             }
 
             return simplifiedExpression;
+        } else if (regexes.empty() && ime._equalities->elementsIsEmpty()) {
+            // Empty IN is always false
+            return std::make_unique<AlwaysFalseMatchExpression>();
         }
 
         return expression;
@@ -788,6 +794,25 @@ bool BitTestMatchExpression::matchesSingleElement(const BSONElement& e,
 
         // This checks if e is an integral double.
         if (eDouble != static_cast<double>(static_cast<long long>(eDouble))) {
+            return false;
+        }
+    } else if (e.type() == BSONType::NumberDecimal) {
+        Decimal128 eDecimal = e.numberDecimal();
+
+        // NaN NumberDecimals are rejected.
+        if (eDecimal.isNaN()) {
+            return false;
+        }
+
+        // NumberDecimals that are too large or small to be represented as a 64-bit signed
+        // integer are treated as 0.
+        if (eDecimal > Decimal128(std::numeric_limits<long long>::max()) ||
+            eDecimal < Decimal128(std::numeric_limits<long long>::min())) {
+            return false;
+        }
+
+        // This checks if e is an integral NumberDecimal.
+        if (eDecimal != eDecimal.round(Decimal128::kRoundTowardZero)) {
             return false;
         }
     }

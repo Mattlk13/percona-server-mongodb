@@ -32,14 +32,21 @@
 #include "mongo/db/server_options.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/transport/grpc/client.h"
+#include "mongo/transport/grpc/grpc_session_manager.h"
+#include "mongo/transport/grpc/service.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/net/socket_utils.h"
+#include "mongo/util/net/ssl_options.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 namespace mongo::transport::grpc {
 namespace {
 const Seconds kSessionManagerShutdownTimeout{10};
+
+inline std::string makeGRPCUnixSockPath(int port) {
+    return makeUnixSockPath(port, "grpc");
+}
 }  // namespace
 
 GRPCTransportLayerImpl::Options::Options(const ServerGlobalParams& params) {
@@ -54,6 +61,29 @@ GRPCTransportLayerImpl::GRPCTransportLayerImpl(ServiceContext* svcCtx,
                                                Options options,
                                                std::unique_ptr<SessionManager> sm)
     : _svcCtx{svcCtx}, _options{std::move(options)}, _sessionManager(std::move(sm)) {}
+
+std::unique_ptr<GRPCTransportLayerImpl> GRPCTransportLayerImpl::createWithConfig(
+    ServiceContext* svcCtx,
+    Options options,
+    std::vector<std::shared_ptr<ClientTransportObserver>> observers) {
+
+    auto clientCache = std::make_shared<ClientCache>();
+
+    auto tl = std::make_unique<GRPCTransportLayerImpl>(
+        svcCtx,
+        std::move(options),
+        std::make_unique<GRPCSessionManager>(svcCtx, clientCache, std::move(observers)));
+    uassertStatusOK(tl->registerService(std::make_unique<CommandService>(
+        tl.get(),
+        [tlPtr = tl.get()](auto session) {
+            invariant(session->getTransportLayer() == tlPtr);
+            tlPtr->getSessionManager()->startSession(std::move(session));
+        },
+        std::make_shared<grpc::WireVersionProvider>(),
+        std::move(clientCache))));
+
+    return tl;
+}
 
 Status GRPCTransportLayerImpl::registerService(std::unique_ptr<Service> svc) {
     try {
@@ -90,17 +120,23 @@ Status GRPCTransportLayerImpl::setup() {
                 addresses.push_back(HostAndPort(ip, _options.bindPort));
             }
             if (_options.useUnixDomainSockets) {
-                addresses.push_back(HostAndPort(makeUnixSockPath(_options.bindPort)));
+                addresses.push_back(HostAndPort(makeGRPCUnixSockPath(_options.bindPort)));
             }
             serverOptions.addresses = std::move(addresses);
             serverOptions.maxThreads = _options.maxServerThreads;
 
+            uassert(ErrorCodes::InvalidOptions,
+                    "Unable to start GRPC transport for ingress without tlsCertificateKeyFile",
+                    !sslGlobalParams.sslPEMKeyFile.empty());
+            serverOptions.tlsCertificateKeyFile = sslGlobalParams.sslPEMKeyFile;
+
             if (!sslGlobalParams.sslCAFile.empty()) {
                 serverOptions.tlsCAFile = sslGlobalParams.sslCAFile;
             }
-            if (!sslGlobalParams.sslPEMKeyFile.empty()) {
-                serverOptions.tlsPEMKeyFile = sslGlobalParams.sslPEMKeyFile;
-            }
+
+            serverOptions.tlsAllowInvalidCertificates = sslGlobalParams.sslAllowInvalidCertificates;
+            serverOptions.tlsAllowConnectionsWithoutCertificates =
+                sslGlobalParams.sslWeakCertificateValidation;
 
             uassert(ErrorCodes::InvalidOptions,
                     "Unable to start GRPCTransportLayerImpl for ingress without SessionManager",
@@ -109,13 +145,16 @@ Status GRPCTransportLayerImpl::setup() {
             _server = std::make_unique<Server>(std::move(services), serverOptions);
         }
         if (_options.enableEgress) {
-            GRPCClient::Options clientOptions;
+            GRPCClient::Options clientOptions{};
+
             if (!sslGlobalParams.sslCAFile.empty()) {
                 clientOptions.tlsCAFile = sslGlobalParams.sslCAFile;
             }
             if (!sslGlobalParams.sslPEMKeyFile.empty()) {
                 clientOptions.tlsCertificateKeyFile = sslGlobalParams.sslPEMKeyFile;
             }
+            clientOptions.tlsAllowInvalidHostnames = sslGlobalParams.sslAllowInvalidHostnames;
+            clientOptions.tlsAllowInvalidCertificates = sslGlobalParams.sslAllowInvalidCertificates;
             iassert(ErrorCodes::InvalidOptions,
                     "gRPC egress networking enabled but no client metadata document was provided",
                     _options.clientMetadata.has_value());
@@ -153,15 +192,11 @@ Status GRPCTransportLayerImpl::start() {
                 "tlsFIPSMode is not supported when gRPC mode is enabled",
                 !sslGlobalParams.sslFIPSMode);
 
-        if (_sessionManager) {
-            uassertStatusOK(_sessionManager->start());
-        }
-
         if (_server) {
             invariant(_sessionManager);
             _server->start();
             if (_options.useUnixDomainSockets) {
-                setUnixDomainSocketPermissions(makeUnixSockPath(_options.bindPort),
+                setUnixDomainSocketPermissions(makeGRPCUnixSockPath(_options.bindPort),
                                                _options.unixDomainSocketPermissions);
             }
         }
@@ -222,11 +257,22 @@ void GRPCTransportLayerImpl::shutdown() {
     }
 }
 
+void GRPCTransportLayerImpl::stopAcceptingSessions() {
+    if (_server) {
+        _server->stopAcceptingRequests();
+    }
+}
+
 #ifdef MONGO_CONFIG_SSL
 Status GRPCTransportLayerImpl::rotateCertificates(std::shared_ptr<SSLManagerInterface> manager,
                                                   bool asyncOCSPStaple) {
     return _server->rotateCertificates();
 }
 #endif
+
+const std::vector<HostAndPort>& GRPCTransportLayerImpl::getListeningAddresses() const {
+    invariant(_server);
+    return _server->getListeningAddresses();
+}
 
 }  // namespace mongo::transport::grpc

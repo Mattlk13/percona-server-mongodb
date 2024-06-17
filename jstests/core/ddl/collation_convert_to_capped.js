@@ -4,9 +4,15 @@
  *
  * @tags: [
  *   # The test runs commands that are not allowed with security token: convertToCapped.
- *   not_allowed_with_security_token,
+ *   not_allowed_with_signed_security_token,
  *   requires_non_retryable_commands,
  *   requires_capped,
+ *   # TODO SERVER-85772 enable testing with balancer once convertToCapped supported on arbitrary
+ *   # shards
+ *   assumes_balancer_off,
+ *   # TODO SERVER-86309 enable testing with FCV transitions once unsharded collections are
+ *   # untracked on downgrade
+ *   cannot_run_during_upgrade_downgrade,
  * ]
  */
 

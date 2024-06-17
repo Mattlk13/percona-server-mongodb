@@ -56,7 +56,7 @@
 #include "mongo/db/op_observer/op_observer_impl.h"
 #include "mongo/db/op_observer/op_observer_registry.h"
 #include "mongo/db/op_observer/op_observer_util.h"
-#include "mongo/db/op_observer/oplog_writer_impl.h"
+#include "mongo/db/op_observer/operation_logger_impl.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/repl/oplog.h"
@@ -102,7 +102,7 @@ void setCollectionFilteringMetadata(OperationContext* opCtx, CollectionMetadata 
 
 class DocumentKeyStateTest : public ShardServerTestFixture {
 protected:
-    virtual void setUp() override {
+    void setUp() override {
         ShardServerTestFixture::setUp();
 
         OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE unsafeCreateCollection(
@@ -268,7 +268,8 @@ TEST_F(DocumentKeyStateTest, MakeDocumentKeyStateShardedWithIdHashInShardKey) {
 
 TEST_F(DocumentKeyStateTest, CheckDBVersion) {
     OpObserverRegistry opObserver;
-    opObserver.addObserver(std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterImpl>()));
+    opObserver.addObserver(
+        std::make_unique<OpObserverImpl>(std::make_unique<OperationLoggerImpl>()));
     opObserver.addObserver(std::make_unique<MigrationChunkClonerSourceOpObserver>());
 
     OperationContext* opCtx = operationContext();
@@ -299,6 +300,7 @@ TEST_F(DocumentKeyStateTest, CheckDBVersion) {
                              *autoColl,
                              toInsert.begin(),
                              toInsert.end(),
+                             /*recordIds*/ {},
                              /*fromMigrate=*/std::vector<bool>(toInsert.size(), fromMigrate),
                              /*defaultFromMigrate=*/fromMigrate);
     };

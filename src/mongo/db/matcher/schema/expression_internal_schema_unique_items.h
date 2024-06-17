@@ -76,7 +76,7 @@ public:
         MONGO_UNREACHABLE_TASSERT(6400219);
     }
 
-    void resetChild(size_t i, MatchExpression*) final override {
+    void resetChild(size_t i, MatchExpression*) final {
         MONGO_UNREACHABLE;
     }
 
@@ -91,7 +91,7 @@ public:
     BSONElement findFirstDuplicateValue(const BSONObj& array) const {
         auto set = _comparator.makeBSONEltSet();
         for (auto&& elem : array) {
-            if (!std::get<bool>(set.insert(elem))) {
+            if (!get<bool>(set.insert(elem))) {
                 return elem;
             }
         }

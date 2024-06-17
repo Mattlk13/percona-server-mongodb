@@ -139,21 +139,21 @@ StringListSet MakeObjSpec::buildFieldDict(std::vector<std::string> names,
     for (size_t i = 0; i < names.size(); ++i) {
         size_t pos = fieldDict.findPos(names[i]);
         if (pos != StringListSet::npos) {
-            auto& action = actions[i];
+            auto& action = actions[pos];
 
-            if (isClosed ? action.isKeep() : action.isDrop()) {
+            if (isClosed ? !action.isDrop() : !action.isKeep()) {
                 displayOrderSet.emplace(pos);
                 displayOrder.push_back(pos);
             }
         }
     }
 
-    for (size_t i = 0; i < actions.size(); ++i) {
-        if (!displayOrderSet.count(i)) {
-            auto& action = actions[i];
+    for (size_t pos = 0; pos < actions.size(); ++pos) {
+        if (!displayOrderSet.count(pos)) {
+            auto& action = actions[pos];
 
-            if (isClosed ? action.isKeep() : action.isDrop()) {
-                displayOrder.push_back(i);
+            if (isClosed ? !action.isDrop() : !action.isKeep()) {
+                displayOrder.push_back(pos);
             }
         }
     }
@@ -286,13 +286,13 @@ size_t MakeObjSpec::getApproximateSize() const {
 }
 
 MakeObjSpec::FieldAction MakeObjSpec::FieldAction::clone() const {
-    return stdx::visit(OverloadedVisitor{[](Keep k) -> FieldAction { return k; },
-                                         [](Drop d) -> FieldAction { return d; },
-                                         [](ValueArg va) -> FieldAction { return va; },
-                                         [](LambdaArg la) -> FieldAction { return la; },
-                                         [](const MakeObj& makeObj) -> FieldAction {
-                                             return MakeObj{makeObj.spec->clone()};
-                                         }},
-                       _data);
+    return visit(OverloadedVisitor{[](Keep k) -> FieldAction { return k; },
+                                   [](Drop d) -> FieldAction { return d; },
+                                   [](ValueArg va) -> FieldAction { return va; },
+                                   [](LambdaArg la) -> FieldAction { return la; },
+                                   [](const MakeObj& makeObj) -> FieldAction {
+                                       return MakeObj{makeObj.spec->clone()};
+                                   }},
+                 _data);
 }
 }  // namespace mongo::sbe

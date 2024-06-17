@@ -76,6 +76,7 @@
 #include "mongo/db/storage/storage_repair_observer.h"
 #include "mongo/db/storage/temporary_record_store.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_component.h"
 #include "mongo/platform/atomic_word.h"
@@ -123,7 +124,8 @@ TEST_F(StorageEngineTest, ReconcileIdentsTest) {
     ASSERT_TRUE(idents.find("_mdb_catalog") != idents.end());
 
     // Drop the `db.coll1` table, while leaving the DurableCatalog entry.
-    ASSERT_OK(dropIdent(opCtx.get()->recoveryUnit(), swCollInfo.getValue().ident));
+    ASSERT_OK(
+        dropIdent(shard_role_details::getRecoveryUnit(opCtx.get()), swCollInfo.getValue().ident));
     ASSERT_EQUALS(static_cast<const unsigned long>(1), getAllKVEngineIdents(opCtx.get()).size());
 
     // Reconciling this should result in an error.
@@ -139,7 +141,8 @@ TEST_F(StorageEngineTest, LoadCatalogDropsOrphansAfterUncleanShutdown) {
     auto swCollInfo = createCollection(opCtx.get(), collNs);
     ASSERT_OK(swCollInfo.getStatus());
 
-    ASSERT_OK(dropIdent(opCtx.get()->recoveryUnit(), swCollInfo.getValue().ident));
+    ASSERT_OK(
+        dropIdent(shard_role_details::getRecoveryUnit(opCtx.get()), swCollInfo.getValue().ident));
     ASSERT(collectionExists(opCtx.get(), collNs));
 
     // After the catalog is reloaded, we expect that the collection has been dropped because the
@@ -221,9 +224,49 @@ TEST_F(StorageEngineTest, ReconcileKeepsTemporary) {
     ASSERT_FALSE(identExists(opCtx.get(), rs->rs()->getIdent()));
 }
 
+TEST_F(StorageEngineTest, TemporaryRecordStoreDoesNotTrackSizeAdjustments) {
+    auto opCtx = cc().makeOperationContext();
+
+    const auto insertRecordAndAssertSize = [&](RecordStore* rs, const RecordId& rid) {
+        // Verify a temporary record store does not track size adjustments.
+        const auto data = "data";
+
+        WriteUnitOfWork wuow(opCtx.get());
+        StatusWith<RecordId> s =
+            rs->insertRecord(opCtx.get(), rid, data, strlen(data), Timestamp());
+        ASSERT_TRUE(s.isOK());
+        wuow.commit();
+
+        ASSERT_EQ(rs->numRecords(opCtx.get()), 0);
+        ASSERT_EQ(rs->dataSize(opCtx.get()), 0);
+    };
+
+    // Create the temporary record store and get its ident.
+    const std::string ident = [&]() {
+        std::unique_ptr<TemporaryRecordStore> rs;
+        Lock::GlobalLock lk(&*opCtx, MODE_IS);
+        rs = makeTemporary(opCtx.get());
+        ASSERT(rs.get());
+
+        insertRecordAndAssertSize(rs->rs(), RecordId(1));
+
+        // Keep ident even when TemporaryRecordStore goes out of scope.
+        rs->keep();
+        return rs->rs()->getIdent();
+    }();
+    ASSERT(identExists(opCtx.get(), ident));
+
+    std::unique_ptr<TemporaryRecordStore> rs;
+    rs = _storageEngine->makeTemporaryRecordStoreFromExistingIdent(
+        opCtx.get(), ident, KeyFormat::Long);
+
+    // Verify a temporary record store does not track size adjustments after re-opening.
+    insertRecordAndAssertSize(rs->rs(), RecordId(2));
+}
+
 class StorageEngineTimestampMonitorTest : public StorageEngineTest {
 public:
-    void setUp() {
+    void setUp() override {
         StorageEngineTest::setUp();
         _storageEngine->startTimestampMonitor();
     }
@@ -467,7 +510,8 @@ TEST_F(StorageEngineRepairTest, ReconcileSucceeds) {
     auto swCollInfo = createCollection(opCtx.get(), collNs);
     ASSERT_OK(swCollInfo.getStatus());
 
-    ASSERT_OK(dropIdent(opCtx.get()->recoveryUnit(), swCollInfo.getValue().ident));
+    ASSERT_OK(
+        dropIdent(shard_role_details::getRecoveryUnit(opCtx.get()), swCollInfo.getValue().ident));
     ASSERT(collectionExists(opCtx.get(), collNs));
 
     // Reconcile would normally return an error if a collection existed with a missing ident in the
@@ -567,15 +611,15 @@ public:
     }
 
     // Increment the timestamps each time they are called for testing purposes.
-    virtual Timestamp getCheckpointTimestamp() const override {
+    Timestamp getCheckpointTimestamp() const override {
         checkpointTimestamp = std::make_unique<Timestamp>(checkpointTimestamp->getInc() + 1);
         return *checkpointTimestamp;
     }
-    virtual Timestamp getOldestTimestamp() const override {
+    Timestamp getOldestTimestamp() const override {
         oldestTimestamp = std::make_unique<Timestamp>(oldestTimestamp->getInc() + 1);
         return *oldestTimestamp;
     }
-    virtual Timestamp getStableTimestamp() const override {
+    Timestamp getStableTimestamp() const override {
         stableTimestamp = std::make_unique<Timestamp>(stableTimestamp->getInc() + 1);
         return *stableTimestamp;
     }
@@ -594,7 +638,7 @@ public:
     /**
      * Create an instance of the KV Storage Engine so that we have a timestamp monitor operating.
      */
-    void setUp() {
+    void setUp() override {
         ServiceContextTest::setUp();
 
         auto opCtx = makeOperationContext();
@@ -611,7 +655,7 @@ public:
         _storageEngine->startTimestampMonitor();
     }
 
-    void tearDown() {
+    void tearDown() override {
         _storageEngine->cleanShutdown(getServiceContext());
         _storageEngine.reset();
 
@@ -695,15 +739,17 @@ TEST_F(TimestampKVEngineTest, TimestampMonitorNotifiesListeners) {
     _storageEngine->getTimestampMonitor()->addListener(&fourth);
 
     // Wait until all 4 listeners get notified at least once.
-    stdx::unique_lock<Latch> lk(mutex);
-    cv.wait(lk, [&] {
-        for (auto const& change : changes) {
-            if (!change) {
-                return false;
+    {
+        stdx::unique_lock<Latch> lk(mutex);
+        cv.wait(lk, [&] {
+            for (auto const& change : changes) {
+                if (!change) {
+                    return false;
+                }
             }
-        }
-        return true;
-    });
+            return true;
+        });
+    };
 
     _storageEngine->getTimestampMonitor()->clearListeners();
 }
@@ -746,7 +792,7 @@ TEST_F(StorageEngineTestNotEphemeral, UseAlternateStorageLocation) {
         reinitializeStorageEngine(opCtx.get(), StorageEngineInitFlags{}, [&newPath] {
             storageGlobalParams.dbpath = newPath;
         });
-    getGlobalServiceContext()->getStorageEngine()->notifyStartupComplete();
+    getGlobalServiceContext()->getStorageEngine()->notifyStorageStartupRecoveryComplete();
     LOGV2(5781103, "Started up storage engine in alternate location");
     ASSERT(StorageEngine::LastShutdownState::kClean == lastShutdownState);
     StorageEngineTest::_storageEngine = getServiceContext()->getStorageEngine();
@@ -764,7 +810,7 @@ TEST_F(StorageEngineTestNotEphemeral, UseAlternateStorageLocation) {
         reinitializeStorageEngine(opCtx.get(), StorageEngineInitFlags{}, [&oldPath] {
             storageGlobalParams.dbpath = oldPath;
         });
-    getGlobalServiceContext()->getStorageEngine()->notifyStartupComplete();
+    getGlobalServiceContext()->getStorageEngine()->notifyStorageStartupRecoveryComplete();
     ASSERT(StorageEngine::LastShutdownState::kClean == lastShutdownState);
     StorageEngineTest::_storageEngine = getServiceContext()->getStorageEngine();
     ASSERT_TRUE(collectionExists(opCtx.get(), coll1Ns));

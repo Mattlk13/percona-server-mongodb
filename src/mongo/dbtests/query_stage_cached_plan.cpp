@@ -113,7 +113,7 @@ class QueryStageCachedPlan : public unittest::Test {
 public:
     QueryStageCachedPlan() : _client(&_opCtx) {}
 
-    void setUp() {
+    void setUp() override {
         // If collection exists already, we need to drop it.
         dropCollection();
 
@@ -184,11 +184,22 @@ public:
         return numResults;
     }
 
+    QueryPlannerParams makePlannerParams(const CollectionPtr& collection,
+                                         const CanonicalQuery& canonicalQuery) {
+        MultipleCollectionAccessor collections(collection);
+        return QueryPlannerParams{
+            QueryPlannerParams::ArgsForSingleCollectionQuery{
+                .opCtx = opCtx(),
+                .canonicalQuery = canonicalQuery,
+                .collections = collections,
+                .plannerOptions = QueryPlannerParams::DEFAULT,
+            },
+        };
+    }
+
     void forceReplanning(const CollectionPtr& collection, CanonicalQuery* cq) {
         // Get planner params.
-        QueryPlannerParams plannerParams;
-        fillOutPlannerParams(&_opCtx, collection, cq, &plannerParams);
-
+        auto plannerParams = makePlannerParams(collection, *cq);
         const size_t decisionWorks = 10;
         const size_t mockWorks =
             1U + static_cast<size_t>(internalQueryCacheEvictionRatio * decisionWorks);
@@ -197,17 +208,12 @@ public:
             mockChild->enqueueStateCode(PlanStage::NEED_TIME);
         }
 
-        CachedPlanStage cachedPlanStage(_expCtx.get(),
-                                        &collection,
-                                        &_ws,
-                                        cq,
-                                        plannerParams,
-                                        decisionWorks,
-                                        std::move(mockChild));
+        CachedPlanStage cachedPlanStage(
+            _expCtx.get(), &collection, &_ws, cq, decisionWorks, std::move(mockChild));
 
         // This should succeed after triggering a replan.
         NoopYieldPolicy yieldPolicy(&_opCtx, _opCtx.getServiceContext()->getFastClockSource());
-        ASSERT_OK(cachedPlanStage.pickBestPlan(&yieldPolicy));
+        ASSERT_OK(cachedPlanStage.pickBestPlan(plannerParams, &yieldPolicy));
     }
 
 protected:
@@ -241,11 +247,8 @@ TEST_F(QueryStageCachedPlan, QueryStageCachedPlanFailureMemoryLimitExceeded) {
     ASSERT(cache);
     ASSERT_EQ(cache->get(key).state, PlanCache::CacheEntryState::kNotPresent);
 
-    // Get planner params.
-    QueryPlannerParams plannerParams;
-    fillOutPlannerParams(&_opCtx, collection.getCollection(), cq.get(), &plannerParams);
-
     // Mock stage will return a failure during the cached plan trial period.
+    auto plannerParams = makePlannerParams(collection.getCollection(), *cq);
     auto mockChild = std::make_unique<MockStage>(_expCtx.get(), &_ws);
     mockChild->enqueueError(
         Status{ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed, "mock error"});
@@ -256,13 +259,12 @@ TEST_F(QueryStageCachedPlan, QueryStageCachedPlanFailureMemoryLimitExceeded) {
                                     &collection.getCollection(),
                                     &_ws,
                                     cq.get(),
-                                    plannerParams,
                                     decisionWorks,
                                     std::move(mockChild));
 
     // This should succeed after triggering a replan.
     NoopYieldPolicy yieldPolicy(&_opCtx, _opCtx.getServiceContext()->getFastClockSource());
-    ASSERT_OK(cachedPlanStage.pickBestPlan(&yieldPolicy));
+    ASSERT_OK(cachedPlanStage.pickBestPlan(plannerParams, &yieldPolicy));
 
     ASSERT_EQ(getNumResultsForStage(_ws, &cachedPlanStage, cq.get()), 2U);
 
@@ -292,12 +294,9 @@ TEST_F(QueryStageCachedPlan, QueryStageCachedPlanHitMaxWorks) {
     ASSERT(cache);
     ASSERT_EQ(cache->get(key).state, PlanCache::CacheEntryState::kNotPresent);
 
-    // Get planner params.
-    QueryPlannerParams plannerParams;
-    fillOutPlannerParams(&_opCtx, collection.getCollection(), cq.get(), &plannerParams);
-
     // Set up queued data stage to take a long time before returning EOF. Should be long
     // enough to trigger a replan.
+    auto plannerParams = makePlannerParams(collection.getCollection(), *cq);
     const size_t decisionWorks = 10;
     const size_t mockWorks =
         1U + static_cast<size_t>(internalQueryCacheEvictionRatio * decisionWorks);
@@ -310,13 +309,12 @@ TEST_F(QueryStageCachedPlan, QueryStageCachedPlanHitMaxWorks) {
                                     &collection.getCollection(),
                                     &_ws,
                                     cq.get(),
-                                    plannerParams,
                                     decisionWorks,
                                     std::move(mockChild));
 
     // This should succeed after triggering a replan.
     NoopYieldPolicy yieldPolicy(&_opCtx, _opCtx.getServiceContext()->getFastClockSource());
-    ASSERT_OK(cachedPlanStage.pickBestPlan(&yieldPolicy));
+    ASSERT_OK(cachedPlanStage.pickBestPlan(plannerParams, &yieldPolicy));
 
     ASSERT_EQ(getNumResultsForStage(_ws, &cachedPlanStage, cq.get()), 2U);
 
@@ -521,16 +519,12 @@ TEST_F(QueryStageCachedPlan, ThrowsOnYieldRecoveryWhenIndexIsDroppedBeforePlanSe
     PlanCache* cache = CollectionQueryInfo::get(collection).getPlanCache();
     ASSERT(cache);
 
-    // Get planner params.
-    QueryPlannerParams plannerParams;
-    fillOutPlannerParams(&_opCtx, collection, cq.get(), &plannerParams);
-
     const size_t decisionWorks = 10;
+    auto plannerParams = makePlannerParams(collection, *cq);
     CachedPlanStage cachedPlanStage(_expCtx.get(),
                                     &collection,
                                     &_ws,
                                     cq.get(),
-                                    plannerParams,
                                     decisionWorks,
                                     std::make_unique<MockStage>(_expCtx.get(), &_ws));
 
@@ -545,7 +539,7 @@ TEST_F(QueryStageCachedPlan, ThrowsOnYieldRecoveryWhenIndexIsDroppedBeforePlanSe
                        ErrorCodes::QueryPlanKilled);
 }
 
-TEST_F(QueryStageCachedPlan, DoesNotThrowOnYieldRecoveryWhenIndexIsDroppedAferPlanSelection) {
+TEST_F(QueryStageCachedPlan, DoesNotThrowOnYieldRecoveryWhenIndexIsDroppedAfterPlanSelection) {
     // Create an index which we will drop later on.
     BSONObj keyPattern = BSON("c" << 1);
     addIndex(keyPattern);
@@ -565,21 +559,17 @@ TEST_F(QueryStageCachedPlan, DoesNotThrowOnYieldRecoveryWhenIndexIsDroppedAferPl
     PlanCache* cache = CollectionQueryInfo::get(collection).getPlanCache();
     ASSERT(cache);
 
-    // Get planner params.
-    QueryPlannerParams plannerParams;
-    fillOutPlannerParams(&_opCtx, collection, cq.get(), &plannerParams);
-
     const size_t decisionWorks = 10;
+    auto plannerParams = makePlannerParams(collection, *cq);
     CachedPlanStage cachedPlanStage(_expCtx.get(),
                                     &collection,
                                     &_ws,
                                     cq.get(),
-                                    plannerParams,
                                     decisionWorks,
                                     std::make_unique<MockStage>(_expCtx.get(), &_ws));
 
     NoopYieldPolicy yieldPolicy(&_opCtx, _opCtx.getServiceContext()->getFastClockSource());
-    ASSERT_OK(cachedPlanStage.pickBestPlan(&yieldPolicy));
+    ASSERT_OK(cachedPlanStage.pickBestPlan(plannerParams, &yieldPolicy));
 
     // Drop an index while the CachedPlanStage is in a saved state. We should be able to restore
     // successfully.

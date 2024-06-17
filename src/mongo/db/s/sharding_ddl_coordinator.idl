@@ -32,12 +32,12 @@ global:
     cpp_namespace: "mongo"
     cpp_includes:
         - "mongo/db/s/forwardable_operation_metadata.h"
-        - "mongo/db/s/sharding_ddl_util.h"
-        - "mongo/s/database_version.h"
 
 imports:
     - "mongo/db/basic_types.idl"
     - "mongo/db/session/logical_session_id.idl"
+    - "mongo/s/database_version.idl"
+    - "mongo/s/error_status.idl"
 
 enums:
     DDLCoordinatorType:
@@ -49,7 +49,8 @@ enums:
             kDropCollection: "dropCollection_V2"
             kRenameCollection: "renameCollection_V2"
             kCreateCollection: "createCollection_V4"
-            kCreateCollectionPre71Compatible: "createCollection_V3"
+            # TODO SERVER-79304: Remove once 8.0 becomes last LTS
+            kCreateCollectionPre80Compatible: "createCollection_V3"
             # TODO SERVER-79064: Remove once 8.0 becomes last LTS
             kRefineCollectionShardKeyPre71Compatible: "refineCollectionShardKey"
             kRefineCollectionShardKey: "refineCollectionShardKey_V2"
@@ -60,6 +61,8 @@ enums:
             kCompactStructuredEncryptionData: "compactStructuredEncryptionData_V3"
             kCleanupStructuredEncryptionData: "cleanupStructuredEncryptionData"
             kMigrationBlockingOperation: "migrationBlockingOperation"
+            kConvertToCapped: "convertToCapped"
+            kUntrackUnsplittableCollection: "untrackUnsplittableCollection"
 
 types:
     ForwardableOperationMetadata:
@@ -68,20 +71,8 @@ types:
         bson_serialization_type: object
         serializer: "mongo::ForwardableOperationMetadata::toBSON"
         deserializer: "mongo::ForwardableOperationMetadata"
-
-    DatabaseVersion:
-        description: ""
-        cpp_type: DatabaseVersion
-        bson_serialization_type: object
-        serializer: "mongo::DatabaseVersion::toBSON"
-        deserializer: "mongo::DatabaseVersion"
-
-    ErrorStatus:
-        bson_serialization_type: any
-        description: "Status representing an error state"
-        cpp_type: "::mongo::Status"
-        serializer: "::mongo::sharding_ddl_util_serializeErrorStatusToBSON"
-        deserializer: "::mongo::sharding_ddl_util_deserializeErrorStatusFromBSON"
+        # ForwardableOperationMetadata has only non view members.
+        is_view: false
 
 structs:
     ShardingDDLCoordinatorId:

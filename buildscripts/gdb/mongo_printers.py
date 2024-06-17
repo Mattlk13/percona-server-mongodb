@@ -118,7 +118,13 @@ class StringDataPrinter(object):
 
     def to_string(self):
         """Return data for printing."""
-        size = self.val["_size"]
+        # As of SERVER-82604, StringData is based on std::string_view, so try with that first
+        sv = self.val['_sv']
+        if sv is not None:
+            return sv
+
+        # ... back-off to the legacy format otherwise
+        size = self.val['_size']
         if size == -1:
             return self.val['_data'].lazy_string()
         return self.val['_data'].lazy_string(length=size)
@@ -320,6 +326,14 @@ def extract_tenant_id(data):
     return "".join([hex(b & 0xFF)[2:].zfill(2) for b in raw_bytes])
 
 
+def is_small_string(flags):
+    return bool(flags & 0b00000010)
+
+
+def small_string_size(flags):
+    return flags >> 2
+
+
 class DatabaseNamePrinter(object):
     """Pretty-printer for mongo::DatabaseName."""
 
@@ -332,29 +346,28 @@ class DatabaseNamePrinter(object):
         """Display hint."""
         return 'string'
 
-    def to_string(self):
-        """Return string representation of DatabaseName."""
-        data = self.val['_data']['_M_dataplus']['_M_p']
-        if data[0] & TENANT_ID_MASK:
-            return f"{extract_tenant_id(data)}_{(data + OBJECT_ID_WIDTH + 1).string()}"
-        return (data + 1).string()
+    def _get_storage_pointer(self):
+        """Return the data pointer from the _data Storage class."""
+        data = self.val['_data']
+        footer = data['_footer']
+        f_size = footer.type.sizeof
 
+        # The last byte of _footer contain the flags (and the size when using small string).
+        flags = footer.cast(gdb.lookup_type('char').array(f_size))[f_size - 1]
 
-class NamespaceStringPrinter(object):
-    """Pretty-printer for mongo::NamespaceString."""
+        data_ptr = data['_data']
+        if is_small_string(flags):
+            size = small_string_size(flags)
+            # Casting to an array first allows conversion to a pointer
+            data_ptr = data_ptr.cast(gdb.lookup_type('char').array(size))\
+                .cast(gdb.lookup_type('char').pointer())
 
-    def __init__(self, val):
-        """Initialize NamespaceStringPrinter."""
-        self.val = val
-
-    @staticmethod
-    def display_hint():
-        """Display hint."""
-        return 'string'
+        return data_ptr
 
     def to_string(self):
         """Return string representation of NamespaceString."""
-        data = self.val['_data']['_M_dataplus']['_M_p']
+        data = self._get_storage_pointer()
+
         if data[0] & TENANT_ID_MASK:
             return f"{extract_tenant_id(data)}_{(data + OBJECT_ID_WIDTH + 1).string()}"
         return (data + 1).string()
@@ -386,33 +399,6 @@ class DecorablePrinter(object):
                 yield ('value', obj)
             except Exception as err:
                 print("Failed to look up decoration type: " + deco_type_name + ": " + str(err))
-
-
-class LazyInitPrinter(object):
-    """Pretty printer for mongo::decorable_detail::LazyInit<T>."""
-
-    def __init__(self, val):
-        """Initialize DecorablePrinter."""
-        self.val = val
-
-    def to_string(self):
-        """Return LazyInit for printing."""
-        state = str(self.val["_flag"]["_state"])
-        state_type = 'mongo::decorable_detail::LazyInitFlag::State'
-        if f'{state_type}::empty' in state:
-            return "[[disengaged]]"
-        if f'{state_type}::busy' in state:
-            return "[[busy]]"
-        if not f'{state_type}::done' in state:
-            return f"[[unknown: {state}]]"
-        buf = self.val["_buf"]
-        try:
-            value_type = self.val.type.template_argument(0)
-            obj = buf.cast(value_type)
-        except Exception as err:
-            obj = f'[[Err:{err}]]'
-        obj = f'{state}: {obj}'
-        return obj
 
 
 def _get_flags(flag_val, flags):
@@ -539,23 +525,30 @@ class WtTxnPrinter(object):
                 yield (field.name, field_val)
 
 
+def absl_container_size(val):
+    return val["settings_"]["value"]["compressed_tuple_"]["value"]
+
+
 def absl_get_nodes(val):
     """Return a generator of every node in absl::container_internal::raw_hash_set and derived classes."""
-    size = val["size_"]
+    size = absl_container_size(val)
 
     if size == 0:
         return
 
     table = val
-    capacity = int(table["capacity_"])
-    ctrl = table["ctrl_"]
+    capacity = int(table["settings_"]["value"]["capacity_"])
+    ctrl = table["settings_"]["value"]["control_"]
+
+    # Derive the underlying type stored in the container.
+    slot_type = lookup_type(str(val.type.strip_typedefs()) + "::slot_type").strip_typedefs()
 
     # Using the array of ctrl bytes, search for in-use slots and return them
-    # https://github.com/abseil/abseil-cpp/blob/7ffbe09f3d85504bd018783bbe1e2c12992fe47c/absl/container/internal/raw_hash_set.h#L787-L788
+    # https://github.com/abseil/abseil-cpp/blob/8a3caf7dea955b513a6c1b572a2423c6b4213402/absl/container/internal/raw_hash_set.h#L2108-L2113
     for item in range(capacity):
         ctrl_t = int(ctrl[item])
         if ctrl_t >= 0:
-            yield table["slots_"][item]
+            yield table["settings_"]["value"]["slots_"].cast(slot_type.pointer())[item]
 
 
 class AbslHashSetPrinterBase(object):
@@ -574,7 +567,7 @@ class AbslHashSetPrinterBase(object):
     def to_string(self):
         """Return absl::[node/flat]_hash_set for printing."""
         return "absl::%s_hash_set<%s> with %s elems " % (
-            self.to_str, self.val.type.template_argument(0), self.val["size_"])
+            self.to_str, self.val.type.template_argument(0), absl_container_size(self.val))
 
 
 class AbslNodeHashSetPrinter(AbslHashSetPrinterBase):
@@ -624,7 +617,7 @@ class AbslHashMapPrinterBase(object):
         """Return absl::[node/flat]_hash_map for printing."""
         return "absl::%s_hash_map<%s, %s> with %s elems " % (
             self.to_str, self.val.type.template_argument(0), self.val.type.template_argument(1),
-            self.val["size_"])
+            absl_container_size(self.val))
 
 
 class AbslNodeHashMapPrinter(AbslHashMapPrinterBase):
@@ -652,7 +645,7 @@ class AbslFlatHashMapPrinter(AbslHashMapPrinterBase):
         """Children."""
         for kvp in absl_get_nodes(self.val):
             yield ('key', kvp['key'])
-            yield ('value', kvp['value'])
+            yield ('value', kvp['value']["second"])
 
 
 class ImmutableMapIter(ImmerListIter):
@@ -1018,15 +1011,15 @@ def build_pretty_printer():
     pp = MongoPrettyPrinterCollection()
     pp.add('BSONObj', 'mongo::BSONObj', False, BSONObjPrinter)
     pp.add('DatabaseName', 'mongo::DatabaseName', False, DatabaseNamePrinter)
-    pp.add('NamespaceString', 'mongo::NamespaceString', False, NamespaceStringPrinter)
+    pp.add('NamespaceString', 'mongo::NamespaceString', False, DatabaseNamePrinter)
     pp.add('Decorable', 'mongo::Decorable', True, DecorablePrinter)
     pp.add('Status', 'mongo::Status', False, StatusPrinter)
     pp.add('StatusWith', 'mongo::StatusWith', True, StatusWithPrinter)
     pp.add('StringData', 'mongo::StringData', False, StringDataPrinter)
-    pp.add('node_hash_map', 'absl::lts_20211102::node_hash_map', True, AbslNodeHashMapPrinter)
-    pp.add('node_hash_set', 'absl::lts_20211102::node_hash_set', True, AbslNodeHashSetPrinter)
-    pp.add('flat_hash_map', 'absl::lts_20211102::flat_hash_map', True, AbslFlatHashMapPrinter)
-    pp.add('flat_hash_set', 'absl::lts_20211102::flat_hash_set', True, AbslFlatHashSetPrinter)
+    pp.add('node_hash_map', 'absl::lts_20230802::node_hash_map', True, AbslNodeHashMapPrinter)
+    pp.add('node_hash_set', 'absl::lts_20230802::node_hash_set', True, AbslNodeHashSetPrinter)
+    pp.add('flat_hash_map', 'absl::lts_20230802::flat_hash_map', True, AbslFlatHashMapPrinter)
+    pp.add('flat_hash_set', 'absl::lts_20230802::flat_hash_set', True, AbslFlatHashSetPrinter)
     pp.add('RecordId', 'mongo::RecordId', False, RecordIdPrinter)
     pp.add('UUID', 'mongo::UUID', False, UUIDPrinter)
     pp.add('OID', 'mongo::OID', False, OIDPrinter)
@@ -1039,7 +1032,6 @@ def build_pretty_printer():
     pp.add('boost::optional', 'boost::optional', True, BoostOptionalPrinter)
     pp.add('immutable::map', 'mongo::immutable::map', True, ImmutableMapPrinter)
     pp.add('immutable::set', 'mongo::immutable::set', True, ImmutableSetPrinter)
-    pp.add('LazyInit', 'mongo::decorable_detail::LazyInit', True, LazyInitPrinter)
 
     # Optimizer/ABT related pretty printers that can be used only with a running process.
     register_optimizer_printers(pp)

@@ -185,8 +185,8 @@ public:
      *
      * Must be in WriteUnitOfWork. View creation rolls back if the unit of work aborts.
      *
-     * Caller must ensure corresponding database exists. Expects db.system.views MODE_X lock and
-     * view namespace MODE_IX lock (unless 'durability' is set to kAlreadyDurable).
+     * Expects db.system.views MODE_X lock and view namespace MODE_IX lock (unless 'durability' is
+     * set to kAlreadyDurable).
      */
     Status createView(OperationContext* opCtx,
                       const NamespaceString& viewName,
@@ -201,8 +201,6 @@ public:
      * Drop the view named 'viewName'.
      *
      * Must be in WriteUnitOfWork. The drop rolls back if the unit of work aborts.
-     *
-     * Caller must ensure corresponding database exists.
      */
     Status dropView(OperationContext* opCtx, const NamespaceString& viewName) const;
 
@@ -210,8 +208,6 @@ public:
      * Modify the view named 'viewName' to have the new 'viewOn' and 'pipeline'.
      *
      * Must be in WriteUnitOfWork. The modification rolls back if the unit of work aborts.
-     *
-     * Caller must ensure corresponding database exists.
      */
     Status modifyView(OperationContext* opCtx,
                       const NamespaceString& viewName,
@@ -264,6 +260,11 @@ public:
     const Collection* establishConsistentCollection(OperationContext* opCtx,
                                                     const NamespaceStringOrUUID& nssOrUUID,
                                                     boost::optional<Timestamp> readTimestamp) const;
+
+    std::vector<const Collection*> establishConsistentCollections(
+        OperationContext* opCtx,
+        const DatabaseName& dbName,
+        boost::optional<Timestamp> readTimestamp) const;
 
     /**
      * Returns a shared_ptr to a drop pending index if it's found and not expired.
@@ -449,10 +450,15 @@ public:
     bool isLatestCollection(OperationContext* opCtx, const Collection* collection) const;
 
     /**
+     * Verifies that the provided collection name doesn't exist in the catalog and is exclusively
+     * present in the uncommitted updates of the operation. For the check to be meaningful it should
+     * be performed against CollectionCatalog::latest.
+     */
+    void ensureCollectionIsNew(OperationContext* opCtx, const NamespaceString& nss) const;
+
+    /**
      * Iterates through the views in the catalog associated with database `dbName`, applying
      * 'callback' to each view.  If the 'callback' returns false, the iterator exits early.
-     *
-     * Caller must ensure corresponding database exists.
      */
     void iterateViews(OperationContext* opCtx,
                       const DatabaseName& dbName,
@@ -461,8 +467,6 @@ public:
     /**
      * Look up the 'nss' in the view catalog, returning a shared pointer to a View definition,
      * or nullptr if it doesn't exist.
-     *
-     * Caller must ensure corresponding database exists.
      */
     std::shared_ptr<const ViewDefinition> lookupView(OperationContext* opCtx,
                                                      const NamespaceString& nss) const;
@@ -470,8 +474,6 @@ public:
     /**
      * Same functionality as above, except this function skips validating durable views in the
      * view catalog.
-     *
-     * Caller must ensure corresponding database exists.
      */
     std::shared_ptr<const ViewDefinition> lookupViewWithoutValidatingDurable(
         OperationContext* opCtx, const NamespaceString& nss) const;
@@ -483,6 +485,13 @@ public:
      */
     NamespaceString resolveNamespaceStringOrUUID(OperationContext* opCtx,
                                                  const NamespaceStringOrUUID& nsOrUUID) const;
+
+    /**
+     * Resolves and validates the namespace from the given DatabaseName and UUID.
+     */
+    NamespaceString resolveNamespaceStringFromDBNameAndUUID(OperationContext* opCtx,
+                                                            const DatabaseName& dbName,
+                                                            const UUID& uuid) const;
 
     /**
      * Returns whether the collection with 'uuid' satisfies the provided 'predicate'. If the

@@ -105,7 +105,7 @@ public:
      * Make a RequestSender and thus send requests.
      */
     void sendRequests(const ReadPreferenceSetting& readPref,
-                      const std::vector<std::pair<ShardId, BSONObj>>& remotes,
+                      const std::vector<AsyncRequestsSender::Request>& remotes,
                       Shard::RetryPolicy retryPolicy);
 
     /**
@@ -169,7 +169,7 @@ private:
 };
 
 void CursorEstablisher::sendRequests(const ReadPreferenceSetting& readPref,
-                                     const std::vector<std::pair<ShardId, BSONObj>>& remotes,
+                                     const std::vector<AsyncRequestsSender::Request>& remotes,
                                      Shard::RetryPolicy retryPolicy) {
     // Construct the requests
     std::vector<AsyncRequestsSender::Request> requests;
@@ -178,10 +178,12 @@ void CursorEstablisher::sendRequests(const ReadPreferenceSetting& readPref,
     for (const auto& remote : remotes) {
         if (_providedOpKeys.size()) {
             // Caller provided their own keys so skip appending the default key.
-            dassert(remote.second.hasField(kOperationKeyField));
-            requests.emplace_back(remote.first, remote.second);
+            dassert(remote.cmdObj.hasField(kOperationKeyField));
+            requests.emplace_back(remote);
         } else {
-            requests.emplace_back(remote.first, appendOpKey(_defaultOpKey, remote.second));
+            BSONObjBuilder newCmd(remote.cmdObj);
+            appendOpKey(_defaultOpKey, &newCmd);
+            requests.emplace_back(remote.shardId, newCmd.obj());
         }
     }
 
@@ -234,9 +236,13 @@ void CursorEstablisher::waitForResponse() noexcept {
 
             hadValidCursor = true;
 
-            _remoteCursors.emplace_back(RemoteCursor(response.shardId.toString(),
-                                                     *response.shardHostAndPort,
-                                                     std::move(cursor.getValue())));
+            auto& cursorValue = cursor.getValue();
+            if (const auto& cursorMetrics = cursorValue.getCursorMetrics()) {
+                CurOp::get(_opCtx)->debug().additiveMetrics.aggregateCursorMetrics(*cursorMetrics);
+            }
+
+            _remoteCursors.emplace_back(RemoteCursor(
+                response.shardId.toString(), *response.shardHostAndPort, std::move(cursorValue)));
         }
 
         if (response.shardHostAndPort && !hadValidCursor) {
@@ -349,6 +355,7 @@ void CursorEstablisher::_handleFailure(const AsyncRequestsSender::Response& resp
                                    boost::none,
                                    boost::none,
                                    boost::none,
+                                   boost::none,
                                    true}});
         return;
     }
@@ -415,17 +422,15 @@ BSONObj appendReadPreferenceNearest(BSONObj cmdObj) {
 // the opCtx may have an OperationKey set on it already, do not inherit it here because we may
 // target ourselves which implies the same node receiving multiple operations with the same
 // opKey.
-BSONObj appendOpKey(const OperationKey& opKey, const BSONObj& request) {
-    BSONObjBuilder newCmd(request);
-    opKey.appendToBuilder(&newCmd, kOperationKeyField);
-    return newCmd.obj();
+void appendOpKey(const OperationKey& opKey, BSONObjBuilder* cmdBuilder) {
+    opKey.appendToBuilder(cmdBuilder, kOperationKeyField);
 }
 
 std::vector<RemoteCursor> establishCursors(OperationContext* opCtx,
                                            std::shared_ptr<executor::TaskExecutor> executor,
                                            const NamespaceString& nss,
                                            const ReadPreferenceSetting readPref,
-                                           const std::vector<std::pair<ShardId, BSONObj>>& remotes,
+                                           const std::vector<AsyncRequestsSender::Request>& remotes,
                                            bool allowPartialResults,
                                            Shard::RetryPolicy retryPolicy,
                                            std::vector<OperationKey> providedOpKeys,
@@ -490,14 +495,18 @@ std::vector<RemoteCursor> establishCursorsOnAllHosts(
     // actual semantics of read preference don't make as much sense when broadcasting to all
     // shards, but we will set read preference to 'nearest' since it does not imply preference for
     // primary or secondary.
-    BSONObj cmd = appendOpKey(opKey, appendReadPreferenceNearest(cmdObj));
+    BSONObjBuilder newCmd(std::move(cmdObj));
+    appendOpKey(opKey, &newCmd);
+    newCmd.append("$readPreference",
+                  BSON("mode"
+                       << "nearest"));
 
     executor::AsyncMulticaster::Options options;
     options.maxConcurrency = internalQueryAggMulticastMaxConcurrency;
     auto results = executor::AsyncMulticaster(executor, options)
                        .multicast(servers,
                                   nss.dbName(),
-                                  cmd,
+                                  newCmd.obj(),
                                   opCtx,
                                   Milliseconds(internalQueryAggMulticastTimeoutMS));
     std::vector<RemoteCursor> remoteCursors;
@@ -521,8 +530,14 @@ std::vector<RemoteCursor> establishCursorsOnAllHosts(
                 }
                 hadValidCursor = true;
 
+                auto& cursorValue = cursor.getValue();
+                if (const auto& cursorMetrics = cursorValue.getCursorMetrics()) {
+                    CurOp::get(opCtx)->debug().additiveMetrics.aggregateCursorMetrics(
+                        *cursorMetrics);
+                }
+
                 remoteCursors.emplace_back(
-                    RemoteCursor(shardId.toString(), hostAndPort, std::move(cursor.getValue())));
+                    RemoteCursor(shardId.toString(), hostAndPort, std::move(cursorValue)));
             }
 
             if (hadValidCursor) {

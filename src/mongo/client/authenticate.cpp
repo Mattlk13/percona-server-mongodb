@@ -132,9 +132,9 @@ StatusWith<OpMsgRequest> createX509AuthCmd(const BSONObj& params, StringData cli
         return {ErrorCodes::AuthenticationFailed, message.str()};
     }
 
-    return OpMsgRequest::fromDBAndBody(
-        DatabaseNameUtil::deserialize(
-            boost::none, db.getValue(), SerializationContext::stateAuthPrevalidated()),
+    return OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired /* db is not tenanted */,
+        AuthDatabaseNameUtil::deserialize(db.getValue()),
         BSON("authenticate" << 1 << "mechanism"
                             << "MONGODB-X509"
                             << "user" << username));
@@ -158,7 +158,7 @@ Future<void> authX509(RunCommandHook runCommand, const BSONObj& params, StringDa
 
 class DefaultInternalAuthParametersProvider : public InternalAuthParametersProvider {
 public:
-    ~DefaultInternalAuthParametersProvider() = default;
+    ~DefaultInternalAuthParametersProvider() override = default;
 
     BSONObj get(size_t index, StringData mechanism) final {
         return getInternalAuthParams(index, mechanism);
@@ -236,7 +236,10 @@ Future<std::string> negotiateSaslMechanism(RunCommandHook runCommand,
     }
     const auto request = builder.obj();
 
-    return runCommand(OpMsgRequest::fromDBAndBody(DatabaseName::kAdmin, request))
+    return runCommand(OpMsgRequestBuilder::create(
+                          auth::ValidatedTenancyScope::kNotRequired /* admin is not per-tenant. */,
+                          DatabaseName::kAdmin,
+                          request))
         .then([](BSONObj reply) -> Future<std::string> {
             auto mechsArrayObj = reply.getField("saslSupportedMechs");
             if (mechsArrayObj.type() != Array) {

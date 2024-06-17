@@ -38,7 +38,9 @@ global:
 imports:
     - "mongo/db/pipeline/document_source_merge_modes.idl"
     - "mongo/db/basic_types.idl"
+    - "mongo/db/namespace_spec.idl"
     - "mongo/s/chunk_version.idl"
+
 types:
     MergeTargetNss:
         bson_serialization_type: any
@@ -48,6 +50,8 @@ types:
         serializer: "::mongo::mergeTargetNssSerializeToBSON"
         deserializer: "::mongo::mergeTargetNssParseFromBSON"
         deserialize_with_tenant: true
+        # NamespaceString is not a view.
+        is_view: false
 
     MergeOnFields:
         bson_serialization_type: any
@@ -55,6 +59,8 @@ types:
         cpp_type: std::vector<std::string>
         serializer: "::mongo::mergeOnFieldsSerializeToBSON"
         deserializer: "::mongo::mergeOnFieldsParseFromBSON"
+        # std::vector<std::string> is not a view.
+        is_view: false
 
     MergeWhenMatchedPolicy:
         bson_serialization_type: any
@@ -64,21 +70,10 @@ types:
         cpp_type: "::mongo::MergeWhenMatchedPolicy"
         serializer: "::mongo::mergeWhenMatchedSerializeToBSON"
         deserializer: "::mongo::mergeWhenMatchedParseFromBSON"
+        # Deserializer uses getOwned.
+        is_view: false
 
 structs:
-    NamespaceSpec:
-        description: A document used to specify a namespace.
-        strict: true
-        fields:
-            db:
-                type: database_name
-                optional: true
-                description: The database field for this namespace.
-            coll:
-                type: string
-                optional: true
-                description: The collection field for this namespace.
-
     DocumentSourceMergeSpec:
         description: A document used to specify the $merge stage of an aggregation pipeline.
         strict: true

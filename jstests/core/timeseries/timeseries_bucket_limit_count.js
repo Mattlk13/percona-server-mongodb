@@ -32,7 +32,7 @@ TimeseriesTest.run((insert) => {
 
         let docs = [];
         for (let i = 0; i < numDocs; i++) {
-            docs.push({_id: i, [timeFieldName]: ISODate(), x: i});
+            docs.push({_id: i, [timeFieldName]: ISODate("2024-01-01T01:00:00Z"), x: i});
             if ((i + 1) % numDocsPerInsert === 0) {
                 assert.commandWorked(insert(coll, docs), 'failed to insert docs: ' + tojson(docs));
                 docs = [];
@@ -68,9 +68,8 @@ TimeseriesTest.run((insert) => {
         assert.eq(bucketMaxCount - 1,
                   bucketDocs[0].control.max.x,
                   'invalid control.max for x in first bucket: ' + tojson(bucketDocs));
-        assert.eq(TimeseriesTest.BucketVersion.kCompressed,
-                  bucketDocs[0].control.version,
-                  'unexpected control.version in first bucket: ' + tojson(bucketDocs));
+        assert(TimeseriesTest.isBucketCompressed(bucketDocs[0].control.version),
+               'unexpected control.version in first bucket: ' + tojson(bucketDocs));
         assert(!bucketDocs[0].control.hasOwnProperty("closed"),
                'unexpected control.closed in first bucket: ' + tojson(bucketDocs));
 
@@ -88,9 +87,8 @@ TimeseriesTest.run((insert) => {
                   bucketDocs[1].control.max.x,
                   'invalid control.max for x in second bucket: ' + tojson(bucketDocs));
         if (TimeseriesTest.timeseriesAlwaysUseCompressedBucketsEnabled(db)) {
-            assert.eq(TimeseriesTest.BucketVersion.kCompressed,
-                      bucketDocs[1].control.version,
-                      'unexpected control.version in second bucket: ' + tojson(bucketDocs));
+            assert(TimeseriesTest.isBucketCompressed(bucketDocs[1].control.version),
+                   'unexpected control.version in second bucket: ' + tojson(bucketDocs));
         } else {
             assert.eq(TimeseriesTest.BucketVersion.kUncompressed,
                       bucketDocs[1].control.version,

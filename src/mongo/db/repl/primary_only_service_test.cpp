@@ -45,13 +45,13 @@
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/repl/primary_only_service_test_fixture.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/thread_pool_task_executor.h"
@@ -99,14 +99,14 @@ public:
     };
 
     explicit TestService(ServiceContext* serviceContext) : PrimaryOnlyService(serviceContext) {}
-    ~TestService() = default;
+    ~TestService() override = default;
 
     StringData getServiceName() const override {
         return kTestServiceName;
     }
 
     NamespaceString getStateDocumentsNS() const override {
-        return NamespaceString::createNamespaceString_forTest("admin", "test_service");
+        return NamespaceString::createNamespaceString_forTest("config", "test_service");
     }
 
     ThreadPool::Limits getThreadPoolLimits() const override {
@@ -286,10 +286,10 @@ public:
                 DBDirectClient client(opCtx.get());
                 if (targetState == State::kDone) {
                     client.remove(
-                        NamespaceString::createNamespaceString_forTest("admin.test_service"), _id);
+                        NamespaceString::createNamespaceString_forTest("config.test_service"), _id);
                 } else {
                     client.update(
-                        NamespaceString::createNamespaceString_forTest("admin.test_service"),
+                        NamespaceString::createNamespaceString_forTest("config.test_service"),
                         _id,
                         newStateDoc,
                         true /*upsert*/);
@@ -354,7 +354,7 @@ public:
         _service = _registry->lookupServiceByName("TestService");
         ASSERT(_service);
         auto serviceByNamespace = _registry->lookupServiceByNamespace(
-            NamespaceString::createNamespaceString_forTest("admin.test_service"));
+            NamespaceString::createNamespaceString_forTest("config.test_service"));
         ASSERT_EQ(_service, serviceByNamespace);
 
         _testExecutor = makeTestExecutor();
@@ -596,7 +596,8 @@ TEST_F(PrimaryOnlyServiceTest, LookupInstanceHoldingISLock) {
         // The RstlKillOpThread would only interrupt a read operation if the OperationContext opted
         // into always being interrupted.
         opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
-        ASSERT_FALSE(opCtx->lockState()->wasGlobalLockTakenInModeConflictingWithWrites());
+        ASSERT_FALSE(shard_role_details::getLocker(opCtx.get())
+                         ->wasGlobalLockTakenInModeConflictingWithWrites());
 
         auto [instance2, isPausedOrShutdown] =
             TestService::Instance::lookup(opCtx.get(), _service, BSON("_id" << 0));
@@ -648,7 +649,8 @@ DEATH_TEST_F(PrimaryOnlyServiceTest,
     {
         Lock::GlobalLock lk(opCtx.get(), MODE_IS);
         ASSERT_FALSE(opCtx->shouldAlwaysInterruptAtStepDownOrUp());
-        ASSERT_FALSE(opCtx->lockState()->wasGlobalLockTakenInModeConflictingWithWrites());
+        ASSERT_FALSE(shard_role_details::getLocker(opCtx.get())
+                         ->wasGlobalLockTakenInModeConflictingWithWrites());
         TestService::Instance::lookup(opCtx.get(), _service, BSON("_id" << 0));
     }
 }

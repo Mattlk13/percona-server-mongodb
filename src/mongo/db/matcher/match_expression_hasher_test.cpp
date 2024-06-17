@@ -27,6 +27,7 @@
  *    it in the license file.
  */
 
+#include "mongo/bson/json.h"
 #include "mongo/db/matcher/expression_always_boolean.h"
 #include "mongo/db/matcher/expression_array.h"
 #include "mongo/db/matcher/expression_hasher.h"
@@ -341,7 +342,7 @@ TEST_F(MatchExpressionHasherTest, ElemMatchObject) {
     assertNotEquivalent(elemMatch1, elemMatch5);
 
     assertNotEquivalent(elemMatch1, elemMatch2, nullptr, &collatorToLowerString);
-    assertNotEquivalent(elemMatch1, elemMatch3, &collatorToLowerString, &collatorToLowerString);
+    assertEquivalent(elemMatch1, elemMatch3, &collatorToLowerString, &collatorToLowerString);
 }
 
 TEST_F(MatchExpressionHasherTest, ElemMatchValue) {
@@ -357,7 +358,7 @@ TEST_F(MatchExpressionHasherTest, ElemMatchValue) {
     assertNotEquivalent(elemMatch1, elemMatch4);
 
     assertNotEquivalent(elemMatch1, elemMatch2, nullptr, &collatorToLowerString);
-    assertNotEquivalent(elemMatch1, elemMatch3, &collatorToLowerString, &collatorToLowerString);
+    assertEquivalent(elemMatch1, elemMatch3, &collatorToLowerString, &collatorToLowerString);
 }
 
 TEST_F(MatchExpressionHasherTest, Exists) {

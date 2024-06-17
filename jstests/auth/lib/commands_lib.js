@@ -463,6 +463,9 @@ export const authCommandsLib = {
           testname: 'transitionFromDedicatedConfigServer',
           command: {transitionFromDedicatedConfigServer: 1},
           skipUnlessSharded: true,
+          skipTest: (conn) => {
+            return !TestData.setParameters.featureFlagTransitionToCatalogShard;
+          },
           testcases: [
             {
               runOnDb: adminDbName,
@@ -477,6 +480,9 @@ export const authCommandsLib = {
           testname: "_configsvrTransitionFromDedicatedConfigServer",
           command: {_configsvrTransitionFromDedicatedConfigServer: 1},
           skipSharded: true,
+          skipTest: (conn) => {
+            return !TestData.setParameters.featureFlagTransitionToCatalogShard;
+          },
           testcases: [
               {
                 runOnDb: adminDbName,
@@ -492,6 +498,9 @@ export const authCommandsLib = {
           testname: "transitionToDedicatedConfigServer",
           command: { transitionToDedicatedConfigServer: 1 },
           skipUnlessSharded: true,
+          skipTest: (conn) => {
+            return !TestData.setParameters.featureFlagTransitionToCatalogShard;
+          },
           testcases: [
             {
               runOnDb: adminDbName,
@@ -507,6 +516,9 @@ export const authCommandsLib = {
           testname: "_configsvrTransitionToDedicatedConfigServer",
           command: {_configsvrTransitionToDedicatedConfigServer: 1},
           skipSharded: true,
+          skipTest: (conn) => {
+            return !TestData.setParameters.featureFlagTransitionToCatalogShard;
+          },
           testcases: [
               {
                 runOnDb: adminDbName,
@@ -1173,6 +1185,14 @@ export const authCommandsLib = {
           ]
         },
         {
+          testname: "aggregate_documents",
+          command: {aggregate: 1, pipeline: [{$documents: [{a: 1}]}], cursor: {}},
+          testcases: [
+              {runOnDb: firstDbName, roles: roles_all, privileges: []},
+              {runOnDb: secondDbName, roles: roles_all, privileges: []}
+          ]
+        },
+        {
           testname: "aggregate_readonly_views",
           setup: function(db) {
               assert.commandWorked(db.createView("view", "collection", [{$match: {}}]));
@@ -1750,6 +1770,69 @@ export const authCommandsLib = {
           ]
         },
         {
+          testname: "aggregate_lookup_documents",
+          command: {
+              aggregate: "foo",
+              pipeline: [{$lookup: {as: "results", pipeline: [{$documents: [{a: 1}]}]}}],
+              cursor: {}
+          },
+          setup: function(db) {
+              assert.commandWorked(db.createCollection("foo"));
+          },
+          teardown: function(db) {
+              db.foo.drop();
+          },
+          testcases: [
+              {
+                  runOnDb: firstDbName,
+                  roles: roles_read,
+                  privileges: [
+                      {resource: {db: firstDbName, collection: "foo"}, actions: ["find"]},
+                  ]
+              },
+              {
+                  runOnDb: secondDbName,
+                  roles: roles_readAny,
+                  privileges: [
+                      {resource: {db: secondDbName, collection: "foo"}, actions: ["find"]},
+                  ]
+              }
+          ]
+        },
+        {
+          // A pipeline starting with $documents still requires permissions of other document
+          // sources later in the pipeline.
+          testname: "aggregate_documents_then_lookup",
+          command: {
+              aggregate: 1,
+              pipeline:
+                [{$documents: [{_id: 0}]}, {$lookup: {from: "bar", localField: "_id", foreignField: "_id", as: "results"}}],
+              cursor: {}
+          },
+          setup: function(db) {
+              assert.commandWorked(db.createCollection("bar"));
+          },
+          teardown: function(db) {
+              db.bar.drop();
+          },
+          testcases: [
+              {
+                  runOnDb: firstDbName,
+                  roles: roles_read,
+                  privileges: [
+                      {resource: {db: firstDbName, collection: "bar"}, actions: ["find"]},
+                  ]
+              },
+              {
+                  runOnDb: secondDbName,
+                  roles: roles_readAny,
+                  privileges: [
+                      {resource: {db: secondDbName, collection: "bar"}, actions: ["find"]},
+                  ]
+              }
+          ]
+        },
+        {
           testname: "aggregate_lookup_nested_pipeline",
           command: {
               aggregate: "foo",
@@ -2314,6 +2397,24 @@ export const authCommandsLib = {
               },
           ],
         },
+        {
+            testname: "autoCompact",
+            // Not need to actually enable background compaction, just verify the user can run this
+            // command.
+            command: {autoCompact: false},
+            skipSharded: true,
+            skipTest: (conn) => {
+              return !TestData.setParameters.featureFlagAutoCompact;
+            },
+            testcases: [
+                {
+                  runOnDb: adminDbName,
+                  roles: roles_hostManager,
+                  privileges:
+                      [{resource: {cluster: true}, actions: ["compact"]}]
+                }
+            ]
+          },
         {
           testname: "buildInfo",
           command: {buildInfo: 1},
@@ -4051,10 +4152,6 @@ export const authCommandsLib = {
               createSearchIndexes: "x",
               indexes: [{'definition': {'mappings': {'dynamic': true}}}],
           },
-          // Only enterprise knows of this command.
-          skipTest: (conn) => {
-              return !getBuildInfo().modules.includes("enterprise");
-          },
           testcases: [{
               runOnDb: firstDbName,
               roles: Object.extend({
@@ -4432,10 +4529,6 @@ export const authCommandsLib = {
               dropSearchIndex: "x",
               name: 'indexName',
           },
-          // Only enterprise knows of this command.
-          skipTest: (conn) => {
-              return !getBuildInfo().modules.includes("enterprise");
-          },
           testcases: [
             {
               runOnDb: firstDbName,
@@ -4740,7 +4833,7 @@ export const authCommandsLib = {
         },
         {
           testname: "findWithTerm",
-          command: {find: "foo", limit: -1, term: NumberLong(1)},
+          command: {find: "foo", limit: 1, term: NumberLong(1)},
           testcases: [
               {
                 runOnDb: firstDbName,
@@ -5573,10 +5666,6 @@ export const authCommandsLib = {
         {
           testname: "listSearchIndexes",
           command: {listSearchIndexes: "x"},
-          // Only enterprise knows of this command.
-          skipTest: (conn) => {
-              return !getBuildInfo().modules.includes("enterprise");
-          },
           testcases: [{
               runOnDb: firstDbName,
               roles: {
@@ -5735,10 +5824,6 @@ export const authCommandsLib = {
               updateSearchIndex: "foo",
               id: 'index-ID-number',
               definition: {"textBlob": "blob"},
-          },
-          // Only enterprise knows of this command.
-          skipTest: (conn) => {
-              return !getBuildInfo().modules.includes("enterprise");
           },
           testcases: [
               {
@@ -7050,11 +7135,7 @@ export const authCommandsLib = {
               }]
           },
           skipSharded: false,
-          // Only enterprise knows of this aggregation stage.
-          skipTest:
-              (conn) =>
-                  !conn.getDB("admin").runCommand({buildInfo: 1}).modules.includes("enterprise"),
-          // Instead of configuring mongot, lets make the search to return EOF early.
+          // Instead of calling to mongot, lets make the search to return EOF early.
           disableSearch: true,
           testcases: [
               {
@@ -7364,6 +7445,7 @@ export const authCommandsLib = {
           },
           settings: {
             "indexHints": {
+              "ns": {db: firstDbName, coll: "foo"},
               "allowedIndexes": [{ "sku": 1 }]
             }
           }
@@ -7406,7 +7488,6 @@ export const authCommandsLib = {
             roles: roles_clusterManager,
             privileges: [{resource: {cluster: true}, actions: ["querySettings"]}],
             expectAuthzFailure: false, // We expect the request to be authorized.
-            expectFail: true // We expect to receive 7746701 because there are no matching query settings .
           },
       ]
       },

@@ -3,7 +3,7 @@
  *
  * @tags: [
  *   # The test runs commands that are not allowed with security token: emptycapped.
- *   not_allowed_with_security_token,
+ *   not_allowed_with_signed_security_token,
  *   requires_collstats,
  *   requires_non_retryable_commands,
  *   uses_testing_only_commands,
@@ -12,6 +12,10 @@
  *   no_selinux,
  *   # TODO SERVER-60823 re-add transaction support
  *   does_not_support_transactions,
+ *   # emptycapped calls WT_SESSION::truncate() which does untimestamped writes. This is unsafe in a
+ *   # replica set or sharded clusters where timestamps are used. Run this test only in standalone
+ *   # mode as timestamps aren't used.
+ *   assumes_standalone_mongod,
  * ]
  */
 

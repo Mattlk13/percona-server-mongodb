@@ -30,12 +30,13 @@ env.Library(
         'ticket_pool.cpp' if env.TargetOSIs('linux') else [],
         'ticketholder.cpp',
     ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/service_context',
-        '$BUILD_DIR/mongo/db/storage/concurrency_adjustment_parameters',
-        '$BUILD_DIR/third_party/shim_boost',
+    LIBDEPS=[
         'admission_context',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/server_base',
+        '$BUILD_DIR/mongo/db/service_context',
+        '$BUILD_DIR/third_party/shim_boost',
     ],
 )
 
@@ -46,6 +47,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        'spin_lock',
     ],
 )
 
@@ -87,8 +89,27 @@ env.Benchmark(
         'ticketholder_bm.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/admission/execution_admission_context',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/service_context_non_d',
         'ticketholder',
     ],
+)
+
+env.Benchmark(
+    target='lock_free_read_list_bm',
+    source=[
+        'lock_free_read_list_bm.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/util/processinfo',
+    ],
+)
+
+env.CppUnitTest(
+    target='lock_free_read_list_test',
+    source=[
+        'lock_free_read_list_test.cpp',
+    ],
+    LIBDEPS=[],
 )

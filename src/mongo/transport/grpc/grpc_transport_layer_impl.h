@@ -32,6 +32,7 @@
 #include <boost/optional.hpp>
 #include <memory>
 
+#include "mongo/transport/client_transport_observer.h"
 #include "mongo/transport/grpc/grpc_transport_layer.h"
 #include "mongo/transport/session_manager.h"
 #include "mongo/util/duration.h"
@@ -48,20 +49,35 @@ public:
                            Options options,
                            std::unique_ptr<SessionManager> sessionManager);
 
-    virtual Status registerService(std::unique_ptr<Service> svc) override;
+    /**
+     * Create a GRPCTransportLayerImpl instance suitable for ingress (and optionally egress).
+     * The instantiated TL will have CommandService pre-attached to route requests via
+     * sessionManager->startSession().
+     *
+     * Note that this TransportLayer will throw during `setup()`
+     * if no tlsCertificateKeyFile is available.
+     */
+    static std::unique_ptr<GRPCTransportLayerImpl> createWithConfig(
+        ServiceContext*,
+        Options options,
+        std::vector<std::shared_ptr<ClientTransportObserver>> observers);
 
-    virtual Status setup() override;
+    Status registerService(std::unique_ptr<Service> svc) override;
 
-    virtual Status start() override;
+    Status setup() override;
 
-    virtual void shutdown() override;
+    Status start() override;
 
-    virtual StatusWith<std::shared_ptr<Session>> connectWithAuthToken(
+    void shutdown() override;
+
+    void stopAcceptingSessions() override;
+
+    StatusWith<std::shared_ptr<Session>> connectWithAuthToken(
         HostAndPort peer,
         Milliseconds timeout,
         boost::optional<std::string> authToken = boost::none) override;
 
-    virtual StatusWith<std::shared_ptr<Session>> connect(
+    StatusWith<std::shared_ptr<Session>> connect(
         HostAndPort peer,
         ConnectSSLMode sslMode,
         Milliseconds timeout,
@@ -72,8 +88,14 @@ public:
                               bool asyncOCSPStaple) override;
 #endif
 
+    const std::vector<HostAndPort>& getListeningAddresses() const override;
+
     SessionManager* getSessionManager() const override {
         return _sessionManager.get();
+    }
+
+    std::shared_ptr<SessionManager> getSharedSessionManager() const override {
+        return _sessionManager;
     }
 
 private:
@@ -86,7 +108,7 @@ private:
     // Invalidated after setup().
     std::vector<std::unique_ptr<Service>> _services;
     Options _options;
-    std::unique_ptr<SessionManager> _sessionManager;
+    std::shared_ptr<SessionManager> _sessionManager;
 };
 
 }  // namespace mongo::transport::grpc

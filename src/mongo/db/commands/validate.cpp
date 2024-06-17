@@ -36,6 +36,7 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bson_validate_gen.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
@@ -45,6 +46,7 @@
 #include "mongo/db/catalog/collection_validation.h"
 #include "mongo/db/catalog/validate_results.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
@@ -53,6 +55,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -196,7 +199,7 @@ public:
             << "Cannot specify both {full: true, background: true}.";
     }
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -231,7 +234,7 @@ public:
     bool run(OperationContext* opCtx,
              const DatabaseName& dbName,
              const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
+             BSONObjBuilder& result) override {
         if (MONGO_unlikely(validateCmdCollectionNotValid.shouldFail())) {
             result.appendBool("valid", false);
             return true;
@@ -242,7 +245,11 @@ public:
             reqSerializationCtx.setPrefixState(expectPrefix.boolean());
         }
         if (auto vts = auth::ValidatedTenancyScope::get(opCtx)) {
-            reqSerializationCtx.setTenantIdSource(vts->hasTenantId());
+            // TODO SERVER-82320 we should no longer need to check here once expectPrefix only comes
+            // from the unsigned security token.
+            if (reqSerializationCtx.getPrefix() == SerializationContext::Prefix::ExcludePrefix) {
+                reqSerializationCtx.setPrefixState(vts->isFromAtlasProxy());
+            }
         }
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
         bool background = cmdObj["background"].trueValue();
@@ -308,6 +315,33 @@ public:
             uasserted(ErrorCodes::InvalidOptions,
                       str::stream() << "Running the validate command with { metadata: true } is not"
                                     << " supported with any other options");
+        }
+
+        // Background validation uses point-in-time catalog lookups. This requires an instance of
+        // the collection at the checkpoint timestamp. Because timestamps aren't used in standalone
+        // mode, this prevents the CollectionCatalog from being able to establish the correct
+        // collection instance.
+        const bool isReplSet = repl::ReplicationCoordinator::get(opCtx)->getSettings().isReplSet();
+        if (background && !isReplSet) {
+            uasserted(ErrorCodes::CommandNotSupported,
+                      str::stream() << "Running the validate command with { background: true } "
+                                    << "is not supported in standalone mode");
+        }
+
+        // The same goes for unreplicated collections, DDL operations are untimestamped.
+        if (background && !nss.isReplicated()) {
+            uasserted(ErrorCodes::CommandNotSupported,
+                      str::stream() << "Running the validate command with { background: true } "
+                                    << "is not supported on unreplicated collections");
+        }
+
+        if (background && nss.isGlobalIndex()) {
+            // TODO SERVER-74209: Reading earlier than the minimum valid snapshot is temporarily not
+            // supported for global index collections as it results in extra index entries being
+            // detected. This requires further investigation.
+            uasserted(ErrorCodes::CommandNotSupported,
+                      str::stream() << "Background validation is temporarily disabled"
+                                    << " on the global indexes namespace");
         }
 
         if (!serverGlobalParams.quiet.load()) {
@@ -393,14 +427,16 @@ public:
         }();
 
         if (repair) {
-            opCtx->recoveryUnit()->setPrepareConflictBehavior(
+            shard_role_details::getRecoveryUnit(opCtx)->setPrepareConflictBehavior(
                 PrepareConflictBehavior::kIgnoreConflictsAllowWrites);
         }
 
         CollectionValidation::AdditionalOptions additionalOptions;
         additionalOptions.enforceTimeseriesBucketsAreAlwaysCompressed =
             cmdObj["enforceTimeseriesBucketsAreAlwaysCompressed"].trueValue();
-        additionalOptions.warnOnSchemaValidation = cmdObj["warnOnSchemaValidation"].trueValue();
+        additionalOptions.validationVersion = getTestCommandsEnabled()
+            ? (ValidationVersion)bsonTestValidationVersion
+            : currentValidationVersion;
 
         ValidateResults validateResults;
         Status status = CollectionValidation::validate(

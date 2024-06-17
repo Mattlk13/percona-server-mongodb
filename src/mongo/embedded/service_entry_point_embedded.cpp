@@ -62,20 +62,14 @@ namespace mongo {
 
 namespace {
 
-/**
- * Use the dedicated threading model for embedded clients. The following ensures any request
- * initiated by the embedded service entry point will always go through the synchronous command
- * execution path, and will never get scheduled on a borrowed thread.
- */
 class EmbeddedClientObserver final : public ServiceContext::ClientObserver {
-    void onCreateClient(Client* client) {
+    void onCreateClient(Client* client) override {
         auto seCtx = std::make_unique<transport::ServiceExecutorContext>();
-        seCtx->setThreadModel(seCtx->kSynchronous);
         transport::ServiceExecutorContext::set(client, std::move(seCtx));
     }
-    void onDestroyClient(Client*) {}
-    void onCreateOperationContext(OperationContext*) {}
-    void onDestroyOperationContext(OperationContext*) {}
+    void onDestroyClient(Client*) override {}
+    void onCreateOperationContext(OperationContext*) override {}
+    void onDestroyOperationContext(OperationContext*) override {}
 };
 
 ServiceContext::ConstructorActionRegisterer registerClientObserverConstructor{
@@ -131,13 +125,14 @@ public:
         }
     }
 
-    void uassertCommandDoesNotSpecifyWriteConcern(const BSONObj& cmd) const override {
-        if (commandSpecifiesWriteConcern(cmd)) {
-            uasserted(ErrorCodes::InvalidOptions, "Command does not support writeConcern");
-        }
+    void uassertCommandDoesNotSpecifyWriteConcern(
+        const CommonRequestArgs& requestArgs) const override {
+        uassert(ErrorCodes::InvalidOptions,
+                "Command does not support writeConcern",
+                !commandSpecifiesWriteConcern(requestArgs));
     }
 
-    void attachCurOpErrInfo(OperationContext*, const BSONObj&) const override {}
+    void attachCurOpErrInfo(OperationContext*, const Status) const override {}
 
     bool refreshDatabase(OperationContext* opCtx,
                          const StaleDbRoutingVersion& se) const noexcept override {
@@ -167,9 +162,13 @@ public:
     }
 
     void appendReplyMetadata(OperationContext* opCtx,
-                             const OpMsgRequest& request,
+                             const CommonRequestArgs& requestArgs,
                              BSONObjBuilder* metadataBob) const override {}
 };
+
+ServiceEntryPointEmbedded::ServiceEntryPointEmbedded() : _hooks(std::make_unique<Hooks>()) {}
+
+ServiceEntryPointEmbedded::~ServiceEntryPointEmbedded() = default;
 
 Future<DbResponse> ServiceEntryPointEmbedded::handleRequest(OperationContext* opCtx,
                                                             const Message& m) noexcept {
@@ -178,7 +177,7 @@ Future<DbResponse> ServiceEntryPointEmbedded::handleRequest(OperationContext* op
     // guarantees of the state (that they have run).
     checked_cast<PeriodicRunnerEmbedded*>(opCtx->getServiceContext()->getPeriodicRunner())
         ->tryPump();
-    return ServiceEntryPointCommon::handleRequest(opCtx, m, std::make_unique<Hooks>());
+    return ServiceEntryPointCommon::handleRequest(opCtx, m, *_hooks);
 }
 
 logv2::LogSeverity ServiceEntryPointEmbedded::slowSessionWorkflowLogSeverity() {

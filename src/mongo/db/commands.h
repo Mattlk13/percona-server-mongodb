@@ -172,8 +172,11 @@ struct CommandHelpers {
 
     static NamespaceStringOrUUID parseNsOrUUID(const DatabaseName& dbName, const BSONObj& cmdObj);
 
-    // Ensure collection identifier is not a Command
-    static void ensureNsNotCommand(const NamespaceString& nss);
+    // Check that the namespace string references a collection that holds documents
+    // rather than an internal configuration collection (the names of which contain
+    // a $). The one exception is kLocalOplogDollarMain, which is considered valid
+    // despite containing $.
+    static void ensureValidCollectionName(const NamespaceString& nss);
 
     /**
      * Return the namespace for the command. If the first field in 'cmdObj' is of type
@@ -217,6 +220,12 @@ struct CommandHelpers {
      * Returns true if reply indicates a success.
      */
     static bool extractOrAppendOk(BSONObjBuilder& reply);
+
+    /**
+     * Parses an "ok" field, or appends "ok" to the command reply. Additionally returns a Status
+     * representing an "ok" or an error.
+     */
+    static Status extractOrAppendOkAndGetStatus(BSONObjBuilder& reply);
 
     /**
      * Helper for setting a writeConcernError field in the command result object if
@@ -478,6 +487,15 @@ public:
      */
     virtual const std::set<std::string>& apiVersions() const;
 
+    /**
+     * After a Command is created, we tell it what Cluster `role` it has.
+     * Role will be `ShardServer` or `RouterServer`, exclusively.
+     * In tests, `role` might be `None` as there's no associated Service.
+     * The virtual `doInitializeClsuterRole` is then invoked to allow
+     * derived types to perform additional role-aware initialization.
+     */
+    void initializeClusterRole(ClusterRole role);
+
     /*
      * Returns the list of API versions in which this command is deprecated.
      */
@@ -616,14 +634,24 @@ public:
      * Increment counter for how many times this command has executed.
      */
     void incrementCommandsExecuted() const {
-        _commandsExecuted->increment();
+        if (_commandsExecuted)
+            _commandsExecuted->increment();
     }
 
     /**
      * Increment counter for how many times this command has failed.
      */
     void incrementCommandsFailed() const {
-        _commandsFailed->increment();
+        if (_commandsFailed)
+            _commandsFailed->increment();
+    }
+
+    /**
+     * Increment counter for how many times this command has been rejected
+     * due to query settings.
+     */
+    void incrementCommandsRejected() const {
+        _commandsRejected->increment();
     }
 
     /**
@@ -647,7 +675,7 @@ public:
     /**
      * Checks if the command is also known by the provided alias.
      */
-    bool hasAlias(const StringData& alias) const;
+    bool hasAlias(StringData alias) const;
 
     /**
      * Audit when this command fails authz check.
@@ -709,13 +737,18 @@ public:
         return false;
     }
 
+protected:
+    /** For extended role-dependent initialization. */
+    virtual void doInitializeClusterRole(ClusterRole role) {}
+
 private:
     const std::string _name;
     const std::vector<StringData> _aliases;
 
     // Counters for how many times this command has been executed and failed
-    std::shared_ptr<CounterMetric> _commandsExecuted;
-    std::shared_ptr<CounterMetric> _commandsFailed;
+    Counter64* _commandsExecuted{};
+    Counter64* _commandsFailed{};
+    Counter64* _commandsRejected{};
 };
 
 /**
@@ -731,7 +764,7 @@ public:
     virtual ~CommandInvocation();
 
     static void set(OperationContext* opCtx, std::shared_ptr<CommandInvocation> invocation);
-    static std::shared_ptr<CommandInvocation> get(OperationContext* opCtx);
+    static std::shared_ptr<CommandInvocation>& get(OperationContext* opCtx);
 
     /**
      * Runs the command, filling in result. Any exception thrown from here will cause result
@@ -764,6 +797,14 @@ public:
      * The primary namespace on which this command operates. May just be the db.
      */
     virtual NamespaceString ns() const = 0;
+
+    /**
+     * The database associated with this command (i.e. the "$db" field in OP_MSG requests).
+     *
+     * This is usually equivalent to ns().dbName(), but some commands are associated with a
+     * different database (usually admin) than the one they modify or operate over.
+     */
+    virtual const DatabaseName& db() const = 0;
 
     /**
      * All of the namespaces this command operates on. For most commands will just be ns().
@@ -882,6 +923,14 @@ public:
      * default.
      */
     virtual bool allowsSpeculativeMajorityReads() const {
+        return false;
+    }
+
+    /**
+     * Returns true if this command invocation should wait until there are ingress admission tickets
+     * available before it is allowed to run.
+     */
+    virtual bool isSubjectToIngressAdmissionControl() const {
         return false;
     }
 
@@ -1048,6 +1097,14 @@ public:
         return false;
     }
 
+    /**
+     * Returns true if this command should wait until there are ingress admission tickets
+     * available before it is allowed to run.
+     */
+    virtual bool isSubjectToIngressAdmissionControl() const {
+        return false;
+    }
+
 private:
     std::unique_ptr<CommandInvocation> parse(OperationContext* opCtx,
                                              const OpMsgRequest& request) final;
@@ -1205,7 +1262,9 @@ private:
         return RequestType::parse(
             IDLParserContext(RequestType::kCommandName,
                              APIParameters::get(opCtx).getAPIStrict().value_or(false),
-                             dbName.tenantId()),
+                             auth::ValidatedTenancyScope::get(opCtx),
+                             dbName.tenantId(),
+                             SerializationContext::stateDefault()),
             cmdObj);
     }
 
@@ -1289,6 +1348,10 @@ public:
         : CommandInvocation(command),
           _request{_parseRequest(opCtx, command, opMsgRequest)},
           _opMsgRequest{opMsgRequest} {}
+
+    const DatabaseName& db() const override {
+        return request().getDbName();
+    }
 
 protected:
     const RequestType& request() const {
@@ -1407,9 +1470,17 @@ public:
 
     Command* findCommand(StringData name) const;
 
-    void incrementUnknownCommands();
+    void incrementUnknownCommands() {
+        if (_onUnknown)
+            _onUnknown();
+    }
 
     void logWeakRegistrations() const;
+
+    /** A production `CommandRegistry` will update a counter. */
+    std::function<void()> setOnUnknownCommandCallback(std::function<void()> cb) {
+        return std::exchange(_onUnknown, std::move(cb));
+    }
 
 private:
     struct Entry {
@@ -1418,6 +1489,7 @@ private:
 
     stdx::unordered_map<Command*, std::unique_ptr<Entry>> _commands;
     StringMap<Command*> _commandNames;
+    std::function<void()> _onUnknown;
 };
 
 CommandRegistry* getCommandRegistry(Service* service);

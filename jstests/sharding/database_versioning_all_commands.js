@@ -14,8 +14,12 @@
  *      - 'conditional': If you set this field to true, the test case will skip the validation that
  *      ensures all test cases match existing commands. This is useful for commands that only exist
  *      in enterprise modules, for instance.
+ *      - 'skipMultiversion': If you set this field to true, the test case will skip running in
+ *      multiversion suites. This is useful if you have a command that existed behind a feature flag
+ *      in the previous version and is now enabled.
  */
 
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
 import {
     commandsAddedToMongosSinceLastLTS,
     commandsRemovedFromMongosSinceLastLTS
@@ -125,6 +129,7 @@ function testCommandAfterMovePrimary(testCase, st, dbName, collName) {
 
     // Run movePrimary through the second mongos.
     assert.commandWorked(st.s1.adminCommand({movePrimary: dbName, to: primaryShardAfter.name}));
+
     const dbVersionAfter =
         st.s1.getDB("config").getCollection("databases").findOne({_id: dbName}).version;
 
@@ -316,26 +321,27 @@ let testCases = {
     },
     appendOplogNote: {skip: "unversioned and executes on all shards"},
     authenticate: {skip: "does not forward command to primary shard"},
+    autoSplitVector: {skip: "does not forward command to primary shard"},
     balancerCollectionStatus: {skip: "does not forward command to primary shard"},
     balancerStart: {skip: "not on a user database"},
     balancerStatus: {skip: "not on a user database"},
     balancerStop: {skip: "not on a user database"},
     buildInfo: {skip: "executes locally on mongos (not sent to any remote node)"},
     bulkWrite: {
-        // TODO SERVER-52419: Run this test and remove the skip.
-        // run: {
-        //     sendsDbVersion: true,
-        //     runsAgainstAdminDb: true,
-        //     command: function(dbName, collName) {
-        //         return {
-        //             bulkWrite: 1,
-        //             ops: [{insert: 0, document: {_id: 1}}],
-        //             nsInfo: [{ns: dbName + "." + collName}]
-        //         };
-        //     },
-        // }
-        skip: "requires feature flag"
+        run: {
+            sendsDbVersion: true,
+            runsAgainstAdminDb: true,
+            command: function(dbName, collName) {
+                return {
+                    bulkWrite: 1,
+                    ops: [{insert: 0, document: {_id: 1}}],
+                    nsInfo: [{ns: dbName + "." + collName}]
+                };
+            },
+        },
+        skipMultiversion: true
     },
+    changePrimary: {skip: "reads primary shard from sharding catalog with readConcern: local"},
     checkMetadataConsistency: {
         run: {
             sendsDbVersion: true,
@@ -825,12 +831,23 @@ commandsRemovedFromMongosSinceLastLTS.forEach(function(cmd) {
 
 const st = new ShardingTest({shards: 2, mongos: 2});
 
+// Database versioning tests only make sense when all collections are not tracked.
+const isTrackUnshardedUponCreationEnabled = FeatureFlagUtil.isPresentAndEnabled(
+    st.s.getDB('admin'), "TrackUnshardedCollectionsUponCreation");
+if (isTrackUnshardedUponCreationEnabled) {
+    st.stop();
+    quit();
+}
+
 const listCommandsRes = st.s0.adminCommand({listCommands: 1});
 assert.commandWorked(listCommandsRes);
 print("--------------------------------------------");
 for (let command of Object.keys(listCommandsRes.commands)) {
     print(command);
 }
+
+const isMultiversion =
+    jsTest.options().shardMixedBinVersions || jsTest.options().useRandomBinVersionsWithinReplicaSet;
 
 (() => {
     // Validate test cases for all commands.
@@ -878,7 +895,7 @@ for (let command of Object.keys(listCommandsRes.commands)) {
 
     for (let command of Object.keys(listCommandsRes.commands)) {
         let testCase = testCases[command];
-        if (testCase.skip) {
+        if (testCase.skip || (isMultiversion && testCase.skipMultiversion)) {
             print("skipping " + command + ": " + testCase.skip);
             continue;
         }
@@ -917,7 +934,7 @@ for (let command of Object.keys(listCommandsRes.commands)) {
 
     for (let command of Object.keys(listCommandsRes.commands)) {
         let testCase = testCases[command];
-        if (testCase.skip) {
+        if (testCase.skip || (isMultiversion && testCase.skipMultiversion)) {
             print("skipping " + command + ": " + testCase.skip);
             continue;
         }
@@ -935,7 +952,7 @@ for (let command of Object.keys(listCommandsRes.commands)) {
 
     for (let command of Object.keys(listCommandsRes.commands)) {
         let testCase = testCases[command];
-        if (testCase.skip) {
+        if (testCase.skip || (isMultiversion && testCase.skipMultiversion)) {
             print("skipping " + command + ": " + testCase.skip);
             continue;
         }

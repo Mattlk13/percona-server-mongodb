@@ -111,6 +111,7 @@
 #include "mongo/s/resharding/resharding_coordinator_service_conflicting_op_in_progress_info.h"
 #include "mongo/s/resharding/resharding_feature_flag_gen.h"
 #include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/s/routing_information_cache.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/s/sharding_feature_flags_gen.h"
 #include "mongo/s/sharding_index_catalog_cache.h"
@@ -140,6 +141,7 @@ MONGO_FAIL_POINT_DEFINE(reshardingPauseCoordinatorBeforeInitializing);
 MONGO_FAIL_POINT_DEFINE(reshardingPauseCoordinatorBeforeCloning);
 MONGO_FAIL_POINT_DEFINE(reshardingPauseCoordinatorBeforeBlockingWrites);
 MONGO_FAIL_POINT_DEFINE(reshardingPauseCoordinatorBeforeDecisionPersisted);
+MONGO_FAIL_POINT_DEFINE(reshardingPauseBeforeTellingParticipantsToCommit);
 MONGO_FAIL_POINT_DEFINE(reshardingPauseCoordinatorBeforeRemovingStateDoc);
 MONGO_FAIL_POINT_DEFINE(reshardingPauseCoordinatorBeforeCompletion);
 MONGO_FAIL_POINT_DEFINE(reshardingPauseCoordinatorBeforeStartingErrorFlow);
@@ -647,7 +649,7 @@ void writeToConfigIndexesForTempNss(OperationContext* opCtx,
                                     const ReshardingCoordinatorDocument& coordinatorDoc,
                                     TxnNumber txnNumber) {
     if (!feature_flags::gGlobalIndexesShardingCatalog.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
         return;
     }
     auto nextState = coordinatorDoc.getState();
@@ -655,7 +657,7 @@ void writeToConfigIndexesForTempNss(OperationContext* opCtx,
     switch (nextState) {
         case CoordinatorStateEnum::kPreparingToDonate: {
             auto [_, optSii] =
-                uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(
+                uassertStatusOK(RoutingInformationCache::get(opCtx)->getCollectionRoutingInfo(
                     opCtx, coordinatorDoc.getSourceNss()));
             if (optSii) {
                 std::vector<BSONObj> indexes;
@@ -1126,7 +1128,7 @@ ChunkVersion ReshardingCoordinatorExternalState::calculateChunkVersionForInitial
 boost::optional<CollectionIndexes> ReshardingCoordinatorExternalState::getCatalogIndexVersion(
     OperationContext* opCtx, const NamespaceString& nss, const UUID& uuid) {
     auto [_, optSii] =
-        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
+        uassertStatusOK(RoutingInformationCache::get(opCtx)->getCollectionRoutingInfo(opCtx, nss));
     if (optSii) {
         VectorClock::VectorTime vt = VectorClock::get(opCtx)->getTime();
         auto time = vt.clusterTime().asTimestamp();
@@ -1138,7 +1140,7 @@ boost::optional<CollectionIndexes> ReshardingCoordinatorExternalState::getCatalo
 bool ReshardingCoordinatorExternalState::getIsUnsplittable(OperationContext* opCtx,
                                                            const NamespaceString& nss) {
     auto [cm, _] =
-        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
+        uassertStatusOK(RoutingInformationCache::get(opCtx)->getCollectionRoutingInfo(opCtx, nss));
     return cm.isUnsplittable();
 }
 
@@ -1146,7 +1148,7 @@ boost::optional<CollectionIndexes>
 ReshardingCoordinatorExternalState::getCatalogIndexVersionForCommit(OperationContext* opCtx,
                                                                     const NamespaceString& nss) {
     auto [_, optSii] =
-        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
+        uassertStatusOK(RoutingInformationCache::get(opCtx)->getCollectionRoutingInfo(opCtx, nss));
     if (optSii) {
         return optSii->getCollectionIndexes();
     }
@@ -1185,7 +1187,7 @@ ReshardingCoordinatorExternalStateImpl::calculateParticipantShardsAndChunks(
     OperationContext* opCtx, const ReshardingCoordinatorDocument& coordinatorDoc) {
 
     const auto [cm, _] = uassertStatusOK(
-        Grid::get(opCtx)->catalogCache()->getTrackedCollectionRoutingInfoWithPlacementRefresh(
+        RoutingInformationCache::get(opCtx)->getTrackedCollectionRoutingInfoWithPlacementRefresh(
             opCtx, coordinatorDoc.getSourceNss()));
 
     std::set<ShardId> donorShardIds;
@@ -1196,7 +1198,12 @@ ReshardingCoordinatorExternalStateImpl::calculateParticipantShardsAndChunks(
 
     // The database primary must always be a recipient to ensure it ends up with consistent
     // collection metadata.
-    recipientShardIds.emplace(cm.dbPrimary());
+    const auto dbPrimaryShard =
+        uassertStatusOK(RoutingInformationCache::get(opCtx)->getDatabaseWithRefresh(
+                            opCtx, coordinatorDoc.getSourceNss().dbName()))
+            ->getPrimary();
+
+    recipientShardIds.emplace(dbPrimaryShard);
 
     if (const auto& chunks = coordinatorDoc.getPresetReshardedChunks()) {
         auto version = calculateChunkVersionForInitialChunks(opCtx);
@@ -1243,7 +1250,7 @@ ReshardingCoordinatorExternalStateImpl::calculateParticipantShardsAndChunks(
                     "Resharding improvements is not enabled, should not have "
                     "shardDistribution in coordinatorDoc",
                     resharding::gFeatureFlagReshardingImprovements.isEnabled(
-                        serverGlobalParams.featureCompatibility));
+                        serverGlobalParams.featureCompatibility.acquireFCVSnapshot()));
             uassert(ErrorCodes::InvalidOptions,
                     "ShardDistribution should not be empty if provided",
                     shardDistribution->size() > 0);
@@ -1399,7 +1406,7 @@ ExecutorFuture<void> ReshardingCoordinatorService::_rebuildService(
                // downgrade simpler, so we can remove all of this initialization when the flag is
                // removed.
                if (!resharding::gFeatureFlagReshardingImprovements.isEnabled(
-                       serverGlobalParams.featureCompatibility)) {
+                       serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
                    client.runCommand(
                        nss.dbName(),
                        BSON("createIndexes"
@@ -1448,13 +1455,8 @@ ReshardingCoordinator::ReshardingCoordinator(
       _metrics{ReshardingMetrics::initializeFrom(coordinatorDoc, _serviceContext)},
       _metadata(coordinatorDoc.getCommonReshardingMetadata()),
       _coordinatorDoc(coordinatorDoc),
-      _markKilledExecutor(std::make_shared<ThreadPool>([] {
-          ThreadPool::Options options;
-          options.poolName = "ReshardingCoordinatorCancelableOpCtxPool";
-          options.minThreads = 1;
-          options.maxThreads = 1;
-          return options;
-      }())),
+      _markKilledExecutor{resharding::makeThreadPoolForMarkKilledExecutor(
+          "ReshardingCoordinatorCancelableOpCtxPool")},
       _reshardingCoordinatorExternalState(externalState) {
     _reshardingCoordinatorObserver = std::make_shared<ReshardingCoordinatorObserver>();
 
@@ -1961,7 +1963,7 @@ ExecutorFuture<void> ReshardingCoordinator::_runReshardingOp(
         .onCompletion([this, self = shared_from_this()](Status status) {
             _metrics->onStateTransition(_coordinatorDoc.getState(), boost::none);
             if (resharding::gFeatureFlagReshardingImprovements.isEnabled(
-                    serverGlobalParams.featureCompatibility)) {
+                    serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
                 _logStatsOnCompletion(status.isOK());
             }
 
@@ -2133,17 +2135,16 @@ ExecutorFuture<bool> ReshardingCoordinator::_isReshardingOpRedundant(
                // Ensure indexes are loaded in the catalog cache, along with the collection
                // placement.
                if (feature_flags::gGlobalIndexesShardingCatalog.isEnabled(
-                       serverGlobalParams.featureCompatibility)) {
+                       serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
 
-                   auto cri = uassertStatusOK(
-                       Grid::get(opCtx)->catalogCache()->getTrackedCollectionRoutingInfoWithRefresh(
-                           opCtx, _coordinatorDoc.getSourceNss()));
+                   auto cri = uassertStatusOK(RoutingInformationCache::get(opCtx)
+                                                  ->getTrackedCollectionRoutingInfoWithRefresh(
+                                                      opCtx, _coordinatorDoc.getSourceNss()));
                    cm.emplace(cri.cm);
                } else {
 
                    auto cri =
-                       uassertStatusOK(Grid::get(opCtx)
-                                           ->catalogCache()
+                       uassertStatusOK(RoutingInformationCache::get(opCtx)
                                            ->getTrackedCollectionRoutingInfoWithPlacementRefresh(
                                                opCtx, _coordinatorDoc.getSourceNss()));
                    cm.emplace(cri.cm);
@@ -2507,8 +2508,7 @@ void ReshardingCoordinator::_commit(const ReshardingCoordinatorDocument& coordin
         std::vector<ShardId> collectionPlacementAsVector;
 
         const auto [cm, _] =
-            uassertStatusOK(Grid::get(opCtx.get())
-                                ->catalogCache()
+            uassertStatusOK(RoutingInformationCache::get(opCtx.get())
                                 ->getTrackedCollectionRoutingInfoWithPlacementRefresh(
                                     opCtx.get(), coordinatorDoc.getTempReshardingNss()));
 
@@ -2549,11 +2549,11 @@ void ReshardingCoordinator::_generateOpEventOnCoordinatingShard(
     ShardsvrNotifyShardingEventRequest request(notify_sharding_event::kCollectionResharded,
                                                eventNotification.toBSON());
 
-    const auto cm = uassertStatusOK(Grid::get(opCtx.get())
-                                        ->catalogCache()
-                                        ->getTrackedCollectionRoutingInfoWithPlacementRefresh(
-                                            opCtx.get(), _coordinatorDoc.getSourceNss()))
-                        .cm;
+    const auto dbPrimaryShard =
+        uassertStatusOK(
+            RoutingInformationCache::get(opCtx.get())
+                ->getDatabaseWithRefresh(opCtx.get(), _coordinatorDoc.getSourceNss().dbName()))
+            ->getPrimary();
 
     // In case the recipient is running a legacy binary, swallow the error.
     try {
@@ -2564,7 +2564,7 @@ void ReshardingCoordinator::_generateOpEventOnCoordinatingShard(
                 **executor, _ctHolder->getStepdownToken(), request, args);
         opts->cmd.setDbName(DatabaseName::kAdmin);
         _reshardingCoordinatorExternalState->sendCommandToShards(
-            opCtx.get(), opts, {cm.dbPrimary()});
+            opCtx.get(), opts, {dbPrimaryShard});
     } catch (const ExceptionFor<ErrorCodes::UnsupportedShardingEventNotification>& e) {
         LOGV2_WARNING(7403100,
                       "Unable to generate op entry on reshardCollection commit",
@@ -2754,6 +2754,12 @@ void ReshardingCoordinator::_tellAllDonorsToRefresh(
 
 void ReshardingCoordinator::_tellAllParticipantsToCommit(
     const NamespaceString& nss, const std::shared_ptr<executor::ScopedTaskExecutor>& executor) {
+    {
+        auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
+        reshardingPauseBeforeTellingParticipantsToCommit.pauseWhileSetAndNotCanceled(
+            opCtx.get(), _ctHolder->getAbortToken());
+    }
+
     auto opts = createShardsvrCommitReshardCollectionOptions(
         nss, _coordinatorDoc.getReshardingUUID(), **executor, _ctHolder->getStepdownToken(), {});
     opts->cmd.setDbName(DatabaseName::kAdmin);
@@ -2776,9 +2782,9 @@ void ReshardingCoordinator::_updateChunkImbalanceMetrics(const NamespaceString& 
     auto opCtx = cancellableOpCtx.get();
 
     try {
-        auto [routingInfo, _] = uassertStatusOK(
-            Grid::get(opCtx)->catalogCache()->getTrackedCollectionRoutingInfoWithPlacementRefresh(
-                opCtx, nss));
+        auto [routingInfo, _] =
+            uassertStatusOK(RoutingInformationCache::get(opCtx)
+                                ->getTrackedCollectionRoutingInfoWithPlacementRefresh(opCtx, nss));
 
         const auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
         const auto collectionZones =

@@ -1,6 +1,6 @@
 // Tests that aggregation is supported in transactions.
 // @tags: [uses_transactions, uses_snapshot_read_concern, references_foreign_collection]
-// TODO (SERVER-39704): Remove the following load after SERVER-397074 is completed
+// TODO (SERVER-39704): Remove the following load after SERVER-39704 is completed
 import {
     withTxnAndAutoRetryOnMongos
 } from "jstests/libs/auto_retry_transaction_in_sharding.js";  // For isSharded.
@@ -30,7 +30,13 @@ const foreignDoc = {
 };
 assert.commandWorked(foreignColl.insert(foreignDoc, {writeConcern: {w: "majority"}}));
 
-const isForeignSharded = FixtureHelpers.isSharded(foreignColl);
+// TODO SERVER-84470 $lookup is currently not supported on a sharded collection within a
+// transaction due to the possibility of a deadlock as a consequence of serializing on the same
+// session. This behaviour extends to unsplittable collections as well since they are not guaranteed
+// to be on the primary shard. Remove remove `|| FixtureHelpers.isUnsplittable(foreignColl)` once
+// unsplittable collection are supported.
+const isForeignSharded =
+    FixtureHelpers.isSharded(foreignColl) || FixtureHelpers.isUnsplittable(foreignColl)
 
 const txnOptions = {
     readConcern: {level: "snapshot"}

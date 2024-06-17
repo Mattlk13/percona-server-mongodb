@@ -65,7 +65,6 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -371,7 +370,7 @@ StatusWith<std::vector<BSONObj>> DefaultClonerImpl::_filterCollectionsForClone(
 
         const auto nss = NamespaceStringUtil::deserialize(fromDBName, collectionName.c_str());
         if (nss.isSystem()) {
-            if (!nss.isLegalClientSystemNS(serverGlobalParams.featureCompatibility)) {
+            if (!nss.isLegalClientSystemNS()) {
                 LOGV2_DEBUG(20419, 2, "\t\t not cloning because system collection");
                 continue;
             }
@@ -388,7 +387,7 @@ Status DefaultClonerImpl::_createCollectionsForDb(
     const DatabaseName& dbName) {
     auto databaseHolder = DatabaseHolder::get(opCtx);
     auto db = databaseHolder->openDb(opCtx, dbName);
-    invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_X));
+    invariant(shard_role_details::getLocker(opCtx)->isDbLockedForMode(dbName, MODE_X));
 
     auto catalog = CollectionCatalog::get(opCtx);
     auto collCount = 0;
@@ -410,7 +409,7 @@ Status DefaultClonerImpl::_createCollectionsForDb(
 
             const Collection* collection = catalog->lookupCollectionByNamespace(opCtx, nss);
             if (collection) {
-                if (!params.shardedOrTrackedOutsideDbPrimary) {
+                if (!params.trackedColls) {
                     // If the collection is unsharded then we want to fail when a collection
                     // we're trying to create already exists.
                     return Status(ErrorCodes::NamespaceExists,
@@ -436,13 +435,13 @@ Status DefaultClonerImpl::_createCollectionsForDb(
                                   << existingOpts.uuid << " and new UUID is " << clonedUUID);
             }
 
-            // If the collection does not already exist and is sharded, we create a new
-            // collection on the target shard with the UUID of the original collection and
-            // copy the options and secondary indexes. If the collection does not already
-            // exist and is unsharded, we create a new collection with its own UUID and
-            // copy the options and secondary indexes of the original collection.
+            // If the collection does not already exist and is tracked, we create a new collection
+            // on the target shard with the UUID of the original collection and copy the options and
+            // secondary indexes. If the collection does not already exist and is untracked, we
+            // create a new collection with its own UUID and copy the options and secondary indexes
+            // of the original collection.
 
-            if (params.shardedOrTrackedOutsideDbPrimary || params.forceSameUUIDAsSource) {
+            if (params.trackedColls) {
                 optionsBuilder.append(params.collectionInfo["info"]["uuid"]);
             }
 
@@ -478,7 +477,7 @@ Status DefaultClonerImpl::_createCollectionsForDb(
 
 Status DefaultClonerImpl::setupConn(OperationContext* opCtx, const std::string& masterHost) {
     invariant(!_conn);
-    invariant(!opCtx->lockState()->isLocked());
+    invariant(!shard_role_details::getLocker(opCtx)->isLocked());
     auto statusWithMasterHost = ConnectionString::parse(masterHost);
 
     if (!statusWithMasterHost.isOK()) {
@@ -523,7 +522,7 @@ Status DefaultClonerImpl::setupConn(OperationContext* opCtx, const std::string& 
 
 StatusWith<std::vector<BSONObj>> DefaultClonerImpl::getListOfCollections(
     OperationContext* opCtx, const DatabaseName& dbName, const std::string& masterHost) {
-    invariant(!opCtx->lockState()->isLocked());
+    invariant(!shard_role_details::getLocker(opCtx)->isLocked());
     std::vector<BSONObj> collsToClone;
     if (!_conn) {
         auto connStatus = setupConn(opCtx, masterHost);
@@ -538,18 +537,16 @@ StatusWith<std::vector<BSONObj>> DefaultClonerImpl::getListOfCollections(
     return _filterCollectionsForClone(dbName, initialCollections);
 }
 
-Status DefaultClonerImpl::copyDb(
-    OperationContext* opCtx,
-    const DatabaseName& dbName,
-    const std::string& masterHost,
-    const std::vector<NamespaceString>& shardedOrTrackedOutsideDbPrimary,
-    bool forceSameUUIDAsSource,
-    std::set<std::string>* clonedColls) {
+Status DefaultClonerImpl::copyDb(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const std::string& masterHost,
+                                 const std::vector<NamespaceString>& trackedColls,
+                                 std::set<std::string>* clonedColls) {
     invariant(clonedColls && clonedColls->empty(),
               str::stream() << masterHost << ":" << dbName.toStringForErrorMsg());
     // This function can potentially block for a long time on network activity, so holding of locks
     // is disallowed.
-    invariant(!opCtx->lockState()->isLocked());
+    invariant(!shard_role_details::getLocker(opCtx)->isLocked());
     auto toCloneStatus = getListOfCollections(opCtx, dbName, masterHost);
     if (!toCloneStatus.isOK()) {
         return toCloneStatus.getStatus();
@@ -567,12 +564,9 @@ Status DefaultClonerImpl::copyDb(
         }
 
         const auto nss = NamespaceStringUtil::deserialize(dbName, params.collectionName);
-        if (std::find(shardedOrTrackedOutsideDbPrimary.begin(),
-                      shardedOrTrackedOutsideDbPrimary.end(),
-                      nss) != shardedOrTrackedOutsideDbPrimary.end()) {
-            params.shardedOrTrackedOutsideDbPrimary = true;
+        if (std::find(trackedColls.begin(), trackedColls.end(), nss) != trackedColls.end()) {
+            params.trackedColls = true;
         }
-        params.forceSameUUIDAsSource = forceSameUUIDAsSource;
         createCollectionParams.push_back(params);
     }
 
@@ -611,7 +605,7 @@ Status DefaultClonerImpl::copyDb(
 
             // Indexes of sharded collections are not copied: the primary shard is not required to
             // have all indexes. The listIndexes cmd is sent to the shard owning the MinKey value.
-            if (params.shardedOrTrackedOutsideDbPrimary) {
+            if (params.trackedColls) {
                 continue;
             }
 
@@ -628,7 +622,7 @@ Status DefaultClonerImpl::copyDb(
     }
 
     for (auto&& params : createCollectionParams) {
-        if (params.shardedOrTrackedOutsideDbPrimary) {
+        if (params.trackedColls) {
             continue;
         }
 
@@ -655,15 +649,9 @@ Cloner::Cloner() : Cloner(std::make_unique<DefaultClonerImpl>()) {}
 Status Cloner::copyDb(OperationContext* opCtx,
                       const DatabaseName& dbName,
                       const std::string& masterHost,
-                      const std::vector<NamespaceString>& shardedOrTrackedOutsideDbPrimary,
-                      bool forceSameUUIDAsSource,
+                      const std::vector<NamespaceString>& trackedColls,
                       std::set<std::string>* clonedColls) {
-    return _clonerImpl->copyDb(opCtx,
-                               dbName,
-                               masterHost,
-                               shardedOrTrackedOutsideDbPrimary,
-                               forceSameUUIDAsSource,
-                               clonedColls);
+    return _clonerImpl->copyDb(opCtx, dbName, masterHost, trackedColls, clonedColls);
 }
 
 StatusWith<std::vector<BSONObj>> Cloner::getListOfCollections(OperationContext* opCtx,

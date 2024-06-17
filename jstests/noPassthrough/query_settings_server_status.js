@@ -5,11 +5,14 @@
 // * are restored to their previous values on upon restarts
 //
 // @tags: [
-//   featureFlagQuerySettings
+//   requires_fcv_80,
+//   # This test needs persistence to ensure that query settings metrics survive cluster restarts.
+//   requires_persistence,
 // ]
 
 import "jstests/multiVersion/libs/multi_cluster.js";
 
+import {assertDropAndRecreateCollection} from "jstests/libs/collection_drop_recreate.js";
 import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 import {QuerySettingsUtils} from "jstests/libs/query_settings_utils.js";
 
@@ -19,20 +22,26 @@ const db = st.s.getDB("test");
 // Creating the collection, because some sharding passthrough suites are failing when explain
 // command is issued on the nonexistent database and collection.
 const collName = jsTestName();
-assert.commandWorked(db.createCollection(collName));
+assertDropAndRecreateCollection(db, collName);
 
 const primaryQSU = new QuerySettingsUtils(db, collName);
-const query = primaryQSU.makeFindQueryInstance({a: 1});
-const smallerQuerySetting = {
-    indexHints: {allowedIndexes: ["a_1"]}
+const query = primaryQSU.makeFindQueryInstance({filter: {a: 1}});
+const smallerQuerySettings = {
+    indexHints: {ns: {db: db.getName(), coll: collName}, allowedIndexes: ["a_1"]}
 };
-const biggerQuerySetting = {
-    indexHints: {allowedIndexes: ["a_1", {$natural: 1}]}
+const biggerQuerySettings = {
+    indexHints: {ns: {db: db.getName(), coll: collName}, allowedIndexes: ["a_1", {$natural: 1}]}
 };
 
-// Set the 'clusterServerParameterRefreshIntervalSecs' value to 1 second for faster fetching of
-// 'querySettings' cluster parameter on mongos from the configsvr.
-const clusterParamRefreshSecs = primaryQSU.setClusterParamRefreshSecs(1);
+function restartCluster() {
+    st.restartMongoses();
+    // Refresh the db reference so it's possible to later call 'clusterParamRefreshSecs.restore()'.
+    primaryQSU.db = st.s.getDB(db.getName());
+    st.stopAllConfigServers({startClean: false}, /* forRestart*/ true);
+    st.restartAllConfigServers();
+    st.stopAllShards({startClean: false}, /* forRestart */ true);
+    st.restartAllShards();
+}
 
 // Extends the `jstests/libs/fixture_helpers.js::mapOnEachShardNode()` function to also process
 // mongos instances from the current test instance. It runs the `func()` function over all the
@@ -70,7 +79,7 @@ function runTest({expectedQueryShapeConfiguration, assertionFunc}) {
 // Expect both the count and the size to be zero, as this is a newly created replica set.
 runTest({
     expectedQueryShapeConfiguration: [],
-    assertionFunc: ({count, size}) => {
+    assertionFunc: ({count, size, rejectCount}) => {
         assert.eq(
             count,
             0,
@@ -79,6 +88,10 @@ runTest({
             size,
             0,
             "`querySettings.size` server status should be 0 if no query settings are present");
+        assert.eq(
+            rejectCount,
+            0,
+            "`querySettings.rejectCount` should be zero before any reject settings are applied.");
     }
 });
 
@@ -87,10 +100,10 @@ let lastSize;
 
 // Insert the bigger entry and verify that the count increases to 1 and that the size is now
 // greater than 0.
-st.adminCommand({setQuerySettings: query, settings: biggerQuerySetting});
+st.adminCommand({setQuerySettings: query, settings: biggerQuerySettings});
 runTest({
     expectedQueryShapeConfiguration:
-        [primaryQSU.makeQueryShapeConfiguration(biggerQuerySetting, query)],
+        [primaryQSU.makeQueryShapeConfiguration(biggerQuerySettings, query)],
     assertionFunc: ({count, size}) => {
         assert.eq(count, 1, "`querySettings.count` server status failed to increase on addition.");
         assert.gt(size, 0, "`querySettings.size` server status failed to increase on addition.");
@@ -100,10 +113,10 @@ runTest({
 
 // Replace the query setting with a smaller one and ensure that the size decreases while the
 // count remains unchanged.
-st.adminCommand({setQuerySettings: query, settings: smallerQuerySetting});
+st.adminCommand({setQuerySettings: query, settings: smallerQuerySettings});
 runTest({
     expectedQueryShapeConfiguration:
-        [primaryQSU.makeQueryShapeConfiguration(smallerQuerySetting, query)],
+        [primaryQSU.makeQueryShapeConfiguration(smallerQuerySettings, query)],
     assertionFunc: ({count, size}) => {
         assert.eq(count,
                   1,
@@ -117,16 +130,10 @@ runTest({
 });
 
 // Restart the cluster and ensure that the metrics remain unchanged.
-st.restartMongoses();
-primaryQSU.db = st.s.getDB(db.getName());  // refresh the db reference so it's possible to later
-                                           // call 'clusterParamRefreshSecs.restore()'
-st.stopAllConfigServers({startClean: false}, /* forRestart*/ true);
-st.restartAllConfigServers();
-st.stopAllShards({startClean: false}, /* forRestart */ true);
-st.restartAllShards();
+restartCluster();
 runTest({
     expectedQueryShapeConfiguration:
-        [primaryQSU.makeQueryShapeConfiguration(smallerQuerySetting, query)],
+        [primaryQSU.makeQueryShapeConfiguration(smallerQuerySettings, query)],
     assertionFunc: ({count, size}) => {
         assert.eq(count,
                   1,
@@ -150,6 +157,55 @@ runTest({
             size, lastSize, "`querySettings.size` server status failed to decrease on deletion.");
     }
 });
-// Reset the 'clusterServerParameterRefreshIntervalSecs' parameter to its initial value.
-clusterParamRefreshSecs.restore();
+
+const rejectQuerySettings = {
+    "reject": true
+};
+const rejectQueryConfig = primaryQSU.makeQueryShapeConfiguration(rejectQuerySettings, query);
+// Set reject=true for the test query.
+st.adminCommand({setQuerySettings: query, settings: rejectQuerySettings});
+
+// Confirm rejectCount was updated.
+runTest({
+    expectedQueryShapeConfiguration: [rejectQueryConfig],
+    assertionFunc: ({rejectCount}) => {
+        assert.eq(
+            rejectCount,
+            1,
+            "`querySettings.rejectCount` should be one after reject has been set for test query.");
+    }
+});
+
+restartCluster();
+
+// Confirm rejectCount persists across restart.
+runTest({
+    expectedQueryShapeConfiguration: [rejectQueryConfig],
+    assertionFunc: ({rejectCount}) => {
+        assert.eq(rejectCount, 1, "`querySettings.rejectCount` should still be one after restart.");
+    }
+});
+
+// Remove settings.
+st.adminCommand({removeQuerySettings: query});
+
+runTest({
+    expectedQueryShapeConfiguration: [],
+    assertionFunc: ({rejectCount}) => {
+        assert.eq(rejectCount,
+                  0,
+                  "`querySettings.rejectCount` should be zero after settings are removed.");
+    }
+});
+
+restartCluster();
+
+// Confirm reject is not accidentally restored after restart.
+runTest({
+    expectedQueryShapeConfiguration: [],
+    assertionFunc: ({rejectCount}) => {
+        assert.eq(rejectCount, 0, "`querySettings.rejectCount` should be zero after restart.");
+    }
+});
+
 st.stop();

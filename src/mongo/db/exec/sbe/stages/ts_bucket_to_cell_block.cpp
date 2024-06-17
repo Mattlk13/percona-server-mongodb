@@ -52,14 +52,19 @@ TsBucketToCellBlockStage::TsBucketToCellBlockStage(
     std::vector<value::CellBlock::PathRequest> pathReqs,
     value::SlotVector blocksOut,
     boost::optional<value::SlotId> metaOut,
+    value::SlotId bitmapOutSlotId,
     const std::string& timeField,
     PlanNodeId nodeId,
     bool participateInTrialRunTracking)
-    : PlanStage("ts_bucket_to_cellblock"_sd, nodeId, participateInTrialRunTracking),
+    : PlanStage("ts_bucket_to_cellblock"_sd,
+                nullptr /* yieldPolicy */,
+                nodeId,
+                participateInTrialRunTracking),
       _bucketSlotId(bucketSlot),
       _pathReqs(pathReqs),
       _blocksOutSlotId(std::move(blocksOut)),
       _metaOutSlotId(metaOut),
+      _bitmapOutSlotId(bitmapOutSlotId),
       _timeField(timeField),
       _pathExtractor(pathReqs, _timeField) {
     _children.emplace_back(std::move(input));
@@ -71,9 +76,10 @@ std::unique_ptr<PlanStage> TsBucketToCellBlockStage::clone() const {
                                                       _pathReqs,
                                                       _blocksOutSlotId,
                                                       _metaOutSlotId,
+                                                      _bitmapOutSlotId,
                                                       _timeField,
                                                       _commonStats.nodeId,
-                                                      _participateInTrialRunTracking);
+                                                      participateInTrialRunTracking());
 }
 
 void TsBucketToCellBlockStage::prepare(CompileCtx& ctx) {
@@ -86,6 +92,10 @@ void TsBucketToCellBlockStage::prepare(CompileCtx& ctx) {
 }
 
 value::SlotAccessor* TsBucketToCellBlockStage::getAccessor(CompileCtx& ctx, value::SlotId slot) {
+    if (slot == _bitmapOutSlotId) {
+        return &_bitmapOutAccessor;
+    }
+
     if (_metaOutSlotId && slot == *_metaOutSlotId) {
         return &_metaOutAccessor;
     }
@@ -116,6 +126,13 @@ PlanState TsBucketToCellBlockStage::getNext() {
     // case it yields as the state will be completely overwritten after the getNext() call.
     disableSlotAccess();
 
+    // Before throwing away the TSBlocks we currently hold onto, count how many of them were
+    // decompressed.
+    for (size_t i = 0; i < _tsBlockStorage.size(); ++i) {
+        _specificStats.numStorageBlocks++;
+        _specificStats.numStorageBlocksDecompressed += _tsBlockStorage[i]->decompressed();
+    }
+
     for (auto& acc : _blocksOutAccessor) {
         acc.reset();
     }
@@ -127,6 +144,8 @@ PlanState TsBucketToCellBlockStage::getNext() {
     state = trackPlanState(state);
 
     initCellBlocks();
+
+    _specificStats.numCellBlocksProduced += _blocksOutAccessor.size();
 
     return state;
 }
@@ -142,11 +161,22 @@ std::unique_ptr<PlanStageStats> TsBucketToCellBlockStage::getStats(bool includeD
     auto ret = std::make_unique<PlanStageStats>(_commonStats);
 
     ret->children.emplace_back(_children[0]->getStats(includeDebugInfo));
+    if (includeDebugInfo) {
+        BSONObjBuilder bob;
+        bob.appendNumber("numCellBlocksProduced",
+                         static_cast<long long>(_specificStats.numCellBlocksProduced));
+        bob.appendNumber("numStorageBlocks",
+                         static_cast<long long>(_specificStats.numStorageBlocks));
+        bob.appendNumber("numStorageBlocksDecompressed",
+                         static_cast<long long>(_specificStats.numStorageBlocksDecompressed));
+
+        ret->debugInfo = bob.obj();
+    }
     return ret;
 }
 
 const SpecificStats* TsBucketToCellBlockStage::getSpecificStats() const {
-    return nullptr;
+    return &_specificStats;
 }
 
 std::vector<DebugPrinter::Block> TsBucketToCellBlockStage::debugPrint() const {
@@ -167,9 +197,12 @@ std::vector<DebugPrinter::Block> TsBucketToCellBlockStage::debugPrint() const {
     ret.emplace_back(DebugPrinter::Block("`]"));
 
     if (_metaOutSlotId) {
+        ret.emplace_back("meta =");
         DebugPrinter::addIdentifier(ret, *_metaOutSlotId);
-        ret.emplace_back("= meta");
     }
+
+    ret.emplace_back("bitmap =");
+    DebugPrinter::addIdentifier(ret, _bitmapOutSlotId);
 
     DebugPrinter::addNewLine(ret);
     DebugPrinter::addBlocks(ret, _children[0]->debugPrint());
@@ -210,7 +243,7 @@ void TsBucketToCellBlockStage::initCellBlocks() {
         _metaOutAccessor.reset(false, metaTag, metaVal);
     }
 
-    auto [tsBlocks, cellBlocks] = _pathExtractor.extractCellBlocks(bucketObj);
+    auto [nMeasurements, tsBlocks, cellBlocks] = _pathExtractor.extractCellBlocks(bucketObj);
     _tsBlockStorage = std::move(tsBlocks);
     invariant(cellBlocks.size() == _blocksOutAccessor.size());
     for (size_t i = 0; i < cellBlocks.size(); ++i) {
@@ -218,5 +251,14 @@ void TsBucketToCellBlockStage::initCellBlocks() {
                                     value::TypeTags::cellBlock,
                                     value::bitcastFrom<value::CellBlock*>(cellBlocks[i].release()));
     }
+
+    // Initialize an all-1s bitset.
+    _bitmapOutAccessor.reset(true,
+                             value::TypeTags::valueBlock,
+                             value::bitcastFrom<value::ValueBlock*>(
+                                 std::make_unique<value::MonoBlock>(nMeasurements,
+                                                                    value::TypeTags::Boolean,
+                                                                    value::bitcastFrom<bool>(true))
+                                     .release()));
 }
 }  // namespace mongo::sbe

@@ -93,9 +93,12 @@ extern "C" {
 #include "mongo/crypto/fle_data_frames.h"
 #include "mongo/crypto/fle_field_schema_gen.h"
 #include "mongo/crypto/fle_fields_util.h"
+#include "mongo/crypto/fle_numeric.h"
+#include "mongo/crypto/fle_tokens_gen.h"
 #include "mongo/crypto/sha256_block.h"
 #include "mongo/db/basic_types.h"
 #include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
@@ -105,7 +108,6 @@ extern "C" {
 #include "mongo/platform/random.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/stdx/unordered_set.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/str.h"
@@ -124,6 +126,8 @@ extern "C" {
 #ifdef FLE2_DEBUG_STATE_COLLECTIONS
 static_assert(kDebugBuild == 1, "Only use in debug builds");
 #endif
+
+using namespace fmt::literals;
 
 namespace mongo {
 
@@ -149,6 +153,13 @@ constexpr uint64_t kTwiceDerivedTokenFromECCValue = 2;
 constexpr uint64_t kServerCountAndContentionFactorEncryption = 1;
 constexpr uint64_t kServerZerosEncryption = 2;
 
+// "d" value in: S^esc_f_d = Fs[f,1,2,d]; where d = 17 octets of 0
+constexpr char kAnchorPaddingTokenDVal[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+static_assert(sizeof(kAnchorPaddingTokenDVal) == 17);
+
+constexpr uint64_t kAnchorPaddingKeyToken = 1;
+constexpr uint64_t kAnchorPaddingValueToken = 2;
+
 constexpr int32_t kEncryptionInformationSchemaVersion = 1;
 
 constexpr auto kECCNullId = 0;
@@ -164,6 +175,7 @@ constexpr uint64_t kESCompactionRecordValue = std::numeric_limits<uint64_t>::max
 constexpr uint64_t kESCAnchorId = 0;
 constexpr uint64_t kESCNullAnchorPosition = 0;
 constexpr uint64_t kESCNonNullAnchorValuePrefix = 0;
+constexpr uint64_t kESCPaddingId = 0;
 
 constexpr auto kId = "_id";
 constexpr auto kValue = "value";
@@ -177,10 +189,6 @@ constexpr auto kDollarIn = "$in";
 constexpr auto kEncryptedFields = "encryptedFields";
 
 constexpr size_t kHmacKeyOffset = 64;
-
-constexpr boost::multiprecision::uint128_t k1(1);
-constexpr boost::multiprecision::int128_t k10(10);
-constexpr boost::multiprecision::uint128_t k10ui(10);
 
 #ifdef FLE2_DEBUG_STATE_COLLECTIONS
 constexpr auto kDebugId = "_debug_id";
@@ -905,7 +913,7 @@ FLE2InsertUpdatePayloadV2 EDCClientPayload::serializeInsertUpdatePayloadV2(
     iupayload.setServerDerivedFromDataToken(serverDerivedFromDataToken.toCDR());
 
     auto swEncryptedTokens =
-        EncryptedStateCollectionTokensV2(escDataCounterToken).serialize(ecocToken);
+        EncryptedStateCollectionTokensV2(escDataCounterToken, boost::none).serialize(ecocToken);
     uassertStatusOK(swEncryptedTokens);
     iupayload.setEncryptedTokens(swEncryptedTokens.getValue());
 
@@ -923,6 +931,7 @@ std::unique_ptr<Edges> getEdges(FLE2RangeInsertSpec spec, int sparsity) {
     auto element = spec.getValue().getElement();
     auto minBound = spec.getMinBound().map([](IDLAnyType m) { return m.getElement(); });
     auto maxBound = spec.getMaxBound().map([](IDLAnyType m) { return m.getElement(); });
+    auto trimFactor = spec.getTrimFactor() ? spec.getTrimFactor().value() : 0;
 
     switch (element.type()) {
         case BSONType::NumberInt:
@@ -935,7 +944,8 @@ std::unique_ptr<Edges> getEdges(FLE2RangeInsertSpec spec, int sparsity) {
             return getEdgesInt32(element.Int(),
                                  minBound.map([](BSONElement m) { return m.Int(); }),
                                  maxBound.map([](BSONElement m) { return m.Int(); }),
-                                 sparsity);
+                                 sparsity,
+                                 trimFactor);
 
         case BSONType::NumberLong:
             uassert(6775503,
@@ -947,7 +957,8 @@ std::unique_ptr<Edges> getEdges(FLE2RangeInsertSpec spec, int sparsity) {
             return getEdgesInt64(element.Long(),
                                  minBound.map([](BSONElement m) { return int64_t(m.Long()); }),
                                  maxBound.map([](BSONElement m) { return int64_t(m.Long()); }),
-                                 sparsity);
+                                 sparsity,
+                                 trimFactor);
 
         case BSONType::Date:
             uassert(6775505,
@@ -959,7 +970,8 @@ std::unique_ptr<Edges> getEdges(FLE2RangeInsertSpec spec, int sparsity) {
             return getEdgesInt64(element.Date().asInt64(),
                                  minBound.map([](BSONElement m) { return m.Date().asInt64(); }),
                                  maxBound.map([](BSONElement m) { return m.Date().asInt64(); }),
-                                 sparsity);
+                                 sparsity,
+                                 trimFactor);
 
         case BSONType::NumberDouble:
             uassert(6775507,
@@ -973,7 +985,8 @@ std::unique_ptr<Edges> getEdges(FLE2RangeInsertSpec spec, int sparsity) {
                 minBound.map([](BSONElement m) { return m.Double(); }),
                 maxBound.map([](BSONElement m) { return m.Double(); }),
                 spec.getPrecision().map([](std::int32_t m) { return static_cast<uint32_t>(m); }),
-                sparsity);
+                sparsity,
+                trimFactor);
 
         case BSONType::NumberDecimal:
             uassert(6775509,
@@ -987,7 +1000,8 @@ std::unique_ptr<Edges> getEdges(FLE2RangeInsertSpec spec, int sparsity) {
                 minBound.map([](BSONElement m) { return m.numberDecimal(); }),
                 maxBound.map([](BSONElement m) { return m.numberDecimal(); }),
                 spec.getPrecision().map([](std::int32_t m) { return static_cast<uint32_t>(m); }),
-                sparsity);
+                sparsity,
+                trimFactor);
 
         default:
             uassert(6775500, "must use supported FLE2 range type", false);
@@ -1033,8 +1047,9 @@ std::vector<EdgeTokenSetV2> getEdgeTokenSet(
         ets.setEscDerivedToken(escDataCounterkey.toCDR());
         ets.setServerDerivedFromDataToken(serverDatakey.toCDR());
 
+        const bool isLeaf = edge == edges->getLeaf();
         auto swEncryptedTokens =
-            EncryptedStateCollectionTokensV2(escDataCounterkey).serialize(ecocToken);
+            EncryptedStateCollectionTokensV2(escDataCounterkey, isLeaf).serialize(ecocToken);
         uassertStatusOK(swEncryptedTokens);
         ets.setEncryptedTokens(swEncryptedTokens.getValue());
 
@@ -1086,8 +1101,8 @@ FLE2InsertUpdatePayloadV2 EDCClientPayload::serializeInsertUpdatePayloadV2ForRan
     iupayload.setServerEncryptionToken(serverEncryptToken.toCDR());
     iupayload.setServerDerivedFromDataToken(serverDerivedFromDataToken.toCDR());
 
-    auto swEncryptedTokens =
-        EncryptedStateCollectionTokensV2(escDataCounterkey).serialize(ecocToken);
+    auto swEncryptedTokens = EncryptedStateCollectionTokensV2(escDataCounterkey, false /* isLeaf */)
+                                 .serialize(ecocToken);
     uassertStatusOK(swEncryptedTokens);
     iupayload.setEncryptedTokens(swEncryptedTokens.getValue());
 
@@ -1679,18 +1694,6 @@ std::string toBinaryString(T v) {
     return str;
 }
 
-boost::multiprecision::int128_t exp10(int x) {
-    return pow(k10, x);
-}
-
-boost::multiprecision::uint128_t exp10ui128(int x) {
-    return pow(k10ui, x);
-}
-
-double exp10Double(int x) {
-    return pow(10, x);
-}
-
 void mongocryptLogHandler(mongocrypt_log_level_t level,
                           const char* message,
                           uint32_t message_len,
@@ -1855,8 +1858,23 @@ FLEEdgeCountInfo getEdgeCountInfoForCleanup(const FLEStateCollectionReader& read
                                             ConstDataRange tag) {
     auto escToken = EDCServerPayloadInfo::getESCToken(tag);
 
+    // This method is overloaded to provide edge counts for both "real" tokens based on
+    // FLETwiceDerivedToken and range query padding tokens based on AnchorPaddingRootToken. In both
+    // cases, the tag/key token is derived via F(Root, 1) while the value token is derived via
+    // F(Root, 2), therefore we can treat the subderivate tokens equivalently prodived the correct
+    // root token is passed. The dassert() statements below guard this assumption.
+
     auto tagToken = FLETwiceDerivedTokenGenerator::generateESCTwiceDerivedTagToken(escToken);
+    dassert(tagToken.data ==
+            FLEAnchorPaddingDerivedGenerator::generateAnchorPaddingKeyToken(
+                AnchorPaddingRootToken(escToken.data))
+                .data);
+
     auto valueToken = FLETwiceDerivedTokenGenerator::generateESCTwiceDerivedValueToken(escToken);
+    dassert(valueToken.data ==
+            FLEAnchorPaddingDerivedGenerator::generateAnchorPaddingValueToken(
+                AnchorPaddingRootToken(escToken.data))
+                .data);
 
     // step (C)
     // positions.cpos is a_1
@@ -2034,6 +2052,8 @@ std::vector<std::string> getMinCover(const FLE2RangeFindSpec& spec, uint8_t spar
     auto includeLowerBound = edgesInfo.getLbIncluded();
     auto includeUpperBound = edgesInfo.getUbIncluded();
 
+    auto trimFactor = edgesInfo.getTrimFactor().value_or(0);
+
     // Open-ended ranges are represented with infinity as the other endpoint. Resolve infinite
     // bounds at this point to end at the min or max for this index.
     if (isInfinite(lowerBound)) {
@@ -2054,7 +2074,8 @@ std::vector<std::string> getMinCover(const FLE2RangeFindSpec& spec, uint8_t spar
                                  includeUpperBound,
                                  indexMin.Int(),
                                  indexMax.Int(),
-                                 sparsity);
+                                 sparsity,
+                                 trimFactor);
         case NumberLong:
             return minCoverInt64(lowerBound.safeNumberLong(),
                                  includeLowerBound,
@@ -2062,7 +2083,8 @@ std::vector<std::string> getMinCover(const FLE2RangeFindSpec& spec, uint8_t spar
                                  includeUpperBound,
                                  indexMin.Long(),
                                  indexMax.Long(),
-                                 sparsity);
+                                 sparsity,
+                                 trimFactor);
         case Date:
             return minCoverInt64(lowerBound.Date().asInt64(),
                                  includeLowerBound,
@@ -2070,7 +2092,8 @@ std::vector<std::string> getMinCover(const FLE2RangeFindSpec& spec, uint8_t spar
                                  includeUpperBound,
                                  indexMin.Date().asInt64(),
                                  indexMax.Date().asInt64(),
-                                 sparsity);
+                                 sparsity,
+                                 trimFactor);
         case NumberDouble:
             return minCoverDouble(lowerBound.numberDouble(),
                                   includeLowerBound,
@@ -2080,8 +2103,8 @@ std::vector<std::string> getMinCover(const FLE2RangeFindSpec& spec, uint8_t spar
                                   indexMax.numberDouble(),
                                   edgesInfo.getPrecision().map(
                                       [](std::int32_t m) { return static_cast<uint32_t>(m); }),
-
-                                  sparsity);
+                                  sparsity,
+                                  trimFactor);
         case NumberDecimal:
             return minCoverDecimal128(lowerBound.numberDecimal(),
                                       includeLowerBound,
@@ -2091,8 +2114,8 @@ std::vector<std::string> getMinCover(const FLE2RangeFindSpec& spec, uint8_t spar
                                       indexMax.numberDecimal(),
                                       edgesInfo.getPrecision().map(
                                           [](std::int32_t m) { return static_cast<uint32_t>(m); }),
-
-                                      sparsity);
+                                      sparsity,
+                                      trimFactor);
         default:
             // IDL validates that no other type is permitted.
             MONGO_UNREACHABLE_TASSERT(6901302);
@@ -2272,6 +2295,20 @@ FLEServerMetadataEncryptionTokenGenerator::generateServerZerosEncryptionToken(
     return FLEUtil::prf(token.data, kServerZerosEncryption);
 }
 
+AnchorPaddingRootToken FLEAnchorPaddingGenerator::generateAnchorPaddingRootToken(ESCToken token) {
+    return FLEUtil::prf(token.data, ConstDataRange(kAnchorPaddingTokenDVal));
+}
+
+AnchorPaddingKeyToken FLEAnchorPaddingDerivedGenerator::generateAnchorPaddingKeyToken(
+    AnchorPaddingRootToken token) {
+    return FLEUtil::prf(token.data, kAnchorPaddingKeyToken);
+}
+
+AnchorPaddingValueToken FLEAnchorPaddingDerivedGenerator::generateAnchorPaddingValueToken(
+    AnchorPaddingRootToken token) {
+    return FLEUtil::prf(token.data, kAnchorPaddingValueToken);
+}
+
 StatusWith<EncryptedStateCollectionTokens> EncryptedStateCollectionTokens::decryptAndParse(
     ECOCToken token, ConstDataRange cdr) {
     auto swUnpack = decryptAndUnpack<PrfBlock, PrfBlock>(cdr, token);
@@ -2294,6 +2331,17 @@ StatusWith<std::vector<uint8_t>> EncryptedStateCollectionTokens::serialize(ECOCT
 StatusWith<EncryptedStateCollectionTokensV2> EncryptedStateCollectionTokensV2::decryptAndParse(
     ECOCToken token, ConstDataRange cdr) {
 
+    // Ciphertext encodes precisely one PrfBlock (ESC) plus an optional octet for isLeaf.
+    constexpr std::size_t kCipherLengthESCOnly = crypto::aesCTRIVSize + sizeof(PrfBlock);
+    constexpr std::size_t kCipherLengthESCAndLeafFlag = kCipherLengthESCOnly + 1;
+    const bool expectLeaf = cdr.length() == kCipherLengthESCAndLeafFlag;
+    if (!expectLeaf && (cdr.length() != kCipherLengthESCOnly)) {
+        return Status(
+            ErrorCodes::BadValue,
+            "Invalid ciphertext for ESCTokensV2, length should be {} or {}, got {}"_format(
+                kCipherLengthESCOnly, kCipherLengthESCAndLeafFlag, cdr.length()));
+    }
+
     auto swVec = FLEUtil::decryptData(token.toCDR(), cdr);
     if (!swVec.isOK()) {
         return swVec.getStatus();
@@ -2306,13 +2354,39 @@ StatusWith<EncryptedStateCollectionTokensV2> EncryptedStateCollectionTokensV2::d
     if (!swToken.isOK()) {
         return swToken.getStatus();
     }
-
     auto escToken = ESCDerivedFromDataTokenAndContentionFactorToken(swToken.getValue());
-    return EncryptedStateCollectionTokensV2(std::move(escToken));
+
+    boost::optional<bool> isLeaf;
+    if (expectLeaf) {
+        auto swLeaf = cdrc.readAndAdvanceNoThrow<uint8_t>();
+        if (!swLeaf.isOK()) {
+            // Should be impossible given expectLeaf length check above.
+            return swLeaf.getStatus().withContext("Unable to read ESCTokensV2::isLeaf");
+        }
+        auto leafVal = std::move(swLeaf.getValue());
+        if ((leafVal != 0) && (leafVal != 1)) {
+            return Status(ErrorCodes::BadValue,
+                          "Invalid value for ESCTokensV2 leaf tag {}"_format(leafVal));
+        }
+
+        isLeaf = !!leafVal;
+    }
+
+    return EncryptedStateCollectionTokensV2(std::move(escToken), isLeaf);
 }
 
 StatusWith<std::vector<uint8_t>> EncryptedStateCollectionTokensV2::serialize(ECOCToken token) {
-    return encryptData(token.toCDR(), esc.toCDR());
+    if (isLeaf) {
+        // Range
+        auto escCDR = esc.toCDR();
+        DataBuilder builder(escCDR.length() + 1);
+        uassertStatusOK(builder.writeAndAdvance(escCDR));
+        uassertStatusOK(builder.writeAndAdvance(*isLeaf));
+        return encryptData(token.toCDR(), builder.getCursor());
+    } else {
+        // Equality
+        return encryptData(token.toCDR(), esc.toCDR());
+    }
 }
 
 FLEKeyVault::~FLEKeyVault() {}
@@ -2346,8 +2420,26 @@ BSONObj FLEClientCrypto::generateCompactionTokens(const EncryptedFieldConfig& cf
         auto collToken = FLELevel1TokenGenerator::generateCollectionsLevel1Token(indexKey.key);
         auto ecocToken = FLECollectionTokenGenerator::generateECOCToken(collToken);
         auto tokenCdr = ecocToken.toCDR();
-        tokensBuilder.appendBinData(
-            field.getPath(), tokenCdr.length(), BinDataType::BinDataGeneral, tokenCdr.data());
+        if (hasQueryType(field, QueryTypeEnum::RangePreviewDeprecated) ||
+            hasQueryType(field, QueryTypeEnum::Range)) {
+            BSONObjBuilder token(tokensBuilder.subobjStart(field.getPath()));
+            token.appendBinData(CompactionTokenDoc::kECOCTokenFieldName,
+                                tokenCdr.length(),
+                                BinDataType::BinDataGeneral,
+                                tokenCdr.data());
+
+            auto escToken = FLECollectionTokenGenerator::generateESCToken(collToken);
+            auto paddingToken = FLEAnchorPaddingGenerator::generateAnchorPaddingRootToken(escToken);
+            auto paddingCdr = paddingToken.toCDR();
+            token.appendBinData(CompactionTokenDoc::kAnchorPaddingTokenFieldName,
+                                paddingCdr.length(),
+                                BinDataType::BinDataGeneral,
+                                paddingCdr.data());
+        } else {
+            // Equality
+            tokensBuilder.appendBinData(
+                field.getPath(), tokenCdr.length(), BinDataType::BinDataGeneral, tokenCdr.data());
+        }
     }
     return tokensBuilder.obj();
 }
@@ -2382,94 +2474,7 @@ void FLEClientCrypto::validateTagsArray(const BSONObj& doc) {
         6371507, str::stream() << kSafeContent << " must be an array", safeContent.type() == Array);
 }
 
-void FLEClientCrypto::validateDocument(const BSONObj& doc,
-                                       const EncryptedFieldConfig& efc,
-                                       FLEKeyVault* keyVault) {
-    stdx::unordered_map<std::string, ConstDataRange> validateFields;
-
-    visitEncryptedBSON(doc, [&validateFields](ConstDataRange cdr, StringData fieldPath) {
-        collectFieldValidationInfo(&validateFields, cdr, fieldPath);
-    });
-
-    auto configMap = toFieldMap(efc);
-
-    stdx::unordered_map<PrfBlock, std::string> tags;
-
-    // Ensure all encrypted fields are in EncryptedFieldConfig
-    // It is ok for fields to be in EncryptedFieldConfig but not present
-    for (const auto& field : validateFields) {
-        auto configField = configMap.find(field.first);
-        uassert(6371508,
-                str::stream() << "Field '" << field.first
-                              << "' is encrypted by not marked as an encryptedField",
-                configField != configMap.end());
-
-        auto [encryptedTypeBinding, subCdr] = fromEncryptedConstDataRange(field.second);
-
-        if (configField->second.getQueries().has_value()) {
-            if (hasQueryType(configField->second, QueryTypeEnum::Equality)) {
-                uassert(7293205,
-                        str::stream() << "Field '" << field.first
-                                      << "' is marked as equality but not indexed",
-                        encryptedTypeBinding == EncryptedBinDataType::kFLE2EqualityIndexedValueV2);
-
-                auto swTag = FLE2IndexedEqualityEncryptedValueV2::parseMetadataBlockTag(subCdr);
-                uassertStatusOK(swTag.getStatus());
-                tags.insert({swTag.getValue(), field.first});
-            } else if (hasQueryType(configField->second, QueryTypeEnum::RangePreview)) {
-                uassert(7293206,
-                        str::stream()
-                            << "Field '" << field.first << "' is marked as range but not indexed",
-                        encryptedTypeBinding == EncryptedBinDataType::kFLE2RangeIndexedValueV2);
-
-                auto swTags = FLE2IndexedRangeEncryptedValueV2::parseMetadataBlockTags(subCdr);
-                uassertStatusOK(swTags.getStatus());
-                for (const auto& tag : swTags.getValue()) {
-                    tags.insert({tag, field.first});
-                }
-            }
-        } else {
-            uassert(7293207,
-                    str::stream() << "Field '" << field.first << "' must be marked unindexed",
-                    encryptedTypeBinding == EncryptedBinDataType::kFLE2UnindexedEncryptedValueV2);
-        }
-    }
-
-    BSONElement safeContent = doc[kSafeContent];
-
-    // If there are no tags and no safeContent, then this document is not Queryable Encryption and
-    // is therefore fine
-    if (tags.size() == 0 && safeContent.eoo()) {
-        return;
-    }
-
-    validateTagsArray(doc);
-
-    size_t count = 0;
-    for (const auto& element : safeContent.Obj()) {
-        uassert(6371515,
-                str::stream() << "Field'" << element.fieldNameStringData()
-                              << "' must be a bindata and general subtype",
-                element.isBinData(BinDataType::BinDataGeneral));
-
-        auto vec = element._binDataVector();
-        auto block = PrfBlockfromCDR(vec);
-
-        uassert(6371510,
-                str::stream() << "Missing tag for encrypted indexed field '"
-                              << element.fieldNameStringData() << "'",
-                tags.count(block) == 1);
-
-        ++count;
-    }
-
-    uassert(6371516,
-            str::stream() << "Mismatch in expected count of tags, Expected: '" << tags.size()
-                          << "', Actual: '" << count << "'",
-            count == tags.size());
-}
-
-PrfBlock ESCCollection::generateId(ESCTwiceDerivedTagToken tagToken,
+PrfBlock ESCCollection::generateId(const ESCTwiceDerivedTagToken& tagToken,
                                    boost::optional<uint64_t> index) {
     if (index.has_value()) {
         return prf(tagToken.data, kESCNonNullId, index.value());
@@ -2483,19 +2488,22 @@ PrfBlock ESCCollection::generateNonAnchorId(const ESCTwiceDerivedTagToken& tagTo
     return FLEUtil::prf(tagToken.data, cpos);
 }
 
-PrfBlock ESCCollection::generateAnchorId(const ESCTwiceDerivedTagToken& tagToken, uint64_t apos) {
+template <class TagToken, class ValueToken>
+PrfBlock ESCCollectionCommon<TagToken, ValueToken>::generateAnchorId(const TagToken& tagToken,
+                                                                     uint64_t apos) {
     return prf(tagToken.data, kESCAnchorId, apos);
 }
 
-PrfBlock ESCCollection::generateNullAnchorId(const ESCTwiceDerivedTagToken& tagToken) {
-    return ESCCollection::generateAnchorId(tagToken, kESCNullAnchorPosition);
+template <class TagToken, class ValueToken>
+PrfBlock ESCCollectionCommon<TagToken, ValueToken>::generateNullAnchorId(const TagToken& tagToken) {
+    return generateAnchorId(tagToken, kESCNullAnchorPosition);
 }
 
-BSONObj ESCCollection::generateNullDocument(ESCTwiceDerivedTagToken tagToken,
-                                            ESCTwiceDerivedValueToken valueToken,
+BSONObj ESCCollection::generateNullDocument(const ESCTwiceDerivedTagToken& tagToken,
+                                            const ESCTwiceDerivedValueToken& valueToken,
                                             uint64_t pos,
                                             uint64_t count) {
-    auto block = ESCCollection::generateId(tagToken, boost::none);
+    auto block = generateId(tagToken, boost::none);
 
     auto swCipherText = packAndEncrypt(std::tie(pos, count), valueToken);
     uassertStatusOK(swCipherText);
@@ -2512,12 +2520,35 @@ BSONObj ESCCollection::generateNullDocument(ESCTwiceDerivedTagToken tagToken,
     return builder.obj();
 }
 
+PrfBlock ESCCollectionAnchorPadding::generateAnchorId(const AnchorPaddingKeyToken& keyToken,
+                                                      uint64_t apos) {
+    return prf(keyToken.data, kESCPaddingId, apos);
+}
 
-BSONObj ESCCollection::generateInsertDocument(ESCTwiceDerivedTagToken tagToken,
-                                              ESCTwiceDerivedValueToken valueToken,
+BSONObj ESCCollectionAnchorPadding::generatePaddingDocument(
+    const AnchorPaddingKeyToken& keyToken, const AnchorPaddingValueToken& valueToken, uint64_t id) {
+    auto block = generateAnchorId(keyToken, id);
+
+    constexpr uint64_t dummy{0};
+    auto cipherText = uassertStatusOK(packAndEncrypt(std::tie(dummy, dummy), valueToken));
+
+    BSONObjBuilder builder;
+    toBinData(kId, block, &builder);
+    toBinData(kValue, cipherText, &builder);
+#ifdef FLE2_DEBUG_STATE_COLLECTIONS
+    builder.append(kDebugId, "NULL DOC({})"_format(id));
+    builder.append(kDebugValuePosition, 0);
+    builder.append(kDebugValueCount, 0);
+#endif
+
+    return builder.obj();
+}
+
+BSONObj ESCCollection::generateInsertDocument(const ESCTwiceDerivedTagToken& tagToken,
+                                              const ESCTwiceDerivedValueToken& valueToken,
                                               uint64_t index,
                                               uint64_t count) {
-    auto block = ESCCollection::generateId(tagToken, index);
+    auto block = generateId(tagToken, index);
 
     auto swCipherText = packAndEncrypt(std::tie(KESCInsertRecordValue, count), valueToken);
     uassertStatusOK(swCipherText);
@@ -2533,11 +2564,12 @@ BSONObj ESCCollection::generateInsertDocument(ESCTwiceDerivedTagToken tagToken,
     return builder.obj();
 }
 
-BSONObj ESCCollection::generateCompactionPlaceholderDocument(ESCTwiceDerivedTagToken tagToken,
-                                                             ESCTwiceDerivedValueToken valueToken,
-                                                             uint64_t index,
-                                                             uint64_t count) {
-    auto block = ESCCollection::generateId(tagToken, index);
+BSONObj ESCCollection::generateCompactionPlaceholderDocument(
+    const ESCTwiceDerivedTagToken& tagToken,
+    const ESCTwiceDerivedValueToken& valueToken,
+    uint64_t index,
+    uint64_t count) {
+    auto block = generateId(tagToken, index);
 
     auto swCipherText = packAndEncrypt(std::tie(kESCompactionRecordValue, count), valueToken);
     uassertStatusOK(swCipherText);
@@ -2551,7 +2583,7 @@ BSONObj ESCCollection::generateCompactionPlaceholderDocument(ESCTwiceDerivedTagT
 
 BSONObj ESCCollection::generateNonAnchorDocument(const ESCTwiceDerivedTagToken& tagToken,
                                                  uint64_t cpos) {
-    auto block = ESCCollection::generateNonAnchorId(tagToken, cpos);
+    auto block = generateNonAnchorId(tagToken, cpos);
     BSONObjBuilder builder;
     toBinData(kId, block, &builder);
     return builder.obj();
@@ -2561,7 +2593,7 @@ BSONObj ESCCollection::generateAnchorDocument(const ESCTwiceDerivedTagToken& tag
                                               const ESCTwiceDerivedValueToken& valueToken,
                                               uint64_t apos,
                                               uint64_t cpos) {
-    auto block = ESCCollection::generateAnchorId(tagToken, apos);
+    auto block = generateAnchorId(tagToken, apos);
 
     auto swCipherText = packAndEncrypt(std::tie(kESCNonNullAnchorValuePrefix, cpos), valueToken);
     uassertStatusOK(swCipherText);
@@ -2576,7 +2608,7 @@ BSONObj ESCCollection::generateNullAnchorDocument(const ESCTwiceDerivedTagToken&
                                                   const ESCTwiceDerivedValueToken& valueToken,
                                                   uint64_t apos,
                                                   uint64_t cpos) {
-    auto block = ESCCollection::generateNullAnchorId(tagToken);
+    auto block = generateNullAnchorId(tagToken);
 
     auto swCipherText = packAndEncrypt(std::tie(apos, cpos), valueToken);
     uassertStatusOK(swCipherText);
@@ -2587,13 +2619,33 @@ BSONObj ESCCollection::generateNullAnchorDocument(const ESCTwiceDerivedTagToken&
     return builder.obj();
 }
 
-StatusWith<ESCNullDocument> ESCCollection::decryptNullDocument(ESCTwiceDerivedValueToken valueToken,
-                                                               BSONObj& doc) {
-    return ESCCollection::decryptNullDocument(valueToken, std::move(doc));
+PrfBlock ESCCollectionAnchorPadding::generateNullAnchorId(const AnchorPaddingKeyToken& keyToken) {
+    return prf(keyToken.data, kESCPaddingId, 0);
 }
 
-StatusWith<ESCNullDocument> ESCCollection::decryptNullDocument(ESCTwiceDerivedValueToken valueToken,
-                                                               BSONObj&& doc) {
+BSONObj ESCCollectionAnchorPadding::generateNullAnchorDocument(
+    const AnchorPaddingKeyToken& keyToken,
+    const AnchorPaddingValueToken& valueToken,
+    uint64_t apos,
+    uint64_t /* cpos */) {
+    auto block = generateNullAnchorId(keyToken);
+
+    constexpr uint64_t ignored{0};
+    auto cipherText = uassertStatusOK(packAndEncrypt(std::tie(apos, ignored), valueToken));
+
+    BSONObjBuilder builder;
+    toBinData(kId, block, &builder);
+    toBinData(kValue, cipherText, &builder);
+    return builder.obj();
+}
+
+StatusWith<ESCNullDocument> ESCCollection::decryptNullDocument(
+    const ESCTwiceDerivedValueToken& valueToken, BSONObj& doc) {
+    return decryptNullDocument(valueToken, std::move(doc));
+}
+
+StatusWith<ESCNullDocument> ESCCollection::decryptNullDocument(
+    const ESCTwiceDerivedValueToken& valueToken, BSONObj&& doc) {
     BSONElement encryptedValue;
     auto status = bsonExtractTypedField(doc, kValue, BinData, &encryptedValue);
     if (!status.isOK()) {
@@ -2611,13 +2663,15 @@ StatusWith<ESCNullDocument> ESCCollection::decryptNullDocument(ESCTwiceDerivedVa
     return ESCNullDocument{std::get<0>(value), std::get<1>(value)};
 }
 
-StatusWith<ESCDocument> ESCCollection::decryptDocument(ESCTwiceDerivedValueToken valueToken,
-                                                       BSONObj& doc) {
-    return ESCCollection::decryptDocument(valueToken, std::move(doc));
+template <class TagToken, class ValueToken>
+StatusWith<ESCDocument> ESCCollectionCommon<TagToken, ValueToken>::decryptDocument(
+    const ValueToken& valueToken, BSONObj& doc) {
+    return decryptDocument(valueToken, std::move(doc));
 }
 
-StatusWith<ESCDocument> ESCCollection::decryptDocument(ESCTwiceDerivedValueToken valueToken,
-                                                       BSONObj&& doc) {
+template <class TagToken, class ValueToken>
+StatusWith<ESCDocument> ESCCollectionCommon<TagToken, ValueToken>::decryptDocument(
+    const ValueToken& valueToken, BSONObj&& doc) {
     BSONElement encryptedValue;
     auto status = bsonExtractTypedField(doc, kValue, BinData, &encryptedValue);
     if (!status.isOK()) {
@@ -2638,12 +2692,12 @@ StatusWith<ESCDocument> ESCCollection::decryptDocument(ESCTwiceDerivedValueToken
 
 StatusWith<ESCDocument> ESCCollection::decryptAnchorDocument(
     const ESCTwiceDerivedValueToken& valueToken, BSONObj& doc) {
-    return ESCCollection::decryptDocument(valueToken, doc);
+    return decryptDocument(valueToken, doc);
 }
 
 boost::optional<uint64_t> ESCCollection::emuBinary(const FLEStateCollectionReader& reader,
-                                                   ESCTwiceDerivedTagToken tagToken,
-                                                   ESCTwiceDerivedValueToken valueToken) {
+                                                   const ESCTwiceDerivedTagToken& tagToken,
+                                                   const ESCTwiceDerivedValueToken& valueToken) {
     return emuBinaryCommon<ESCCollection, ESCTwiceDerivedTagToken, ESCTwiceDerivedValueToken>(
         reader, tagToken, valueToken);
 }
@@ -2719,27 +2773,28 @@ EmuBinaryResult ESCCollection::emuBinaryV2(const FLEStateCollectionReader& reade
                                            const ESCTwiceDerivedValueToken& valueToken) {
     auto tracker = FLEStatusSection::get().makeEmuBinaryTracker();
 
-    auto x = ESCCollection::anchorBinaryHops(reader, tagToken, valueToken, tracker);
-    auto i = ESCCollection::binaryHops(reader, tagToken, valueToken, x, tracker);
+    auto x = anchorBinaryHops(reader, tagToken, valueToken, tracker);
+    auto i = binaryHops(reader, tagToken, valueToken, x, tracker);
     return EmuBinaryResult{i, x};
 }
 
-boost::optional<uint64_t> ESCCollection::anchorBinaryHops(
+template <class TagToken, class ValueToken>
+boost::optional<uint64_t> ESCCollectionCommon<TagToken, ValueToken>::anchorBinaryHops(
     const FLEStateCollectionReader& reader,
-    const ESCTwiceDerivedTagToken& tagToken,
-    const ESCTwiceDerivedValueToken& valueToken,
+    const TagToken& tagToken,
+    const ValueToken& valueToken,
     FLEStatusSection::EmuBinaryTracker& tracker) {
 
     uint64_t lambda;
     boost::optional<uint64_t> x;
 
     // 1. find null anchor
-    PrfBlock nullAnchorId = ESCCollection::generateNullAnchorId(tagToken);
+    PrfBlock nullAnchorId = generateNullAnchorId(tagToken);
     BSONObj nullAnchorDoc = reader.getById(nullAnchorId);
 
     // 2. case: null anchor exists
     if (!nullAnchorDoc.isEmpty()) {
-        auto swAnchor = ESCCollection::decryptDocument(valueToken, nullAnchorDoc);
+        auto swAnchor = decryptDocument(valueToken, nullAnchorDoc);
         uassertStatusOK(swAnchor.getStatus());
         lambda = swAnchor.getValue().position;
         x = boost::none;
@@ -2755,7 +2810,7 @@ boost::optional<uint64_t> ESCCollection::anchorBinaryHops(
 
     // 5-8. perform binary searches
     auto idGenerator = [&tagToken](uint64_t value) -> PrfBlock {
-        return ESCCollection::generateAnchorId(tagToken, value);
+        return generateAnchorId(tagToken, value);
     };
 
 #ifdef DEBUG_ENUM_BINARY
@@ -2781,12 +2836,11 @@ boost::optional<uint64_t> ESCCollection::binaryHops(const FLEStateCollectionRead
         i = 0;
         lambda = 0;
     } else {
-        auto id = x.has_value() ? ESCCollection::generateAnchorId(tagToken, *x)
-                                : ESCCollection::generateNullAnchorId(tagToken);
+        auto id = x.has_value() ? generateAnchorId(tagToken, *x) : generateNullAnchorId(tagToken);
         auto doc = reader.getById(id);
         uassert(7291501, "ESC anchor document not found", !doc.isEmpty());
 
-        auto swAnchor = ESCCollection::decryptDocument(valueToken, doc);
+        auto swAnchor = decryptDocument(valueToken, doc);
         uassertStatusOK(swAnchor.getStatus());
         lambda = swAnchor.getValue().count;
         i = boost::none;
@@ -2799,7 +2853,7 @@ boost::optional<uint64_t> ESCCollection::binaryHops(const FLEStateCollectionRead
     }
 
     auto idGenerator = [&tagToken](uint64_t value) -> PrfBlock {
-        return ESCCollection::generateNonAnchorId(tagToken, value);
+        return generateNonAnchorId(tagToken, value);
     };
 
 #ifdef DEBUG_ENUM_BINARY
@@ -3079,6 +3133,7 @@ ECOCCompactionDocumentV2 ECOCCollection::parseAndDecryptV2(const BSONObj& doc, E
     ECOCCompactionDocumentV2 ret;
     ret.fieldName = ecocDoc.getFieldName().toString();
     ret.esc = keys.esc;
+    ret.isLeaf = keys.isLeaf;
     return ret;
 }
 
@@ -4003,7 +4058,8 @@ BSONObj EncryptionInformationHelpers::encryptionInformationSerialize(
     EncryptionInformation ei;
     ei.setType(kEncryptionInformationSchemaVersion);
 
-    // Do not include tenant id in nss in the schema as the command request has "$tenant".
+    // Do not include tenant id in nss in the schema as the command request has unsigned security
+    // token.
     ei.setSchema(BSON(nss.serializeWithoutTenantPrefix_UNSAFE() << encryptedFields));
 
     return ei.toBSON();
@@ -4013,7 +4069,8 @@ EncryptedFieldConfig EncryptionInformationHelpers::getAndValidateSchema(
     const NamespaceString& nss, const EncryptionInformation& ei) {
     BSONObj schema = ei.getSchema();
 
-    // Do not include tenant id in nss in the schema as the command request has "$tenant".
+    // Do not include tenant id in nss in the schema as the command request has unsigned security
+    // token.
     auto element = schema.getField(nss.serializeWithoutTenantPrefix_UNSAFE());
 
     uassert(6371205,
@@ -4024,7 +4081,10 @@ EncryptedFieldConfig EncryptionInformationHelpers::getAndValidateSchema(
 
     uassert(6371207, "Expected a value for escCollection", efc.getEscCollection().has_value());
     uassert(6371208, "Expected a value for ecocCollection", efc.getEcocCollection().has_value());
-
+    uassert(8575606,
+            "Collection contains the 'rangePreview' query type which is deprecated. Please "
+            "recreate the collection with the 'range' query type.",
+            !hasQueryType(efc, QueryTypeEnum::RangePreviewDeprecated));
     return efc;
 }
 
@@ -4105,19 +4165,33 @@ ParsedFindRangePayload::ParsedFindRangePayload(ConstDataRange cdr) {
 
 
 std::vector<CompactionToken> CompactionHelpers::parseCompactionTokens(BSONObj compactionTokens) {
+    const bool featureFlagQERangeV2 = gFeatureFlagQERangeV2.isEnabledUseLastLTSFCVWhenUninitialized(
+        serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
     std::vector<CompactionToken> parsed;
+    std::transform(
+        compactionTokens.begin(),
+        compactionTokens.end(),
+        std::back_inserter(parsed),
+        [featureFlagQERangeV2](const auto& token) {
+            auto fieldName = token.fieldNameStringData().toString();
 
-    for (auto& elem : compactionTokens) {
-        uassert(6346801,
-                str::stream() << "Field '" << elem.fieldNameStringData()
-                              << "' of compaction tokens must be a bindata and general subtype",
-                elem.isBinData(BinDataType::BinDataGeneral));
+            if (token.isBinData(BinDataType::BinDataGeneral)) {
+                auto ecoc = FLETokenFromCDR<ECOCToken>(token._binDataVector());
+                return CompactionToken{std::move(fieldName), std::move(ecoc), boost::none};
+            }
 
-        auto vec = elem._binDataVector();
-        auto block = PrfBlockfromCDR(vec);
+            if (featureFlagQERangeV2 && (token.type() == Object)) {
+                auto doc =
+                    CompactionTokenDoc::parse(IDLParserContext{"compactionToken"}, token.Obj());
+                return CompactionToken{
+                    std::move(fieldName), doc.getECOCToken(), doc.getAnchorPaddingToken()};
+            }
 
-        parsed.push_back({elem.fieldNameStringData().toString(), ECOCToken(std::move(block))});
-    }
+            uasserted(
+                6346801,
+                "Field '{}' of compaction tokens must be a BinData(General) or Object, got '{}'"_format(
+                    fieldName, typeName(token.type())));
+        });
     return parsed;
 }
 
@@ -4156,18 +4230,15 @@ bool hasQueryType(const EncryptedField& field, QueryTypeEnum queryType) {
         return false;
     }
 
-    return stdx::visit(OverloadedVisitor{[&](QueryTypeConfig query) {
-                                             return (query.getQueryType() == queryType);
-                                         },
-                                         [&](std::vector<QueryTypeConfig> queries) {
-                                             return std::any_of(queries.cbegin(),
-                                                                queries.cend(),
-                                                                [&](const QueryTypeConfig& qtc) {
-                                                                    return qtc.getQueryType() ==
-                                                                        queryType;
-                                                                });
-                                         }},
-                       field.getQueries().get());
+    return visit(OverloadedVisitor{
+                     [&](QueryTypeConfig query) { return (query.getQueryType() == queryType); },
+                     [&](std::vector<QueryTypeConfig> queries) {
+                         return std::any_of(
+                             queries.cbegin(), queries.cend(), [&](const QueryTypeConfig& qtc) {
+                                 return qtc.getQueryType() == queryType;
+                             });
+                     }},
+                 field.getQueries().get());
 }
 
 bool hasQueryType(const EncryptedFieldConfig& config, QueryTypeEnum queryType) {
@@ -4185,463 +4256,32 @@ bool hasQueryType(const EncryptedFieldConfig& config, QueryTypeEnum queryType) {
     return false;
 }
 
-/**
- * Encode a signed 32-bit integer as an unsigned 32-bit integer
- */
-uint32_t encodeInt32(int32_t v) {
-    if (v < 0) {
-
-        // Signed integers have a value that there is no positive equivalent and must be handled
-        // specially
-        if (v == std::numeric_limits<int32_t>::min()) {
-            return 0;
-        }
-
-        return (v & ~(1U << 31));
-    }
-
-    return v + (1U << 31);
-}
-
-
-OSTType_Int32 getTypeInfo32(int32_t value,
-                            boost::optional<int32_t> min,
-                            boost::optional<int32_t> max) {
-    uassert(6775001,
-            "Must specify both a lower and upper bound or no bounds.",
-            min.has_value() == max.has_value());
-
-    if (!min.has_value()) {
-        uint32_t uv = encodeInt32(value);
-        return {uv, 0, std::numeric_limits<uint32_t>::max()};
-    } else {
-        uassert(6775002,
-                "The minimum value must be less than the maximum value",
-                min.value() < max.value());
-        uassert(6775003,
-                "Value must be greater than or equal to the minimum value and less than or equal "
-                "to the maximum value",
-                value >= min.value() && value <= max.value());
-
-        // Handle min int32 as a special case
-        if (min.value() == std::numeric_limits<int32_t>::min()) {
-            uint32_t uv = encodeInt32(value);
-            return {uv, 0, encodeInt32(max.value())};
-        }
-
-        // For negative numbers, first convert them to unbiased uint32 and then subtract the min
-        // value.
-        if (min.value() < 0) {
-            uint32_t uv = encodeInt32(value);
-            uint32_t min_v = encodeInt32(min.value());
-            uint32_t max_v = encodeInt32(max.value());
-
-            uv -= min_v;
-            max_v -= min_v;
-
-            return {uv, 0, max_v};
-        }
-
-        return {static_cast<uint32_t>(value - min.value()),
-                0,
-                static_cast<uint32_t>(max.value() - min.value())};
-    }
-}
-
-/**
- * Encode a signed 64-bit integer as an unsigned 64-bit integer
- */
-uint64_t encodeInt64(int64_t v) {
-    if (v < 0) {
-
-        // Signed integers have a value that there is no positive equivalent and must be handled
-        // specially
-        if (v == std::numeric_limits<int64_t>::min()) {
-            return 0;
-        }
-
-        return (v & ~(1ULL << 63));
-    }
-
-    return v + (1ULL << 63);
-}
-
-OSTType_Int64 getTypeInfo64(int64_t value,
-                            boost::optional<int64_t> min,
-                            boost::optional<int64_t> max) {
-    uassert(6775004,
-            "Must specify both a lower and upper bound or no bounds.",
-            min.has_value() == max.has_value());
-
-    if (!min.has_value()) {
-        uint64_t uv = encodeInt64(value);
-        return {uv, 0, std::numeric_limits<uint64_t>::max()};
-    } else {
-        uassert(6775005,
-                "The minimum value must be less than the maximum value",
-                min.value() < max.value());
-        uassert(6775006,
-                "Value must be greater than or equal to the minimum value and less than or equal "
-                "to the maximum value",
-                value >= min.value() && value <= max.value());
-
-        // Handle min int64 as a special case
-        if (min.value() == std::numeric_limits<int64_t>::min()) {
-            uint64_t uv = encodeInt64(value);
-            return {uv, 0, encodeInt64(max.value())};
-        }
-
-        // For negative numbers, first convert them to unbiased uin64 and then subtract the min
-        // value.
-        if (min.value() < 0) {
-            uint64_t uv = encodeInt64(value);
-            uint64_t min_v = encodeInt64(min.value());
-            uint64_t max_v = encodeInt64(max.value());
-
-            uv -= min_v;
-            max_v -= min_v;
-
-            return {uv, 0, max_v};
-        }
-
-        return {static_cast<uint64_t>(value - min.value()),
-                0,
-                static_cast<uint64_t>(max.value() - min.value())};
-    }
-}
-
-OSTType_Double getTypeInfoDouble(double value,
-                                 boost::optional<double> min,
-                                 boost::optional<double> max,
-                                 boost::optional<uint32_t> precision) {
-    uassert(6775007,
-            "Must specify both a lower bound and upper bound or no bounds.",
-            min.has_value() == max.has_value());
-
-    uassert(6775008,
-            "Infinity and Nan double values are not supported.",
-            !std::isinf(value) && !std::isnan(value));
-
-    if (min.has_value()) {
-        uassert(6775009,
-                "The minimum value must be less than the maximum value",
-                min.value() < max.value());
-        uassert(6775010,
-                "Value must be greater than or equal to the minimum value and less than or equal "
-                "to the maximum value",
-                value >= min.value() && value <= max.value());
-    }
-
-    // Map negative 0 to zero so sign bit is 0.
-    if (std::signbit(value) && value == 0) {
-        value = 0;
-    }
-
-    // When we use precision mode, we try to represent as a double value that fits in [-2^63, 2^63]
-    // (i.e. is a valid int64)
-    //
-    // This check determines if we can represent the precision truncated value as a 64-bit integer
-    // I.e. Is ((ub - lb) * 10^precision) < 64 bits.
-    //
-    // It is important we determine whether a range and its precision fit without looking that value
-    // because the encoding for precision truncated doubles is incompatible with the encoding for
-    // doubles without precision.
-    //
-    bool use_precision_mode = false;
-    uint32_t bits_range;
-    if (precision.has_value()) {
-
-        // Subnormal representations can support up to 5x10^-324 as a number
-        uassert(6966801, "Precision must be between 0 and 324 inclusive", precision.get() <= 324);
-
-        uassert(6966803,
-                "Must specify both a lower bound, upper bound and precision",
-                min.has_value() == max.has_value() && max.has_value() == precision.has_value());
-
-        double range = max.get() - min.get();
-
-        // We can overflow if max = max double and min = min double so make sure we have finite
-        // number after we do subtraction
-        if (std::isfinite(range)) {
-
-            // This creates a range which is wider then we permit by our min/max bounds check with
-            // the +1 but it is as the algorithm is written in the paper.
-            double rangeAndPrecision = (range + 1) * exp10Double(precision.get());
-
-            if (std::isfinite(rangeAndPrecision)) {
-
-                double bits_range_double = log2(rangeAndPrecision);
-                bits_range = ceil(bits_range_double);
-
-                if (bits_range < 64) {
-                    use_precision_mode = true;
-                }
-            }
-        }
-    }
-
-    if (use_precision_mode) {
-
-        // Take a number of xxxx.ppppp and truncate it xxxx.ppp if precision = 3. We do not change
-        // the digits before the decimal place.
-        double v_prime = trunc(value * exp10Double(precision.get())) / exp10Double(precision.get());
-        int64_t v_prime2 = (v_prime - min.get()) * exp10Double(precision.get());
-
-        invariant(v_prime2 < std::numeric_limits<int64_t>::max() && v_prime2 >= 0);
-
-        uint64_t ret = static_cast<uint64_t>(v_prime2);
-
-        // Adjust maximum value to be the max bit range. This will be used by getEdges/minCover to
-        // trim bits.
-        uint64_t max_value = (1ULL << bits_range) - 1;
-        invariant(ret <= max_value);
-
-        return {ret, 0, max_value};
-    }
-
-    // When we translate the double into "bits", the sign bit means that the negative numbers
-    // get mapped into the higher 63 bits of a 64-bit integer. We want them to map into the lower
-    // 64-bits so we invert the sign bit.
-    //
-    // On Endianness, we support two sets of architectures
-    // 1. Little Endian (ppc64le, x64, aarch64) - in these architectures, int64 and double are both
-    // 64-bits and both arranged in little endian byte order.
-    // 2. Big Endian (s390x) - in these architectures, int64 and double are both
-    // 64-bits and both arranged in big endian byte order.
-    //
-    // Therefore, since the order of bytes on each platform is consistent with itself, the
-    // conversion below converts a double into correct 64-bit integer that produces the same
-    // behavior across plaforms.
-    bool is_neg = value < 0;
-
-    value *= -1;
-    char* buf = reinterpret_cast<char*>(&value);
-    uint64_t uv = DataView(buf).read<uint64_t>();
-
-    if (is_neg) {
-        dassert(uv < std::numeric_limits<uint64_t>::max());
-        uv = (1ULL << 63) - uv;
-    }
-
-    return {uv, 0, std::numeric_limits<uint64_t>::max()};
-}
-
-boost::multiprecision::uint128_t toInt128FromDecimal128(Decimal128 dec) {
-    // This algorithm only works because it assumes we are dealing with Decimal128 numbers that are
-    // valid uint128 numbers. This means the Decimal128 has to be an integer or else the result is
-    // undefined.
-    invariant(dec.isFinite());
-    invariant(!dec.isNegative());
-
-    // If after rounding, the number has changed, we have a fraction, not an integer.
-    invariant(dec.round() == dec);
-
-    boost::multiprecision::uint128_t ret(dec.getCoefficientHigh());
-
-    ret <<= 64;
-    ret |= dec.getCoefficientLow();
-
-    auto exponent = static_cast<int32_t>(dec.getBiasedExponent()) - Decimal128::kExponentBias;
-
-    auto e1 = exp10ui128(labs(exponent));
-    if (exponent < 0) {
-        ret /= e1;
-    } else {
-        ret *= e1;
-    }
-
-    // Round-trip our new Int128 back to Decimal128 and make sure it is equal to the original
-    // Decimal128 or else.
-    Decimal128 roundTrip(ret.str());
-    invariant(roundTrip == dec);
-
-    return ret;
-}
-
-// For full algorithm see SERVER-68542
-OSTType_Decimal128 getTypeInfoDecimal128(Decimal128 value,
-                                         boost::optional<Decimal128> min,
-                                         boost::optional<Decimal128> max,
-                                         boost::optional<uint32_t> precision) {
-    uassert(6854201,
-            "Must specify both a lower bound and upper bound or no bounds.",
-            min.has_value() == max.has_value());
-
-    uassert(6854202,
-            "Infinity and Nan Decimal128 values are not supported.",
-            !value.isInfinite() && !value.isNaN());
-
-    if (min.has_value()) {
-        uassert(6854203,
-                "The minimum value must be less than the maximum value",
-                min.value() < max.value());
-
-        uassert(6854204,
-                "Value must be greater than or equal to the minimum value and less than or equal "
-                "to the maximum value",
-                value >= min.value() && value <= max.value());
-    }
-
-    // When we use precision mode, we try to represent as a decimal128 value that fits in [-2^127,
-    // 2^127] (i.e. is a valid int128)
-    //
-    // This check determines if we can represent the precision truncated value as a 128-bit integer
-    // I.e. Is ((ub - lb) * 10^precision) < 128 bits.
-    //
-    // It is important we determine whether a range and its precision fit without looking that value
-    // because the encoding for precision truncated decimal128 is incompatible with normal
-    // decimal128 values.
-    bool use_precision_mode = false;
-    int bits_range = 0;
-    if (precision.has_value()) {
-        uassert(6966804,
-                "Must specify both a lower bound, upper bound and precision",
-                min.has_value() == max.has_value() && max.has_value() == precision.has_value());
-
-        uassert(6966802, "Precision must be between 0 and 6182 inclusive", precision.get() <= 6142);
-
-
-        Decimal128 bounds = max.get().subtract(min.get()).add(Decimal128(1));
-
-        if (bounds.isFinite()) {
-            Decimal128 bits_range_dec = bounds.scale(precision.get()).logarithm(Decimal128(2));
-
-            if (bits_range_dec.isFinite() && bits_range_dec < Decimal128(128)) {
-                // kRoundTowardPositive is the same as C99 ceil()
-
-                bits_range = bits_range_dec.toIntExact(Decimal128::kRoundTowardPositive);
-
-                // bits_range is always >= 0 but coverity cannot be sure since it does not
-                // understand Decimal128 math so we add a check for positive integers.
-                if (bits_range >= 0 && bits_range < 128) {
-                    use_precision_mode = true;
-                }
-            }
-        }
-    }
-
-    if (use_precision_mode) {
-        // Example value: 31.4159
-        // Example Precision = 2
-
-        // Shift the number up
-        // Returns: 3141.9
-        Decimal128 valueScaled = value.scale(precision.get());
-
-        // Round the number down
-        // Returns 3141.0
-        Decimal128 valueTruncated = valueScaled.round(Decimal128::kRoundTowardZero);
-
-        // Shift the number down
-        // Returns: 31.41
-        Decimal128 v_prime = valueTruncated.scale(-static_cast<int32_t>(precision.get()));
-
-        // Adjust the number by the lower bound
-        // Make it an integer by scaling the number
-        //
-        // Returns 3141.0
-        Decimal128 v_prime2 = v_prime.subtract(min.get()).scale(precision.get());
-        // Round the number down again. min may have a fractional value with more decimal places
-        // than the precision (e.g. .001). Subtracting min may have resulted in v_prime2 with
-        // a non-zero fraction. v_prime2 is expected to have no fractional value when
-        // converting to int128.
-        v_prime2 = v_prime2.round(Decimal128::kRoundTowardZero);
-
-        invariant(v_prime2.logarithm(Decimal128(2)).isLess(Decimal128(128)));
-
-        // Now we need to get the Decimal128 out as a 128-bit integer
-        // But Decimal128 does not support conversion to Int128.
-        //
-        // If we think the Decimal128 fits in the range, based on the maximum value, we try to
-        // convert to int64 directly.
-        if (bits_range < 64) {
-
-            // Try conversion to int64, it may fail but since it is easy we try this first.
-            //
-            uint32_t signalingFlags = Decimal128::SignalingFlag::kNoFlag;
-
-            std::int64_t vPrimeInt264 = v_prime2.toLongExact(&signalingFlags);
-
-            if (signalingFlags == Decimal128::SignalingFlag::kNoFlag) {
-                std::uint64_t vPrimeUInt264 = static_cast<uint64_t>(vPrimeInt264);
-                return {vPrimeUInt264, 0, (1ULL << bits_range) - 1};
-            }
-        }
-
-        boost::multiprecision::uint128_t u_ret = toInt128FromDecimal128(v_prime2);
-
-        boost::multiprecision::uint128_t max_dec =
-            (boost::multiprecision::uint128_t(1) << bits_range) - 1;
-
-        return {u_ret, 0, max_dec};
-    }
-
-    bool isNegative = value.isNegative();
-    int32_t scale = value.getBiasedExponent() - Decimal128::kExponentBias;
-    int64_t highCoefficent = value.getCoefficientHigh();
-    int64_t lowCoefficient = value.getCoefficientLow();
-
-// use int128_t where possible on gcc/clang
-#ifdef __SIZEOF_INT128__
-    __int128 cMax1 = 0x1ed09bead87c0;
-    cMax1 <<= 64;
-    cMax1 |= 0x378d8e63ffffffff;
-    const boost::multiprecision::uint128_t cMax(cMax1);
-    if (kDebugBuild) {
-        const boost::multiprecision::uint128_t cMaxStr("9999999999999999999999999999999999");
-        dassert(cMaxStr == cMax);
-    }
-#else
-    boost::multiprecision::uint128_t cMax("9999999999999999999999999999999999");
-#endif
-    const int64_t eMin = -6176;
-
-    boost::multiprecision::int128_t unscaledValue(highCoefficent);
-    unscaledValue <<= 64;
-    unscaledValue += lowCoefficient;
-
-    int64_t rho = 0;
-    auto stepValue = unscaledValue;
-
-    bool flag = true;
-    if (unscaledValue == 0) {
-        flag = false;
-    }
-
-    while (flag != false) {
-        if (stepValue > cMax) {
-            flag = false;
-            rho = rho - 1;
-            stepValue /= k10;
-        } else {
-            rho = rho + 1;
-            stepValue *= k10;
-        }
-    }
-
-    boost::multiprecision::uint128_t mapping = 0;
-    auto part2 = k1 << 127;
-
-    if (unscaledValue == 0) {
-        mapping = part2;
-    } else if (rho <= scale - eMin) {
-        auto part1 = stepValue + (cMax * (scale - eMin - rho));
-        if (isNegative) {
-            part1 = -part1;
-        }
-
-        mapping = static_cast<boost::multiprecision::uint128_t>(part1 + part2);
-
-    } else {
-        auto part1 = exp10(scale - eMin) * unscaledValue;
-        if (isNegative) {
-            part1 = -part1;
-        }
-
-        mapping = static_cast<boost::multiprecision::uint128_t>(part1 + part2);
-    }
-
-    return {mapping, 0, std::numeric_limits<boost::multiprecision::uint128_t>::max()};
+QueryTypeConfig getQueryType(const EncryptedField& field, QueryTypeEnum queryType) {
+    uassert(8574703,
+            "Field '{}' is missing a QueryTypeConfig"_format(field.getPath()),
+            field.getQueries());
+
+    return visit(OverloadedVisitor{
+                     [&](QueryTypeConfig query) {
+                         uassert(8574704,
+                                 "Field '{}' should be of type '{}', got '{}'"_format(
+                                     field.getPath(),
+                                     QueryType_serializer(queryType),
+                                     QueryType_serializer(query.getQueryType())),
+                                 query.getQueryType() == queryType);
+                         return query;
+                     },
+                     [&](std::vector<QueryTypeConfig> queries) {
+                         for (const auto& query : queries) {
+                             if (query.getQueryType() == queryType) {
+                                 return query;
+                             }
+                         }
+                         uasserted(8674705,
+                                   "Field '{}' should be of type '{}', but no configs match"_format(
+                                       field.getPath(), QueryType_serializer(queryType)));
+                     }},
+                 field.getQueries().get());
 }
 
 EncryptedPredicateEvaluatorV2::EncryptedPredicateEvaluatorV2(
@@ -4679,21 +4319,27 @@ bool EncryptedPredicateEvaluatorV2::evaluate(
 
 // Edges
 
-Edges::Edges(std::string leaf, int sparsity) : _leaf(std::move(leaf)), _sparsity(sparsity) {
+Edges::Edges(std::string leaf, int sparsity, int trimFactor)
+    : _leaf(std::move(leaf)), _sparsity(sparsity), _trimFactor(trimFactor) {
     uassert(6775101, "sparsity must be 1 or larger", _sparsity > 0);
     dassert(std::all_of(_leaf.begin(), _leaf.end(), [](char c) { return c == '1' || c == '0'; }));
+    uassert(8574105,
+            "trim factor must be >= 0 and less than the number of bits used to represent an "
+            "element of the domain",
+            _trimFactor >= 0 && (_trimFactor == 0 || (size_t)_trimFactor < _leaf.length()));
 }
 
 std::vector<StringData> Edges::get() {
     static const StringData kRoot = "root"_sd;
     StringData leaf = _leaf;
+    std::vector<StringData> result;
+    if (_trimFactor == 0) {
+        result.push_back(kRoot);
+    }
+    result.push_back(leaf);
 
-    std::vector<StringData> result{
-        kRoot,
-        leaf,
-    };
-
-    for (size_t i = 1; i < _leaf.size(); ++i) {
+    size_t startLevel = _trimFactor < 1 ? 1 : _trimFactor;
+    for (size_t i = startLevel; i < _leaf.size(); ++i) {
         if (i % _sparsity == 0) {
             result.push_back(leaf.substr(0, i));
         }
@@ -4701,8 +4347,20 @@ std::vector<StringData> Edges::get() {
     return result;
 }
 
+std::size_t Edges::size() const {
+    // Edges::get() generates "root" plus every {sparsity}'th chunk of leaf,
+    // With the full leaf being a guaranteed capture, regardless of sparsity.
+    std::size_t edges = _leaf.size() / _sparsity;
+    if ((_leaf.size() % _sparsity) != 0) {
+        // Capture full leaf in the count anyway.
+        ++edges;
+    }
+    // Also capture "root" edge.
+    return 1 + edges;
+}
+
 template <typename T>
-std::unique_ptr<Edges> getEdgesT(T value, T min, T max, int sparsity) {
+std::unique_ptr<Edges> getEdgesT(T value, T min, T max, int sparsity, int trimFactor) {
     static_assert(!std::numeric_limits<T>::is_signed);
     static_assert(std::numeric_limits<T>::is_integer);
 
@@ -4713,59 +4371,126 @@ std::unique_ptr<Edges> getEdgesT(T value, T min, T max, int sparsity) {
     size_t maxlen = getFirstBitSet(max);
     std::string valueBin = toBinaryString(value);
     std::string valueBinTrimmed = valueBin.substr(bits - maxlen, maxlen);
-    return std::make_unique<Edges>(valueBinTrimmed, sparsity);
+    return std::make_unique<Edges>(valueBinTrimmed, sparsity, trimFactor);
 }
 
 std::unique_ptr<Edges> getEdgesInt32(int32_t value,
                                      boost::optional<int32_t> min,
                                      boost::optional<int32_t> max,
-                                     int sparsity) {
+                                     int sparsity,
+                                     int trimFactor) {
     auto aost = getTypeInfo32(value, min, max);
-    return getEdgesT(aost.value, aost.min, aost.max, sparsity);
+    return getEdgesT(aost.value, aost.min, aost.max, sparsity, trimFactor);
 }
 
 std::unique_ptr<Edges> getEdgesInt64(int64_t value,
                                      boost::optional<int64_t> min,
                                      boost::optional<int64_t> max,
-                                     int sparsity) {
+                                     int sparsity,
+                                     int trimFactor) {
     auto aost = getTypeInfo64(value, min, max);
-    return getEdgesT(aost.value, aost.min, aost.max, sparsity);
+    return getEdgesT(aost.value, aost.min, aost.max, sparsity, trimFactor);
 }
 
 std::unique_ptr<Edges> getEdgesDouble(double value,
                                       boost::optional<double> min,
                                       boost::optional<double> max,
                                       boost::optional<uint32_t> precision,
-                                      int sparsity) {
+                                      int sparsity,
+                                      int trimFactor) {
     auto aost = getTypeInfoDouble(value, min, max, precision);
-    return getEdgesT(aost.value, aost.min, aost.max, sparsity);
+    return getEdgesT(aost.value, aost.min, aost.max, sparsity, trimFactor);
 }
 
 std::unique_ptr<Edges> getEdgesDecimal128(Decimal128 value,
                                           boost::optional<Decimal128> min,
                                           boost::optional<Decimal128> max,
                                           boost::optional<uint32_t> precision,
-                                          int sparsity) {
+                                          int sparsity,
+                                          int trimFactor) {
     auto aost = getTypeInfoDecimal128(value, min, max, precision);
-    return getEdgesT(aost.value, aost.min, aost.max, sparsity);
+    return getEdgesT(aost.value, aost.min, aost.max, sparsity, trimFactor);
 }
 
+std::uint64_t getEdgesLength(const QueryTypeConfig& config) {
+    uassert(8574707,
+            "Unable to determine field type without queryTypeConfig.min/max",
+            config.getMin() && config.getMax());
+    uassert(8574708,
+            "Range QueryTypeConfig mismatch between min and max"_format(
+                typeName(config.getMin()->getType()), typeName(config.getMax()->getType())),
+            config.getMin()->getType() == config.getMax()->getType());
+    const auto fieldType = config.getMin()->getType();
+    const auto sparsity = config.getSparsity().get_value_or(1);
+    const auto trimFactor = config.getTrimFactor().get_value_or(0);
+    const bool needsPrecision = (fieldType == NumberDouble) || (fieldType == NumberDecimal);
+    uassert(8574709,
+            "Floating point range QueryTypeConfig requires precision argument",
+            !needsPrecision || config.getPrecision());
+
+    switch (fieldType) {
+        case NumberInt: {
+            auto min = config.getMin()->getInt();
+            return getEdgesInt32(min, min, config.getMax()->getInt(), sparsity, trimFactor)->size();
+        }
+        case NumberLong: {
+            auto min = config.getMin()->getLong();
+            return getEdgesInt64(min, min, config.getMax()->getLong(), sparsity, trimFactor)
+                ->size();
+        }
+        case NumberDouble: {
+            auto min = config.getMin()->getDouble();
+            return getEdgesDouble(min,
+                                  min,
+                                  config.getMax()->getDouble(),
+                                  *config.getPrecision(),
+                                  sparsity,
+                                  trimFactor)
+                ->size();
+        }
+        case NumberDecimal: {
+            auto min = config.getMin()->getDecimal();
+            return getEdgesDecimal128(min,
+                                      min,
+                                      config.getMax()->getDecimal(),
+                                      *config.getPrecision(),
+                                      sparsity,
+                                      trimFactor)
+                ->size();
+        }
+        case Date: {
+            auto min = config.getMin()->getDate().toMillisSinceEpoch();
+            return getEdgesInt64(min,
+                                 min,
+                                 config.getMax()->getDate().toMillisSinceEpoch(),
+                                 sparsity,
+                                 trimFactor)
+                ->size();
+        }
+        default:
+            uasserted(8674710, "Invalid queryTypeConfig.type '{}'"_format(typeName(fieldType)));
+    }
+
+    MONGO_UNREACHABLE;
+}
 
 template <typename T>
 class MinCoverGenerator {
 public:
-    static std::vector<std::string> minCover(T lowerBound, T upperBound, T max, int sparsity) {
-        MinCoverGenerator<T> mcg(lowerBound, upperBound, max, sparsity);
+    static std::vector<std::string> minCover(
+        T lowerBound, T upperBound, T max, int sparsity, int trimFactor) {
+        MinCoverGenerator<T> mcg(lowerBound, upperBound, max, sparsity, trimFactor);
         std::vector<std::string> c;
         mcg.minCoverRec(c, 0, mcg._maxlen);
         return c;
     }
 
 private:
-    MinCoverGenerator(T lowerBound, T upperBound, T max, int sparsity)
+    MinCoverGenerator(T lowerBound, T upperBound, T max, int sparsity, int trimFactor)
         : _lowerBound(lowerBound),
           _upperBound(upperBound),
           _sparsity(sparsity),
+          _trimFactor(trimFactor),
           _maxlen(getFirstBitSet(max)) {
         static_assert(!std::numeric_limits<T>::is_signed);
         static_assert(std::numeric_limits<T>::is_integer);
@@ -4773,6 +4498,10 @@ private:
                 "Lower bound must be less or equal to upper bound for range search.",
                 lowerBound <= upperBound);
         dassert(lowerBound >= 0 && upperBound <= max);
+        uassert(8574106,
+                "Trim factor must be >= 0 and less than the number of bits used to represent an "
+                "element of the domain",
+                trimFactor >= 0 && (trimFactor == 0 || trimFactor < _maxlen));
     }
 
     // Generate and apply a mask to an integer, filling masked bits with 1;
@@ -4792,12 +4521,12 @@ private:
         return value | mask;
     }
 
-    // Some levels are discarded when sparsity does not divide current level
-    // Discarded levels are replaced by the set of edges on the next level
-    // Return true if level is stored
+    // Some levels are discarded when sparsity does not divide current level, or when they are
+    // trimmed when trim factor is greater than the current level Discarded levels are replaced by
+    // the set of edges on the next level Return true if level is stored
     bool isLevelStored(int maskedBits) {
         int level = _maxlen - maskedBits;
-        return 0 == maskedBits || 0 == (level % _sparsity);
+        return 0 == maskedBits || (level >= _trimFactor && 0 == (level % _sparsity));
     }
 
     std::string toString(T start, int maskedBits) {
@@ -4836,13 +4565,15 @@ private:
     T _lowerBound;
     T _upperBound;
     int _sparsity;
+    int _trimFactor;
     int _maxlen;
 };
 
 template <typename T>
-std::vector<std::string> minCover(T lowerBound, T upperBound, T min, T max, int sparsity) {
+std::vector<std::string> minCover(
+    T lowerBound, T upperBound, T min, T max, int sparsity, int trimFactor) {
     dassert(0 == min);
-    return MinCoverGenerator<T>::minCover(lowerBound, upperBound, max, sparsity);
+    return MinCoverGenerator<T>::minCover(lowerBound, upperBound, max, sparsity, trimFactor);
 }
 
 /**
@@ -4877,7 +4608,8 @@ std::vector<std::string> minCoverInt32(int32_t lowerBound,
                                        bool includeUpperBound,
                                        boost::optional<int32_t> min,
                                        boost::optional<int32_t> max,
-                                       int sparsity) {
+                                       int sparsity,
+                                       int trimFactor) {
     auto a = getTypeInfo32(lowerBound, min, max);
     auto b = getTypeInfo32(upperBound, min, max);
     dassert(a.min == b.min);
@@ -4886,7 +4618,7 @@ std::vector<std::string> minCoverInt32(int32_t lowerBound,
     if (a.value > b.value) {
         return {};
     }
-    return minCover(a.value, b.value, a.min, a.max, sparsity);
+    return minCover(a.value, b.value, a.min, a.max, sparsity, trimFactor);
 }
 
 std::vector<std::string> minCoverInt64(int64_t lowerBound,
@@ -4895,7 +4627,8 @@ std::vector<std::string> minCoverInt64(int64_t lowerBound,
                                        bool includeUpperBound,
                                        boost::optional<int64_t> min,
                                        boost::optional<int64_t> max,
-                                       int sparsity) {
+                                       int sparsity,
+                                       int trimFactor) {
     auto a = getTypeInfo64(lowerBound, min, max);
     auto b = getTypeInfo64(upperBound, min, max);
     dassert(a.min == b.min);
@@ -4904,7 +4637,7 @@ std::vector<std::string> minCoverInt64(int64_t lowerBound,
     if (a.value > b.value) {
         return {};
     }
-    return minCover(a.value, b.value, a.min, a.max, sparsity);
+    return minCover(a.value, b.value, a.min, a.max, sparsity, trimFactor);
 }
 
 std::vector<std::string> minCoverDouble(double lowerBound,
@@ -4914,7 +4647,8 @@ std::vector<std::string> minCoverDouble(double lowerBound,
                                         boost::optional<double> min,
                                         boost::optional<double> max,
                                         boost::optional<uint32_t> precision,
-                                        int sparsity) {
+                                        int sparsity,
+                                        int trimFactor) {
     auto a = getTypeInfoDouble(lowerBound, min, max, precision);
     auto b = getTypeInfoDouble(upperBound, min, max, precision);
     dassert(a.min == b.min);
@@ -4923,7 +4657,7 @@ std::vector<std::string> minCoverDouble(double lowerBound,
     if (a.value > b.value) {
         return {};
     }
-    return minCover(a.value, b.value, a.min, a.max, sparsity);
+    return minCover(a.value, b.value, a.min, a.max, sparsity, trimFactor);
 }
 std::vector<std::string> minCoverDecimal128(Decimal128 lowerBound,
                                             bool includeLowerBound,
@@ -4932,7 +4666,8 @@ std::vector<std::string> minCoverDecimal128(Decimal128 lowerBound,
                                             boost::optional<Decimal128> min,
                                             boost::optional<Decimal128> max,
                                             boost::optional<uint32_t> precision,
-                                            int sparsity) {
+                                            int sparsity,
+                                            int trimFactor) {
     auto a = getTypeInfoDecimal128(lowerBound, min, max, precision);
     auto b = getTypeInfoDecimal128(upperBound, min, max, precision);
     dassert(a.min == b.min);
@@ -4941,7 +4676,7 @@ std::vector<std::string> minCoverDecimal128(Decimal128 lowerBound,
     if (a.value > b.value) {
         return {};
     }
-    return minCover(a.value, b.value, a.min, a.max, sparsity);
+    return minCover(a.value, b.value, a.min, a.max, sparsity, trimFactor);
 }
 
 PrfBlock FLEUtil::blockToArray(const SHA256Block& block) {
@@ -4989,4 +4724,8 @@ StatusWith<std::vector<uint8_t>> FLEUtil::decryptData(ConstDataRange key,
 
     return {out};
 }
+
+template class ESCCollectionCommon<ESCTwiceDerivedTagToken, ESCTwiceDerivedValueToken>;
+template class ESCCollectionCommon<AnchorPaddingKeyToken, AnchorPaddingValueToken>;
+
 }  // namespace mongo

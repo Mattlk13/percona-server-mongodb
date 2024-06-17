@@ -143,6 +143,8 @@ void disableSBEForUnsupportedExpressions(const boost::intrusive_ptr<ExpressionCo
 void addExpressionToRoot(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                          AndMatchExpression* root,
                          std::unique_ptr<MatchExpression> newNode) {
+    // TODO SERVER-87587 Remove the call to disableSBE when support for numeric paths
+    // in index filters is restored (and other similar issues have been tracked)
     disableSBEForUnsupportedExpressions(expCtx, newNode.get());
     root->add(std::move(newNode));
 }
@@ -360,7 +362,7 @@ bool isExpressionDocument(BSONElement e, bool allowIncompleteDBRef) {
         return false;
 
     auto name = o.firstElement().fieldNameStringData();
-    if (name[0] != '$')
+    if (!name.starts_with('$'))
         return false;
 
     if (isDBRefDocument(o, allowIncompleteDBRef)) {
@@ -1431,6 +1433,8 @@ StatusWithMatchExpression parseElemMatch(boost::optional<StringData> name,
 
     doc_validation_error::annotateTreeToIgnoreForErrorDetails(expCtx, sub.get());
 
+    disableSBEForUnsupportedExpressions(expCtx, sub.get());
+
     return {std::make_unique<ElemMatchObjectMatchExpression>(
         name, std::move(sub), createAnnotation(expCtx, e.fieldNameStringData(), name, e))};
 }
@@ -2330,7 +2334,7 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(MatchExpressionCounters,
 boost::optional<PathAcceptingKeyword> MatchExpressionParser::parsePathAcceptingKeyword(
     BSONElement typeElem, boost::optional<PathAcceptingKeyword> defaultKeyword) {
     auto fieldName = typeElem.fieldNameStringData();
-    if (fieldName[0] == '$' && fieldName[1]) {
+    if (fieldName.starts_with('$') && fieldName.size() > 1) {
         auto opName = fieldName.substr(1);
         auto queryOp = queryOperatorMap->find(opName);
 

@@ -582,7 +582,7 @@ void runPathLowering(VariableEnvironment& env, PrefixId& prefixId, ABT& tree) {
     bool changed = false;
     do {
         changed = false;
-        if (PathLowering{prefixId, env}.optimize(tree)) {
+        if (PathLowering{prefixId}.optimize(tree)) {
             changed = true;
             env.rebuild(tree);
         }
@@ -856,46 +856,18 @@ TEST(Path, LowerPathField) {
 
     runPathLowering(env, prefixId, tree);
 
-    ASSERT_EXPLAIN(
-        "Let [valField_1]\n"
-        "  FunctionCall [traverseP]\n"
-        "    FunctionCall [getField]\n"
-        "      Variable [rootObj]\n"
-        "      Const [\"fieldA\"]\n"
-        "    LambdaAbstraction [inputField_0]\n"
-        "      Let [valField_0]\n"
-        "        Let [valDefault_0]\n"
-        "          FunctionCall [getField]\n"
-        "            Variable [inputField_0]\n"
-        "            Const [\"fieldB\"]\n"
-        "          If []\n"
-        "            FunctionCall [exists]\n"
-        "              Variable [valDefault_0]\n"
-        "            Variable [valDefault_0]\n"
-        "            Const [0]\n"
-        "        If []\n"
-        "          BinaryOp [Or]\n"
-        "            FunctionCall [exists]\n"
-        "              Variable [valField_0]\n"
-        "            FunctionCall [isObject]\n"
-        "              Variable [inputField_0]\n"
-        "          FunctionCall [setField]\n"
-        "            Variable [inputField_0]\n"
-        "            Const [\"fieldB\"]\n"
-        "            Variable [valField_0]\n"
-        "          Variable [inputField_0]\n"
-        "    Const [Nothing]\n"
-        "  If []\n"
-        "    BinaryOp [Or]\n"
+    ASSERT_EXPLAIN_AUTO(
+        "FunctionCall [makeBsonObj]\n"
+        "  Const [MakeObjSpec([fieldA = MakeObj([fieldB = LambdaArg(0, false)], Open)], Open, "
+        "NewObj, 0)]\n"
+        "  Variable [rootObj]\n"
+        "  Const [false]\n"
+        "  LambdaAbstraction [valDefault_0]\n"
+        "    If []\n"
         "      FunctionCall [exists]\n"
-        "        Variable [valField_1]\n"
-        "      FunctionCall [isObject]\n"
-        "        Variable [rootObj]\n"
-        "    FunctionCall [setField]\n"
-        "      Variable [rootObj]\n"
-        "      Const [\"fieldA\"]\n"
-        "      Variable [valField_1]\n"
-        "    Variable [rootObj]\n",
+        "        Variable [valDefault_0]\n"
+        "      Variable [valDefault_0]\n"
+        "      Const [0]\n",
         tree);
 }
 
@@ -907,13 +879,11 @@ TEST(Path, LowerPathCompare) {
     auto env = VariableEnvironment::build(tree);
     runPathLowering(env, prefixId, tree);
 
-    ASSERT_EXPLAIN(
+    ASSERT_EXPLAIN_AUTO(
         "BinaryOp [FillEmpty]\n"
         "  BinaryOp [Eq]\n"
-        "    BinaryOp [Cmp3w]\n"
-        "      Variable [root]\n"
-        "      Const [1]\n"
-        "    Const [0]\n"
+        "    Variable [root]\n"
+        "    Const [1]\n"
         "  Const [false]\n",
         tree);
 }
@@ -929,14 +899,10 @@ TEST(Path, LowerPathDrop) {
     runPathLowering(env, prefixId, tree);
 
     ASSERT_EXPLAIN_AUTO(
-        "If []\n"
-        "  FunctionCall [isObject]\n"
-        "    Variable [root]\n"
-        "  FunctionCall [dropFields]\n"
-        "    Variable [root]\n"
-        "    Const [\"a\"]\n"
-        "    Const [\"b\"]\n"
-        "  Variable [root]\n",
+        "FunctionCall [makeBsonObj]\n"
+        "  Const [MakeObjSpec([a, b], Open, RetInput, 0)]\n"
+        "  Variable [root]\n"
+        "  Const [false]\n",
         tree);
 }
 
@@ -951,14 +917,10 @@ TEST(Path, LowerPathKeep) {
     runPathLowering(env, prefixId, tree);
 
     ASSERT_EXPLAIN_AUTO(
-        "If []\n"
-        "  FunctionCall [isObject]\n"
-        "    Variable [root]\n"
-        "  FunctionCall [keepFields]\n"
-        "    Variable [root]\n"
-        "    Const [\"a\"]\n"
-        "    Const [\"b\"]\n"
-        "  Variable [root]\n",
+        "FunctionCall [makeBsonObj]\n"
+        "  Const [MakeObjSpec([a, b], Closed, RetInput, 0)]\n"
+        "  Variable [root]\n"
+        "  Const [false]\n",
         tree);
 }
 
@@ -1180,8 +1142,6 @@ TEST(Path, FuseTraverseWithConstant) {
         "Root [{x}]\n"
         "Filter []\n"
         "|   BinaryOp [Eq]\n"
-        "|   |   Const [0]\n"
-        "|   BinaryOp [Cmp3w]\n"
         "|   |   Const [2]\n"
         "|   Const [\"hello\"]\n"
         "Evaluation [{x}]\n"
@@ -1753,11 +1713,36 @@ TEST(Path, PathCompareEqMemberUnknownTypeLower) {
         "|   |   BinaryOp [EqMember]\n"
         "|   |   |   Variable [a]\n"
         "|   |   Const [\"hello\"]\n"
+        "|   BinaryOp [Or]\n"
+        "|   |   FunctionCall [isInListData] Variable [a]\n"
         "|   FunctionCall [isArray] Variable [a]\n"
         "Evaluation [{x}]\n"
         "|   EvalPath []\n"
         "|   |   Variable [root]\n"
         "|   PathField [a] PathConstant [] Const [\"hello\"]\n"
+        "Scan [test, {root}]\n",
+        tree);
+}
+
+TEST(Path, FuseConstantAndCompare) {
+    auto tree = NodeBuilder{}
+                    .root("p1")
+                    .filter(_evalf(_get("a", _cmp("Lt", "2"_cint64)), "p1"_var))
+                    .eval("p1", _evalp(_field("a", _pconst("3"_cint64)), "root"_var))
+                    .finish(_scan("root", "test"));
+
+    auto env = VariableEnvironment::build(tree);
+    while (PathFusion{env}.optimize(tree) || ConstEval{env}.optimize(tree))
+        ;
+
+    ASSERT_EXPLAIN_V2Compact_AUTO(
+        "Root [{p1}]\n"
+        "Filter []\n"
+        "|   Const [false]\n"
+        "Evaluation [{p1}]\n"
+        "|   EvalPath []\n"
+        "|   |   Variable [root]\n"
+        "|   PathField [a] PathConstant [] Const [3]\n"
         "Scan [test, {root}]\n",
         tree);
 }

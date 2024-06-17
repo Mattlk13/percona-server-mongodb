@@ -6,7 +6,7 @@
  *   assumes_against_mongod_not_mongos,
  *   multiversion_incompatible,
  *   # The test runs commands that are not allowed with security token: compact.
- *   not_allowed_with_security_token,
+ *   not_allowed_with_signed_security_token,
  *   # Cannot compact when using the in-memory storage engine.
  *   requires_persistence,
  *   requires_timeseries,
@@ -28,6 +28,10 @@ TimeseriesTest.run(() => {
         assert.commandWorked(coll.insert({[timeFieldName]: ISODate(), x: i}));
     }
 
-    assert.commandWorked(db.runCommand({compact: coll.getName(), force: true}));
-    assert.commandWorked(db.runCommand({compact: "system.buckets." + coll.getName(), force: true}));
+    // The compact command can be successful or interrupted because of cache pressure or
+    // concurrent calls to compact.
+    let res = db.runCommand({compact: coll.getName(), force: true});
+    assert.commandWorkedOrFailedWithCode(res, ErrorCodes.Interrupted, tojson(res));
+    res = db.runCommand({compact: "system.buckets." + coll.getName(), force: true});
+    assert.commandWorkedOrFailedWithCode(res, ErrorCodes.Interrupted, tojson(res));
 });

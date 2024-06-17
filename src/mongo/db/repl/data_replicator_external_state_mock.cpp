@@ -42,6 +42,8 @@ namespace repl {
 
 namespace {
 
+constexpr std::size_t kTestOplogBufferSize = 64 * 1024 * 1024;
+
 class OplogApplierMock : public OplogApplier {
     OplogApplierMock(const OplogApplierMock&) = delete;
     OplogApplierMock& operator=(const OplogApplierMock&) = delete;
@@ -58,6 +60,12 @@ public:
           _observer(observer),
           _externalState(externalState) {}
 
+    void scheduleWritesToOplogAndChangeCollection(OperationContext* opCtx,
+                                                  StorageInterface* storageInterface,
+                                                  ThreadPool* writerPool,
+                                                  const std::vector<OplogEntry>& ops,
+                                                  bool skipWritesToOplog) override;
+
 private:
     void _run(OplogBuffer* oplogBuffer) final {}
     StatusWith<OpTime> _applyOplogBatch(OperationContext* opCtx,
@@ -68,6 +76,12 @@ private:
     OplogApplier::Observer* const _observer;
     DataReplicatorExternalStateMock* const _externalState;
 };
+
+void OplogApplierMock::scheduleWritesToOplogAndChangeCollection(OperationContext* opCtx,
+                                                                StorageInterface* storageInterface,
+                                                                ThreadPool* writerPool,
+                                                                const std::vector<OplogEntry>& ops,
+                                                                bool skipWritesToOplog) {}
 
 }  // namespace
 
@@ -85,11 +99,13 @@ std::shared_ptr<executor::TaskExecutor> DataReplicatorExternalStateMock::getShar
 }
 
 OpTimeWithTerm DataReplicatorExternalStateMock::getCurrentTermAndLastCommittedOpTime() {
+    stdx::lock_guard<Latch> lk(_mutex);
     return {currentTerm, lastCommittedOpTime};
 }
 
 void DataReplicatorExternalStateMock::processMetadata(const rpc::ReplSetMetadata& replMetadata,
                                                       const rpc::OplogQueryMetadata& oqMetadata) {
+    stdx::lock_guard<Latch> lk(_mutex);
     replMetadataProcessed = rpc::ReplSetMetadata(replMetadata);
     oqMetadataProcessed = rpc::OplogQueryMetadata(oqMetadata);
     metadataWasProcessed = true;
@@ -101,6 +117,7 @@ ChangeSyncSourceAction DataReplicatorExternalStateMock::shouldStopFetching(
     const rpc::OplogQueryMetadata& oqMetadata,
     const OpTime& previousOpTimeFetched,
     const OpTime& lastOpTimeFetched) const {
+    stdx::lock_guard<Latch> lk(_mutex);
     lastSyncSourceChecked = source;
     syncSourceLastOpTime = oqMetadata.getLastOpApplied();
     syncSourceHasSyncSource = oqMetadata.getSyncSourceIndex() != -1;
@@ -109,13 +126,14 @@ ChangeSyncSourceAction DataReplicatorExternalStateMock::shouldStopFetching(
 
 ChangeSyncSourceAction DataReplicatorExternalStateMock::shouldStopFetchingOnError(
     const HostAndPort& source, const OpTime& lastOpTimeFetched) const {
+    stdx::lock_guard<Latch> lk(_mutex);
     lastSyncSourceChecked = source;
     return shouldStopFetchingResult;
 }
 
 std::unique_ptr<OplogBuffer> DataReplicatorExternalStateMock::makeInitialSyncOplogBuffer(
     OperationContext* opCtx) const {
-    return std::make_unique<OplogBufferBlockingQueue>();
+    return std::make_unique<OplogBufferBlockingQueue>(kTestOplogBufferSize);
 }
 
 std::unique_ptr<OplogApplier> DataReplicatorExternalStateMock::makeOplogApplier(
@@ -129,11 +147,13 @@ std::unique_ptr<OplogApplier> DataReplicatorExternalStateMock::makeOplogApplier(
 }
 
 StatusWith<ReplSetConfig> DataReplicatorExternalStateMock::getCurrentConfig() const {
+    stdx::lock_guard<Latch> lk(_mutex);
     return replSetConfigResult;
 }
 
 StatusWith<BSONObj> DataReplicatorExternalStateMock::loadLocalConfigDocument(
     OperationContext* opCtx) const {
+    stdx::lock_guard<Latch> lk(_mutex);
     if (replSetConfigResult.isOK()) {
         return replSetConfigResult.getValue().toBSON();
     }

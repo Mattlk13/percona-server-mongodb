@@ -94,7 +94,7 @@ public:
 
     void benchmarkExpression(BSONObj expressionSpec,
                              benchmark::State& benchmarkState,
-                             const std::vector<Document>& documents) override final {
+                             const std::vector<Document>& documents) final {
         QueryTestServiceContext serviceContext;
         auto opCtx = serviceContext.makeOperationContext();
         auto expCtx = make_intrusive<ExpressionContextForTest>(opCtx.get(), kNss);
@@ -131,27 +131,32 @@ public:
             _env,
             _planStageData.get(),
             _variables,
+            nullptr /* yieldPolicy */,
             &_slotIdGenerator,
             &_frameIdGenerator,
             &_spoolIdGenerator,
             &_inListsSet,
             &_collatorsMap,
+            &_sortSpecMap,
             _expCtx,
             false /* needsMerge */,
             false /* allowDiskUse */
         };
 
-        auto evalExpr = stage_builder::generateExpression(
-            state,
-            expression.get(),
-            stage_builder::TypedSlot{_inputSlotId, stage_builder::TypeSignature::kAnyScalarType});
+        auto rootSlot =
+            stage_builder::SbSlot{_inputSlotId, stage_builder::TypeSignature::kAnyScalarType};
+
+        stage_builder::PlanStageSlots slots;
+        slots.setResultObj(rootSlot);
+
+        auto evalExpr = stage_builder::generateExpression(state, expression.get(), rootSlot, slots);
 
         LOGV2_DEBUG(6979801,
                     1,
                     "sbe expression benchmark PlanStage",
                     "stage"_attr = debugPrint(stage.get()));
 
-        auto expr = evalExpr.extractExpr(state).expr;
+        auto expr = evalExpr.extractExpr(state);
         LOGV2_DEBUG(6979802,
                     1,
                     "sbe expression benchmark EExpression",
@@ -200,6 +205,7 @@ private:
     sbe::value::SpoolIdGenerator _spoolIdGenerator;
     stage_builder::StageBuilderState::InListsSet _inListsSet;
     stage_builder::StageBuilderState::CollatorsMap _collatorsMap;
+    stage_builder::StageBuilderState::SortSpecMap _sortSpecMap;
     boost::intrusive_ptr<ExpressionContext> _expCtx;
 
     sbe::value::SlotId _inputSlotId;

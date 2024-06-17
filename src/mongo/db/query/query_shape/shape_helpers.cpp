@@ -29,6 +29,7 @@
 
 #include "mongo/db/query/query_shape/shape_helpers.h"
 
+#include "mongo/db/query/query_request_helper.h"
 #include "mongo/db/query/query_shape/query_shape_gen.h"
 
 namespace mongo::shape_helpers {
@@ -44,19 +45,21 @@ BSONObj shapifyFlatObj(BSONObj obj, const SerializationOptions& opts, bool value
 
     BSONObjBuilder bob;
     for (BSONElement elem : obj) {
-        if (hintSpecialField.compare(elem.fieldNameStringData()) == 0) {
+        if (hintSpecialField == elem.fieldNameStringData()) {
             if (elem.type() == BSONType::String) {
                 bob.append(hintSpecialField, opts.serializeFieldPathFromString(elem.String()));
             } else if (elem.type() == BSONType::Object) {
                 opts.appendLiteral(&bob, hintSpecialField, elem.Obj());
             } else {
-                uasserted(ErrorCodes::FailedToParse, "$hint must be a string or an object");
+                // SERVER-85500: $hint syntax will not be validated if the collection does not
+                // exist, so we should accept a value that is neither string nor object here.
+                opts.appendLiteral(&bob, hintSpecialField, elem);
             }
             continue;
         }
 
         // $natural doesn't need to be redacted.
-        if (elem.fieldNameStringData().compare(query_request_helper::kNaturalSortField) == 0) {
+        if (elem.fieldNameStringData() == query_request_helper::kNaturalSortField) {
             bob.append(elem);
             continue;
         }
@@ -81,37 +84,10 @@ BSONObj extractMinOrMaxShape(BSONObj obj, const SerializationOptions& opts) {
 void appendNamespaceShape(BSONObjBuilder& bob,
                           const NamespaceString& nss,
                           const SerializationOptions& opts) {
-    if (nss.tenantId()) {
-        bob.append("tenantId", opts.serializeIdentifier(nss.tenantId().value().toString()));
-    }
-    // We do not want to include the tenantId as prefix of 'db' because the tenantid is added above.
+    // We do not want to include the tenantId as prefix of 'db' because the tenant id is not
+    // included into query shape.
     bob.append("db", opts.serializeIdentifier(nss.dbName().serializeWithoutTenantPrefix_UNSAFE()));
     bob.append("coll", opts.serializeIdentifier(nss.coll()));
-}
-
-NamespaceStringOrUUID parseNamespaceShape(BSONElement cmdNsElt,
-                                          const SerializationContext& serializationContext) {
-    tassert(7632900, "cmdNs must be an object.", cmdNsElt.type() == BSONType::Object);
-    // cmdNs is internally built from structured requests and can be deserialized as storage.
-    auto cmdNs = query_shape::CommandNamespace::parse(
-        IDLParserContext("cmdNs", false /*apiStrict*/, boost::none), cmdNsElt.embeddedObject());
-
-    boost::optional<TenantId> tenantId = cmdNs.getTenantId().map(TenantId::parseFromString);
-
-    if (cmdNs.getColl().has_value()) {
-        tassert(7632903,
-                "Exactly one of 'uuid' and 'coll' can be defined.",
-                !cmdNs.getUuid().has_value());
-        return NamespaceStringUtil::deserialize(
-            tenantId, cmdNs.getDb(), cmdNs.getColl().value(), SerializationContext::stateDefault());
-    } else {
-        tassert(7632904,
-                "Exactly one of 'uuid' and 'coll' can be defined.",
-                !cmdNs.getColl().has_value());
-        UUID uuid = uassertStatusOK(UUID::parse(cmdNs.getUuid().value().toString()));
-        return NamespaceStringOrUUID(
-            DatabaseNameUtil::deserialize(tenantId, cmdNs.getDb(), serializationContext), uuid);
-    }
 }
 
 }  // namespace mongo::shape_helpers

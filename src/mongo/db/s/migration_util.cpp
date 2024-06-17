@@ -57,7 +57,6 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/op_observer/op_observer.h"
@@ -76,6 +75,7 @@
 #include "mongo/db/s/sharding_statistics.h"
 #include "mongo/db/s/sharding_util.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/vector_clock_mutable.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/thread_pool_task_executor.h"
@@ -397,8 +397,8 @@ void notifyChangeStreamsOnRecipientFirstChunk(OperationContext* opCtx,
     auto const serviceContext = opCtx->getClient()->getServiceContext();
 
     // TODO (SERVER-71444): Fix to be interruptible or document exception.
-    UninterruptibleLockGuard noInterrupt(opCtx->lockState());  // NOLINT.
-    AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
+    UninterruptibleLockGuard noInterrupt(shard_role_details::getLocker(opCtx));  // NOLINT.
+    AutoGetOplogFastPath oplogWrite(opCtx, OplogAccessMode::kWrite);
     writeConflictRetry(opCtx, "migrateChunkToNewShard", NamespaceString::kRsOplogNamespace, [&] {
         WriteUnitOfWork uow(opCtx);
         serviceContext->getOpObserver()->onInternalOpMessage(opCtx,
@@ -432,8 +432,8 @@ void notifyChangeStreamsOnDonorLastChunk(OperationContext* opCtx,
     auto const serviceContext = opCtx->getClient()->getServiceContext();
 
     // TODO (SERVER-71444): Fix to be interruptible or document exception.
-    UninterruptibleLockGuard noInterrupt(opCtx->lockState());  // NOLINT.
-    AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
+    UninterruptibleLockGuard noInterrupt(shard_role_details::getLocker(opCtx));  // NOLINT.
+    AutoGetOplogFastPath oplogWrite(opCtx, OplogAccessMode::kWrite);
     writeConflictRetry(opCtx, "migrateLastChunkFromShard", NamespaceString::kRsOplogNamespace, [&] {
         WriteUnitOfWork uow(opCtx);
         serviceContext->getOpObserver()->onInternalOpMessage(opCtx,

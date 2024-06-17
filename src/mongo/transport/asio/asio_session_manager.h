@@ -40,11 +40,16 @@ class AsioSessionManager : public SessionManagerCommon {
 public:
     using SessionManagerCommon::SessionManagerCommon;
 
-    void appendStats(BSONObjBuilder* bob) const override;
+    void appendStats(BSONObjBuilder* bob) const;
 
 protected:
     std::string getClientThreadName(const Session&) const override;
     void configureServiceExecutorContext(Client* client, bool isPrivilegedSession) const override;
+    void onClientConnect(Client* client) override;
+    void onClientDisconnect(Client* client) override;
+
+private:
+    Counter64 _loadBalancedConnections;
 };
 
 }  // namespace mongo::transport

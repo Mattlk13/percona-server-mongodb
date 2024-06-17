@@ -236,6 +236,86 @@ TEST(CurOpTest, AdditiveMetricsFieldsShouldIncrementByN) {
     ASSERT_EQ(*additiveMetrics.executionTime, Microseconds{280});
 }
 
+TEST(CurOpTest, AdditiveMetricsShouldAggregateCursorMetrics) {
+    OpDebug::AdditiveMetrics additiveMetrics;
+
+    additiveMetrics.keysExamined = 1;
+    additiveMetrics.docsExamined = 2;
+    additiveMetrics.hasSortStage = false;
+    additiveMetrics.usedDisk = false;
+
+    CursorMetrics cursorMetrics(3 /* keysExamined */,
+                                4 /* docsExamined */,
+                                true /* hasSortStage */,
+                                false /* usedDisk */,
+                                true /* fromMultiPlanner */,
+                                false /* fromPlanCache */);
+
+    additiveMetrics.aggregateCursorMetrics(cursorMetrics);
+
+    ASSERT_EQ(*additiveMetrics.keysExamined, 4);
+    ASSERT_EQ(*additiveMetrics.docsExamined, 6);
+    ASSERT_EQ(additiveMetrics.hasSortStage, true);
+    ASSERT_EQ(additiveMetrics.usedDisk, false);
+}
+
+TEST(CurOpTest, AdditiveMetricsAggregateCursorMetricsTreatsNoneAsZero) {
+    OpDebug::AdditiveMetrics additiveMetrics;
+
+    additiveMetrics.keysExamined = boost::none;
+    additiveMetrics.docsExamined = boost::none;
+
+    CursorMetrics cursorMetrics(1 /* keysExamined */,
+                                2 /* docsExamined */,
+                                true /* hasSortStage */,
+                                false /* usedDisk */,
+                                true /* fromMultiPlanner */,
+                                false /* fromPlanCache */);
+
+    additiveMetrics.aggregateCursorMetrics(cursorMetrics);
+
+    ASSERT_EQ(*additiveMetrics.keysExamined, 1);
+    ASSERT_EQ(*additiveMetrics.docsExamined, 2);
+}
+
+TEST(CurOpTest, AdditiveMetricsShouldAggregateDataBearingNodeMetrics) {
+    OpDebug::AdditiveMetrics additiveMetrics;
+
+    additiveMetrics.keysExamined = 1;
+    additiveMetrics.docsExamined = 2;
+    additiveMetrics.hasSortStage = false;
+    additiveMetrics.usedDisk = false;
+
+    query_stats::DataBearingNodeMetrics remoteMetrics;
+    remoteMetrics.keysExamined = 3;
+    remoteMetrics.docsExamined = 4;
+    remoteMetrics.hasSortStage = true;
+    remoteMetrics.usedDisk = false;
+
+    additiveMetrics.aggregateDataBearingNodeMetrics(remoteMetrics);
+
+    ASSERT_EQ(*additiveMetrics.keysExamined, 4);
+    ASSERT_EQ(*additiveMetrics.docsExamined, 6);
+    ASSERT_EQ(additiveMetrics.hasSortStage, true);
+    ASSERT_EQ(additiveMetrics.usedDisk, false);
+}
+
+TEST(CurOpTest, AdditiveMetricsAggregateDataBearingNodeMetricsTreatsNoneAsZero) {
+    OpDebug::AdditiveMetrics additiveMetrics;
+
+    additiveMetrics.keysExamined = boost::none;
+    additiveMetrics.docsExamined = boost::none;
+
+    query_stats::DataBearingNodeMetrics remoteMetrics;
+    remoteMetrics.keysExamined = 1;
+    remoteMetrics.docsExamined = 2;
+
+    additiveMetrics.aggregateDataBearingNodeMetrics(remoteMetrics);
+
+    ASSERT_EQ(*additiveMetrics.keysExamined, 1);
+    ASSERT_EQ(*additiveMetrics.docsExamined, 2);
+}
+
 TEST(CurOpTest, OptionalAdditiveMetricsNotDisplayedIfUninitialized) {
     // 'basicFields' should always be present in the logs and profiler, for any operation.
     std::vector<std::string> basicFields{
@@ -310,9 +390,7 @@ TEST(CurOpTest, ShouldReportIsFromUserConnection) {
         // reportCurrentOpForClient.
         auto sc = SerializationContext(SerializationContext::Source::Command,
                                        SerializationContext::CallerType::Reply,
-                                       SerializationContext::Prefix::Default,
-                                       false,
-                                       true);
+                                       SerializationContext::Prefix::ExcludePrefix);
         auto expCtx = make_intrusive<ExpressionContextForTest>(opCtx.get(), nss, sc);
 
         curop->reportCurrentOpForClient(expCtx, client, false, false, &curOpObj);
@@ -374,10 +452,10 @@ TEST(CurOpTest, CheckNSAgainstSerializationContext) {
         command,
         NetworkOp::dbQuery);
 
-    // Test without using the expectPrefix field.
-    for (bool tenantIdFromDollarTenantOrSecurityToken : {false, true}) {
+    // Test expectPrefix field.
+    for (bool expectPrefix : {false, true}) {
         SerializationContext sc = SerializationContext::stateCommandReply();
-        sc.setTenantIdSource(tenantIdFromDollarTenantOrSecurityToken);
+        sc.setPrefixState(expectPrefix);
 
         BSONObjBuilder builder;
         {
@@ -386,11 +464,20 @@ TEST(CurOpTest, CheckNSAgainstSerializationContext) {
         }
         auto bsonObj = builder.done();
 
-        std::string serializedNs = tenantIdFromDollarTenantOrSecurityToken
-            ? "testDb.coll"
-            : tid.toString() + "_testDb.coll";
+        std::string serializedNs = expectPrefix ? tid.toString() + "_testDb.coll" : "testDb.coll";
         ASSERT_EQ(serializedNs, bsonObj.getField("ns").String());
     }
 }
+
+TEST(CurOpTest, GetCursorMetricsProducesValidObject) {
+    // This test just checks that the cursor metrics object produced by getCursorMetrics
+    // is a valid, serializable object. In particular, it must have all required fields.
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+    auto metrics = curop->debug().getCursorMetrics();
+    ASSERT_DOES_NOT_THROW(metrics.toBSON());
+}
+
 }  // namespace
 }  // namespace mongo

@@ -215,16 +215,6 @@ public:
     static Pipeline::SourceContainer::iterator optimizeEndOfPipeline(
         Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container);
 
-    /**
-     * Applies optimizeAt() to all stages in the given pipeline after the stage that 'itr' points
-     * to.
-     *
-     * Returns a valid iterator that points to the new "end of the pipeline": i.e., the stage that
-     * comes after 'itr' in the newly optimized pipeline.
-     */
-    static Pipeline::SourceContainer::iterator optimizeAtEndOfPipeline(
-        Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container);
-
     static std::unique_ptr<Pipeline, PipelineDeleter> makePipelineFromViewDefinition(
         const boost::intrusive_ptr<ExpressionContext>& subPipelineExpCtx,
         ExpressionContext::ResolvedNamespace resolvedNs,
@@ -298,9 +288,27 @@ public:
     BSONObj getInitialQuery() const;
 
     /**
-     * Returns 'true' if the pipeline must merge on the primary shard.
+     * Convenience wrapper that parameterizes a pipeline's match stage, if present.
      */
-    bool needsPrimaryShardMerger() const;
+    void parameterize();
+
+    /**
+     * Clear any parameterization in the pipeline.
+     */
+    void unparameterize();
+
+    /**
+     * Returns 'true' if a pipeline's structure is eligible for parameterization. It must have a
+     * $match first stage.
+     */
+    bool canParameterize();
+
+    /**
+     * Returns 'true' if a pipeline is parameterized.
+     */
+    bool isParameterized() {
+        return _isParameterized;
+    }
 
     /**
      * Returns a specific ShardId that should be merger for this pipeline or boost::none if it is
@@ -319,15 +327,16 @@ public:
     bool needsShard() const;
 
     /**
-     * Returns 'true' if any stage in the pipeline requires being run on all shards.
+     * Returns 'true' if any stage in the pipeline requires being run on all hosts within targeted
+     * shards.
      */
-    bool needsAllShardServers() const;
+    bool needsAllShardHosts() const;
 
     /**
-     * Returns true if the pipeline can run on mongoS, but is not obliged to; that is, it can run
-     * either on mongoS or on a shard.
+     * Returns Status::OK() if the pipeline can run on mongoS, but is not obliged to; that is, it
+     * can run either on mongoS or on a shard.
      */
-    bool canRunOnMongos() const;
+    Status canRunOnMongos() const;
 
     /**
      * Returns true if this pipeline must only run on mongoS. Can be called on unsplit or merge
@@ -341,7 +350,13 @@ public:
     void optimizePipeline();
 
     /**
-     * Modifies the container, optimizing it by combining and swapping stages.
+     * Modifies the container, optimizes each stage individually.
+     */
+    static void optimizeEachStage(SourceContainer* container);
+
+    /**
+     * Modifies the container, optimizing it by combining, swapping, dropping and/or inserting
+     * stages.
      */
     static void optimizeContainer(SourceContainer* container);
 
@@ -522,12 +537,6 @@ private:
     void stitch();
 
     /**
-     * Returns Status::OK if the pipeline can run on mongoS, or an error with a message explaining
-     * why it cannot.
-     */
-    Status _pipelineCanRunOnMongoS() const;
-
-    /**
      * Asserts whether operation contexts associated with this pipeline are consistent across
      * sources.
      */
@@ -538,6 +547,7 @@ private:
     SplitState _splitState = SplitState::kUnsplit;
     boost::intrusive_ptr<ExpressionContext> pCtx;
     bool _disposed = false;
+    bool _isParameterized = false;
 };
 
 /**
@@ -591,4 +601,6 @@ extern ServiceContext::Decoration<std::unique_ptr<Pipeline, PipelineDeleter> (*)
     Pipeline* origPipeline,
     boost::optional<UUID> uuid)>
     generateMetadataPipelineFunc;
+
+using PipelinePtr = std::unique_ptr<Pipeline, PipelineDeleter>;
 }  // namespace mongo

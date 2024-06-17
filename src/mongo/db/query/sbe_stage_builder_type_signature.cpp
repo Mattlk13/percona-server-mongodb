@@ -33,8 +33,17 @@ namespace mongo::stage_builder {
 
 TypeSignature getTypeSignature(sbe::value::TypeTags type) {
     uint8_t tagIndex = static_cast<uint8_t>(type);
-    return TypeSignature{1LL << tagIndex};
+    return TypeSignature{1ull << tagIndex};
 }
+
+TypeSignature TypeSignature::kAnyType = TypeSignature{TypeSignature::AllTypesTag{}};
+
+TypeSignature TypeSignature::kBlockType = getTypeSignature(sbe::value::TypeTags::valueBlock);
+
+TypeSignature TypeSignature::kCellType = getTypeSignature(sbe::value::TypeTags::cellBlock);
+
+TypeSignature TypeSignature::kAnyScalarType = TypeSignature::kAnyType.exclude(
+    getTypeSignature(sbe::value::TypeTags::cellBlock, sbe::value::TypeTags::valueBlock));
 
 // This constant signature holds all the types that have a BSON counterpart and can
 // represent a value stored in the database, excluding all the TypeTags that describe
@@ -68,15 +77,12 @@ TypeSignature TypeSignature::kAnyBSONType = getTypeSignature(sbe::value::TypeTag
                                                              sbe::value::TypeTags::bsonJavascript,
                                                              sbe::value::TypeTags::bsonDBPointer,
                                                              sbe::value::TypeTags::bsonCodeWScope);
-TypeSignature TypeSignature::kAnyScalarType = TypeSignature{~0}.exclude(
-    getTypeSignature(sbe::value::TypeTags::cellBlock, sbe::value::TypeTags::valueBlock));
+
 TypeSignature TypeSignature::kArrayType = getTypeSignature(sbe::value::TypeTags::Array,
                                                            sbe::value::TypeTags::ArraySet,
                                                            sbe::value::TypeTags::ArrayMultiSet,
                                                            sbe::value::TypeTags::bsonArray);
-TypeSignature TypeSignature::kBlockType = getTypeSignature(sbe::value::TypeTags::valueBlock);
 TypeSignature TypeSignature::kBooleanType = getTypeSignature(sbe::value::TypeTags::Boolean);
-TypeSignature TypeSignature::kCellType = getTypeSignature(sbe::value::TypeTags::cellBlock);
 TypeSignature TypeSignature::kDateTimeType =
     getTypeSignature(sbe::value::TypeTags::Date, sbe::value::TypeTags::Timestamp);
 TypeSignature TypeSignature::kNothingType = getTypeSignature(sbe::value::TypeTags::Nothing);
@@ -90,11 +96,41 @@ TypeSignature TypeSignature::kStringType = getTypeSignature(sbe::value::TypeTags
                                                             sbe::value::TypeTags::StringBig,
                                                             sbe::value::TypeTags::bsonString);
 
+std::string TypeSignature::debugString() const {
+    if (*this == kAnyType) {
+        return "kAnyType";
+    }
+    if (*this == kAnyScalarType) {
+        return "kAnyScalarType";
+    }
+
+    return std::bitset<sizeof(MaskType) * 8>(typesMask).to_string();
+}
+
+bool TypeSignature::canCompareWith(TypeSignature other) const {
+    auto lhsTypes = getBSONTypesFromSignature(*this);
+    auto rhsTypes = getBSONTypesFromSignature(other);
+    for (auto& lhsTag : lhsTypes) {
+        if (lhsTag == sbe::value::TypeTags::Nothing) {
+            return false;
+        }
+        for (auto& rhsTag : rhsTypes) {
+            if (rhsTag == sbe::value::TypeTags::Nothing ||
+                (lhsTag != rhsTag &&
+                 !(sbe::value::isNumber(lhsTag) && sbe::value::isNumber(rhsTag)) &&
+                 !(sbe::value::isStringOrSymbol(lhsTag) && sbe::value::isStringOrSymbol(rhsTag)))) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 // Return the set of SBE types encoded in the provided signature.
 std::vector<sbe::value::TypeTags> getBSONTypesFromSignature(TypeSignature signature) {
     signature = signature.intersect(TypeSignature::kAnyBSONType);
     std::vector<sbe::value::TypeTags> tags;
-    for (size_t i = 0; i < sizeof(size_t) * 8; i++) {
+    for (size_t i = 0; i < sizeof(TypeSignature::typesMask) * 8; i++) {
         auto tag = static_cast<sbe::value::TypeTags>(i);
         if (getTypeSignature(tag).isSubset(signature)) {
             tags.push_back(tag);

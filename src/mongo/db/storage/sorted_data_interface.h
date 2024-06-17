@@ -46,6 +46,7 @@ class BSONObjBuilder;
 class BucketDeletionNotification;
 class SortedDataBuilderInterface;
 struct IndexValidateResults;
+class SortedDataKeyValueView;
 
 /**
  * This is the uniform interface for storing indexes and supporting point queries as well as range
@@ -132,8 +133,9 @@ public:
     /**
      * Attempt to reduce the storage space used by this index via compaction. Only called if the
      * indexed record store supports compaction-in-place.
+     * Returns an estimated number of bytes when doing a dry run.
      */
-    virtual Status compact(OperationContext* opCtx) {
+    virtual StatusWith<int64_t> compact(OperationContext* opCtx, const CompactOptions& options) {
         return Status::OK();
     }
 
@@ -268,14 +270,19 @@ public:
          * any, isn't checked.
          */
         virtual void setEndPosition(const BSONObj& key, bool inclusive) = 0;
+        virtual void setEndPosition(const key_string::Value& keyString) = 0;
 
         /**
          * Moves forward and returns the new data or boost::none if there is no more data.
-         * If not positioned, returns boost::none.
+         * If not positioned, returns the first entry or boost::none.
+         *
+         * Note that nextKeyValueView() returns unowned data, which is invalidated upon
+         * calling a next() or seek() variant, a save(), or when the cursor is destructed.
          */
         virtual boost::optional<IndexKeyEntry> next(
             KeyInclusion keyInclusion = KeyInclusion::kInclude) = 0;
         virtual boost::optional<KeyStringEntry> nextKeyString() = 0;
+        virtual SortedDataKeyValueView nextKeyValueView() = 0;
 
         //
         // Seeking
@@ -289,12 +296,27 @@ public:
             const key_string::Value& keyString) = 0;
 
         /**
+         * Seeks to the provided keyString and returns the SortedDataKeyValueView.
+         * The provided keyString has discriminator information encoded.
+         * Returns unowned data, which is invalidated upon calling a next() or seek()
+         * variant, a save(), or when the cursor is destructed.
+         */
+        virtual SortedDataKeyValueView seekForKeyValueView(const key_string::Value& keyString) = 0;
+
+        /**
          * Seeks to the provided keyString and returns the IndexKeyEntry.
          * The provided keyString has discriminator information encoded.
          */
         virtual boost::optional<IndexKeyEntry> seek(
             const key_string::Value& keyString,
             KeyInclusion keyInclusion = KeyInclusion::kInclude) = 0;
+
+        /**
+         * Seeks to the provided keyString and returns the RecordId of the matching key, or
+         * boost::none if one does not exist.
+         * The provided key must always have a kInclusive discriminator.
+         */
+        virtual boost::optional<RecordId> seekExact(const key_string::Value& keyString) = 0;
 
         //
         // Saving and restoring state
@@ -387,18 +409,6 @@ public:
 
     virtual Status initAsEmpty(OperationContext* opCtx) = 0;
 
-    /**
-     * Insert an entry into the index with the specified KeyString, without a RecordId
-     * appended to the end.
-     *
-     * This generates index entries consistent with index keys created in the server prior to 4.2.
-     *
-     * For testing only.
-     */
-    virtual void insertWithRecordIdInValue_forTest(OperationContext* opCtx,
-                                                   const key_string::Value& keyString,
-                                                   RecordId rid) = 0;
-
 protected:
     std::shared_ptr<Ident> _ident;
 
@@ -425,6 +435,129 @@ public:
      * any parent WriteUnitOfWork.
      */
     virtual Status addKey(const key_string::Value& keyString) = 0;
+};
+
+/**
+ * A SortedDataKeyValueView is an unowned view into a KeyString-formatted binary blob.
+ *
+ * A SortedDataKeyValueView is composed of three parts:
+ * - KeyString data without RecordId
+ * - Encoded RecordId
+ * - TypeBits (optional)
+ */
+class SortedDataKeyValueView {
+public:
+    /**
+     * Construct a SortedDataKeyValueView with pointers and sizes to each underlying component.
+     */
+    SortedDataKeyValueView(const char* ksData,
+                           int32_t ksSize,
+                           const char* ridData,
+                           int32_t ridSize,
+                           const char* typeBitsData,
+                           int32_t typeBitsSize,
+                           key_string::Version version,
+                           bool isRecordIdAtEndOfKeyString)
+        : _ksData(ksData),
+          _ridData(ridData),
+          _tbData(typeBitsData),
+          _ksSize(ksSize),
+          _ridSize(ridSize),
+          _tbSize(typeBitsSize),
+          _version(version) {
+        invariant(ksSize > 0 && ridSize > 0 && typeBitsSize >= 0);
+        _ksOriginalSize = isRecordIdAtEndOfKeyString ? (ksSize + ridSize) : ksSize;
+    }
+
+    SortedDataKeyValueView() = default;
+    SortedDataKeyValueView(const SortedDataKeyValueView& other) = default;
+    SortedDataKeyValueView(SortedDataKeyValueView&& other) = default;
+    SortedDataKeyValueView& operator=(const SortedDataKeyValueView& other) = default;
+    SortedDataKeyValueView& operator=(SortedDataKeyValueView&& other) = default;
+
+    /**
+     * Return the original index key buffer as is, which may or may not end with a RecordId,
+     * depending on isRecordIdAtEndOfKeyString().
+     */
+    StringData getKeyStringOriginalView() const {
+        return {_ksData, static_cast<StringData::size_type>(_ksOriginalSize)};
+    }
+
+    StringData getKeyStringWithoutRecordIdView() const {
+        return {_ksData, static_cast<StringData::size_type>(_ksSize)};
+    }
+
+    /**
+     * Return the raw TypeBits buffer including the size prefix.
+     */
+    StringData getTypeBitsView() const {
+        return {_tbData, static_cast<StringData::size_type>(_tbSize)};
+    }
+
+    key_string::Version getVersion() const {
+        return _version;
+    }
+
+    bool isRecordIdAtEndOfKeyString() const {
+        return _ksOriginalSize > _ksSize;
+    }
+
+    RecordId decodeRecordId(KeyFormat ridFormat) const {
+        if (KeyFormat::Long == ridFormat) {
+            BufReader reader(_ridData, _ridSize);
+            return key_string::decodeRecordIdLong(&reader);
+        } else if (KeyFormat::String == ridFormat) {
+            return key_string::decodeRecordIdStrAtEnd(_ridData, _ridSize);
+        } else {
+            MONGO_UNREACHABLE;
+        }
+    }
+
+    /**
+     * Create a Value copy from this view including all components.
+     */
+    key_string::Value getValueCopy() const {
+        const auto bufSize = _ksSize + _ridSize + (_tbSize > 0 ? _tbSize : 1);
+        BufBuilder buf(bufSize);
+        buf.appendBuf(_ksData, _ksSize);
+        buf.appendBuf(_ridData, _ridSize);
+        if (_tbSize == 0) {
+            buf.appendChar(0);
+        } else {
+            buf.appendBuf(_tbData, _tbSize);
+        }
+
+        invariant(bufSize == buf.len());
+        return {_version, _ksSize + _ridSize, SharedBufferFragment(buf.release(), bufSize)};
+    }
+
+    bool isEmpty() const {
+        return _ksSize == 0;
+    }
+
+    void reset() {
+        _ksSize = 0;
+    }
+
+    std::string toString() const {
+        if (isEmpty())
+            return "";
+        std::stringstream ss;
+        ss << hexblob::encode(_ksData, _ksSize) << "_" << hexblob::encode(_ridData, _ridSize) << "_"
+           << (_tbSize > 0 ? hexblob::encode(_tbData, _tbSize) : "");
+        return ss.str();
+    }
+
+private:
+    const char* _ksData = nullptr;
+    const char* _ridData = nullptr;
+    const char* _tbData = nullptr;
+
+    int32_t _ksSize = 0;
+    int32_t _ksOriginalSize = 0;
+    int32_t _ridSize = 0;
+    int32_t _tbSize = 0;
+    key_string::Version _version;
 };
 
 }  // namespace mongo

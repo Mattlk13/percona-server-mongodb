@@ -85,6 +85,7 @@
 #include "mongo/platform/overflow_arithmetic.h"
 #include "mongo/s/database_version.h"
 #include "mongo/s/shard_version.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/namespace_string_util.h"
@@ -146,9 +147,17 @@ NamespaceString parseLookupFromAndResolveNamespace(const BSONElement& elem,
     }
 
     // Valdate the db and coll names.
-    auto spec = NamespaceSpec::parse(
-        IDLParserContext{elem.fieldNameStringData(), false /* apiStrict */, defaultDb.tenantId()},
-        elem.embeddedObject());
+    const auto tenantId = defaultDb.tenantId();
+    const auto vts = tenantId
+        ? boost::make_optional(auth::ValidatedTenancyScopeFactory::create(
+              *tenantId, auth::ValidatedTenancyScopeFactory::TrustedForInnerOpMsgRequestTag{}))
+        : boost::none;
+    auto spec = NamespaceSpec::parse(IDLParserContext{elem.fieldNameStringData(),
+                                                      false /* apiStrict */,
+                                                      vts,
+                                                      tenantId,
+                                                      SerializationContext::stateDefault()},
+                                     elem.embeddedObject());
     auto nss = NamespaceStringUtil::deserialize(spec.getDb().value_or(DatabaseName()),
                                                 spec.getColl().value_or(""));
     uassert(
@@ -246,6 +255,7 @@ DocumentSourceLookUp::DocumentSourceLookUp(
 
     _fromExpCtx = expCtx->copyForSubPipeline(resolvedNamespace.ns, resolvedNamespace.uuid);
     _fromExpCtx->inLookup = true;
+
     if (fromCollator) {
         _fromExpCtx->setCollator(std::move(fromCollator.value()));
         _hasExplicitCollation = true;
@@ -347,7 +357,7 @@ DocumentSourceLookUp::DocumentSourceLookUp(const DocumentSourceLookUp& original,
       _hasExplicitCollation(original._hasExplicitCollation),
       _resolvedPipeline(original._resolvedPipeline),
       _userPipeline(original._userPipeline),
-      _resolvedIntrospectionPipeline(original._resolvedIntrospectionPipeline->clone()),
+      _resolvedIntrospectionPipeline(original._resolvedIntrospectionPipeline->clone(_fromExpCtx)),
       _letVariables(original._letVariables) {
     if (!_localField && !_foreignField) {
         _cache.emplace(internalDocumentSourceCursorBatchSizeBytes.load());
@@ -449,7 +459,9 @@ const char* DocumentSourceLookUp::getSourceName() const {
 }
 
 bool DocumentSourceLookUp::foreignShardedLookupAllowed() const {
-    return !pExpCtx->opCtx->inMultiDocumentTransaction();
+    const auto fcvSnapshot = serverGlobalParams.mutableFCV.acquireFCVSnapshot();
+    return !pExpCtx->opCtx->inMultiDocumentTransaction() ||
+        gFeatureFlagAllowAdditionalParticipants.isEnabled(fcvSnapshot);
 }
 
 void DocumentSourceLookUp::determineSbeCompatibility() {
@@ -477,10 +489,11 @@ void DocumentSourceLookUp::determineSbeCompatibility() {
 
 StageConstraints DocumentSourceLookUp::constraints(Pipeline::SplitState pipeState) const {
     HostTypeRequirement hostRequirement;
+    bool nominateMergingShard = false;
     if (_fromNs.isConfigDotCacheDotChunks()) {
         // $lookup from config.cache.chunks* namespaces is permitted to run on each individual
-        // shard, rather than just the primary, since each shard should have an identical copy of
-        // the namespace.
+        // shard, rather than just a merging shard, since each shard should have an identical copy
+        // of the namespace.
         hostRequirement = HostTypeRequirement::kAnyShard;
     } else if (pipeState == Pipeline::SplitState::kSplitForShards) {
         // This stage will only be on the shards pipeline if $lookup on sharded foreign collections
@@ -490,13 +503,9 @@ StageConstraints DocumentSourceLookUp::constraints(Pipeline::SplitState pipeStat
         // When the inner pipeline does not target a collection, it can run on any node.
         hostRequirement = HostTypeRequirement::kRunOnceAnyNode;
     } else {
-        // If the pipeline is unsplit or this stage is on the merging part of the pipeline,
-        // when $lookup on sharded foreign collections is allowed, the foreign collection is
-        // sharded, and the stage is executing on mongos, the stage can run on mongos or any shard.
-        hostRequirement = (foreignShardedLookupAllowed() && pExpCtx->inMongos &&
-                           pExpCtx->mongoProcessInterface->isSharded(pExpCtx->opCtx, _fromNs))
-            ? HostTypeRequirement::kNone
-            : HostTypeRequirement::kPrimaryShard;
+        // If the pipeline is unsplit, then this $lookup can run anywhere.
+        hostRequirement = HostTypeRequirement::kNone;
+        nominateMergingShard = pipeState == Pipeline::SplitState::kSplitForMerge;
     }
 
     // By default, $lookup is allowed in a transaction and does not use disk.
@@ -516,10 +525,39 @@ StageConstraints DocumentSourceLookUp::constraints(Pipeline::SplitState pipeStat
             _resolvedIntrospectionPipeline->getSources(), constraints);
     }
 
+    if (nominateMergingShard) {
+        constraints.mergeShardId = getMergeShardId();
+    }
+
     constraints.canSwapWithMatch = true;
     constraints.canSwapWithSkippingOrLimitingStage = !_unwindSrc;
 
     return constraints;
+}
+
+boost::optional<ShardId> DocumentSourceLookUp::computeMergeShardId() const {
+    // If this $lookup is on the merging half of the pipeline and the inner collection isn't
+    // sharded (that is, it is either unsplittable or untracked), then we should merge on the shard
+    // which owns the inner collection.
+    if (auto msi =
+            pExpCtx->mongoProcessInterface->determineSpecificMergeShard(pExpCtx->opCtx, _fromNs)) {
+        return msi;
+    }
+
+    // If we have not yet designated a merging shard, and are either executing on mongod, the
+    // foreign collection is unsharded, or sharded $lookup is not allowed, designate the current
+    // shard as the merging shard. This is done to prevent pushing this $lookup to the shards part
+    // of the pipeline. This is an important optimization designating as this $lookup  as a merging
+    // stage allows us to execute a single $lookup (as opposed to executing one $lookup on each
+    // involved shard). When this stage is part of a deeply nested pipeline, it  prevents creating
+    // an exponential explosion of cursors/resources (proportional to the level of pipeline
+    // nesting).
+    if (!(pExpCtx->inMongos && pExpCtx->mongoProcessInterface->isSharded(pExpCtx->opCtx, _fromNs) &&
+          foreignShardedLookupAllowed())) {
+        return ShardingState::get(pExpCtx->opCtx)->shardId();
+    }
+
+    return boost::none;
 }
 
 DocumentSource::GetNextResult DocumentSourceLookUp::doGetNext() {
@@ -538,16 +576,9 @@ DocumentSource::GetNextResult DocumentSourceLookUp::doGetNext() {
     // '_unwindSrc' would be non-null, and we would not have made it here.
     invariant(!_matchSrc);
 
-    if (hasLocalFieldForeignFieldJoin()) {
-        auto matchStage =
-            makeMatchStageFromInput(inputDoc, *_localField, _foreignField->fullPath(), BSONObj());
-        // We've already allocated space for the trailing $match stage in '_resolvedPipeline'.
-        _resolvedPipeline[*_fieldMatchPipelineIdx] = matchStage;
-    }
-
     std::unique_ptr<Pipeline, PipelineDeleter> pipeline;
     try {
-        pipeline = buildPipeline(inputDoc);
+        pipeline = buildPipeline(_fromExpCtx, inputDoc);
     } catch (const ExceptionForCat<ErrorCategory::StaleShardVersionError>& ex) {
         // If lookup on a sharded collection is disallowed and the foreign collection is sharded,
         // throw a custom exception.
@@ -621,38 +652,56 @@ std::unique_ptr<Pipeline, PipelineDeleter> DocumentSourceLookUp::buildPipelineFr
     return pipeline;
 }
 
-std::unique_ptr<Pipeline, PipelineDeleter> DocumentSourceLookUp::buildPipeline(
-    const Document& inputDoc) {
+template <bool isStreamsEngine>
+PipelinePtr DocumentSourceLookUp::buildPipeline(
+    const boost::intrusive_ptr<ExpressionContext>& fromExpCtx, const Document& inputDoc) {
+    if (hasLocalFieldForeignFieldJoin()) {
+        BSONObj filter =
+            !_unwindSrc || hasPipeline() ? BSONObj() : _additionalFilter.value_or(BSONObj());
+        auto matchStage =
+            makeMatchStageFromInput(inputDoc, *_localField, _foreignField->fullPath(), filter);
+        // We've already allocated space for the trailing $match stage in '_resolvedPipeline'.
+        _resolvedPipeline[*_fieldMatchPipelineIdx] = matchStage;
+    }
+
     // Copy all 'let' variables into the foreign pipeline's expression context.
-    _variables.copyToExpCtx(_variablesParseState, _fromExpCtx.get());
-    _fromExpCtx->forcePlanCache = true;
+    _variables.copyToExpCtx(_variablesParseState, fromExpCtx.get());
+    fromExpCtx->forcePlanCache = true;
+
+    // Query settings are looked up after parsing and therefore are not populated in the
+    // 'fromExpCtx' as part of DocumentSourceLookUp constructor. Assign query settings to the
+    // 'fromExpCtx' by copying them from the parent query ExpressionContext.
+    setQuerySettingsIfNeeded(fromExpCtx, getContext()->getQuerySettings());
 
     // Resolve the 'let' variables to values per the given input document.
-    resolveLetVariables(inputDoc, &_fromExpCtx->variables);
+    resolveLetVariables(inputDoc, &fromExpCtx->variables);
 
     std::unique_ptr<MongoProcessInterface::ScopedExpectUnshardedCollection>
         expectUnshardedCollectionInScope;
 
     const auto allowForeignShardedColl = foreignShardedLookupAllowed();
-    if (!allowForeignShardedColl) {
+    if (!allowForeignShardedColl && !fromExpCtx->inMongos) {
         // Enforce that the foreign collection must be unsharded for lookup.
         expectUnshardedCollectionInScope =
-            _fromExpCtx->mongoProcessInterface->expectUnshardedCollectionInScope(
-                _fromExpCtx->opCtx, _fromExpCtx->ns, boost::none);
+            fromExpCtx->mongoProcessInterface->expectUnshardedCollectionInScope(
+                fromExpCtx->opCtx, fromExpCtx->ns, boost::none);
     }
 
-    // If we don't have a cache, build and return the pipeline immediately.
-    if (!_cache || _cache->isAbandoned()) {
+    // If we don't have a cache, build and return the pipeline immediately. We don't support caching
+    // for the streams engine.
+    if (isStreamsEngine || !_cache || _cache->isAbandoned()) {
         MakePipelineOptions pipelineOpts;
         pipelineOpts.optimize = true;
-        pipelineOpts.attachCursorSource = true;
+        // The streams engine attaches its own remote cursor source, so we don't need to do it here.
+        pipelineOpts.attachCursorSource = !isStreamsEngine;
         pipelineOpts.validator = lookupPipeValidator;
-        // By default, $lookup doesnt support sharded 'from' collections.
-        pipelineOpts.shardTargetingPolicy = allowForeignShardedColl
+        // By default, $lookup does not support sharded 'from' collections. The streams engine does
+        // not care about sharding, and so it does not allow shard targeting.
+        pipelineOpts.shardTargetingPolicy = !isStreamsEngine && allowForeignShardedColl
             ? ShardTargetingPolicy::kAllowed
             : ShardTargetingPolicy::kNotAllowed;
         try {
-            return Pipeline::makePipeline(_resolvedPipeline, _fromExpCtx, pipelineOpts);
+            return Pipeline::makePipeline(_resolvedPipeline, fromExpCtx, pipelineOpts);
         } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& e) {
             // This exception returns the information we need to resolve a sharded view. Update the
             // pipeline with the resolved view definition.
@@ -669,7 +718,7 @@ std::unique_ptr<Pipeline, PipelineDeleter> DocumentSourceLookUp::buildPipeline(
                         "new_pipe"_attr = _resolvedPipeline);
 
             // We can now safely optimize and reattempt attaching the cursor source.
-            pipeline = Pipeline::makePipeline(_resolvedPipeline, _fromExpCtx, pipelineOpts);
+            pipeline = Pipeline::makePipeline(_resolvedPipeline, fromExpCtx, pipelineOpts);
 
             return pipeline;
         }
@@ -681,7 +730,7 @@ std::unique_ptr<Pipeline, PipelineDeleter> DocumentSourceLookUp::buildPipeline(
     pipelineOpts.optimize = false;
     pipelineOpts.attachCursorSource = false;
     pipelineOpts.validator = lookupPipeValidator;
-    auto pipeline = Pipeline::makePipeline(_resolvedPipeline, _fromExpCtx, pipelineOpts);
+    auto pipeline = Pipeline::makePipeline(_resolvedPipeline, fromExpCtx, pipelineOpts);
 
     // We can store the unoptimized serialization of the pipeline so that if we need to resolve
     // a sharded view later on, and we have a local-foreign field join, we will need to update
@@ -695,7 +744,7 @@ std::unique_ptr<Pipeline, PipelineDeleter> DocumentSourceLookUp::buildPipeline(
         auto shardTargetingPolicy = allowForeignShardedColl ? ShardTargetingPolicy::kAllowed
                                                             : ShardTargetingPolicy::kNotAllowed;
         try {
-            pipeline = pExpCtx->mongoProcessInterface->attachCursorSourceToPipeline(
+            pipeline = pExpCtx->mongoProcessInterface->preparePipelineForExecution(
                 pipeline.release(), shardTargetingPolicy);
         } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& e) {
             // This exception returns the information we need to resolve a sharded view. Update the
@@ -719,7 +768,7 @@ std::unique_ptr<Pipeline, PipelineDeleter> DocumentSourceLookUp::buildPipeline(
                         "new_pipe"_attr = _resolvedPipeline);
 
             // Try to attach the cursor source again.
-            pipeline = pExpCtx->mongoProcessInterface->attachCursorSourceToPipeline(
+            pipeline = pExpCtx->mongoProcessInterface->preparePipelineForExecution(
                 pipeline.release(), shardTargetingPolicy);
         }
     }
@@ -733,21 +782,65 @@ std::unique_ptr<Pipeline, PipelineDeleter> DocumentSourceLookUp::buildPipeline(
     return pipeline;
 }
 
+// Explicit instantiations for buildPipeline().
+template PipelinePtr DocumentSourceLookUp::buildPipeline<false /*isStreamsEngine*/>(
+    const boost::intrusive_ptr<ExpressionContext>& fromExpCtx, const Document& inputDoc);
+
+template PipelinePtr DocumentSourceLookUp::buildPipeline<true /*isStreamsEngine*/>(
+    const boost::intrusive_ptr<ExpressionContext>& fromExpCtx, const Document& inputDoc);
+
+/**
+ * Method that looks for a DocumentSourceSequentialDocumentCache stage and calls optimizeAt() on
+ * it if it has yet to be optimized.
+ */
+void findAndOptimizeSequentialDocumentCache(Pipeline& pipeline) {
+    auto& container = pipeline.getSources();
+    auto itr = (&container)->begin();
+    while (itr != (&container)->end()) {
+        if (dynamic_cast<DocumentSourceSequentialDocumentCache*>(itr->get())) {
+            auto sequentialCache = dynamic_cast<DocumentSourceSequentialDocumentCache*>(itr->get());
+            if (!sequentialCache->hasOptimizedPos()) {
+                sequentialCache->optimizeAt(itr, &container);
+            }
+        }
+        itr = std::next(itr);
+    }
+}
+
 void DocumentSourceLookUp::addCacheStageAndOptimize(Pipeline& pipeline) {
-    // Add the cache stage at the end and optimize. During the optimization process, the cache will
-    // either move itself to the correct position in the pipeline, or will abandon itself if no
-    // suitable cache position exists. Do it only if pipeline optimization is enabled, otherwise
-    // Pipeline::optimizePipeline() will exit early and correct placement of the cache will not
-    // occur.
+    // Adds the cache to the end of the pipeline and calls optimizeContainer which will ensure the
+    // stages of the pipeline are in the correct and optimal order, before the cache runs
+    // doOptimizeAt. During the optimization process, the cache will either move itself to the
+    // correct position in the pipeline, or abandon itself if no suitable cache position exists.
+    // Once the cache is finished optimizing, the entire pipeline is optimized.
+    //
+    // When pipeline optimization is disabled, 'Pipeline::optimizePipeline()' exits early and so the
+    // cache would not be placed correctly. So we only add the cache when pipeline optimization is
+    // enabled.
     if (auto fp = globalFailPointRegistry().find("disablePipelineOptimization");
         fp && fp->shouldFail()) {
         _cache->abandon();
     } else {
+        // The cache needs to see the full pipeline in its correct order in order to properly place
+        // itself, therefore we are adding it to the end of the pipeline, and calling
+        // optimizeContainer on the pipeline to ensure the rest of the pipeline is in its correct
+        // order before optimizing the cache.
+        // TODO SERVER-84113: We will no longer have separate logic based on if a cache is present
+        // in doOptimizeAt(), so we can instead only add and optimize the cache after
+        // optimizeContainer is called.
         pipeline.addFinalSource(
             DocumentSourceSequentialDocumentCache::create(_fromExpCtx, _cache.get_ptr()));
-    }
 
-    pipeline.optimizePipeline();
+        auto& container = pipeline.getSources();
+
+        Pipeline::optimizeContainer(&container);
+
+        // We want to ensure the cache has been optimized prior to any calls to optimize().
+        findAndOptimizeSequentialDocumentCache(pipeline);
+
+        // Optimize the pipeline, with the cache in its correct position if it exists.
+        Pipeline::optimizeEachStage(&container);
+    }
 }
 
 DocumentSource::GetModPathsReturn DocumentSourceLookUp::getModifiedPaths() const {
@@ -769,8 +862,8 @@ Pipeline::SourceContainer::iterator DocumentSourceLookUp::doOptimizeAt(
         return container->end();
     }
 
-    // If the following stage is $sort and there is no internal $unwind, consider pushing it ahead
-    // of $lookup.
+    // If the following stage is $sort and this $lookup has not absorbed a following $unwind, try to
+    // move the $sort ahead of the $lookup.
     if (!_unwindSrc) {
         itr = tryReorderingWithSort(itr, container);
         if (*itr != this) {
@@ -780,13 +873,22 @@ Pipeline::SourceContainer::iterator DocumentSourceLookUp::doOptimizeAt(
 
     auto nextUnwind = dynamic_cast<DocumentSourceUnwind*>((*std::next(itr)).get());
 
-    // If we are not already handling an $unwind stage internally, we can combine with the
-    // following $unwind stage.
+    // If we are not already handling an $unwind stage internally and the following stage is an
+    // $unwind of the $lookup "as" output array, subsume the $unwind into the current $lookup as an
+    // $LU ($lookup + $unwind) macro stage. The combined stage acts like a SQL join (one result
+    // record per LHS x RHS match instead of one result per LHS with an array of its RHS matches).
+    //
+    // Ideally for simplicity in the stage builder we would not absorb the downstream $unwind if the
+    // lookup strategy is kNonExistentForeignCollection, but that is not determined until later and
+    // would be hard to do so here as it requires several inputs we do not have. It is also hard to
+    // move that determination earlier as it occurs in the deep stack under createLegacyExecutor().
     if (nextUnwind && !_unwindSrc && nextUnwind->getUnwindPath() == _as.fullPath()) {
+        if (nextUnwind->preserveNullAndEmptyArrays() || nextUnwind->indexPath()) {
+            downgradeSbeCompatibility(SbeCompatibility::notCompatible);
+        } else {
+            downgradeSbeCompatibility(SbeCompatibility::requiresTrySbe);
+        }
         _unwindSrc = std::move(nextUnwind);
-
-        // We cannot push absorbed $unwind stages into SBE.
-        _sbeCompatibility = SbeCompatibility::notCompatible;
         container->erase(std::next(itr));
         return itr;
     }
@@ -871,17 +973,13 @@ Pipeline::SourceContainer::iterator DocumentSourceLookUp::doOptimizeAt(
         return std::next(itr);
     }
 
-    // We can internalize the $match. This $lookup should already be marked as SBE incompatible
-    // because a $match can only be internalized if an $unwind, which is SBE incompatible, was
-    // absorbed as well.
-    tassert(5843701,
-            "This $lookup cannot be compatible with SBE",
-            _sbeCompatibility == SbeCompatibility::notCompatible);
+    // We cannot yet lower $LUM (combined $lookup + $unwind + $match) stages to SBE.
+    _sbeCompatibility = SbeCompatibility::notCompatible;
     if (!_matchSrc) {
         _matchSrc = nextMatch;
     } else {
         // We have already absorbed a $match. We need to join it with 'dependent'.
-        _matchSrc->joinMatchWith(nextMatch);
+        _matchSrc->joinMatchWith(nextMatch, "$and"_sd);
     }
 
     // Remove the original $match.
@@ -905,7 +1003,7 @@ Pipeline::SourceContainer::iterator DocumentSourceLookUp::doOptimizeAt(
     // There may be further optimization between this $lookup and the new neighbor, so we return an
     // iterator pointing to ourself.
     return itr;
-}
+}  // doOptimizeAt
 
 bool DocumentSourceLookUp::usedDisk() {
     if (_pipeline)
@@ -971,18 +1069,7 @@ DocumentSource::GetNextResult DocumentSourceLookUp::unwindResult() {
 
         _input = nextInput.releaseDocument();
 
-        if (hasLocalFieldForeignFieldJoin()) {
-            // At this point, if there is a pipeline, '_additionalFilter' was added to the end of
-            // '_resolvedPipeline' in doOptimizeAt(). If there is no pipeline, we must add it to the
-            // $match stage created here.
-            BSONObj filter = hasPipeline() ? BSONObj() : _additionalFilter.value_or(BSONObj());
-            auto matchStage =
-                makeMatchStageFromInput(*_input, *_localField, _foreignField->fullPath(), filter);
-            // We've already allocated space for the trailing $match stage in '_resolvedPipeline'.
-            _resolvedPipeline[*_fieldMatchPipelineIdx] = matchStage;
-        }
-
-        _pipeline = buildPipeline(*_input);
+        _pipeline = buildPipeline(_fromExpCtx, *_input);
 
         // The $lookup stage takes responsibility for disposing of its Pipeline, since it will
         // potentially be used by multiple OperationContexts, and the $lookup stage is part of an
@@ -1208,6 +1295,11 @@ boost::optional<DocumentSource::DistributedPlanLogic> DocumentSourceLookUp::dist
     // either choice will work correctly; we are simply applying a heuristic optimization.
     if (foreignShardedLookupAllowed() && pExpCtx->subPipelineDepth == 0 &&
         pExpCtx->mongoProcessInterface->isSharded(_fromExpCtx->opCtx, _fromNs)) {
+        tassert(
+            8725000,
+            "Should not attempt to nominate merging shard when $lookup is not acting as a merger",
+            !mergeShardId.isInitialized() ||
+                (mergeShardId.isInitialized() && getMergeShardId() == boost::none));
         return boost::none;
     }
 
@@ -1215,6 +1307,11 @@ boost::optional<DocumentSource::DistributedPlanLogic> DocumentSourceLookUp::dist
         // When $lookup reads from config.cache.chunks.* namespaces, it should run on each
         // individual shard in parallel. This is a special case, and atypical for standard $lookup
         // since a full copy of config.cache.chunks.* collections exists on all shards.
+        tassert(
+            8725001,
+            "Should not attempt to nominate merging shard when $lookup is not acting as a merger",
+            !mergeShardId.isInitialized() ||
+                (mergeShardId.isInitialized() && getMergeShardId() == boost::none));
         return boost::none;
     }
 
@@ -1388,6 +1485,17 @@ void DocumentSourceLookUp::addInvolvedCollections(
     for (auto&& stage : _resolvedIntrospectionPipeline->getSources()) {
         stage->addInvolvedCollections(collectionNames);
     }
+}
+
+void DocumentSourceLookUp::setQuerySettingsIfNeeded(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const query_settings::QuerySettings& querySettings) {
+    if (_didSetQuerySettingsToPipeline) {
+        return;
+    }
+
+    expCtx->setQuerySettings(querySettings);
+    _didSetQuerySettingsToPipeline = true;
 }
 
 }  // namespace mongo

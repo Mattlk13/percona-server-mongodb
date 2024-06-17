@@ -115,7 +115,7 @@ public:
     };
 
     MigrationDestinationManager();
-    ~MigrationDestinationManager();
+    ~MigrationDestinationManager() override;
 
     /**
      * Returns the singleton instance of the migration destination manager.
@@ -196,7 +196,7 @@ public:
         BSONObj idIndexSpec;
     };
     static IndexesAndIdIndex getCollectionIndexes(OperationContext* opCtx,
-                                                  const NamespaceStringOrUUID& nssOrUUID,
+                                                  const NamespaceString& nss,
                                                   const ShardId& fromShardId,
                                                   const boost::optional<CollectionRoutingInfo>& cri,
                                                   boost::optional<Timestamp> afterClusterTime);
@@ -214,11 +214,17 @@ public:
         BSONObj options;
         UUID uuid;
     };
+
+    static CollectionOptionsAndUUID getCollectionOptions(
+        OperationContext* opCtx,
+        const NamespaceStringOrUUID& nssOrUUID,
+        boost::optional<Timestamp> afterClusterTime);
+
     static CollectionOptionsAndUUID getCollectionOptions(
         OperationContext* opCtx,
         const NamespaceStringOrUUID& nssOrUUID,
         const ShardId& fromShardId,
-        const boost::optional<ChunkManager>& cm,
+        const boost::optional<DatabaseVersion>& dbVersion,
         boost::optional<Timestamp> afterClusterTime);
 
     /**
@@ -298,7 +304,7 @@ private:
     void onStepDown() final;
     void onRollback() final {}
     void onBecomeArbiter() final {}
-    inline std::string getServiceName() const override final {
+    inline std::string getServiceName() const final {
         return "MigrationDestinationManager";
     }
 

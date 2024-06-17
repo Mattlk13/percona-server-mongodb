@@ -129,7 +129,7 @@ public:
                        ThreadPool* writerPool,
                        Timestamp resumeBatchingTs = Timestamp());
 
-    virtual ~TenantOplogApplier();
+    ~TenantOplogApplier() override;
 
     /**
      * Return a future which will be notified when that optime has been reached.  Future will
@@ -172,6 +172,8 @@ private:
     void _writeTransactionEntryNoOp(OperationContext* opCtx,
                                     MutableOplogEntry& noopEntry,
                                     const OplogEntry& entry);
+    std::vector<StmtId> _fixupNssAndGatherStmtIdsforApplyOpsNoop(MutableOplogEntry& noopEntry,
+                                                                 const OplogEntry& entry);
     void _writeRetryableWriteEntryNoOp(OperationContext* opCtx,
                                        MutableOplogEntry& noopEntry,
                                        const OplogEntry& entry,

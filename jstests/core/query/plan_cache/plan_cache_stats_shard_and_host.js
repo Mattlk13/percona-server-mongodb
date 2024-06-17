@@ -8,9 +8,6 @@
 //   does_not_support_stepdowns,
 //   # Plan cache state is node-local and will not get migrated alongside tenant data.
 //   tenant_migration_incompatible,
-//   # TODO SERVER-67607: Test plan cache with CQF enabled.
-//   cqf_experimental_incompatible,
-//   requires_fcv_71,
 // ]
 import {getPlanCacheKeyFromExplain} from "jstests/libs/analyze_plan.js";
 import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
@@ -26,7 +23,7 @@ assert.commandWorked(coll.insert({a: 2, b: 3}));
 assert.eq(1, coll.find({a: 2, b: 3}).itcount());
 
 const explain = coll.find({a: 2, b: 3}).explain();
-const planCacheKey = getPlanCacheKeyFromExplain(explain, db);
+const planCacheKey = getPlanCacheKeyFromExplain(explain);
 
 function filterPlanCacheEntriesByKey(planCacheKey, planCacheContents) {
     let filteredPlanCacheEntries = [];
@@ -53,7 +50,11 @@ for (const entry of planCacheContents) {
 // Otherwise, we expect "shard" to be absent. In either case, this should be true for each
 // individual plan cache entry.
 for (const entry of planCacheContents) {
-    assert.eq(FixtureHelpers.isMongos(db), entry.hasOwnProperty("shard"), entry);
+    assert.eq(FixtureHelpers.isMongos(db) ||
+                  (TestData.hasOwnProperty("testingReplicaSetEndpoint") &&
+                   TestData.testingReplicaSetEndpoint),
+              entry.hasOwnProperty("shard"),
+              entry);
 }
 
 // If we group the results by shard or host, then we should only get one plan cache entry for each

@@ -43,12 +43,14 @@
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
+#include "mongo/db/pipeline/document_source_limit.h"
+#include "mongo/db/pipeline/initialize_auto_get_helper.h"
 #include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/explain_options.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/query_knobs_gen.h"
-#include "mongo/db/query/query_settings_gen.h"
+#include "mongo/db/query/query_settings/query_settings_gen.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/logv2/log.h"
@@ -63,7 +65,6 @@
 #include "mongo/util/uuid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
-
 
 namespace mongo {
 
@@ -196,11 +197,20 @@ void DocumentSourceCursor::loadBatch() {
 
             // As long as we're waiting for inserts, we shouldn't do any batching at this level we
             // need the whole pipeline to see each document to see if we should stop waiting.
-            if (awaitDataState(pExpCtx->opCtx).shouldWaitForInserts ||
-                static_cast<long long>(_currentBatch.memUsageBytes()) >
-                    internalDocumentSourceCursorBatchSizeBytes.load()) {
-                // End this batch and prepare PlanExecutor for yielding.
-                _exec->saveState();
+            bool batchCountFull = _batchSizeCount != 0 && _currentBatch.count() >= _batchSizeCount;
+            if (batchCountFull || _currentBatch.memUsageBytes() > _batchSizeBytes ||
+                awaitDataState(pExpCtx->opCtx).shouldWaitForInserts) {
+                // At any given time only one operation can own the entirety of resources used by a
+                // multi-document transaction. As we can perform a remote call during the query
+                // execution we will check in the session to avoid deadlocks. If we don't release
+                // the storage engine resources used here then we could have two operations
+                // interacting with resources of a session at the same time. This will leave the
+                // plan in the saved state as a side-effect.
+                _exec->releaseAllAcquiredResources();
+                // Double the size for next batch when batch is full.
+                if (batchCountFull && overflow::mul(_batchSizeCount, 2, &_batchSizeCount)) {
+                    _batchSizeCount = 0;  // Go unlimited if we overflow.
+                }
                 return;
             }
         }
@@ -212,7 +222,13 @@ void DocumentSourceCursor::loadBatch() {
         // since we will need to retrieve the resume information the executor observed before
         // hitting EOF.
         if (_resumeTrackingType != ResumeTrackingType::kNone || pExpCtx->isTailableAwaitData()) {
-            _exec->saveState();
+            // At any given time only one operation can own the entirety of resources used by a
+            // multi-document transaction. As we can perform a remote call during the query
+            // execution we will check in the session to avoid deadlocks. If we don't release the
+            // storage engine resources used here then we could have two operations interacting with
+            // resources of a session at the same time. This will leave the plan in the saved state
+            // as a side-effect.
+            _exec->releaseAllAcquiredResources();
             return;
         }
     } catch (...) {
@@ -276,17 +292,24 @@ Value DocumentSourceCursor::serialize(const SerializationOptions& opts) const {
     {
         auto opCtx = pExpCtx->opCtx;
         auto secondaryNssList = _exec->getSecondaryNamespaces();
-        AutoGetCollectionForReadMaybeLockFree readLock(
-            opCtx,
-            _exec->nss(),
-            AutoGetCollection::Options{}.secondaryNssOrUUIDs(secondaryNssList.cbegin(),
-                                                             secondaryNssList.cend()));
+        boost::optional<AutoGetCollectionForReadMaybeLockFree> readLock = boost::none;
+        auto initAutoGetFn = [&]() {
+            readLock.emplace(pExpCtx->opCtx,
+                             _exec->nss(),
+                             AutoGetCollection::Options{}.secondaryNssOrUUIDs(
+                                 secondaryNssList.cbegin(), secondaryNssList.cend()));
+        };
+        bool isAnySecondaryCollectionNotLocal =
+            intializeAutoGet(opCtx, _exec->nss(), secondaryNssList, initAutoGetFn);
+        tassert(8322003,
+                "Should have initialized AutoGet* after calling 'initializeAutoGet'",
+                readLock.has_value());
         MultipleCollectionAccessor collections(opCtx,
-                                               &readLock.getCollection(),
-                                               readLock.getNss(),
-                                               readLock.isAnySecondaryNamespaceAViewOrSharded(),
+                                               &readLock->getCollection(),
+                                               readLock->getNss(),
+                                               readLock->isAnySecondaryNamespaceAView() ||
+                                                   isAnySecondaryCollectionNotLocal,
                                                secondaryNssList);
-
         Explain::explainStages(_exec.get(),
                                collections,
                                verbosity.value(),
@@ -402,6 +425,28 @@ DocumentSourceCursor::DocumentSourceCursor(
             CollectionQueryInfo::get(coll).notifyOfQuery(pExpCtx->opCtx, coll, stats);
         }
     }
+
+    initializeBatchSizeCounts();
+    _batchSizeBytes = static_cast<size_t>(internalDocumentSourceCursorBatchSizeBytes.load());
+}
+
+void DocumentSourceCursor::initializeBatchSizeCounts() {
+    // '0' means there's no limitation.
+    _batchSizeCount = 0;
+    if (auto cq = _exec->getCanonicalQuery()) {
+        if (cq->getFindCommandRequest().getLimit().has_value()) {
+            // $limit is pushed down into executor, skipping batch size count limitation.
+            return;
+        }
+        for (const auto& ds : cq->cqPipeline()) {
+            if (ds->getSourceName() == DocumentSourceLimit::kStageName) {
+                // $limit is pushed down into executor, skipping batch size count limitation.
+                return;
+            }
+        }
+    }
+    // No $limit is pushed down into executor, reading limit from knobs.
+    _batchSizeCount = internalDocumentSourceCursorInitialBatchSize.load();
 }
 
 intrusive_ptr<DocumentSourceCursor> DocumentSourceCursor::create(

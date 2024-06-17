@@ -34,15 +34,23 @@ function checkExplainOutput(explain, verbosity) {
     if (verbosity == "allPlansExecution") {
         const allPlans = explain.executionStats.allPlansExecution;
         for (let plan of allPlans) {
-            assert(plan.hasOwnProperty("score"), explain);
-            assert.gt(plan.score, 0, explain);
+            if (plan.hasOwnProperty("shardName")) {
+                for (let shardPlan of plan.allPlans) {
+                    assert(shardPlan.hasOwnProperty("score"), {explain, shardPlan});
+                    assert.gt(shardPlan.score, 0, {explain, shardPlan});
+                }
+            } else {
+                assert(plan.hasOwnProperty("score"), {explain, plan});
+                assert.gt(plan.score, 0, {explain, plan});
+            }
         }
     }
 }
 
 // Create indexes so that there are multiple plans.
 assert.commandWorked(coll.createIndex({a: 1}));
-assert.commandWorked(coll.createIndex({a: 1, b: 1}));
+// Create descending index to avoid index deduplication.
+assert.commandWorked(coll.createIndex({a: -1, b: 1}));
 
 ["queryPlanner", "executionStats", "allPlansExecution"].forEach(verbosity => {
     const explain = coll.find({a: {$gte: 0}}).explain(verbosity);

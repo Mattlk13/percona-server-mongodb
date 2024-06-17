@@ -34,13 +34,14 @@ base_command="db-contrib-tool setup-repro-env"
 evergreen_args="--installDir /data/install \
   --linkDir /data/multiversion \
   --platform $platform \
-  --architecture $architecture"
+  --architecture $architecture \
+  --evgVersionsFile multiversion-downloads.json"
 local_args="--edition $edition \
   --fallbackToMaster \
   --resmokeCmd \"python buildscripts/resmoke.py\" \
   --debug \
   ${last_lts_arg} \
-  ${last_continuous_arg} 4.4 5.0 6.0"
+  ${last_continuous_arg} 4.2 4.4 5.0 6.0"
 
 remote_invocation="${base_command} ${evergreen_args} ${local_args}"
 eval "${remote_invocation}"

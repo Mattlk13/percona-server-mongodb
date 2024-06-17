@@ -330,9 +330,8 @@ public:
  */
 class FLEQueryInterfaceImpl : public FLEQueryInterface {
 public:
-    FLEQueryInterfaceImpl(const txn_api::TransactionClient& txnClient,
-                          ServiceContext* serviceContext)
-        : _txnClient(txnClient), _serviceContext(serviceContext) {}
+    FLEQueryInterfaceImpl(const txn_api::TransactionClient& txnClient, Service* service)
+        : _txnClient(txnClient), _service(service) {}
 
     BSONObj getById(const NamespaceString& nss, BSONElement element) final;
 
@@ -378,8 +377,41 @@ public:
 
 private:
     const txn_api::TransactionClient& _txnClient;
-    ServiceContext* _serviceContext;
+    Service* _service;
     std::shared_ptr<executor::InlineExecutor::SleepableExecutor> _executor;
+};
+
+/**
+ * FLEStateCollectionReader using an FLEQueryInterface.
+ */
+class FLEStateCollectionQueryInterfaceReader : public FLEStateCollectionReader {
+public:
+    FLEStateCollectionQueryInterfaceReader(FLEQueryInterface* iface, const NamespaceString& nss)
+        : _query(iface), _nss(nss) {}
+
+    uint64_t getDocumentCount() const override {
+        return _query->countDocuments(_nss);
+    }
+
+    BSONObj getById(PrfBlock block) const override {
+        BSONObjBuilder bob;
+        bob.appendBinData("_id"_sd, block.size(), BinDataType::BinDataGeneral, block.data());
+        auto docs = _query->findDocuments(_nss, bob.obj());
+        _stats.setRead(_stats.getRead() + 1);
+        if (docs.empty()) {
+            return {};
+        }
+        return std::move(docs[0]);
+    }
+
+    ECStats getStats() const override {
+        return _stats;
+    }
+
+private:
+    FLEQueryInterface* _query;
+    NamespaceString _nss;
+    mutable ECStats _stats;
 };
 
 /**

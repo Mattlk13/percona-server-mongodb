@@ -32,7 +32,6 @@
 #include <memory>
 #include <string>
 
-#include "mongo/bson/oid.h"
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/s/sharding_mongod_test_fixture.h"
 #include "mongo/db/shard_id.h"
@@ -47,15 +46,18 @@ namespace mongo {
 
 /**
  * Test fixture for shard components, as opposed to config or mongos components. Provides a mock
- * network via ShardingMongodTestFixture.
+ * network via ShardingMongoDTestFixture.
  */
-class ShardServerTestFixture : public ShardingMongodTestFixture {
+class ShardServerTestFixture : public ShardingMongoDTestFixture {
 protected:
     ShardServerTestFixture(Options options = {}, bool setUpMajorityReads = true);
-    ~ShardServerTestFixture();
+    ~ShardServerTestFixture() override;
 
     void setUp() override;
-    void tearDown() override;
+
+    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient() override;
+
+    void setCatalogCacheLoader(std::unique_ptr<CatalogCacheLoader> loader);
 
     /**
      * Returns the mock targeter for the config server. Useful to use like so,
@@ -68,14 +70,10 @@ protected:
      */
     std::shared_ptr<RemoteCommandTargeterMock> configTargeterMock();
 
-    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient() override;
+    const HostAndPort kConfigHostAndPort{"dummy", 123};
+    const ShardId kMyShardName{"myShardName"};
 
-    void setCatalogCacheLoader(std::unique_ptr<CatalogCacheLoader> loader);
-
-    static const HostAndPort kConfigHostAndPort;
-
-    const ShardId _myShardName{"myShardName"};
-    OID _clusterId;
+    service_context_test::ShardRoleOverride _shardRole;
 
     std::unique_ptr<CatalogCacheLoader> _catalogCacheLoader;
 };
@@ -83,7 +81,7 @@ protected:
 class ShardServerTestFixtureWithCatalogCacheMock : public ShardServerTestFixture {
 protected:
     void setUp() override;
-    virtual std::unique_ptr<CatalogCache> makeCatalogCache() override;
+    std::unique_ptr<CatalogCache> makeCatalogCache() override;
     CatalogCacheMock* getCatalogCacheMock();
     CatalogCacheLoaderMock* getCatalogCacheLoaderMock();
 

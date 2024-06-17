@@ -62,8 +62,6 @@
 
 namespace mongo {
 
-class PlanYieldPolicy;
-
 namespace executor {
 
 /**
@@ -99,7 +97,8 @@ public:
 
         // Optional yield policy allows us to yield(release storage resources) during remote call.
         // Using shared_ptr to allow tries on network failure, don't share the pointer on other
-        // purpose.
+        // purpose. In practice, this will always be of type PlanYieldPolicyRemoteCursor, but
+        // for dependency reasons, we must use the generic PlanYieldPolicy here.
         std::shared_ptr<PlanYieldPolicy> yieldPolicy{nullptr};
 
         Options() {}
@@ -179,7 +178,7 @@ public:
         return _cursorVars;
     }
 
-    boost::optional<std::string> getType() const {
+    boost::optional<CursorTypeEnum> getType() const {
         return _cursorType;
     }
 
@@ -211,6 +210,10 @@ public:
         if (_options.yieldPolicy && !_options.yieldPolicy->usesCollectionAcquisitions()) {
             _options.yieldPolicy->setYieldable(yieldable);
         }
+    }
+
+    PlanYieldPolicy* getYieldPolicy() {
+        return _options.yieldPolicy.get();
     }
 
 private:
@@ -278,7 +281,7 @@ private:
     boost::optional<BSONObj> _cursorVars = boost::none;
 
     // For commands that return multiple cursors, the type of the cursor.
-    boost::optional<std::string> _cursorType;
+    boost::optional<CursorTypeEnum> _cursorType;
 
     // This is a sum of the time spent waiting on remote calls.
     Milliseconds _millisecondsWaiting = Milliseconds(0);

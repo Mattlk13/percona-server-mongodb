@@ -157,7 +157,11 @@ bool ReplicationCoordinatorMock::isInPrimaryOrSecondaryState_UNSAFE() const {
 }
 
 Seconds ReplicationCoordinatorMock::getSecondaryDelaySecs() const {
-    return Seconds(0);
+    return _secondaryDelaySecs;
+}
+
+void ReplicationCoordinatorMock::setSecondaryDelaySecs(Seconds sec) {
+    _secondaryDelaySecs = sec;
 }
 
 void ReplicationCoordinatorMock::clearSyncSourceDenylist() {}
@@ -261,26 +265,25 @@ void ReplicationCoordinatorMock::_setMyLastAppliedOpTimeAndWallTime(
     }
 }
 
-void ReplicationCoordinatorMock::setMyLastAppliedOpTimeAndWallTime(
+void ReplicationCoordinatorMock::setMyLastWrittenOpTimeAndWallTimeForward(
     const OpTimeAndWallTime& opTimeAndWallTime) {
     stdx::lock_guard<Mutex> lk(_mutex);
 
-    _setMyLastAppliedOpTimeAndWallTime(lk, opTimeAndWallTime);
-}
-
-void ReplicationCoordinatorMock::setMyLastDurableOpTimeAndWallTime(
-    const OpTimeAndWallTime& opTimeAndWallTime) {
-    stdx::lock_guard<Mutex> lk(_mutex);
-
-    _myLastDurableOpTime = opTimeAndWallTime.opTime;
-    _myLastDurableWallTime = opTimeAndWallTime.wallTime;
+    // = is necessary here because in some unit test setup, we want to update the term while not
+    // changing the opTime.
+    if (opTimeAndWallTime.opTime >= _myLastWrittenOpTime) {
+        _myLastWrittenOpTime = opTimeAndWallTime.opTime;
+        _myLastWrittenWallTime = opTimeAndWallTime.wallTime;
+    }
 }
 
 void ReplicationCoordinatorMock::setMyLastAppliedOpTimeAndWallTimeForward(
-    const OpTimeAndWallTime& opTimeAndWallTime, bool advanceGlobalTimestamp) {
+    const OpTimeAndWallTime& opTimeAndWallTime) {
     stdx::lock_guard<Mutex> lk(_mutex);
 
-    if (opTimeAndWallTime.opTime > _myLastAppliedOpTime) {
+    // = is necessary here because in some unit test setup, we want to update the term while not
+    // changing the opTime.
+    if (opTimeAndWallTime.opTime >= _myLastAppliedOpTime) {
         _setMyLastAppliedOpTimeAndWallTime(lk, opTimeAndWallTime);
     }
 }
@@ -289,7 +292,42 @@ void ReplicationCoordinatorMock::setMyLastDurableOpTimeAndWallTimeForward(
     const OpTimeAndWallTime& opTimeAndWallTime) {
     stdx::lock_guard<Mutex> lk(_mutex);
 
-    if (opTimeAndWallTime.opTime > _myLastDurableOpTime) {
+    // = is necessary here because in some unit test setup, we want to update the term while not
+    // changing the opTime.
+    if (opTimeAndWallTime.opTime >= _myLastDurableOpTime) {
+        _myLastDurableOpTime = opTimeAndWallTime.opTime;
+        _myLastDurableWallTime = opTimeAndWallTime.wallTime;
+    }
+}
+
+void ReplicationCoordinatorMock::setMyLastAppliedAndLastWrittenOpTimeAndWallTimeForward(
+    const OpTimeAndWallTime& opTimeAndWallTime) {
+    stdx::lock_guard<Mutex> lk(_mutex);
+
+    // = is necessary here because in some unit test setup, we want to update the term while not
+    // changing the opTime.
+    if (opTimeAndWallTime.opTime >= _myLastWrittenOpTime) {
+        _myLastWrittenOpTime = opTimeAndWallTime.opTime;
+        _myLastWrittenWallTime = opTimeAndWallTime.wallTime;
+    }
+
+    if (opTimeAndWallTime.opTime >= _myLastAppliedOpTime) {
+        _setMyLastAppliedOpTimeAndWallTime(lk, opTimeAndWallTime);
+    }
+}
+
+void ReplicationCoordinatorMock::setMyLastDurableAndLastWrittenOpTimeAndWallTimeForward(
+    const OpTimeAndWallTime& opTimeAndWallTime) {
+    stdx::lock_guard<Mutex> lk(_mutex);
+
+    // = is necessary here because in some unit test setup, we want to update the term while not
+    // changing the opTime.
+    if (opTimeAndWallTime.opTime >= _myLastWrittenOpTime) {
+        _myLastWrittenOpTime = opTimeAndWallTime.opTime;
+        _myLastWrittenWallTime = opTimeAndWallTime.wallTime;
+    }
+
+    if (opTimeAndWallTime.opTime >= _myLastDurableOpTime) {
         _myLastDurableOpTime = opTimeAndWallTime.opTime;
         _myLastDurableWallTime = opTimeAndWallTime.wallTime;
     }
@@ -302,12 +340,23 @@ void ReplicationCoordinatorMock::resetMyLastOpTimes() {
     _myLastDurableWallTime = Date_t();
 }
 
-OpTimeAndWallTime ReplicationCoordinatorMock::getMyLastAppliedOpTimeAndWallTime(
+OpTimeAndWallTime ReplicationCoordinatorMock::getMyLastWrittenOpTimeAndWallTime(
     bool rollbackSafe) const {
     stdx::lock_guard<Mutex> lk(_mutex);
     if (rollbackSafe && _memberState.rollback()) {
         return {};
     }
+    return {_myLastWrittenOpTime, _myLastWrittenWallTime};
+}
+
+OpTime ReplicationCoordinatorMock::getMyLastWrittenOpTime() const {
+    stdx::lock_guard<Mutex> lk(_mutex);
+
+    return _myLastWrittenOpTime;
+}
+
+OpTimeAndWallTime ReplicationCoordinatorMock::getMyLastAppliedOpTimeAndWallTime() const {
+    stdx::lock_guard<Mutex> lk(_mutex);
     return {_myLastAppliedOpTime, _myLastAppliedWallTime};
 }
 
@@ -346,6 +395,12 @@ Status ReplicationCoordinatorMock::waitUntilOpTimeForReadUntil(OperationContext*
     return Status::OK();
 }
 
+Status ReplicationCoordinatorMock::waitUntilOpTimeWrittenUntil(OperationContext* opCtx,
+                                                               LogicalTime clusterTime,
+                                                               boost::optional<Date_t> deadline) {
+    return Status::OK();
+}
+
 Status ReplicationCoordinatorMock::awaitTimestampCommitted(OperationContext* opCtx, Timestamp ts) {
     return Status::OK();
 }
@@ -378,8 +433,13 @@ Status ReplicationCoordinatorMock::setFollowerModeRollback(OperationContext* opC
     return setFollowerMode(MemberState::RS_ROLLBACK);
 }
 
+void ReplicationCoordinatorMock::setApplierState(const ApplierState& newState) {
+    stdx::lock_guard<Mutex> lk(_mutex);
+    _applierState = newState;
+}
+
 ReplicationCoordinator::ApplierState ReplicationCoordinatorMock::getApplierState() {
-    return ApplierState::Running;
+    return _applierState;
 }
 
 void ReplicationCoordinatorMock::signalDrainComplete(OperationContext*, long long) noexcept {}
@@ -454,10 +514,11 @@ Status ReplicationCoordinatorMock::validateWriteConcern(
     return _getConfigReturnValue.validateWriteConcern(writeConcern);
 }
 
-const MemberConfig* ReplicationCoordinatorMock::findConfigMemberByHostAndPort(
+boost::optional<MemberConfig> ReplicationCoordinatorMock::findConfigMemberByHostAndPort_deprecated(
     const HostAndPort& hap) const {
     stdx::lock_guard<Mutex> lock(_mutex);
-    return _getConfigReturnValue.findMemberByHostAndPort(hap);
+    const MemberConfig* result = _getConfigReturnValue.findMemberByHostAndPort(hap);
+    return boost::make_optional(result, *result);
 }
 
 bool ReplicationCoordinatorMock::isConfigLocalHostAllowed() const {
@@ -647,7 +708,7 @@ Status ReplicationCoordinatorMock::processReplSetRequestVotes(
     return Status::OK();
 }
 
-void ReplicationCoordinatorMock::prepareReplMetadata(const BSONObj& metadataRequestObj,
+void ReplicationCoordinatorMock::prepareReplMetadata(const CommonRequestArgs& requestArgs,
                                                      const OpTime& lastOpTimeFromClient,
                                                      BSONObjBuilder* builder) const {}
 
@@ -725,8 +786,6 @@ Status ReplicationCoordinatorMock::abortCatchupIfNeeded(PrimaryCatchUpConclusion
 void ReplicationCoordinatorMock::incrementNumCatchUpOpsIfCatchingUp(long numOps) {
     return;
 }
-
-void ReplicationCoordinatorMock::signalDropPendingCollectionsRemovedFromStorage() {}
 
 boost::optional<Timestamp> ReplicationCoordinatorMock::getRecoveryTimestamp() {
     if (_storage) {

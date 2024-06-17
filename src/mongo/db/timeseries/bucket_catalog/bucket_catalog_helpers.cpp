@@ -52,6 +52,7 @@
 #include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/db/timeseries/bucket_catalog/bucket_catalog.h"
 #include "mongo/db/timeseries/timeseries_constants.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/redaction.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/duration.h"
@@ -104,7 +105,7 @@ BSONObj generateReopeningMatchFilter(const Date_t& time,
                                      int64_t bucketMaxSpanSeconds) {
     boost::optional<BSONObj> versionFilter;
     if (!feature_flags::gTimeseriesAlwaysUseCompressedBuckets.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
         // The bucket must be uncompressed.
         versionFilter = BSON(kControlVersionPath << kTimeseriesControlUncompressedVersion);
     }
@@ -178,7 +179,8 @@ std::vector<BSONObj> generateReopeningPipeline(OperationContext* opCtx,
     return pipeline;
 }
 
-StatusWith<MinMax> generateMinMaxFromBucketDoc(const BSONObj& bucketDoc,
+StatusWith<MinMax> generateMinMaxFromBucketDoc(TrackingContext& trackingContext,
+                                               const BSONObj& bucketDoc,
                                                const StringDataComparator* comparator) {
     auto swDocs = extractMinAndMax(bucketDoc);
     if (!swDocs.isOK()) {
@@ -188,13 +190,14 @@ StatusWith<MinMax> generateMinMaxFromBucketDoc(const BSONObj& bucketDoc,
     const auto& [minObj, maxObj] = swDocs.getValue();
 
     try {
-        return MinMax::parseFromBSON(minObj, maxObj, comparator);
+        return MinMax::parseFromBSON(trackingContext, minObj, maxObj, comparator);
     } catch (...) {
         return exceptionToStatus();
     }
 }
 
-StatusWith<Schema> generateSchemaFromBucketDoc(const BSONObj& bucketDoc,
+StatusWith<Schema> generateSchemaFromBucketDoc(TrackingContext& trackingContext,
+                                               const BSONObj& bucketDoc,
                                                const StringDataComparator* comparator) {
     auto swDocs = extractMinAndMax(bucketDoc);
     if (!swDocs.isOK()) {
@@ -204,7 +207,7 @@ StatusWith<Schema> generateSchemaFromBucketDoc(const BSONObj& bucketDoc,
     const auto& [minObj, maxObj] = swDocs.getValue();
 
     try {
-        return Schema::parseFromBSON(minObj, maxObj, comparator);
+        return Schema::parseFromBSON(trackingContext, minObj, maxObj, comparator);
     } catch (...) {
         return exceptionToStatus();
     }
@@ -264,27 +267,24 @@ BSONObj findDocFromOID(OperationContext* opCtx, const Collection* coll, const OI
     return (foundDoc) ? bucketObj.value() : BSONObj();
 }
 
-void handleDirectWrite(OperationContext* opCtx, const NamespaceString& ns, const OID& bucketId) {
-    // Ensure we have the view namespace, as that's what the BucketCatalog operates on.
-    NamespaceString resolvedNs =
-        ns.isTimeseriesBucketsCollection() ? ns.getTimeseriesViewNamespace() : ns;
-
+void handleDirectWrite(OperationContext* opCtx, const UUID& collectionUUID, const OID& bucketId) {
     // First notify the BucketCatalog that we intend to start a direct write, so we can conflict
     // with any already-prepared operation, and also block bucket reopening if it's enabled.
     auto& bucketCatalog = BucketCatalog::get(opCtx);
-    directWriteStart(bucketCatalog.bucketStateRegistry, resolvedNs, bucketId);
+    directWriteStart(bucketCatalog.bucketStateRegistry, collectionUUID, bucketId);
 
     // Then register callbacks so we can let the BucketCatalog know that we are done with our direct
     // write after the actual write takes place (or is abandoned), and allow reopening.
-    opCtx->recoveryUnit()->onCommit([svcCtx = opCtx->getServiceContext(), resolvedNs, bucketId](
-                                        OperationContext*, boost::optional<Timestamp>) {
-        auto& bucketCatalog = BucketCatalog::get(svcCtx);
-        directWriteFinish(bucketCatalog.bucketStateRegistry, resolvedNs, bucketId);
-    });
-    opCtx->recoveryUnit()->onRollback(
-        [svcCtx = opCtx->getServiceContext(), resolvedNs, bucketId](OperationContext*) {
+    shard_role_details::getRecoveryUnit(opCtx)->onCommit(
+        [svcCtx = opCtx->getServiceContext(), collectionUUID, bucketId](
+            OperationContext*, boost::optional<Timestamp>) {
             auto& bucketCatalog = BucketCatalog::get(svcCtx);
-            directWriteFinish(bucketCatalog.bucketStateRegistry, resolvedNs, bucketId);
+            directWriteFinish(bucketCatalog.bucketStateRegistry, collectionUUID, bucketId);
+        });
+    shard_role_details::getRecoveryUnit(opCtx)->onRollback(
+        [svcCtx = opCtx->getServiceContext(), collectionUUID, bucketId](OperationContext*) {
+            auto& bucketCatalog = BucketCatalog::get(svcCtx);
+            directWriteFinish(bucketCatalog.bucketStateRegistry, collectionUUID, bucketId);
         });
 }
 

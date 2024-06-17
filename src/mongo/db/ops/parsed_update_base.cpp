@@ -102,12 +102,13 @@ ParsedUpdateBase::ParsedUpdateBase(OperationContext* opCtx,
       _canonicalQuery(),
       _extensionsCallback(std::move(extensionsCallback)),
       _collection(collection),
-      _timeseriesUpdateQueryExprs(isRequestToTimeseries
-                                      ? createTimeseriesWritesQueryExprsIfNecessary(
-                                            feature_flags::gTimeseriesUpdatesSupport.isEnabled(
-                                                serverGlobalParams.featureCompatibility),
-                                            collection)
-                                      : nullptr),
+      _timeseriesUpdateQueryExprs(
+          isRequestToTimeseries
+              ? createTimeseriesWritesQueryExprsIfNecessary(
+                    feature_flags::gTimeseriesUpdatesSupport.isEnabled(
+                        serverGlobalParams.featureCompatibility.acquireFCVSnapshot()),
+                    collection)
+              : nullptr),
       _isRequestToTimeseries(isRequestToTimeseries) {
     if (forgoOpCounterIncrements) {
         _expCtx->enabledCounters = false;
@@ -129,7 +130,8 @@ void ParsedUpdateBase::maybeTranslateTimeseriesUpdate() {
     // that in findAndModify code path, the parsed update constructor should be called with
     // isRequestToTimeseries = true for a time-series collection.
     uassert(ErrorCodes::InvalidOptions,
-            "Cannot perform a findAndModify with a query and sort on a time-series collection.",
+            "Cannot perform an updateOne or a findAndModify with a query and sort on a time-series "
+            "collection.",
             _request->isMulti() || _request->getSort().isEmpty());
 
     // If we're updating documents in a time-series collection, splits the match expression into a
@@ -156,6 +158,7 @@ void ParsedUpdateBase::maybeTranslateTimeseriesUpdate() {
     }
     _originalExpr = uassertStatusOK(MatchExpressionParser::parse(
         _request->getQuery(), _expCtx, ExtensionsCallbackNoop(), allowedFeatures));
+    _originalExpr = MatchExpression::normalize(std::move(_originalExpr));
 }
 
 Status ParsedUpdateBase::parseRequest() {
@@ -206,9 +209,7 @@ Status ParsedUpdateBase::parseRequest() {
     parseUpdate();
     Status status = parseQuery();
 
-    // After parsing to detect if $$USER_ROLES is referenced in the query, set the value of
-    // $$USER_ROLES for the update.
-    _expCtx->setUserRoles();
+    _expCtx->initializeReferencedSystemVariables();
 
     return status;
 }

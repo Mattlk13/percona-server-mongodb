@@ -35,37 +35,46 @@
 #include <boost/optional/optional.hpp>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <functional>
 #include <iterator>
+#include <type_traits>
 #include <vector>
 
 #include "mongo/bson/util/builder.h"
 #include "mongo/platform/int128.h"
 
 namespace mongo {
-
-
 /**
- * Callback type to implement writing of 64 bit Simple8b words.
+ * Concept for writing 64bit simple8b blocks via a callback.
  */
-using Simple8bWriteFn = std::function<void(uint64_t)>;
+template <class F>
+concept Simple8bBlockWriter = requires(F&& f) {
+    std::invoke(std::forward<F>(f), std::declval<uint64_t>());
+};
 
 /**
  * Simple8bBuilder compresses a series of integers into chains of 64 bit Simple8b blocks.
  *
  * T may be uint64_t and uint128_t only.
  */
-template <typename T>
+template <typename T, class Allocator = std::allocator<void>>
 class Simple8bBuilder {
 private:
     struct PendingValue;
+    using PendingValueAllocator =
+        typename std::allocator_traits<Allocator>::template rebind_alloc<PendingValue>;
 
 public:
     // Callback to handle writing of finalized Simple-8b blocks. Machine Endian byte order, the
     // value need to be converted to Little Endian before persisting.
-    Simple8bBuilder(Simple8bWriteFn writeFunc = nullptr);
+    explicit Simple8bBuilder(Allocator = {});
     ~Simple8bBuilder();
+
+    Simple8bBuilder(const Simple8bBuilder&) = default;
+    Simple8bBuilder(Simple8bBuilder&&) = default;
+
+    Simple8bBuilder& operator=(const Simple8bBuilder&) = default;
+    Simple8bBuilder& operator=(Simple8bBuilder&&) = default;
 
     /**
      * Appends val to Simple8b. Returns true if the append was successful and false if the value was
@@ -73,21 +82,27 @@ public:
      *
      * A call to append may result in multiple Simple8b blocks being finalized.
      */
-    bool append(T val);
+    template <class F>
+    requires Simple8bBlockWriter<F>
+    bool append(T val, F&& writeFn);
 
     /**
      * Appends a missing value to Simple8b.
      *
      * May result in a single Simple8b being finalized.
      */
-    void skip();
+    template <class F>
+    requires Simple8bBlockWriter<F>
+    void skip(F&& writeFn);
 
     /**
      * Flushes all buffered values into finalized Simple8b blocks.
      *
      * It is allowed to continue to append values after this call.
      */
-    void flush();
+    template <class F>
+    requires Simple8bBlockWriter<F>
+    void flush(F&& writeFn);
 
     /**
      * Iterator for reading pending values in Simple8bBuilder that has not yet been written to
@@ -118,13 +133,14 @@ public:
         bool operator!=(const PendingIterator& rhs) const;
 
     private:
-        PendingIterator(typename std::deque<PendingValue>::const_iterator beginning,
-                        typename std::deque<PendingValue>::const_iterator it,
-                        reference rleValue,
-                        uint32_t rleCount);
+        PendingIterator(
+            typename std::vector<PendingValue, PendingValueAllocator>::const_iterator beginning,
+            typename std::vector<PendingValue, PendingValueAllocator>::const_iterator it,
+            reference rleValue,
+            uint32_t rleCount);
 
-        typename std::deque<PendingValue>::const_iterator _begin;
-        typename std::deque<PendingValue>::const_iterator _it;
+        typename std::vector<PendingValue, PendingValueAllocator>::const_iterator _begin;
+        typename std::vector<PendingValue, PendingValueAllocator>::const_iterator _it;
 
         const boost::optional<T>& _rleValue;
         uint32_t _rleCount;
@@ -143,9 +159,26 @@ public:
     std::reverse_iterator<PendingIterator> rend() const;
 
     /**
-     * Set write callback
+     * Forcibly set last value so future append/skip calls may use this to construct RLE. This
+     * should not be called in normal operation.
      */
-    void setWriteCallback(Simple8bWriteFn writer);
+    void setLastForRLE(boost::optional<T> val);
+
+    /**
+     * Reset RLE state on the last value, if needed. This should not be called in normal operation.
+     */
+    void resetLastForRLEIfNeeded();
+
+    /**
+     * Initialize RLE state from another builder
+     */
+    void initializeRLEFrom(const Simple8bBuilder<T, Allocator>& other);
+
+    /**
+     * Validates that the internal state of this Simple8bBuilder is identical to the provided one.
+     * This guarantees that appending more data to either of them would produce the same binary.
+     */
+    bool isInternalStateIdentical(const Simple8bBuilder<T, Allocator>& other) const;
 
 private:
     // Number of different type of selectors and their extensions available
@@ -197,13 +230,22 @@ private:
     struct EightSelectorLargeEncodeFunctor;
 
     /**
+     * Helper function to calculate PendingValue from user input. Pending value contain number of
+     * significant bits and trailing zeros required to store the value in the different selector
+     * types. If the value is not possible to store in a Simple8b block boost::none will be
+     * returned.
+     */
+    static boost::optional<PendingValue> _calculatePendingValue(T val);
+
+    /**
      * Appends a value to the Simple8b chain of words.
      * Return true if successfully appended and false otherwise.
      *
      * 'tryRle' indicates if we are allowed to put this skip in RLE count or not. Should only be set
      * to true when terminating RLE and we are flushing excess values.
      */
-    bool _appendValue(T value, bool tryRle);
+    template <class F>
+    bool _appendValue(T value, bool tryRle, F&& writeFn);
 
     /**
      * Appends a skip to _pendingValues and forms a new Simple8b word if there is no space.
@@ -211,19 +253,22 @@ private:
      * 'tryRle' indicates if we are allowed to put this value in RLE count or not. Should only be
      * set to true when terminating RLE and we are flushing excess values.
      */
-    void _appendSkip(bool tryRle);
+    template <class F>
+    void _appendSkip(bool tryRle, F&& writeFn);
 
     /**
      * When an RLE ends because of inconsecutive values, check if there are enough
      * consecutive values for a RLE value and/or any values to be appended to _pendingValues.
      */
-    void _handleRleTermination();
+    template <class F>
+    void _handleRleTermination(F&& writeFn);
 
     /**
      * Based on _rleCount, create a RLE Simple8b word if possible.
      * If _rleCount is not large enough, do nothing.
      */
-    void _appendRleEncoding();
+    template <class F>
+    void _appendRleEncoding(F&& writeFn);
 
     /*
      * Checks to see if RLE is possible and/or ongoing
@@ -277,11 +322,11 @@ private:
     // If RLE is ongoing, the number of consecutive repeats fo lastValueInPrevWord.
     uint32_t _rleCount = 0;
     // If RLE is ongoing, the last value in the previous Simple8b word.
-    PendingValue _lastValueInPrevWord;
+    boost::optional<T> _lastValueInPrevWord{0};
 
     // These variables hold the max amount of bits for each value in _pendingValues. They are
     // updated whenever values are added or removed from _pendingValues to always reflect the max
-    // value in the deque.
+    // value in the pending queue.
     std::array<uint8_t, kNumOfSelectorTypes> _currMaxBitLen = kMinDataBits;
     std::array<uint8_t, kNumOfSelectorTypes> _currTrailingZerosCount = {0, 0, 0, 0};
 
@@ -297,10 +342,9 @@ private:
 
     // This holds values that have not be encoded to the simple8b buffer, but are waiting for a full
     // simple8b word to be filled before writing to buffer.
-    std::deque<PendingValue> _pendingValues;
-
-    // User-defined callback to handle writing of finalized Simple-8b blocks
-    Simple8bWriteFn _writeFn;
+    std::vector<PendingValue, PendingValueAllocator> _pendingValues;
 };
 
 }  // namespace mongo
+
+#include "mongo/bson/util/simple8b_builder.inl"

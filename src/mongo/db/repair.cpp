@@ -47,7 +47,6 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/validate_results.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/rebuild_indexes.h"
@@ -59,6 +58,7 @@
 #include "mongo/db/storage/storage_repair_observer.h"
 #include "mongo/db/storage/storage_util.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -75,11 +75,11 @@ using namespace fmt::literals;
 Status rebuildIndexesForNamespace(OperationContext* opCtx,
                                   const NamespaceString& nss,
                                   StorageEngine* engine) {
-    if (opCtx->recoveryUnit()->isActive()) {
+    if (shard_role_details::getRecoveryUnit(opCtx)->isActive()) {
         // This function is shared by multiple callers. Some of which have opened a transaction to
         // perform reads. This function may make mixed-mode writes. Mixed-mode assertions can only
         // be suppressed when beginning a fresh transaction.
-        opCtx->recoveryUnit()->abandonSnapshot();
+        shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
     }
 
     opCtx->checkForInterrupt();
@@ -191,7 +191,7 @@ Status repairDatabase(OperationContext* opCtx, StorageEngine* engine, const Data
     DisableDocumentValidation validationDisabler(opCtx);
 
     // We must hold some form of lock here
-    invariant(opCtx->lockState()->isW());
+    invariant(shard_role_details::getLocker(opCtx)->isW());
 
     LOGV2(21029, "repairDatabase", logAttrs(dbName));
 
@@ -276,6 +276,11 @@ Status repairCollection(OperationContext* opCtx,
     const SerializationContext serializaionCtx(SerializationContext::Source::Command,
                                                SerializationContext::CallerType::Reply,
                                                SerializationContext::Prefix::IncludePrefix);
+
+    // Close the open transaction to allow enabling pre-fetching in validation.
+    if (shard_role_details::getRecoveryUnit(opCtx)->isActive()) {
+        shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
+    }
 
     // Exclude full record store validation because we have already validated the underlying
     // record store in the call to repairRecordStore above.

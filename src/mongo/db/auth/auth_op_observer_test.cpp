@@ -58,6 +58,7 @@
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/framework.h"
@@ -91,8 +92,9 @@ public:
 
         // Create test collection
         writeConflictRetry(opCtx.get(), "createColl", _nss, [&] {
-            opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
-            opCtx->recoveryUnit()->abandonSnapshot();
+            shard_role_details::getRecoveryUnit(opCtx.get())
+                ->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+            shard_role_details::getRecoveryUnit(opCtx.get())->abandonSnapshot();
 
             WriteUnitOfWork wunit(opCtx.get());
             AutoGetCollection collRaii(opCtx.get(), _nss, MODE_X);
@@ -119,7 +121,7 @@ private:
 TEST_F(AuthOpObserverTest, OnRollbackInvalidatesAuthCacheWhenAuthNamespaceRolledBack) {
     AuthOpObserver opObserver;
     auto opCtx = cc().makeOperationContext();
-    auto authMgr = AuthorizationManager::get(getServiceContext());
+    auto authMgr = AuthorizationManager::get(opCtx->getService());
     auto initCacheGen = authMgr->getCacheGeneration();
 
     // Verify that the rollback op observer invalidates the user cache for each auth namespace by
@@ -143,7 +145,7 @@ TEST_F(AuthOpObserverTest, OnRollbackInvalidatesAuthCacheWhenAuthNamespaceRolled
 TEST_F(AuthOpObserverTest, OnRollbackDoesntInvalidateAuthCacheWhenNoAuthNamespaceRolledBack) {
     AuthOpObserver opObserver;
     auto opCtx = cc().makeOperationContext();
-    auto authMgr = AuthorizationManager::get(getServiceContext());
+    auto authMgr = AuthorizationManager::get(opCtx->getService());
     auto initCacheGen = authMgr->getCacheGeneration();
 
     // Verify that the rollback op observer doesn't invalidate the user cache.

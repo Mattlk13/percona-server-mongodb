@@ -205,8 +205,13 @@ void ReplicationCoordinatorEmbedded::setMyHeartbeatMessage(const std::string&) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
+void ReplicationCoordinatorEmbedded::setMyLastWrittenOpTimeAndWallTimeForward(
+    const OpTimeAndWallTime&) {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
 void ReplicationCoordinatorEmbedded::setMyLastAppliedOpTimeAndWallTimeForward(
-    const OpTimeAndWallTime&, bool) {
+    const OpTimeAndWallTime&) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -215,11 +220,13 @@ void ReplicationCoordinatorEmbedded::setMyLastDurableOpTimeAndWallTimeForward(
     UASSERT_NOT_IMPLEMENTED;
 }
 
-void ReplicationCoordinatorEmbedded::setMyLastAppliedOpTimeAndWallTime(const OpTimeAndWallTime&) {
+void ReplicationCoordinatorEmbedded::setMyLastAppliedAndLastWrittenOpTimeAndWallTimeForward(
+    const OpTimeAndWallTime&) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
-void ReplicationCoordinatorEmbedded::setMyLastDurableOpTimeAndWallTime(const OpTimeAndWallTime&) {
+void ReplicationCoordinatorEmbedded::setMyLastDurableAndLastWrittenOpTimeAndWallTimeForward(
+    const OpTimeAndWallTime&) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -227,8 +234,16 @@ void ReplicationCoordinatorEmbedded::resetMyLastOpTimes() {
     UASSERT_NOT_IMPLEMENTED;
 }
 
-OpTimeAndWallTime ReplicationCoordinatorEmbedded::getMyLastAppliedOpTimeAndWallTime(
+OpTimeAndWallTime ReplicationCoordinatorEmbedded::getMyLastWrittenOpTimeAndWallTime(
     bool rollbackSafe) const {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+OpTime ReplicationCoordinatorEmbedded::getMyLastWrittenOpTime() const {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+OpTimeAndWallTime ReplicationCoordinatorEmbedded::getMyLastAppliedOpTimeAndWallTime() const {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -266,6 +281,12 @@ Status ReplicationCoordinatorEmbedded::waitUntilOpTimeForRead(OperationContext*,
 
 Status ReplicationCoordinatorEmbedded::waitUntilOpTimeForReadUntil(OperationContext*,
                                                                    const ReadConcernArgs&,
+                                                                   boost::optional<Date_t>) {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+Status ReplicationCoordinatorEmbedded::waitUntilOpTimeWrittenUntil(OperationContext*,
+                                                                   LogicalTime,
                                                                    boost::optional<Date_t>) {
     UASSERT_NOT_IMPLEMENTED;
 }
@@ -362,7 +383,8 @@ BSONObj ReplicationCoordinatorEmbedded::getConfigBSON() const {
     UASSERT_NOT_IMPLEMENTED;
 }
 
-const MemberConfig* ReplicationCoordinatorEmbedded::findConfigMemberByHostAndPort(
+boost::optional<MemberConfig>
+ReplicationCoordinatorEmbedded::findConfigMemberByHostAndPort_deprecated(
     const HostAndPort& hap) const {
     UASSERT_NOT_IMPLEMENTED;
 }
@@ -521,7 +543,7 @@ Status ReplicationCoordinatorEmbedded::processReplSetRequestVotes(OperationConte
     UASSERT_NOT_IMPLEMENTED;
 }
 
-void ReplicationCoordinatorEmbedded::prepareReplMetadata(const BSONObj&,
+void ReplicationCoordinatorEmbedded::prepareReplMetadata(const CommonRequestArgs&,
                                                          const OpTime&,
                                                          BSONObjBuilder*) const {
     UASSERT_NOT_IMPLEMENTED;
@@ -558,10 +580,6 @@ void ReplicationCoordinatorEmbedded::clearCommittedSnapshot() {
 }
 
 Status ReplicationCoordinatorEmbedded::stepUpIfEligible(bool skipDryRun) {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
-void ReplicationCoordinatorEmbedded::signalDropPendingCollectionsRemovedFromStorage() {
     UASSERT_NOT_IMPLEMENTED;
 }
 

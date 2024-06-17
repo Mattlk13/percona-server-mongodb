@@ -475,8 +475,8 @@ protected:
 
         auto dataReplicatorExternalState = std::make_unique<DataReplicatorExternalStateMock>();
         dataReplicatorExternalState->taskExecutor = _executorProxy;
-        dataReplicatorExternalState->currentTerm = 1LL;
-        dataReplicatorExternalState->lastCommittedOpTime = _myLastOpTime;
+        dataReplicatorExternalState->setCurrentTerm(1LL);
+        dataReplicatorExternalState->setLastCommittedOpTime(_myLastOpTime);
         {
             ReplSetConfig config(
                 ReplSetConfig::parse(BSON("_id"
@@ -486,7 +486,7 @@ protected:
                                                                    << "localhost:12345"))
                                           << "settings"
                                           << BSON("electionTimeoutMillis" << 10000))));
-            dataReplicatorExternalState->replSetConfigResult = config;
+            dataReplicatorExternalState->setReplSetConfigResult(config);
         }
         _externalState = dataReplicatorExternalState.get();
 
@@ -637,7 +637,7 @@ RemoteCommandResponse makeCursorResponse(CursorId cursorId,
     OpTime futureOpTime(Timestamp(1000, 1000), 1000);
     Date_t futureWallTime = Date_t() + Seconds(futureOpTime.getSecs());
     rpc::OplogQueryMetadata oqMetadata(
-        {futureOpTime, futureWallTime}, futureOpTime, rbid, 0, 0, "");
+        {futureOpTime, futureWallTime}, futureOpTime, futureOpTime, rbid, 0, 0, "");
 
     BSONObjBuilder bob;
     {
@@ -865,7 +865,7 @@ TEST_F(InitialSyncerTest, StartupSetsInitialDataTimestampAndStableTimestampOnSuc
     ASSERT_TRUE(initialSyncer->isActive());
 
     ASSERT_EQUALS(Timestamp::kAllowUnstableCheckpointsSentinel,
-                  _storageInterface->getInitialDataTimestamp());
+                  _storageInterface->getInitialDataTimestamp(getGlobalServiceContext()));
     ASSERT_EQUALS(Timestamp::min(), _storageInterface->getStableTimestamp());
 }
 
@@ -1728,7 +1728,7 @@ TEST_F(InitialSyncerTest,
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
 
-    getExternalState()->replSetConfigResult = Status(ErrorCodes::OperationFailed, "");
+    getExternalState()->setReplSetConfigResult(Status(ErrorCodes::OperationFailed, ""));
 
     _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 12345));
     ASSERT_OK(initialSyncer->startup(opCtx.get(), maxAttempts));
@@ -4258,12 +4258,13 @@ OplogEntry InitialSyncerTest::doInitialSyncWithOneBatch() {
 
 void InitialSyncerTest::doSuccessfulInitialSyncWithOneBatch() {
     auto lastOp = doInitialSyncWithOneBatch();
-    serverGlobalParams.mutableFeatureCompatibility.reset();
+    serverGlobalParams.mutableFCV.reset();
     ASSERT_OK(_lastApplied.getStatus());
     ASSERT_EQUALS(lastOp.getOpTime(), _lastApplied.getValue().opTime);
     ASSERT_EQUALS(lastOp.getWallClockTime(), _lastApplied.getValue().wallTime);
 
-    ASSERT_EQUALS(lastOp.getOpTime().getTimestamp(), _storageInterface->getInitialDataTimestamp());
+    ASSERT_EQUALS(lastOp.getOpTime().getTimestamp(),
+                  _storageInterface->getInitialDataTimestamp(getGlobalServiceContext()));
 }
 
 TEST_F(InitialSyncerTest,

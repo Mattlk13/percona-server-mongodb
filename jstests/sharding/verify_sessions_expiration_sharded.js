@@ -12,6 +12,10 @@
 //    expiring from the config.system.sessions collection. If the expiration date has been reached
 //    during a currently running operation, the logical session cache should vivify the session and
 //    replace it in the config.system.sessions collection.
+//
+// @tags: [
+//    temp_disabled_embedded_router_metrics,
+// ]
 
 // This test makes assertions about the number of logical session records.
 TestData.disableImplicitSessions = true;
@@ -87,6 +91,12 @@ refreshSessionsAndVerifyExistence(mongosConfig, shardConfig, sessionIDs, false /
 for (let i = 0; i < 10; i++) {
     db[testCollName].insert({_id: i, a: i, b: 1});
 }
+
+// Make sure we have no opened sessions before starting the test. Creating a collection will
+// generate a new session during the commit phase of the create coordinator
+refreshSessionsAndVerifyExistence(mongosConfig, shardConfig, [], false /* expectToExist */);
+let openedSessionIDs = mongosConfig.system.sessions.find().toArray().map(s => s._id);
+assert.commandWorked(db.runCommand({endSessions: openedSessionIDs}))
 
 let cursors = [];
 sessionIDs = [];

@@ -53,6 +53,22 @@ constexpr auto fle2Prefix = "enxcol_."_sd;
 constexpr auto fle2EscSuffix = ".esc"_sd;
 constexpr auto fle2EccSuffix = ".ecc"_sd;
 constexpr auto fle2EcocSuffix = ".ecoc"_sd;
+constexpr auto fle2EcocCompactSuffix = ".ecoc.compact"_sd;
+
+// The following are namespaces in the form of config.xxx for which only one instance exist globally
+// within the cluster.
+static const absl::flat_hash_set<NamespaceString> globallyUniqueConfigDbCollections = {
+    NamespaceString::kConfigsvrCollectionsNamespace,
+    NamespaceString::kConfigsvrChunksNamespace,
+    NamespaceString::kConfigDatabasesNamespace,
+    NamespaceString::kConfigsvrShardsNamespace,
+    NamespaceString::kConfigsvrIndexCatalogNamespace,
+    NamespaceString::kConfigsvrPlacementHistoryNamespace,
+    NamespaceString::kConfigChangelogNamespace,
+    NamespaceString::kConfigsvrTagsNamespace,
+    NamespaceString::kConfigVersionNamespace,
+    NamespaceString::kConfigMongosNamespace,
+    NamespaceString::kLogicalSessionsNamespace};
 
 }  // namespace
 
@@ -64,8 +80,7 @@ bool NamespaceString::isCollectionlessAggregateNS() const {
     return coll() == collectionlessAggregateCursorCol;
 }
 
-bool NamespaceString::isLegalClientSystemNS(
-    const ServerGlobalParams::FeatureCompatibility& currentFCV) const {
+bool NamespaceString::isLegalClientSystemNS() const {
     auto collectionName = coll();
     if (isAdminDB()) {
         if (collectionName == "system.roles")
@@ -75,6 +90,8 @@ bool NamespaceString::isLegalClientSystemNS(
         if (collectionName == kKeysCollectionNamespace.coll())
             return true;
         if (collectionName == "system.backup_users")
+            return true;
+        if (collectionName == "system.new_users")
             return true;
     } else if (isConfigDB()) {
         if (collectionName == "system.sessions")
@@ -152,13 +169,14 @@ bool NamespaceString::mustBeAppliedInOwnOplogBatch() const {
 }
 
 NamespaceString NamespaceString::makeBulkWriteNSS(const boost::optional<TenantId>& tenantId) {
-    return NamespaceString(tenantId, DatabaseName::kAdmin.db(), bulkWriteCursorCol);
+    return NamespaceString(tenantId, DatabaseName::kAdmin.db(omitTenant), bulkWriteCursorCol);
 }
 
 NamespaceString NamespaceString::makeClusterParametersNSS(
     const boost::optional<TenantId>& tenantId) {
-    return tenantId ? NamespaceString(tenantId, DatabaseName::kConfig.db(), "clusterParameters")
-                    : kClusterParametersNamespace;
+    return tenantId
+        ? NamespaceString(tenantId, DatabaseName::kConfig.db(omitTenant), "clusterParameters")
+        : kClusterParametersNamespace;
 }
 
 NamespaceString NamespaceString::makeSystemDotViewsNamespace(const DatabaseName& dbName) {
@@ -193,7 +211,7 @@ NamespaceString NamespaceString::makeCollectionlessAggregateNSS(const DatabaseNa
 
 NamespaceString NamespaceString::makeChangeCollectionNSS(
     const boost::optional<TenantId>& tenantId) {
-    return NamespaceString{tenantId, DatabaseName::kConfig.db(), kChangeCollectionName};
+    return NamespaceString{tenantId, DatabaseName::kConfig.db(omitTenant), kChangeCollectionName};
 }
 
 NamespaceString NamespaceString::makeGlobalIndexNSS(const UUID& id) {
@@ -203,7 +221,8 @@ NamespaceString NamespaceString::makeGlobalIndexNSS(const UUID& id) {
 
 NamespaceString NamespaceString::makePreImageCollectionNSS(
     const boost::optional<TenantId>& tenantId) {
-    return NamespaceString{tenantId, DatabaseName::kConfig.db(), kPreImagesCollectionName};
+    return NamespaceString{
+        tenantId, DatabaseName::kConfig.db(omitTenant), kPreImagesCollectionName};
 }
 
 NamespaceString NamespaceString::makeReshardingLocalOplogBufferNSS(
@@ -222,12 +241,14 @@ NamespaceString NamespaceString::makeReshardingLocalConflictStashNSS(
 
 NamespaceString NamespaceString::makeTenantUsersCollection(
     const boost::optional<TenantId>& tenantId) {
-    return NamespaceString(tenantId, DatabaseName::kAdmin.db(), NamespaceString::kSystemUsers);
+    return NamespaceString(
+        tenantId, DatabaseName::kAdmin.db(omitTenant), NamespaceString::kSystemUsers);
 }
 
 NamespaceString NamespaceString::makeTenantRolesCollection(
     const boost::optional<TenantId>& tenantId) {
-    return NamespaceString(tenantId, DatabaseName::kAdmin.db(), NamespaceString::kSystemRoles);
+    return NamespaceString(
+        tenantId, DatabaseName::kAdmin.db(omitTenant), NamespaceString::kSystemRoles);
 }
 
 NamespaceString NamespaceString::makeCommandNamespace(const DatabaseName& dbName) {
@@ -235,7 +256,7 @@ NamespaceString NamespaceString::makeCommandNamespace(const DatabaseName& dbName
 }
 
 NamespaceString NamespaceString::makeDummyNamespace(const boost::optional<TenantId>& tenantId) {
-    return NamespaceString(tenantId, DatabaseName::kConfig.db(), "dummy.namespace");
+    return NamespaceString(tenantId, DatabaseName::kConfig.db(omitTenant), "dummy.namespace");
 }
 
 std::string NamespaceString::getSisterNS(StringData local) const {
@@ -331,6 +352,25 @@ bool NamespaceString::isNamespaceAlwaysUntracked() const {
     return false;
 }
 
+bool NamespaceString::isShardLocalNamespace() const {
+    if (isLocalDB() || isAdminDB()) {
+        return true;
+    }
+
+    if (isConfigDB()) {
+        return !globallyUniqueConfigDbCollections.contains(*this);
+    }
+
+    if (isSystem()) {
+        // Only some db.system.xxx collections are cluster global.
+        const bool isUniqueInstanceSystemCollection =
+            isTemporaryReshardingCollection() || isTimeseriesBucketsCollection();
+        return !isUniqueInstanceSystemCollection;
+    }
+
+    return false;
+}
+
 bool NamespaceString::isConfigDotCacheDotChunks() const {
     return db_deprecated() == "config" && coll().startsWith("cache.chunks.");
 }
@@ -344,7 +384,8 @@ bool NamespaceString::isReshardingConflictStashCollection() const {
 }
 
 bool NamespaceString::isTemporaryReshardingCollection() const {
-    return coll().startsWith(kTemporaryReshardingCollectionPrefix);
+    return coll().startsWith(kTemporaryTimeseriesReshardingCollectionPrefix) ||
+        coll().startsWith(kTemporaryReshardingCollectionPrefix);
 }
 
 bool NamespaceString::isTimeseriesBucketsCollection() const {
@@ -370,7 +411,7 @@ bool NamespaceString::isConfigTransactionsCollection() const {
 bool NamespaceString::isFLE2StateCollection() const {
     return coll().startsWith(fle2Prefix) &&
         (coll().endsWith(fle2EscSuffix) || coll().endsWith(fle2EccSuffix) ||
-         coll().endsWith(fle2EcocSuffix));
+         coll().endsWith(fle2EcocSuffix) || coll().endsWith(fle2EcocCompactSuffix));
 }
 
 bool NamespaceString::isFLE2StateCollection(StringData coll) {
@@ -402,7 +443,7 @@ NamespaceString NamespaceString::getTimeseriesViewNamespace() const {
 }
 
 bool NamespaceString::isImplicitlyReplicated() const {
-    if (db_deprecated() == DatabaseName::kConfig.db()) {
+    if (db_deprecated() == DatabaseName::kConfig.db(omitTenant)) {
         if (isChangeStreamPreImagesCollection() || isConfigImagesCollection() ||
             isChangeCollection()) {
             // Implicitly replicated namespaces are replicated, although they only replicate a

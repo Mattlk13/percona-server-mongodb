@@ -46,25 +46,24 @@
 namespace mongo {
 namespace {
 static const auto handle = ServiceContext::declareDecoration<APIVersionMetrics>();
+constexpr auto kDefaultAppName = "default"_sd;
 }  // namespace
 
 APIVersionMetrics& APIVersionMetrics::get(ServiceContext* svc) {
     return handle(svc);
 }
 
-void APIVersionMetrics::update(const std::string& appName, const APIParameters& apiParams) {
+void APIVersionMetrics::update(StringData appName, const APIParameters& apiParams) {
     Date_t now = getGlobalServiceContext()->getFastClockSource()->now();
     stdx::lock_guard<Latch> lk(_mutex);
     // Ensure that the number of saved app names does not exceed the limit.
-    if (!_apiVersionMetrics.count(appName) && _apiVersionMetrics.size() >= KMaxNumOfSavedAppNames) {
+    if (_apiVersionMetrics.size() >= KMaxNumOfSavedAppNames && !_apiVersionMetrics.count(appName)) {
         return;
     }
 
-    if (apiParams.getAPIVersion()) {
-        _apiVersionMetrics[appName][*apiParams.getAPIVersion()] = now;
-    } else {
-        _apiVersionMetrics[appName]["default"] = now;
-    }
+    auto version =
+        apiParams.getAPIVersion() ? StringData(*apiParams.getAPIVersion()) : kDefaultAppName;
+    _apiVersionMetrics[appName][version] = now;
 }
 
 void APIVersionMetrics::_removeStaleTimestamps(WithLock lk, Date_t now) {
@@ -143,17 +142,15 @@ APIVersionMetrics::APIVersionMetricsMap APIVersionMetrics::getAPIVersionMetrics_
     return _apiVersionMetrics;
 }
 
-class APIVersionMetrics::APIVersionMetricsSSM : public ServerStatusMetric {
-private:
-    void appendTo(BSONObjBuilder& b, StringData leafName) const override {
-        BSONObjBuilder apiVersionBob(b.subobjStart(leafName));
-        APIVersionMetrics::get(getGlobalServiceContext())
-            .appendAPIVersionMetricsInfo(&apiVersionBob);
-        apiVersionBob.done();
+namespace {
+struct ApiVersionsMetricPolicy {
+    void appendTo(BSONObjBuilder& b, StringData leafName) const {
+        BSONObjBuilder bob{b.subobjStart(leafName)};
+        auto&& instance = APIVersionMetrics::get(getGlobalServiceContext());
+        instance.appendAPIVersionMetricsInfo(&bob);
     }
 };
+auto& apiVersionMetricsSSM = *CustomMetricBuilder<ApiVersionsMetricPolicy>{"apiVersions"};
 
-auto& apiVersionMetricsSSM =
-    addMetricToTree("apiVersions", std::make_unique<APIVersionMetrics::APIVersionMetricsSSM>());
-
+}  // namespace
 }  // namespace mongo

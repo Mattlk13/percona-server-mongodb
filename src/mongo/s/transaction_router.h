@@ -122,7 +122,7 @@ public:
      * the transaction that created it.
      */
     struct Participant {
-        enum class ReadOnly { kUnset, kReadOnly, kNotReadOnly };
+        enum class ReadOnly { kUnset, kReadOnly, kNotReadOnly, kOutstandingAdditionalParticipant };
 
         Participant(bool isCoordinator,
                     StmtId stmtIdCreatedAt,
@@ -134,13 +134,15 @@ public:
          */
         BSONObj attachTxnFieldsIfNeeded(OperationContext* opCtx,
                                         BSONObj cmd,
-                                        bool isFirstStatementInThisParticipant) const;
+                                        bool isFirstStatementInThisParticipant,
+                                        bool addingParticipantViaSubRouter,
+                                        bool hasTxnCreatedAnyDatabase) const;
 
         // True if the participant has been chosen as the coordinator for its transaction
         const bool isCoordinator{false};
 
-        // Is updated to kReadOnly or kNotReadOnly based on the readOnly field in the participant's
-        // responses to statements.
+        // Is updated to kReadOnly, kNotReadOnly, or kOutstandingAdditionalParticipant based on the
+        // readOnly field in the participant's responses to statements.
         const ReadOnly readOnly{ReadOnly::kUnset};
 
         // Returns the shared transaction options this participant was created with
@@ -204,7 +206,7 @@ public:
         TickSource::Tick lastTimeActiveStart{0};
     };
 
-    enum class TransactionActions { kStart, kContinue, kCommit };
+    enum class TransactionActions { kStart, kContinue, kStartOrContinue, kCommit };
 
     // Reason a transaction terminated.
     enum class TerminationCause {
@@ -499,6 +501,18 @@ public:
         void setDefaultAtClusterTime(OperationContext* opCtx);
 
         /**
+         * Sets the atClusterTime for starting a transaction in a sub-router using opCtx
+         * atClusterTime. This should only be called when the TransactionAction is kStartOrContinue.
+         */
+        void setAtClusterTimeForStartOrContinue(OperationContext* opCtx);
+
+        /**
+         * If the transaction has specified a placementConflictTime returns the value, otherwise
+         * returns boost::none.
+         */
+        boost::optional<LogicalTime> getPlacementConflictTime() const;
+
+        /**
          * If a coordinator has been selected for the current transaction, returns its id.
          */
         const boost::optional<ShardId>& getCoordinatorId() const;
@@ -507,6 +521,22 @@ public:
          * If a recovery shard has been selected for the current transaction, returns its id.
          */
         const boost::optional<ShardId>& getRecoveryShardId() const;
+
+        /**
+         * If this router is a sub-router and the txnNumber and retryCounter match that on the
+         * opCtx, returns a map containing {participantShardId : readOnly} for each participant
+         * added by this router. It's possible that readOnly is not set if either an error occured
+         * before receiving a response from a particular shard, or a shard returned an error.
+         *
+         * Returns boost::none if this router is not a sub-router, or if the txnNumber or
+         * retryCounter on this router do not match that on the opCtx.
+         */
+        // TODO SERVER-85353 Remove commandName and nss parameters, which are used only for the
+        // failpoint
+        boost::optional<StringMap<boost::optional<bool>>> getAdditionalParticipantsForResponse(
+            OperationContext* opCtx,
+            boost::optional<const std::string&> commandName = boost::none,
+            boost::optional<const NamespaceString&> nss = boost::none);
 
         /**
          * Commits the transaction.
@@ -574,6 +604,13 @@ public:
             if (o().metricsTracker)
                 return o().metricsTracker->isTrackingOver();
             return true;
+        }
+
+        /**
+         * Annotate that this transaction has attempted to create database 'dbName'.
+         */
+        void annotateCreatedDatabase(DatabaseName dbName) {
+            p().createdDatabases.insert(dbName);
         }
 
     private:
@@ -722,6 +759,12 @@ public:
          */
         bool _errorAllowsRetryOnStaleShardOrDb(const Status& status) const;
 
+        /**
+         * Returns true if the router is currently processing a retryable statement in a retryable
+         * internal transaction.
+         */
+        bool _isRetryableStmtInARetryableInternalTxn(const BSONObj& cmdObj) const;
+
         TransactionRouter::PrivateState& p() {
             return _tr->_p;
         }
@@ -768,14 +811,17 @@ public:
         const repl::ReadConcernArgs& readConcernArgs,
         const boost::optional<LogicalTime>& atClusterTimeForSnapshotReadConcern,
         const boost::optional<LogicalTime>& placementConflictTimeForNonSnapshotReadConcern,
-        bool doAppendStartTransaction);
+        bool doAppendStartTransaction,
+        bool startOrContinueTransaction,
+        bool hasTxnCreatedAnyDatabase);
 
     /**
      * Appends the needed fields when continuing a transaction on a participant.
      */
     static BSONObj appendFieldsForContinueTransaction(
         BSONObj cmdObj,
-        const boost::optional<LogicalTime>& placementConflictTimeForNonSnapshotReadConcern);
+        const boost::optional<LogicalTime>& placementConflictTimeForNonSnapshotReadConcern,
+        bool hasTxnCreatedAnyDatabase);
 
     /**
      * Returns a new read concern settings object by combining the input settings.
@@ -843,6 +889,10 @@ private:
         // transaction number cannot be changed until this returns to 0, otherwise we cannot
         // guarantee that unyielding the session cannot fail.
         int32_t activeYields{0};
+
+        // Indicates whether the router was created by a shard that is an active transaction
+        // participant.
+        bool subRouter{false};
     } _o;
 
     /**
@@ -873,6 +923,9 @@ private:
 
         // Track whether commit or abort have been initiated.
         bool terminationInitiated{false};
+
+        // Tracks databases that this transaction has attempted to create.
+        std::set<DatabaseName> createdDatabases;
     } _p;
 };
 

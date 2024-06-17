@@ -28,57 +28,22 @@
  */
 
 /**
- * This file contains tests for sbe::LoopJoinStage.
+ * This file contains tests for sbe::HashLookupStage.
  */
 
-#include <cstdint>
-#include <memory>
-#include <ostream>
-#include <string>
-#include <utility>
-
-#include <absl/container/node_hash_map.h>
-#include <boost/move/utility_core.hpp>
-#include <boost/optional/optional.hpp>
-
-#include "mongo/base/string_data.h"
-#include "mongo/bson/bsonobj.h"
-#include "mongo/bson/json.h"
-#include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
-#include "mongo/db/exec/sbe/expressions/expression.h"
-#include "mongo/db/exec/sbe/sbe_plan_stage_test.h"
-#include "mongo/db/exec/sbe/sbe_unittest.h"
+#include "mongo/db/exec/sbe/sbe_hash_lookup_shared_test.h"
 #include "mongo/db/exec/sbe/stages/hash_lookup.h"
-#include "mongo/db/exec/sbe/stages/plan_stats.h"
-#include "mongo/db/exec/sbe/stages/stages.h"
-#include "mongo/db/exec/sbe/util/print_options.h"
-#include "mongo/db/exec/sbe/util/stage_results_printer.h"
-#include "mongo/db/exec/sbe/values/slot.h"
-#include "mongo/db/exec/sbe/values/value.h"
-#include "mongo/db/exec/sbe/values/value_printer.h"
-#include "mongo/db/query/collation/collator_interface.h"
-#include "mongo/db/query/collation/collator_interface_mock.h"
-#include "mongo/db/query/query_knobs_gen.h"
-#include "mongo/db/query/sbe_stage_builder_helpers.h"
-#include "mongo/db/query/stage_types.h"
-#include "mongo/platform/atomic_word.h"
-#include "mongo/unittest/assert.h"
-#include "mongo/unittest/framework.h"
-#include "mongo/unittest/golden_test.h"
-#include "mongo/util/scopeguard.h"
 
 namespace mongo::sbe {
 
-class HashLookupStageTest : public PlanStageTestFixture {
+class HashLookupStageTest : public HashLookupSharedTest {
 public:
     void runVariation(unittest::GoldenTestContext& gctx,
                       const std::string& name,
                       const BSONArray& outer,
                       const BSONArray& inner,
                       bool outerKeyOnly = true,
-                      CollatorInterface* collator = nullptr) {
+                      CollatorInterface* collator = nullptr) override {
         auto& stream = gctx.outStream();
         if (stream.tellp()) {
             stream << std::endl;
@@ -123,16 +88,16 @@ public:
         }
 
         // Build and prepare for execution loop join of the two scan stages.
-        auto lookupAggSlot = generateSlotId();
-        auto aggs = makeSlotExprPairVec(
-            lookupAggSlot,
+        value::SlotId lookupStageOutputSlot = generateSlotId();
+        SlotExprPair agg = std::make_pair(
+            lookupStageOutputSlot,
             stage_builder::makeFunction("addToArray", makeE<EVariable>(innerScanSlots[0])));
         auto lookupStage = makeS<HashLookupStage>(std::move(outerScanStage),
                                                   std::move(innerScanStage),
                                                   outerScanSlots[1],
                                                   innerScanSlots[1],
-                                                  makeSV(innerScanSlots[0]),
-                                                  std::move(aggs),
+                                                  innerScanSlots[0],
+                                                  std::move(agg),
                                                   collatorSlot,
                                                   kEmptyPlanNodeId);
 
@@ -142,137 +107,11 @@ public:
         } else {
             slotNames.emplace_back(outerScanSlots[0], "outer");
         }
-        slotNames.emplace_back(lookupAggSlot, "inner_agg");
+        slotNames.emplace_back(lookupStageOutputSlot, "inner_agg");
 
         prepareAndEvalStageWithReopen(ctx.get(), stream, slotNames, lookupStage.get());
-    }
-
-    void cloneAndEvalStage(std::ostream& stream,
-                           const StageResultsPrinters::SlotNames& slotNames,
-                           PlanStage* stage) {
-        auto ctx = makeCompileCtx();
-        auto clone = stage->clone();
-        prepareAndEvalStage(ctx.get(), stream, slotNames, clone.get());
-    }
-
-    void prepareAndEvalStage(CompileCtx* ctx,
-                             std::ostream& stream,
-                             const StageResultsPrinters::SlotNames& slotNames,
-                             PlanStage* stage) {
-        prepareTree(ctx, stage);
-        StageResultsPrinters::make(stream, printOptions).printStageResults(ctx, slotNames, stage);
-        stage->close();
-    }
-
-    /**
-     * Evaluate stage with reopens, but only write output once to the output stream.
-     */
-    void prepareAndEvalStageWithReopen(CompileCtx* ctx,
-                                       std::ostream& stream,
-                                       const StageResultsPrinters::SlotNames& slotNames,
-                                       PlanStage* stage) {
-        prepareTree(ctx, stage);
-
-        // Execute the stage normally.
-        std::stringstream firstStream;
-        StageResultsPrinters::make(firstStream, printOptions)
-            .printStageResults(ctx, slotNames, stage);
-        std::string firstStr = firstStream.str();
-        stream << "--- First Stats" << std::endl;
-        printHashLookupStats(stream, stage);
-
-        // Execute the stage after reopen and verify that output is the same.
-        stage->open(true);
-        std::stringstream secondStream;
-        StageResultsPrinters::make(secondStream, printOptions)
-            .printStageResults(ctx, slotNames, stage);
-        std::string secondStr = secondStream.str();
-        ASSERT_EQ(firstStr, secondStr);
-        stream << "--- Second Stats" << std::endl;
-        printHashLookupStats(stream, stage);
-
-        // Execute the stage after close and open and verify that output is the same.
-        stage->close();
-        stage->open(false);
-        std::stringstream thirdStream;
-        StageResultsPrinters::make(thirdStream, printOptions)
-            .printStageResults(ctx, slotNames, stage);
-        std::string thirdStr = thirdStream.str();
-        ASSERT_EQ(firstStr, thirdStr);
-        stream << "--- Third Stats" << std::endl;
-        printHashLookupStats(stream, stage);
-
-        stage->close();
-
-        // Execute the stage with spilling to disk.
-        auto defaultInternalQuerySBELookupApproxMemoryUseInBytesBeforeSpill =
-            internalQuerySBELookupApproxMemoryUseInBytesBeforeSpill.load();
-        internalQuerySBELookupApproxMemoryUseInBytesBeforeSpill.store(10);
-        ON_BLOCK_EXIT([&] {
-            internalQuerySBELookupApproxMemoryUseInBytesBeforeSpill.store(
-                defaultInternalQuerySBELookupApproxMemoryUseInBytesBeforeSpill);
-        });
-
-        // Run the stage after the knob is set and spill to disk. We need to hold a global IS lock
-        // to read from WT.
-        Lock::GlobalLock lk(operationContext(), MODE_IS);
-        stage->open(true);
-        std::stringstream fourthStream;
-        StageResultsPrinters::make(fourthStream, printOptions)
-            .printStageResults(ctx, slotNames, stage);
-        std::string fourthStr = fourthStream.str();
-        ASSERT_EQ(firstStr, fourthStr);
-        stream << "--- Fourth Stats" << std::endl;
-        printHashLookupStats(stream, stage);
-        stream << std::endl;
-
-        // Execute the stage after close and open and verify that output is the same.
-        stage->close();
-        stage->open(false);
-        std::stringstream fifthStream;
-        StageResultsPrinters::make(fifthStream, printOptions)
-            .printStageResults(ctx, slotNames, stage);
-        std::string fifthStr = fifthStream.str();
-        ASSERT_EQ(firstStr, fifthStr);
-        stream << "--- Fifth Stats" << std::endl;
-        printHashLookupStats(stream, stage);
-        stream << std::endl;
-
-        // Execute the stage after reopen and we have spilled to disk and verify that output is the
-        // same.
-        stage->open(true);
-        std::stringstream sixthStream;
-        StageResultsPrinters::make(sixthStream, printOptions)
-            .printStageResults(ctx, slotNames, stage);
-        std::string sixthStr = sixthStream.str();
-        ASSERT_EQ(firstStr, sixthStr);
-        stream << "--- Sixth Stats" << std::endl;
-        printHashLookupStats(stream, stage);
-        stream << std::endl;
-
-        stage->close();
-
-        stream << "-- OUTPUT ";
-        stream << firstStr;
-    }
-
-public:
-    PrintOptions printOptions =
-        PrintOptions().arrayObjectOrNestingMaxDepth(SIZE_MAX).useTagForAmbiguousValues(true);
-
-private:
-    static void printHashLookupStats(std::ostream& stream, const PlanStage* stage) {
-        auto stats = static_cast<const HashLookupStats*>(stage->getSpecificStats());
-        printHashLookupStats(stream, stats);
-    }
-    static void printHashLookupStats(std::ostream& stream, const HashLookupStats* stats) {
-        stream << "dsk:" << stats->usedDisk << std::endl;
-        stream << "htRecs:" << stats->spilledHtRecords << std::endl;
-        stream << "htIndices:" << stats->spilledHtBytesOverAllRecords << std::endl;
-        stream << "buffRecs:" << stats->spilledBuffRecords << std::endl;
-        stream << "buffBytes:" << stats->spilledBuffBytesOverAllRecords << std::endl;
-    }
-};
+    }  // runVariation
+};     // class HashLookupStageTest
 
 TEST_F(HashLookupStageTest, BasicTests) {
     unittest::GoldenTestContext gctx(&goldenTestConfigSbe);

@@ -51,7 +51,6 @@
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/namespace_string.h"
@@ -104,15 +103,15 @@ enum OplogEntryType {
 };
 OplogEntryType getOplogEntryType(const OplogEntry& entry) {
     // Final applyOp for a transaction.
-    if (entry.getTxnNumber() && !entry.isPartialTransaction() &&
-        (entry.getCommandType() == repl::OplogEntry::CommandType::kCommitTransaction ||
-         entry.getCommandType() == repl::OplogEntry::CommandType::kApplyOps)) {
+    if (entry.isInTransaction() && !entry.isPartialTransaction()) {
         return OplogEntryType::kOplogEntryTypeTransaction;
     }
 
-    // If it has a statement id but isn't a transaction, it's a retryable write.
+    // It it's a MultiOplogEntryType::kApplyOpsAppliedSeparately oplog entry, or if it has a
+    // statement id but isn't a transaction, it's a retryable write.
     const auto isRetryableWriteEntry =
-        !entry.getStatementIds().empty() && !SessionUpdateTracker::isTransactionEntry(entry);
+        entry.getMultiOpType() == MultiOplogEntryType::kApplyOpsAppliedSeparately ||
+        (!entry.getStatementIds().empty() && !SessionUpdateTracker::isTransactionEntry(entry));
 
     // There are two types of no-ops we expect here. One is pre/post image, which will have an empty
     // o2 field. The other is previously transformed retryable write entries from earlier
@@ -506,6 +505,40 @@ bool isResumeTokenNoop(const OplogEntry& entry) {
 }
 }  // namespace
 
+std::vector<StmtId> TenantOplogApplier::_fixupNssAndGatherStmtIdsforApplyOpsNoop(
+    MutableOplogEntry& noopEntry, const OplogEntry& entry) {
+    std::vector<StmtId> stmtIds;
+    for (const auto& innerOp :
+         entry.getObject()[repl::ApplyOpsCommandInfoBase::kOperationsFieldName].Array()) {
+        auto innerStmtIds =
+            repl::parseZeroOneManyStmtId(innerOp[OplogEntry::kStatementIdFieldName]);
+        stmtIds.insert(stmtIds.end(), innerStmtIds.begin(), innerStmtIds.end());
+    }
+    // For multiTenantMigration, make sure the no-op's namespace is in this tenant, not just
+    // "admin.$cmd". This makes sure if the no-op itself is migrated it will be accounted for
+    // as part of the correct tenant.
+    if (_protocol == MigrationProtocolEnum::kMultitenantMigrations && _tenantId) {
+        if (!gMultitenancySupport) {
+            // TODO(SERVER-87214): Some of our tests run the tenantOplogApplier without
+            // multitenancy support, which doesn't allow NamespaceStringUtil to accept
+            // tenant IDs.
+            noopEntry.setNss(NamespaceStringUtil::deserialize(
+                boost::none, *_tenantId + "_", SerializationContext::stateDefault()));
+        } else {
+            auto tenantId =
+                noopEntry.getTid().value_or(TenantId{OID::createFromString(*_tenantId)});
+            noopEntry.setNss(NamespaceStringUtil::deserialize(
+                tenantId, ""_sd, SerializationContext::stateDefault()));
+        }
+    } else if (_protocol == MigrationProtocolEnum::kShardMerge && entry.getTid()) {
+        // For shard merge all tenants are migrated and oplog entries are not checked
+        // for the correct namespace, but we set it here anyway for consistency.
+        noopEntry.setNss(NamespaceStringUtil::deserialize(
+            entry.getTid(), ""_sd, SerializationContext::stateDefault()));
+    }
+    return stmtIds;
+}
+
 void TenantOplogApplier::_writeRetryableWriteEntryNoOp(
     OperationContext* opCtx,
     MutableOplogEntry& noopEntry,
@@ -516,6 +549,12 @@ void TenantOplogApplier::_writeRetryableWriteEntryNoOp(
     auto sessionId = *entry.getSessionId();
     auto txnNumber = *entry.getTxnNumber();
     auto stmtIds = entry.getStatementIds();
+    if (stmtIds.empty()) {
+        uassert(8680900,
+                "A retryable write with no top-level statement IDs must be an applyOps",
+                entry.getCommandType() == OplogEntry::CommandType::kApplyOps);
+        stmtIds = _fixupNssAndGatherStmtIdsforApplyOpsNoop(noopEntry, entry);
+    }
     LOGV2_DEBUG(5351000,
                 2,
                 "Tenant Oplog Applier processing retryable write",
@@ -573,7 +612,7 @@ void TenantOplogApplier::_writeRetryableWriteEntryNoOp(
         txnParticipant.beginOrContinue(opCtx,
                                        txnNumberAndRetryCounter,
                                        boost::none /* autocommit */,
-                                       boost::none /* startTransaction */);
+                                       TransactionParticipant::TransactionActions::kNone);
         noopEntry.setPrevWriteOpTimeInTransaction(txnParticipant.getLastWriteOpTime());
     } else {
         // We can end up here under the following circumstances:
@@ -601,7 +640,7 @@ void TenantOplogApplier::_writeRetryableWriteEntryNoOp(
         txnParticipant.beginOrContinue(opCtx,
                                        txnNumberAndRetryCounter,
                                        boost::none /* autocommit */,
-                                       boost::none /* startTransaction */);
+                                       TransactionParticipant::TransactionActions::kNone);
 
         // Reset the retryable write history chain.
         noopEntry.setPrevWriteOpTimeInTransaction(OpTime());
@@ -719,7 +758,7 @@ TenantOplogApplier::OpTimePair TenantOplogApplier::_writeNoOpEntries(
 
     // Prevent the node from being able to change state when reserving oplog slots and writing
     // entries.
-    AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
+    AutoGetOplogFastPath oplogWrite(opCtx, OplogAccessMode::kWrite);
 
     // We start WriteUnitOfWork only to reserve oplog slots. So, it's ok to abort the
     // WriteUnitOfWork when it goes out of scope.
@@ -845,7 +884,7 @@ void TenantOplogApplier::_writeSessionNoOp(OperationContext* opCtx,
                 "migrationId"_attr = _migrationUuid,
                 "op"_attr = redact(noopEntry.toBSON()));
 
-    AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
+    AutoGetOplogFastPath oplogWrite(opCtx, OplogAccessMode::kWrite);
     boost::optional<Lock::TenantLock> tenantLock;
     if (auto tid = noopEntry.getTid()) {
         tenantLock.emplace(opCtx, *tid, MODE_IX);
@@ -1037,7 +1076,7 @@ void TenantOplogApplier::_writeNoOpsForRange(OpObserver* opObserver,
 
     opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
-    AutoGetOplog oplogWrite(opCtx.get(), OplogAccessMode::kWrite);
+    AutoGetOplogFastPath oplogWrite(opCtx.get(), OplogAccessMode::kWrite);
     auto tenantLocks = _acquireIntentExclusiveTenantLocks(opCtx.get(), begin, end);
 
     writeConflictRetry(opCtx.get(), "writeTenantNoOps", NamespaceString::kRsOplogNamespace, [&] {
@@ -1181,7 +1220,8 @@ Status TenantOplogApplier::_applyOplogEntryOrGroupedInserts(
     auto op = entryOrGroupedInserts.getOp();
     if (op->isIndexCommandType() &&
         op->getCommandType() != OplogEntry::CommandType::kCreateIndexes &&
-        op->getCommandType() != OplogEntry::CommandType::kDropIndexes) {
+        op->getCommandType() != OplogEntry::CommandType::kDropIndexes &&
+        op->getCommandType() != OplogEntry::CommandType::kDeleteIndexes) {
         LOGV2_ERROR(488610,
                     "Index creation, except createIndex on empty collections, is not supported in "
                     "tenant migration",

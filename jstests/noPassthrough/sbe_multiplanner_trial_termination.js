@@ -2,8 +2,16 @@
  * Tests the logic around the termination condition for the SBE multiplanner. In particular,
  * demonstrates that unlike the classic multiplanner, the SBE multiplanner's end condition is by
  * default not proportional to the size of the collection.
+ *
+ * TODO SERVER-83887 This entire test can be deleted when we remove the "Classic runtime planning
+ * for SBE" feature flag.
+ *
+ * @tags: [
+ *   # This test assumes that SBE is being used for most queries.
+ *   featureFlagSbeFull,
+ * ]
  */
-import {checkSBEEnabled} from "jstests/libs/sbe_util.js";
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
 
 const numDocs = 1000;
 const dbName = "sbe_multiplanner_db";
@@ -19,14 +27,14 @@ const trialLengthFromWorksKnob = 0.1 * numDocs;
 
 const conn = MongoRunner.runMongod({});
 assert.neq(conn, null, "mongod failed to start");
-const db = conn.getDB(dbName);
 
-// This test assumes that SBE is being used for most queries.
-if (!checkSBEEnabled(db)) {
-    jsTestLog("Skipping test because SBE is not enabled");
+if (FeatureFlagUtil.isPresentAndEnabled(conn, "ClassicRuntimePlanningForSbe")) {
+    jsTestLog("Skipping the test because SBE multi planner won't be used");
     MongoRunner.stopMongod(conn);
     quit();
 }
+
+const db = conn.getDB(dbName);
 const coll = db[collName];
 
 // Gets the "allPlansExecution" section from the explain of a query that has zero results, but for

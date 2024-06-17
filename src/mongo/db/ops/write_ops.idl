@@ -49,6 +49,7 @@ types:
         cpp_type: "bool"
         serializer: "::mongo::write_ops::writeMultiDeleteProperty"
         deserializer: "::mongo::write_ops::readMultiDeleteProperty"
+        is_view: false
 
     update_modification:
         bson_serialization_type: any
@@ -57,6 +58,7 @@ types:
         cpp_type: "mongo::write_ops::UpdateModification"
         serializer: "mongo::write_ops::UpdateModification::serializeToBSON"
         deserializer: "mongo::write_ops::UpdateModification::parseFromBSON"
+        is_view: true
 
     write_cmd_optime:
         bson_serialization_type: any
@@ -64,6 +66,8 @@ types:
         cpp_type: "mongo::repl::OpTime"
         serializer: "::mongo::write_ops::opTimeSerializerWithTermCheck"
         deserializer: "::mongo::write_ops::opTimeParser"
+        # repl::OpTime has only non view members.
+        is_view: false
 
     write_error:
         bson_serialization_type: object
@@ -72,6 +76,7 @@ types:
         cpp_type: "mongo::write_ops::WriteError"
         serializer: "mongo::write_ops::WriteError::serialize"
         deserializer: "mongo::write_ops::WriteError::parse"
+        is_view: false
 
 structs:
 
@@ -104,6 +109,11 @@ structs:
                 description: "The statement numbers for the write statements that had already been
                               executed, thus were not executed by this command."
                 type: array<int>
+                optional: true
+                stability: unstable
+            writeConcernError:
+                description: "Contains a write concern error encountered."
+                type: object
                 optional: true
                 stability: unstable
 
@@ -245,6 +255,12 @@ structs:
                 type: object
                 optional: true
                 stability: stable
+            sort:
+                description: "Determines which document the operation modifies if the query selects
+                              multiple documents."
+                type: object
+                optional: true
+                stability: unstable
             arrayFilters:
                 description: "Specifies which array elements an update modifier should apply to."
                 type: array<object>
@@ -361,6 +377,11 @@ structs:
                 description: "The statement number for this findAndModify statement if it had
                               already been executed, thus was not executed by this command."
                 type: int
+                optional: true
+                stability: unstable
+            writeConcernError:
+                description: "Contains a write concern error encountered."
+                type: object
                 optional: true
                 stability: unstable
 

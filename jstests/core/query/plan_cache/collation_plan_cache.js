@@ -3,7 +3,7 @@
 // @tags: [
 //   # The test runs commands that are not allowed with security token: planCacheClear,
 //   # planCacheClearFilters, planCacheListFilters, planCacheSetFilter.
-//   not_allowed_with_security_token,
+//   not_allowed_with_signed_security_token,
 //   assumes_read_concern_unchanged,
 //   # This test attempts to perform queries and introspect the server's plan cache entries. The
 //   # former operation may be routed to a secondary in the replica set, whereas the latter must be
@@ -13,12 +13,16 @@
 //   assumes_standalone_mongod,
 //   assumes_unsharded_collection,
 //   does_not_support_stepdowns,
-//   requires_fcv_61,
-//   # Plan cache state is node-local and will not get migrated alongside tenant data.
+//   # Plan cache state is node-local and will not get migrated alongside user data.
 //   tenant_migration_incompatible,
+//   assumes_balancer_off,
+//   # This test checks a new field "solutionHash" in $planCacheStats, not available in previous
+//   # versions.
+//   requires_fcv_72,
+//   multiversion_incompatible,
 // ]
 import {getPlanCacheKeyFromExplain} from "jstests/libs/analyze_plan.js";
-import {checkSBEEnabled} from "jstests/libs/sbe_util.js";
+import {checkSbeFullyEnabled} from "jstests/libs/sbe_util.js";
 
 var coll = db.collation_plan_cache;
 coll.drop();
@@ -39,11 +43,12 @@ assert.commandWorked(coll.insert({a: 'foo', b: 5}));
 
 // We need two indexes that each query can use so that a plan cache entry is created.
 assert.commandWorked(coll.createIndex({a: 1}, {collation: {locale: 'en_US'}}));
-assert.commandWorked(coll.createIndex({a: 1, b: 1}, {collation: {locale: 'en_US'}}));
+assert.commandWorked(coll.createIndex({a: 1, b: 1}, {name: "ab1", collation: {locale: 'en_US'}}));
 
 // We need an index with a different collation, so that string comparisons affect the query
 // shape.
 assert.commandWorked(coll.createIndex({b: 1}, {collation: {locale: 'fr_CA'}}));
+assert.commandWorked(coll.createIndex({a: 1, b: 1}, {name: "ab2", collation: {locale: 'fr_CA'}}));
 
 // Run a query so that an entry is inserted into the cache.
 assert.commandWorked(
@@ -54,7 +59,7 @@ assert.commandWorked(
 var shapes = coll.aggregate([{$planCacheStats: {}}]).toArray();
 assert.eq(1, shapes.length, 'unexpected cache size after running query');
 
-const isSbeEnabled = checkSBEEnabled(db);
+const isSbeEnabled = checkSbeFullyEnabled(db);
 if (!isSbeEnabled) {
     assert.eq(shapes[0].createdFromQuery.query, {a: 'foo', b: 5}, shapes);
     assert.eq(shapes[0].createdFromQuery.sort, {}, shapes);
@@ -83,19 +88,24 @@ let explainRes = coll.find({a: 'foo', b: 5}).collation({locale: 'en_US'}).explai
 
 // The query should have cached plans.
 assert.lt(0,
-          getCacheEntriesByPlanCacheKey(getPlanCacheKeyFromExplain(explainRes, db)).length,
+          getCacheEntriesByPlanCacheKey(getPlanCacheKeyFromExplain(explainRes)).length,
           dumpPlanCacheState());
 
 explainRes = coll.find({a: 'foo', b: 5}).collation({locale: 'fr_CA'}).explain();
 // A query with a different collation should have no cached plans.
 assert.eq(0,
-          getCacheEntriesByPlanCacheKey(getPlanCacheKeyFromExplain(explainRes, db)).length,
+          getCacheEntriesByPlanCacheKey(getPlanCacheKeyFromExplain(explainRes)).length,
           dumpPlanCacheState());
+// Cache the query, then assert that different collations lead to different hashes.
+coll.find({a: 'foo', b: 5}).collation({locale: 'fr_CA'}).toArray();
+const cache = coll.getPlanCache().list();
+assert.eq(cache.length, 2);
+assert.neq(cache[0].solutionHash, cache[1].solutionHash);
 
 explainRes = coll.find({a: 'foo', b: 'bar'}).collation({locale: 'en_US'}).explain();
 // A query with different string locations should have no cached plans.
 assert.eq(0,
-          getCacheEntriesByPlanCacheKey(getPlanCacheKeyFromExplain(explainRes, db)).length,
+          getCacheEntriesByPlanCacheKey(getPlanCacheKeyFromExplain(explainRes)).length,
           dumpPlanCacheState());
 
 coll.getPlanCache().clear();

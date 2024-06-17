@@ -39,7 +39,6 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsontypes.h"
-#include "mongo/bson/timestamp.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/feature_flag.h"
 #include "mongo/db/pipeline/document_source_query_stats_gen.h"
@@ -62,14 +61,15 @@
 
 namespace mongo {
 namespace {
-CounterMetric queryStatsHmacApplicationErrors("queryStats.numHmacApplicationErrors");
+auto& queryStatsHmacApplicationErrors =
+    *MetricBuilder<Counter64>{"queryStats.numHmacApplicationErrors"};
 }
 
-// TODO SERVER-79494 Use REGISTER_DOCUMENT_SOURCE_WITH_FEATURE_FLAG
-REGISTER_DOCUMENT_SOURCE(queryStats,
-                         DocumentSourceQueryStats::LiteParsed::parse,
-                         DocumentSourceQueryStats::createFromBson,
-                         AllowedWithApiStrict::kNeverInVersion1);
+REGISTER_DOCUMENT_SOURCE_WITH_FEATURE_FLAG(queryStats,
+                                           DocumentSourceQueryStats::LiteParsed::parse,
+                                           DocumentSourceQueryStats::createFromBson,
+                                           AllowedWithApiStrict::kNeverInVersion1,
+                                           feature_flags::gFeatureFlagQueryStats);
 
 namespace {
 
@@ -108,7 +108,7 @@ auto parseSpec(const BSONElement& spec, const Ctor& ctor) {
 
 BSONObj DocumentSourceQueryStats::computeQueryStatsKey(
     std::shared_ptr<const Key> key, const SerializationContext& serializationContext) const {
-    static const auto sha256HmacStringDataHasher = [](std::string key, const StringData& sd) {
+    static const auto sha256HmacStringDataHasher = [](std::string key, StringData sd) {
         auto hashed = SHA256Block::computeHmac(
             (const uint8_t*)key.data(), key.size(), (const uint8_t*)sd.rawData(), sd.size());
         return hashed.toString();
@@ -127,13 +127,6 @@ BSONObj DocumentSourceQueryStats::computeQueryStatsKey(
 
 std::unique_ptr<DocumentSourceQueryStats::LiteParsed> DocumentSourceQueryStats::LiteParsed::parse(
     const NamespaceString& nss, const BSONElement& spec) {
-    // TODO SERVER-79494 Remove this manual feature flag check once we're registering doc source
-    // with REGISTER_DOCUMENT_SOURCE_WITH_FEATURE_FLAG
-    uassert(ErrorCodes::QueryFeatureNotAllowed,
-            "$queryStats is not allowed in the current configuration. You may need to enable the "
-            "correponding feature flag",
-            query_stats::isQueryStatsFeatureEnabled(/*requiresFullQueryStatsFeatureFlag*/ false));
-
     return parseSpec(spec, [&](TransformAlgorithmEnum algorithm, std::string hmacKey) {
         return std::make_unique<DocumentSourceQueryStats::LiteParsed>(
             spec.fieldName(), nss.tenantId(), algorithm, hmacKey);
@@ -142,13 +135,6 @@ std::unique_ptr<DocumentSourceQueryStats::LiteParsed> DocumentSourceQueryStats::
 
 boost::intrusive_ptr<DocumentSource> DocumentSourceQueryStats::createFromBson(
     BSONElement spec, const boost::intrusive_ptr<ExpressionContext>& pExpCtx) {
-    // TODO SERVER-79494 Remove this manual feature flag check once we're registering doc source
-    // with REGISTER_DOCUMENT_SOURCE_WITH_FEATURE_FLAG
-    uassert(ErrorCodes::QueryFeatureNotAllowed,
-            "$queryStats is not allowed in the current configuration. You may need to enable the "
-            "correponding feature flag",
-            query_stats::isQueryStatsFeatureEnabled(/*requiresFullQueryStatsFeatureFlag*/ false));
-
     const NamespaceString& nss = pExpCtx->ns;
 
     uassert(ErrorCodes::InvalidNamespace,
@@ -239,16 +225,36 @@ DocumentSource::GetNextResult DocumentSourceQueryStats::doGetNext() {
 }
 
 boost::optional<Document> DocumentSourceQueryStats::toDocument(
-    const Timestamp& partitionReadTime, const QueryStatsEntry& queryStatsEntry) const {
+    const Date_t& partitionReadTime, const QueryStatsEntry& queryStatsEntry) const {
     const auto& key = queryStatsEntry.key;
-    const auto& hash = absl::HashOf(key);
     try {
         auto queryStatsKey = computeQueryStatsKey(key, SerializationContext::stateDefault());
-        return Document{{"key", std::move(queryStatsKey)},
-                        {"metrics", queryStatsEntry.toBSON()},
-                        {"asOf", partitionReadTime}};
+        // We use the representative shape to generate the key hash. This avoids returning duplicate
+        // hashes if we have bugs that cause two different representative shapes to re-parse into
+        // the same debug shape.
+        auto representativeShapeKey =
+            key->toBson(pExpCtx->opCtx,
+                        SerializationOptions::kRepresentativeQueryShapeSerializeOptions,
+                        SerializationContext::stateDefault());
+
+        // This SHA256 version of the hash is output to aid in data analytics use cases. In these
+        // cases, we often care about comparing hashes from different hosts, potentially on
+        // different versions and platforms. The thinking here is that the SHA256 algorithm is more
+        // stable across these different environments than the quicker 'absl::HashOf'
+        // implementation.
+        auto hash = SHA256Block::computeHash((const uint8_t*)representativeShapeKey.objdata(),
+                                             representativeShapeKey.objsize())
+                        .toString();
+        return Document{
+            {"key", std::move(queryStatsKey)},
+            {"keyHash", hash},
+            {"metrics",
+             queryStatsEntry.toBSON(feature_flags::gFeatureFlagQueryStatsDataBearingNodes.isEnabled(
+                 serverGlobalParams.featureCompatibility.acquireFCVSnapshot()))},
+            {"asOf", partitionReadTime}};
     } catch (const DBException& ex) {
         queryStatsHmacApplicationErrors.increment();
+        const auto& hash = absl::HashOf(key);
         const auto queryShape = key->universalComponents()._queryShape->toBson(
             pExpCtx->opCtx,
             SerializationOptions::kRepresentativeQueryShapeSerializeOptions,
@@ -287,7 +293,7 @@ void DocumentSourceQueryStats::CopiedPartition::load(QueryStatsStore& queryStats
     statsEntries.clear();
 
     // Capture the time at which reading the partition begins.
-    _readTimestamp = Timestamp(Date_t::now().toMillisSinceEpoch() / 1000, 0);
+    _readTimestamp = Date_t::now();
     {
         // We only keep the partition (which holds a lock)
         // for the time needed to collect the metrics (QueryStatsEntry)
@@ -317,7 +323,7 @@ bool DocumentSourceQueryStats::CopiedPartition::isValidPartitionId(
     return _partitionId < maxNumPartitions;
 }
 
-const Timestamp& DocumentSourceQueryStats::CopiedPartition::getReadTimestamp() const {
+const Date_t& DocumentSourceQueryStats::CopiedPartition::getReadTimestamp() const {
     return _readTimestamp;
 }
 

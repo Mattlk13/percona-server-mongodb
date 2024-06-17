@@ -61,7 +61,7 @@
 #include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/op_observer/op_observer_impl.h"
 #include "mongo/db/op_observer/op_observer_registry.h"
-#include "mongo/db/op_observer/oplog_writer_impl.h"
+#include "mongo/db/op_observer/operation_logger_impl.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/oplog.h"
@@ -258,7 +258,7 @@ public:
             OpObserverRegistry* opObserverRegistry =
                 dynamic_cast<OpObserverRegistry*>(serviceContext->getOpObserver());
             opObserverRegistry->addObserver(
-                std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterImpl>()));
+                std::make_unique<OpObserverImpl>(std::make_unique<OperationLoggerImpl>()));
             opObserverRegistry->addObserver(
                 std::make_unique<PrimaryOnlyServiceOpObserver>(serviceContext));
 
@@ -334,7 +334,7 @@ public:
 
         ASSERT_OK(replCoord->setFollowerMode(MemberState::RS_PRIMARY));
         ASSERT_OK(replCoord->updateTerm(opCtx.get(), _term));
-        replCoord->setMyLastAppliedOpTimeAndWallTime(
+        replCoord->setMyLastAppliedOpTimeAndWallTimeForward(
             OpTimeAndWallTime(OpTime(Timestamp(1, 1), _term), Date_t()));
 
         _registry->onStepUpComplete(opCtx.get(), _term);
@@ -3157,7 +3157,7 @@ TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientServiceRecor
 
     auto doc = getStateDoc(instance.get());
     auto docFCV = doc.getRecipientPrimaryStartingFCV();
-    auto currentFCV = serverGlobalParams.featureCompatibility.getVersion();
+    auto currentFCV = serverGlobalParams.featureCompatibility.acquireFCVSnapshot().getVersion();
     LOGV2(5356202, "FCV in doc vs current", "docFCV"_attr = docFCV, "currentFCV"_attr = currentFCV);
     ASSERT(currentFCV == docFCV);
     checkStateDocPersisted(opCtx.get(), instance.get());
@@ -3184,7 +3184,7 @@ TEST_F(TenantMigrationRecipientServiceTest,
     initialStateDocument.setProtocol(MigrationProtocolEnum::kMultitenantMigrations);
 
     // Add an FCV value as if it was from a previous attempt.
-    auto currentFCV = serverGlobalParams.featureCompatibility.getVersion();
+    auto currentFCV = serverGlobalParams.featureCompatibility.acquireFCVSnapshot().getVersion();
     initialStateDocument.setRecipientPrimaryStartingFCV(currentFCV);
 
     // Create and start the instance.

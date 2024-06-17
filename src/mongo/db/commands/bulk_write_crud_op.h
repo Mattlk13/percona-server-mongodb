@@ -36,9 +36,11 @@
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/commands/bulk_write_gen.h"
-#include "mongo/stdx/variant.h"
 
 namespace mongo {
+
+using BulkWriteOpVariant =
+    std::variant<mongo::BulkWriteInsertOp, mongo::BulkWriteUpdateOp, mongo::BulkWriteDeleteOp>;
 
 /**
  * The BulkWriteCRUDOp class makes working with
@@ -48,9 +50,7 @@ class BulkWriteCRUDOp {
 public:
     enum OpType : size_t { kInsert = 0, kUpdate = 1, kDelete = 2 };
 
-    BulkWriteCRUDOp(const stdx::variant<mongo::BulkWriteInsertOp,
-                                        mongo::BulkWriteUpdateOp,
-                                        mongo::BulkWriteDeleteOp>& op);
+    BulkWriteCRUDOp(const BulkWriteOpVariant& op);
 
     OpType getType() const;
     unsigned int getNsInfoIdx() const;
@@ -62,7 +62,7 @@ public:
     const mongo::BulkWriteDeleteOp* getDelete() const;
 
 private:
-    const stdx::
+    const std::
         variant<mongo::BulkWriteInsertOp, mongo::BulkWriteUpdateOp, mongo::BulkWriteDeleteOp>& _op;
     OpType _type;
 };

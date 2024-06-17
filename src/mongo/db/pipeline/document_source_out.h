@@ -91,7 +91,7 @@ public:
         static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
                                                  const BSONElement& spec);
 
-        Status checkShardedForeignCollAllowed(NamespaceString nss,
+        Status checkShardedForeignCollAllowed(const NamespaceString& nss,
                                               bool inMultiDocumentTransaction) const final {
             if (_foreignNss != nss) {
                 return Status::OK();
@@ -101,7 +101,8 @@ public:
                           "$out to a sharded collection is not allowed");
         }
 
-        PrivilegeVector requiredPrivileges(bool isMongos, bool bypassDocumentValidation) const {
+        PrivilegeVector requiredPrivileges(bool isMongos,
+                                           bool bypassDocumentValidation) const override {
             ActionSet actions{ActionType::insert, ActionType::remove};
             if (bypassDocumentValidation) {
                 actions.addAction(ActionType::bypassDocumentValidation);
@@ -112,6 +113,7 @@ public:
 
         ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level,
                                                      bool isImplicitDefault) const final {
+            using namespace fmt::literals;
             return {
                 {level == repl::ReadConcernLevel::kLinearizableReadConcern,
                  {ErrorCodes::InvalidOptions,
@@ -122,18 +124,9 @@ public:
 
     ~DocumentSourceOut() override;
 
-    StageConstraints constraints(Pipeline::SplitState pipeState) const final override {
-        return {StreamType::kStreaming,
-                PositionRequirement::kLast,
-                HostTypeRequirement::kPrimaryShard,
-                DiskUseRequirement::kWritesPersistentData,
-                FacetRequirement::kNotAllowed,
-                TransactionRequirement::kNotAllowed,
-                LookupRequirement::kNotAllowed,
-                UnionRequirement::kNotAllowed};
-    }
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final;
 
-    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final override;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     /**
      * Creates a new $out stage from the given arguments.
@@ -149,12 +142,8 @@ public:
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
-    const char* getSourceName() const final override {
+    const char* getSourceName() const final {
         return kStageName.rawData();
-    }
-
-    const NamespaceString& getOutputNs() const override {
-        return _outputNs;
     }
 
     void addVariableRefs(std::set<Variables::Id>* refs) const final {}
@@ -163,8 +152,7 @@ private:
     DocumentSourceOut(NamespaceString outputNs,
                       boost::optional<TimeseriesOptions> timeseries,
                       const boost::intrusive_ptr<ExpressionContext>& expCtx)
-        : DocumentSourceWriter(kStageName.rawData(), outputNs, expCtx),
-          _outputNs(std::move(outputNs)),
+        : DocumentSourceWriter(kStageName.rawData(), std::move(outputNs), expCtx),
           _writeConcern(expCtx->opCtx->getWriteConcern()),
           _timeseries(std::move(timeseries)) {}
 
@@ -212,9 +200,6 @@ private:
     boost::optional<TimeseriesOptions> validateTimeseries();
 
     NamespaceString makeBucketNsIfTimeseries(const NamespaceString& ns);
-
-    // The namespace where the output will be written to.
-    const NamespaceString _outputNs;
 
     // Stash the writeConcern of the original command as the operation context may change by the
     // time we start to flush writes. This is because certain aggregations (e.g. $exchange)

@@ -9,6 +9,8 @@
 
 import {getPlanStage} from "jstests/libs/analyze_plan.js";
 
+var isHintsToQuerySettingsSuite = TestData.isHintsToQuerySettingsSuite || false;
+
 const collName = "jstests_explain_distinct_hint";
 const coll = db[collName];
 
@@ -31,13 +33,18 @@ explain = db.coll.explain().distinct("a", {a: 1, b: 2}, {hint: {b: 1}});
 let ixScanStage = getPlanStage(explain, "IXSCAN");
 assert(ixScanStage, tojson(explain));
 assert.eq(ixScanStage.indexName, "b_1", tojson(ixScanStage));
-assert.eq(explain.command.hint, {"b": 1});
+// You won't see hint in .explain() if it was overriden by query settings.
+if (!isHintsToQuerySettingsSuite) {
+    assert.eq(explain.command.hint, {"b": 1});
+}
 
 explain = db.coll.explain().distinct("a", {a: 1, b: 2}, {hint: "b_1"});
 ixScanStage = getPlanStage(explain, "IXSCAN");
 assert(ixScanStage, tojson(explain));
 assert.eq(ixScanStage.indexName, "b_1");
-assert.eq(explain.command.hint, "b_1");
+if (!isHintsToQuerySettingsSuite) {
+    assert.eq(explain.command.hint, "b_1");
+}
 
 // Make sure the hint produces the right values when the query is run.
 let cmdObj = db.coll.runCommand("distinct", {"key": "a", query: {a: 1, b: 2}, hint: {a: 1}});
@@ -50,10 +57,21 @@ cmdObj = db.coll.runCommand("distinct", {"key": "a", query: {a: 1, b: 2}, hint: 
 assert.eq(1, cmdObj.values);
 
 cmdObj = db.coll.runCommand("distinct", {"key": "a", query: {a: 1, b: 2}, hint: {x: 1}});
-assert.eq([], cmdObj.values);
+// Hinting a sparse index may produce incomplete result. Query settings have slightly different
+// semantics and if planner can't guarantee query correctness then it will fall back to sequential
+// scan.
+if (!isHintsToQuerySettingsSuite) {
+    assert.eq([], cmdObj.values);
+} else {
+    assert.eq([1], cmdObj.values);
+}
 
 cmdObj = db.coll.runCommand("distinct", {"key": "a", query: {a: 1, b: 2}, hint: "x_1"});
-assert.eq([], cmdObj.values);
+if (!isHintsToQuerySettingsSuite) {
+    assert.eq([], cmdObj.values);
+} else {
+    assert.eq([1], cmdObj.values);
+}
 
 assert.throws(function() {
     db.coll.explain().distinct("a", {a: 1, b: 2}, {hint: {bad: 1, hint: 1}});
@@ -68,3 +86,13 @@ let cmdRes =
 assert.commandFailedWithCode(cmdRes, ErrorCodes.BadValue, cmdRes);
 var regex = new RegExp("hint provided does not correspond to an existing index");
 assert(regex.test(cmdRes.errmsg));
+
+// Make sure $natural hints are applied to distinct.
+if (!isHintsToQuerySettingsSuite) {
+    // Query settings for distinct have different semantics. $natural in that case is _only_ a hint
+    // and may not be enforced if there are better query plans available.
+    let explain = db.coll.explain().distinct("a", {}, {hint: {$natural: 1}});
+    let scanStage = getPlanStage(explain, "COLLSCAN");
+    assert(scanStage, tojson(explain));
+    assert.eq(explain.command.hint, {$natural: 1});
+}

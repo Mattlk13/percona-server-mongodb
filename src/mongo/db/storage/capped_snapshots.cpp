@@ -36,8 +36,8 @@
 #include <boost/optional/optional.hpp>
 
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/storage/record_store.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/util/assert_util_core.h"
 #include "mongo/util/decorable.h"
 
@@ -50,15 +50,16 @@ CappedSnapshots& CappedSnapshots::get(RecoveryUnit* ru) {
 }
 
 CappedSnapshots& CappedSnapshots::get(OperationContext* opCtx) {
-    return getCappedSnapshots(opCtx->recoveryUnit()->getSnapshot());
+    return getCappedSnapshots(shard_role_details::getRecoveryUnit(opCtx)->getSnapshot());
 }
 
 
 void CappedSnapshots::establish(OperationContext* opCtx,
                                 const Collection* coll,
                                 bool isNewCollection) {
-    invariant(!opCtx->recoveryUnit()->isActive() ||
-              opCtx->lockState()->isCollectionLockedForMode(coll->ns(), MODE_X) || isNewCollection);
+    invariant(!shard_role_details::getRecoveryUnit(opCtx)->isActive() ||
+              shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(coll->ns(), MODE_X) ||
+              isNewCollection);
 
 
     auto snapshot =

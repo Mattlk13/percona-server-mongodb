@@ -2,12 +2,11 @@
  * Tests that when certain planning-related server parameters are changed at runtime, the SBE plan
  * cache is cleared.
  * @tags: [
- *   # TODO SERVER-67607: Test plan cache with CQF enabled.
- *   cqf_experimental_incompatible,
+ *   # This test is specifically verifying the behavior of the SBE plan cache.
+ *   featureFlagSbeFull,
  * ]
  */
 import {getPlanCacheKeyFromShape} from "jstests/libs/analyze_plan.js";
-import {checkSBEEnabled} from "jstests/libs/sbe_util.js";
 
 // Lists the names of the setParameters which should result in the SBE plan cache being cleared when
 // the parameter is modified. Along with each parameter, includes a valid new value of the parameter
@@ -19,6 +18,7 @@ const paramList = [
     {name: "internalQueryForceIntersectionPlans", value: true},
     {name: "internalQueryPlannerEnableIndexIntersection", value: false},
     {name: "internalQueryPlannerEnableHashIntersection", value: true},
+    {name: "internalQueryPlannerEnableIndexPruning", value: false},
     {name: "internalQueryCacheEvictionRatio", value: 11.0},
     {name: "internalQueryCacheWorksGrowthCoefficient", value: 3.0},
     {name: "internalQueryCacheDisableInactiveEntries", value: true},
@@ -55,6 +55,7 @@ const paramList = [
     {name: "internalCascadesOptimizerMinIndexEqPrefixes", value: 2},
     {name: "internalCascadesOptimizerMaxIndexEqPrefixes", value: 2},
     {name: "internalQuerySlotBasedExecutionDisableTimeSeriesPushdown", value: true},
+    {name: "internalQueryDisablePlanCache", value: true},
 ];
 
 const conn = MongoRunner.runMongod();
@@ -62,14 +63,6 @@ assert.neq(conn, null, "mongod failed to start up");
 
 const dbName = jsTestName();
 const db = conn.getDB(dbName);
-
-// This test is specifically verifying the behavior of the SBE plan cache.
-if (!checkSBEEnabled(db)) {
-    jsTestLog("Skipping test because SBE is not enabled");
-    MongoRunner.stopMongod(conn);
-    quit();
-}
-
 assert.commandWorked(db.dropDatabase());
 
 const coll = db.coll;

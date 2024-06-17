@@ -64,6 +64,7 @@
 
 namespace mongo {
 namespace {
+using namespace fmt::literals;
 
 class ShardsvrMovePrimaryExitCriticalSectionCommand final
     : public TypedCommand<ShardsvrMovePrimaryExitCriticalSectionCommand> {
@@ -166,7 +167,7 @@ private:
         return "Internal command. Do not call directly.";
     }
 
-    bool supportsRetryableWrite() const {
+    bool supportsRetryableWrite() const override {
         return true;
     }
 };

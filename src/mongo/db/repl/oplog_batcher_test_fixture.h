@@ -65,7 +65,8 @@ public:
     void shutdown(OperationContext* opCtx) final;
     void push(OperationContext* opCtx,
               Batch::const_iterator begin,
-              Batch::const_iterator end) final;
+              Batch::const_iterator end,
+              boost::optional<std::size_t> bytes = boost::none) final;
     void waitForSpace(OperationContext* opCtx, std::size_t size) final{};
     bool isEmpty() const final;
     std::size_t getMaxSize() const final {
@@ -99,7 +100,12 @@ private:
 // Convenience routines for creating oplog entries to test with.
 OplogEntry makeInsertOplogEntry(int t,
                                 const NamespaceString& nss,
-                                boost::optional<UUID> uuid = boost::none);
+                                boost::optional<UUID> uuid = boost::none,
+                                std::int64_t version = repl::OplogEntry::kOplogVersion);
+
+OplogEntry makeDBCheckBatchEntry(int t,
+                                 const NamespaceString& nss,
+                                 boost::optional<UUID> uuid = boost::none);
 
 OplogEntry makeUpdateOplogEntry(int t,
                                 const NamespaceString& nss,
@@ -107,7 +113,7 @@ OplogEntry makeUpdateOplogEntry(int t,
                                 boost::optional<OpTime> preImageOpTime = boost::none,
                                 boost::optional<OpTime> postImageOpTime = boost::none);
 
-OplogEntry makeNoopOplogEntry(int t, const StringData& msg);
+OplogEntry makeNoopOplogEntry(int t, StringData msg);
 
 OplogEntry makeApplyOpsOplogEntry(int t,
                                   bool prepare,
@@ -129,6 +135,11 @@ std::vector<OplogEntry> makeMultiEntryTransactionOplogEntries(
     int t,
     const DatabaseName& dbName,
     bool prepared,
+    std::vector<std::vector<OplogEntry>> innerOps);
+std::vector<OplogEntry> makeRetryableApplyOpsOplogEntries(
+    int t,
+    const DatabaseName& dbName,
+    const OperationSessionInfo& sessionInfo,
     std::vector<std::vector<OplogEntry>> innerOps);
 std::string toString(const std::vector<OplogEntry>& ops);
 }  // namespace repl

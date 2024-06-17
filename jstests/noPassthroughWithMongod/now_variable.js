@@ -2,7 +2,7 @@
  * Tests for the $$NOW and $$CLUSTER_TIME system variable.
  */
 import "jstests/libs/sbe_assert_error_override.js";
-import {checkSBEEnabled} from "jstests/libs/sbe_util.js";
+import {checkSbeFullyEnabled} from "jstests/libs/sbe_util.js";
 
 const coll = db[jsTest.name()];
 const otherColl = db[coll.getName() + "_other"];
@@ -153,7 +153,7 @@ runTestsExpectFailure(baseCollectionClusterTimeAgg);
 runTestsExpectFailure(fromViewWithClusterTime);
 runTestsExpectFailure(withExprClusterTime);
 
-if (checkSBEEnabled(db)) {
+if (checkSbeFullyEnabled(db)) {
     function verifyPlanCacheSize(query) {
         coll.getPlanCache().clear();
 
@@ -179,17 +179,25 @@ if (checkSBEEnabled(db)) {
     verifyPlanCacheSize(aggWithNowNotPushedDown);
 }
 
-// Insert an doc with a future time.
-const futureColl = db[coll.getName() + "_future"];
-futureColl.drop();
-const time = new Date();
-time.setSeconds(time.getSeconds() + 3);
-assert.commandWorked(futureColl.insert({timeField: time}));
+{
+    // Insert an doc with a future time.
+    const futureColl = db[coll.getName() + "_future"];
+    futureColl.drop();
+    const futureTime = new Date();
+    futureTime.setHours(futureTime.getHours() + 1);
+    assert.commandWorked(futureColl.insert({timeField: futureTime}));
 
-// The 'timeField' value is later than '$$NOW' in '$expr'.
-assert.eq(0, futureColl.find({$expr: {$lt: ["$timeField", "$$NOW"]}}).itcount());
-// The '$$NOW' in '$expr' should advance its value after sleeping for 3 second, the 'timeField'
-// value should be earlier than it now.
-assert.soon(() => {
-    return futureColl.find({$expr: {$lt: ["$timeField", "$$NOW"]}}).itcount() == 1;
-}, "$$NOW should catch up after 3 seconds");
+    // The 'timeField' value is later than '$$NOW' in '$expr'.
+    assert.eq(0, futureColl.find({$expr: {$lt: ["$timeField", "$$NOW"]}}).itcount());
+
+    const pastColl = db[coll.getName() + "_past"];
+    pastColl.drop();
+    const time = new Date();
+    time.setSeconds(time.getSeconds() + 3);
+    assert.commandWorked(pastColl.insert({timeField: time}));
+
+    // The 'timeField' will eventually be earlier than '$$NOW' in '$expr'.
+    assert.soon(() => {
+        return pastColl.find({$expr: {$lt: ["$timeField", "$$NOW"]}}).itcount() == 1;
+    }, "$$NOW should catch up after 3 seconds");
+}

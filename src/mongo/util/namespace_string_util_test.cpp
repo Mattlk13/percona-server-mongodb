@@ -36,6 +36,7 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/oid.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/unittest/framework.h"
@@ -44,6 +45,34 @@
 #include "mongo/util/str.h"
 
 namespace mongo {
+
+TEST(AuthNamespaceStringUtil, Deserialize) {
+    {
+        RAIIServerParameterControllerForTest multitenanyController("multitenancySupport", false);
+        ASSERT_THROWS_CODE(AuthNamespaceStringUtil::deserialize(TenantId{OID::gen()}, "foo", "bar"),
+                           DBException,
+                           ErrorCodes::InternalError);
+
+        auto nss = AuthNamespaceStringUtil::deserialize(boost::none, "", "bar");
+        ASSERT_EQ(nss.db_forTest(), "");
+        ASSERT_EQ(nss.coll(), "bar");
+        ASSERT_FALSE(nss.tenantId());
+    }
+
+    {
+        RAIIServerParameterControllerForTest multitenanyController("multitenancySupport", true);
+        TenantId tenant{OID::gen()};
+        auto tenantNs = AuthNamespaceStringUtil::deserialize(tenant, "foo", "bar");
+        ASSERT_EQ(tenantNs.tenantId(), tenant);
+        ASSERT_EQ(tenantNs.db_forTest(), "foo");
+        ASSERT_EQ(tenantNs.coll(), "bar");
+
+        auto ns = AuthNamespaceStringUtil::deserialize(boost::none, "foo", "");
+        ASSERT_FALSE(ns.tenantId());
+        ASSERT_EQ(ns.db_forTest(), "foo");
+        ASSERT_EQ(ns.coll(), "");
+    }
+}
 
 // TenantID is not included in serialization when multitenancySupport and
 // featureFlagRequireTenantID are enabled.
@@ -156,6 +185,28 @@ TEST(NamespaceStringUtilTest,
     ASSERT_EQ(nss.dbName().toString_forTest(), dbNameStr);
 }
 
+TEST(NamespaceStringUtilTest, NamespaceStringToDatabaseNameRoundTrip) {
+    struct Scenario {
+        bool multitenancy;
+        boost::optional<TenantId> tenant;
+        std::string database;
+    };
+
+    for (auto& scenario : {
+             Scenario{false, boost::none, "foo"},
+             Scenario{true, boost::none, "config"},
+             Scenario{true, TenantId{OID::gen()}, "foo"},
+         }) {
+        RAIIServerParameterControllerForTest mc("multitenancySupport", scenario.multitenancy);
+
+        auto expected = NamespaceString::createNamespaceString_forTest(
+            scenario.tenant, scenario.database, "bar");
+        auto actual = NamespaceStringUtil::deserialize(expected.dbName(), "bar");
+
+        ASSERT_EQ(actual, expected);
+    }
+}
+
 // Deserialize NamespaceString when multitenancySupport and featureFlagRequireTenantID are disabled.
 TEST(NamespaceStringUtilTest, DeserializeMultitenancySupportOffFeatureFlagRequireTenantIDOff) {
     RAIIServerParameterControllerForTest multitenanyController("multitenancySupport", false);
@@ -171,79 +222,24 @@ TEST(NamespaceStringUtilTest, DeserializeMultitenancySupportOffFeatureFlagRequir
 // Command Reply as this is a defaulted parameter where tests that don't specify this parameter
 // already test the default codepath.
 
-TEST(NamespaceStringUtilTest, SerializeMissingExpectPrefix_CommandReply) {
-    RAIIServerParameterControllerForTest multitenanyController("multitenancySupport", true);
-    TenantId tenantId(OID::gen());
-    const std::string nsString = "foo.bar";
-    const std::string nsPrefixString = str::stream() << tenantId.toString() << "_" << nsString;
-
-    SerializationContext ctxt_noTenantId(SerializationContext::stateCommandReply());
-    ctxt_noTenantId.setTenantIdSource(false);
-    SerializationContext ctxt_withTenantId(SerializationContext::stateCommandReply());
-    ctxt_withTenantId.setTenantIdSource(true);
-
-    {  // No prefix, no tenantId.
-        // request --> { ns: database.coll }
-        auto nss = NamespaceString::createNamespaceString_forTest(boost::none, nsString);
-        ASSERT_EQ(NamespaceStringUtil::serialize(nss, ctxt_noTenantId), nsString);
-    }
-
-    {  // Has prefix, no tenantId.
-        // request --> { ns: tenantId_database.coll }
-        auto nss = NamespaceString::createNamespaceString_forTest(boost::none, nsPrefixString);
-        ASSERT_EQ(NamespaceStringUtil::serialize(nss, ctxt_noTenantId), nsPrefixString);
-    }
-
-    {  // No prefix, has tenantId.
-        // request --> { ns: database.coll, $tenant: tenantId }
-        auto nss = NamespaceString::createNamespaceString_forTest(tenantId, nsString);
-        ASSERT_EQ(NamespaceStringUtil::serialize(nss, ctxt_withTenantId), nsString);
-    }
-
-    {  // Has prefix, has tenantId.  *** we shouldn't see this from Atlas Proxy
-        // request --> { ns: tenantId_database.coll, $tenant: tenantId }
-        // in this test, we're getting the toString() for ns, but we also have a tenantId. This
-        // means if we called ns.toStringWithTenantId(), we would see two tenantId prefixes
-        auto nss = NamespaceString::createNamespaceString_forTest(tenantId, nsPrefixString);
-        ASSERT_EQ(NamespaceStringUtil::serialize(nss, ctxt_withTenantId), nsPrefixString);
-    }
-}
-
 TEST(NamespaceStringUtilTest, SerializeExpectPrefixFalse_CommandReply) {
     RAIIServerParameterControllerForTest multitenanyController("multitenancySupport", true);
     TenantId tenantId(OID::gen());
     const std::string nsString = "foo.bar";
     const std::string nsPrefixString = str::stream() << tenantId.toString() << "_" << nsString;
 
-    SerializationContext ctxt_noTenantId(SerializationContext::stateCommandReply());
-    ctxt_noTenantId.setTenantIdSource(false);
-    ctxt_noTenantId.setPrefixState(false);
-    SerializationContext ctxt_withTenantId(SerializationContext::stateCommandReply());
-    ctxt_withTenantId.setTenantIdSource(true);
-    ctxt_withTenantId.setPrefixState(false);
-
-    {  // No prefix, no tenantId.
-        // request --> { ns: database.coll, expectPrefix: false }
-        auto nss = NamespaceString::createNamespaceString_forTest(boost::none, nsString);
-        ASSERT_EQ(NamespaceStringUtil::serialize(nss, ctxt_noTenantId), nsString);
-    }
-
-    {  // Has prefix, no tenantId.  *** we shouldn't see this from Atlas Proxy
-        // request --> { ns: tenantId_database.coll, expectPrefix: false }
-        auto nss = NamespaceString::createNamespaceString_forTest(boost::none, nsPrefixString);
-        ASSERT_EQ(NamespaceStringUtil::serialize(nss, ctxt_noTenantId), nsPrefixString);
-    }
+    SerializationContext ctxt(SerializationContext::stateCommandReply());
 
     {  // No prefix, has tenantId.
-        // request --> { ns: database.coll, $tenant: tenantId, expectPrefix: false }
+        // request --> { ns: database.coll }
         auto nss = NamespaceString::createNamespaceString_forTest(tenantId, nsString);
-        ASSERT_EQ(NamespaceStringUtil::serialize(nss, ctxt_withTenantId), nsString);
+        ASSERT_EQ(NamespaceStringUtil::serialize(nss, ctxt), nsString);
     }
 
     {  // Has prefix, has tenantId.  *** we shouldn't see this from Atlas Proxy
-        // request --> { ns: tenantId_database.coll, $tenant: tenantId, expectPrefix: false }
+        // request --> { ns: tenantId_database.coll }
         auto nss = NamespaceString::createNamespaceString_forTest(tenantId, nsPrefixString);
-        ASSERT_EQ(NamespaceStringUtil::serialize(nss, ctxt_withTenantId), nsPrefixString);
+        ASSERT_EQ(NamespaceStringUtil::serialize(nss, ctxt), nsPrefixString);
     }
 }
 
@@ -254,37 +250,21 @@ TEST(NamespaceStringUtilTest, SerializeExpectPrefixTrue_CommandReply) {
     const std::string nsString = "foo.bar";
     const std::string nsPrefixString = str::stream() << tenantId.toString() << "_" << nsString;
 
-    SerializationContext ctxt_noTenantId(SerializationContext::stateCommandReply());
-    ctxt_noTenantId.setTenantIdSource(false);
-    ctxt_noTenantId.setPrefixState(true);
-    SerializationContext ctxt_withTenantId(SerializationContext::stateCommandReply());
-    ctxt_withTenantId.setTenantIdSource(true);
-    ctxt_withTenantId.setPrefixState(true);
-
-    {  // No prefix, no tenantId.  *** we shouldn't see this from Atlas Proxy
-        // request --> { ns: database.coll, expectPrefix: true }
-        auto nss = NamespaceString::createNamespaceString_forTest(boost::none, nsString);
-        ASSERT_EQ(NamespaceStringUtil::serialize(nss, ctxt_noTenantId), nsString);
-    }
-
-    {  // Has prefix, no tenantId.
-        // request --> { ns: tenantId_database.coll, expectPrefix: true }
-        auto nss = NamespaceString::createNamespaceString_forTest(boost::none, nsPrefixString);
-        ASSERT_EQ(NamespaceStringUtil::serialize(nss, ctxt_noTenantId), nsPrefixString);
-    }
+    SerializationContext ctxt(SerializationContext::stateCommandReply());
+    ctxt.setPrefixState(true);
 
     {  // No prefix, has tenantId.  *** we shouldn't see this from Atlas Proxy
-        // request --> { ns: database.coll, $tenant: tenantId, expectPrefix: true }
+        // request --> { ns: database.coll, expectPrefix: true }
         auto nss = NamespaceString::createNamespaceString_forTest(tenantId, nsString);
-        ASSERT_EQ(NamespaceStringUtil::serialize(nss, ctxt_withTenantId), nsPrefixString);
+        ASSERT_EQ(NamespaceStringUtil::serialize(nss, ctxt), nsPrefixString);
     }
 
     {  // Has prefix, has tenantId.
-        // request -->  { ns: tenantId_database.coll, $tenant: tenantId, expectPrefix: true }
+        // request -->  { ns: tenantId_database.coll, expectPrefix: true }
         const std::string nsDoublePrefixString = str::stream()
             << tenantId.toString() << "_" << tenantId.toString() << "_" << nsString;
         auto nss = NamespaceString::createNamespaceString_forTest(tenantId, nsPrefixString);
-        ASSERT_EQ(NamespaceStringUtil::serialize(nss, ctxt_withTenantId), nsDoublePrefixString);
+        ASSERT_EQ(NamespaceStringUtil::serialize(nss, ctxt), nsDoublePrefixString);
     }
 }
 
@@ -325,86 +305,43 @@ TEST(NamespaceStringUtilTest, SerializeEmptyCollectionName) {
 
 #undef ASSERT_NSS_EQ
 
-TEST(NamespaceStringUtilTest, DeserializeMissingExpectPrefix_CommandRequest) {
-    RAIIServerParameterControllerForTest multitenanyController("multitenancySupport", true);
-    TenantId tenantId(OID::gen());
-    const std::string nsString = "foo.bar";
-    const std::string nsPrefixString = str::stream() << tenantId.toString() << "_" << nsString;
-
-    SerializationContext ctxt_noTenantId(SerializationContext::stateCommandRequest());
-    ctxt_noTenantId.setTenantIdSource(false);
-    SerializationContext ctxt_withTenantId(SerializationContext::stateCommandRequest());
-    ctxt_withTenantId.setTenantIdSource(true);
-
-    {  // No prefix, no tenantId.   *** we shouldn't see this from Atlas Proxy in MT mode
-        // request --> { ns: database.coll }
-        ASSERT_THROWS_CODE(NamespaceStringUtil::deserialize(boost::none, nsString, ctxt_noTenantId),
-                           AssertionException,
-                           8423387);
-    }
-
-    {  // Has prefix, no tenantId.
-        // request --> { ns: tenantId_database.coll }
-        auto nss = NamespaceStringUtil::deserialize(boost::none, nsPrefixString, ctxt_noTenantId);
-        ASSERT_EQ(nss.tenantId(), tenantId);
-        ASSERT_EQ(nss.toString_forTest(), nsString);
-    }
-
-    {  // No prefix, has tenantId.
-        // request --> { ns: database.coll, $tenant: tenantId }
-        auto nss = NamespaceStringUtil::deserialize(tenantId, nsString, ctxt_withTenantId);
-        ASSERT_EQ(nss.tenantId(), tenantId);
-        ASSERT_EQ(nss.toString_forTest(), nsString);
-    }
-
-    {  // Has prefix, has tenantId.  *** we shouldn't see this from Atlas Proxy
-        // request --> { ns: tenantId_database.coll, $tenant: tenantId }
-        auto nss = NamespaceStringUtil::deserialize(tenantId, nsPrefixString, ctxt_withTenantId);
-        ASSERT_EQ(nss.tenantId(), tenantId);
-        ASSERT_EQ(nss.toString_forTest(), nsPrefixString);
-    }
-}
-
 TEST(NamespaceStringUtilTest, DeserializeExpectPrefixFalse_CommandRequest) {
     RAIIServerParameterControllerForTest multitenanyController("multitenancySupport", true);
     TenantId tenantId(OID::gen());
     const std::string nsString = "foo.bar";
     const std::string nsPrefixString = str::stream() << tenantId.toString() << "_" << nsString;
 
-    SerializationContext ctxt_noTenantId(SerializationContext::stateCommandRequest());
-    ctxt_noTenantId.setTenantIdSource(false);
-    ctxt_noTenantId.setPrefixState(false);
-    SerializationContext ctxt_withTenantId(SerializationContext::stateCommandRequest());
-    ctxt_withTenantId.setTenantIdSource(true);
-    ctxt_withTenantId.setPrefixState(false);
+    SerializationContext ctxt(SerializationContext::stateCommandRequest());
 
     {  // No prefix, no tenantId.  *** we shouldn't see this from Atlas Proxy in MT mode
-        // request --> { ns: database.coll, expectPrefix: false }
-        ASSERT_THROWS_CODE(NamespaceStringUtil::deserialize(boost::none, nsString, ctxt_noTenantId),
+        // request --> { ns: database.coll }
+        ASSERT_THROWS_CODE(NamespaceStringUtil::deserialize(boost::none, nsString, ctxt),
                            AssertionException,
                            8423387);
     }
 
     {  // Has prefix, no tenantId.  *** we shouldn't see this from Atlas Proxy
-        // request --> { ns: tenantId_database.coll, expectPrefix: false }
-        auto nss = NamespaceStringUtil::deserialize(boost::none, nsPrefixString, ctxt_noTenantId);
-        // This is an anomaly, when no tenantId is supplied, we actually ignore expectPrefix, so we
-        // can't expect nss.toString == nsPrefixString as we will still attempt to parse the prefix
-        // as usual.
-        ASSERT_EQ(nss.tenantId(), tenantId);
-        ASSERT_EQ(nss.toString_forTest(), nsString);
+        // request --> { ns: tenantId_database.coll }
+        ASSERT_THROWS_CODE(NamespaceStringUtil::deserialize(boost::none, nsPrefixString, ctxt),
+                           AssertionException,
+                           8233501);
     }
 
     {  // No prefix, has tenantId.
-        // request --> { ns: database.coll, $tenant: tenantId, expectPrefix: false }
-        auto nss = NamespaceStringUtil::deserialize(tenantId, nsString, ctxt_withTenantId);
+        // request --> { ns: database.coll }
+        auto nss = NamespaceStringUtil::deserialize(tenantId, nsString, ctxt);
         ASSERT_EQ(nss.tenantId(), tenantId);
         ASSERT_EQ(nss.toString_forTest(), nsString);
     }
 
-    {  // Has prefix, has tenantId.  *** we shouldn't see this from Atlas Proxy
-        // request --> { ns: tenantId_database.coll, $tenant: tenantId, expectPrefix: false }
-        auto nss = NamespaceStringUtil::deserialize(tenantId, nsPrefixString, ctxt_withTenantId);
+    {  // Has prefix, has tenantId.  ** Allowed but the prefix is *NOT* stripped (even if it's a
+        // valid tenant ID).
+        // request --> { ns: tenantId_database.coll }
+        auto nss = NamespaceStringUtil::deserialize(tenantId, "foo_bar.baz", ctxt);
+        ASSERT_EQ(nss.tenantId(), tenantId);
+        ASSERT_EQ(nss.toString_forTest(), "foo_bar.baz");
+
+        nss = NamespaceStringUtil::deserialize(tenantId, nsPrefixString, ctxt);
         ASSERT_EQ(nss.tenantId(), tenantId);
         ASSERT_EQ(nss.toString_forTest(), nsPrefixString);
     }
@@ -416,37 +353,33 @@ TEST(NamespaceStringUtilTest, DeserializeExpectPrefixTrue_CommandRequest) {
     const std::string nsString = "foo.bar";
     const std::string nsPrefixString = str::stream() << tenantId.toString() << "_" << nsString;
 
-    SerializationContext ctxt_noTenantId(SerializationContext::stateCommandRequest());
-    ctxt_noTenantId.setTenantIdSource(false);
-    ctxt_noTenantId.setPrefixState(true);
-    SerializationContext ctxt_withTenantId(SerializationContext::stateCommandRequest());
-    ctxt_withTenantId.setTenantIdSource(true);
-    ctxt_withTenantId.setPrefixState(true);
+    SerializationContext ctxt(SerializationContext::stateCommandRequest());
+    ctxt.setPrefixState(true);
 
     {  // No prefix, no tenantId.  *** we shouldn't see this from Atlas Proxy in MT mode
         // request --> { ns: database.coll, expectPrefix: true }
-        ASSERT_THROWS_CODE(NamespaceStringUtil::deserialize(boost::none, nsString, ctxt_noTenantId),
+        ASSERT_THROWS_CODE(NamespaceStringUtil::deserialize(boost::none, nsString, ctxt),
                            AssertionException,
                            8423387);
     }
 
-    {  // Has prefix, no tenantId.
+    {  // Has prefix, no tenantId.  Not valid.
         // request --> { ns: tenantId_database.coll, expectPrefix: true }
-        auto nss = NamespaceStringUtil::deserialize(boost::none, nsPrefixString, ctxt_noTenantId);
-        ASSERT_EQ(nss.tenantId(), tenantId);
-        ASSERT_EQ(nss.toString_forTest(), nsString);
+        ASSERT_THROWS_CODE(NamespaceStringUtil::deserialize(boost::none, nsPrefixString, ctxt),
+                           AssertionException,
+                           8233501);
     }
 
     {  // No prefix, has tenantId.  *** we shouldn't see this from Atlas Proxy
-        // request --> { ns: database.coll, $tenant: tenantId, expectPrefix: true }
-        ASSERT_THROWS_CODE(NamespaceStringUtil::deserialize(tenantId, nsString, ctxt_withTenantId),
+        // request --> { ns: database.coll, expectPrefix: true }
+        ASSERT_THROWS_CODE(NamespaceStringUtil::deserialize(tenantId, nsString, ctxt),
                            AssertionException,
                            8423385);
     }
 
     {  // Has prefix, has tenantId.
-        // request -->  { ns: tenantId_database.coll, $tenant: tenantId, expectPrefix: true }
-        auto nss = NamespaceStringUtil::deserialize(tenantId, nsPrefixString, ctxt_withTenantId);
+        // request -->  { ns: tenantId_database.coll, expectPrefix: true }
+        auto nss = NamespaceStringUtil::deserialize(tenantId, nsPrefixString, ctxt);
         ASSERT_EQ(nss.tenantId(), tenantId);
         ASSERT_EQ(nss.toString_forTest(), nsString);
     }
@@ -466,104 +399,201 @@ TEST(NamespaceStringUtilTest, ParseNSSWithTenantId) {
     ASSERT_EQ(*nss.tenantId(), tenantId);
 }
 
-TEST(NamespaceStringUtilTest, ParseFailPointData) {
-    const TenantId tid = TenantId(OID::gen());
-
-    for (bool multitenancy : {false, true}) {
+TEST(NamespaceStringUtilTest, ParseNSSWithUnderscoreAfterDbPortion) {
+    for (const bool multitenancy : {true, false}) {
         RAIIServerParameterControllerForTest multitenancyController("multitenancySupport",
                                                                     multitenancy);
-        // Test fail point data has both name space and $tenant.
+        // no tenant, "foo.bar"
         {
-            BSONObjBuilder bob;
-            bob.append("nss", "myDb.myColl");
-            tid.serializeToBSON("$tenant", &bob);
-            if (multitenancy) {
-                auto fpNss = NamespaceStringUtil::parseFailPointData(bob.obj(), "nss"_sd);
-                ASSERT_EQ(NamespaceString::createNamespaceString_forTest(tid, "myDb.myColl"),
-                          fpNss);
-            } else {
-                ASSERT_THROWS_CODE(NamespaceStringUtil::parseFailPointData(bob.obj(), "nss"_sd),
-                                   AssertionException,
-                                   6972102);
-            }
+            NamespaceString nss =
+                NamespaceStringUtil::parseFromStringExpectTenantIdInMultitenancyMode("foo.bar");
+            ASSERT_EQ(nss.ns_forTest(), "foo.bar");
+            ASSERT_EQ(nss.toStringWithTenantId_forTest(), "foo.bar");
+            ASSERT_EQ(nss.tenantId(), boost::none);
         }
-        // Test fail point data only has $tenant.
+
+        // '_' positioned after '.'. Ex: foo.123_bar
         {
-            BSONObjBuilder bob;
-            tid.serializeToBSON("$tenant", &bob);
-            if (multitenancy) {
-                auto fpNss = NamespaceStringUtil::parseFailPointData(bob.obj(), "nss"_sd);
-                ASSERT_EQ(NamespaceString::createNamespaceString_forTest(tid, ""), fpNss);
-            } else {
-                ASSERT_THROWS_CODE(NamespaceStringUtil::parseFailPointData(bob.obj(), "nss"_sd),
-                                   AssertionException,
-                                   6972102);
-            }
+            TenantId tenantId(OID::gen());
+            std::string nssWithTenantStr = str::stream() << "foo." << tenantId.toString() << "_bar";
+            NamespaceString nss =
+                NamespaceStringUtil::parseFromStringExpectTenantIdInMultitenancyMode(
+                    nssWithTenantStr);
+            ASSERT_EQ(nss.ns_forTest(), nssWithTenantStr);
+            ASSERT_EQ(nss.toStringWithTenantId_forTest(), nssWithTenantStr);
+            ASSERT_EQ(nss.tenantId(), boost::none);
         }
-        // Test fail point data only has name space.
+
+        // '_' positioned after db but before '.'. Ex: foo_123.bar
         {
-            BSONObjBuilder bob;
-            bob.append("nss", "myDb.myColl");
-            const auto fpNss = NamespaceStringUtil::parseFailPointData(bob.obj(), "nss"_sd);
-            ASSERT_EQ(NamespaceString::createNamespaceString_forTest(boost::none, "myDb.myColl"),
-                      fpNss);
+            TenantId tenantId(OID::gen());
+            std::string nssWithTenantStr = str::stream() << "foo_" << tenantId.toString() << ".bar";
+            NamespaceString nss =
+                NamespaceStringUtil::parseFromStringExpectTenantIdInMultitenancyMode(
+                    nssWithTenantStr);
+            ASSERT_EQ(nss.ns_forTest(), nssWithTenantStr);
+            ASSERT_EQ(nss.toStringWithTenantId_forTest(), nssWithTenantStr);
+            ASSERT_EQ(nss.tenantId(), boost::none);
         }
-        // Test fail point data has neither $teannt nor name sapce.
+
+        // '_' positioned after coll. Ex: foo.bar_123
         {
-            auto fpNss = NamespaceStringUtil::parseFailPointData(BSONObj(), "nss"_sd);
-            ASSERT_EQ(NamespaceString(), fpNss);
+            TenantId tenantId(OID::gen());
+            std::string nssWithTenantStr = str::stream() << "foo"
+                                                         << ".bar_" << tenantId.toString();
+            NamespaceString nss =
+                NamespaceStringUtil::parseFromStringExpectTenantIdInMultitenancyMode(
+                    nssWithTenantStr);
+            ASSERT_EQ(nss.ns_forTest(), nssWithTenantStr);
+            ASSERT_EQ(nss.toStringWithTenantId_forTest(), nssWithTenantStr);
+            ASSERT_EQ(nss.tenantId(), boost::none);
         }
     }
 }
 
-TEST(NamespaceStringUtilTest, AuthPrevalidatedContext) {
-    const TenantId tid = TenantId(OID::gen());
-    auto ctxt = SerializationContext::stateAuthPrevalidated();
-    std::vector<std::pair<boost::optional<TenantId>, std::string>> casesToTest = {
-        {boost::none, ""},
-        {tid, ""},
-        {boost::none, "foo"},
-        {tid, "foo"},
-        {boost::none, "foo.bar"},
-        {tid, "foo.bar"},
-        {boost::none, ".bar"},
-        {tid, ".bar"},
-    };
-    for (bool multitenancy : {false, true}) {
-        for (bool ff : {false, true}) {
-            if (ff && !multitenancy)  // Feature flag on with multitenancy off is not handled
-                continue;
-            RAIIServerParameterControllerForTest multitenancyController("multitenancySupport",
-                                                                        multitenancy);
-            RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID",
-                                                                       ff);
-            for (auto [tenantId, nsStr] : casesToTest) {
-                auto expectedNss = NamespaceString::createNamespaceString_forTest(tenantId, nsStr);
-                std::string fullNsStr;
-                if (!tenantId) {
-                    fullNsStr = nsStr;
-                } else {
-                    fullNsStr = str::stream() << tenantId->toString() << "_" << nsStr;
-                }
-                if (tenantId && !multitenancy) {
-                    // Clang is stupid, so to use ASSERT_THROWS_CODE (which internally creates a
-                    // lambda function), we need to rebind the two structured bindings tenantId and
-                    // nsStr to real variables.
-                    auto t = tenantId;
-                    auto n = nsStr;
-                    // Expect deserialization to fail when we have a tenant ID and multitenancy
-                    // support is disabled
-                    ASSERT_THROWS_CODE(
-                        NamespaceStringUtil::deserialize(t, n, ctxt), AssertionException, 6972102);
-                    // Expect serialization to drop the tenant ID when multitenancy support is
-                    // disabled
-                    ASSERT_EQ(NamespaceStringUtil::serialize(expectedNss, ctxt), nsStr);
-                } else {
-                    ASSERT_EQ(NamespaceStringUtil::deserialize(tenantId, nsStr, ctxt), expectedNss);
-                    ASSERT_EQ(NamespaceStringUtil::serialize(expectedNss, ctxt), fullNsStr);
-                }
-            }
-        }
+TEST(NamespaceStringUtilTest, ParseNSSWithTenantIdAndUnderscoreAfterDbPortionMultitenancyOff) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", false);
+    // no tenant
+    {
+        NamespaceString nss =
+            NamespaceStringUtil::parseFromStringExpectTenantIdInMultitenancyMode("foo.bar");
+        ASSERT_EQ(nss.ns_forTest(), "foo.bar");
+        ASSERT_EQ(nss.toStringWithTenantId_forTest(), "foo.bar");
+        ASSERT_EQ(nss.tenantId(), boost::none);
+    }
+
+    // '_' positioned after db and '.'. Ex: 123_foo.456_bar
+    {
+        TenantId tenantId(OID::gen());
+        TenantId rightSideTenantId(OID::gen());
+        std::string nssWithTenantStr = str::stream()
+            << tenantId.toString() << "_foo." << rightSideTenantId.toString() << "_bar";
+        NamespaceString nss =
+            NamespaceStringUtil::parseFromStringExpectTenantIdInMultitenancyMode(nssWithTenantStr);
+        ASSERT_EQ(nss.ns_forTest(), nssWithTenantStr);
+        ASSERT_EQ(nss.toStringWithTenantId_forTest(), nssWithTenantStr);
+        ASSERT_EQ(nss.tenantId(), boost::none);
+    }
+
+    // '_' positioned after tenantId. Ex: 123_456_foo.bar
+    {
+        TenantId tenantId(OID::gen());
+        TenantId rightSideTenantId(OID::gen());
+        std::string nssWithTenantStr = str::stream()
+            << tenantId.toString() << "_" << rightSideTenantId.toString() << "_foo.bar";
+        NamespaceString nss =
+            NamespaceStringUtil::parseFromStringExpectTenantIdInMultitenancyMode(nssWithTenantStr);
+        ASSERT_EQ(nss.ns_forTest(), nssWithTenantStr);
+        ASSERT_EQ(nss.toStringWithTenantId_forTest(), nssWithTenantStr);
+        ASSERT_EQ(nss.tenantId(), boost::none);
+    }
+
+    // '_' positioned after db but before '.'. Ex: 123_foo_456.bar
+    {
+        TenantId tenantId(OID::gen());
+        TenantId rightSideTenantId(OID::gen());
+        std::string nssWithTenantStr = str::stream()
+            << tenantId.toString() << "_foo_" << rightSideTenantId.toString() << ".bar";
+        NamespaceString nss =
+            NamespaceStringUtil::parseFromStringExpectTenantIdInMultitenancyMode(nssWithTenantStr);
+        ASSERT_EQ(nss.ns_forTest(), nssWithTenantStr);
+        ASSERT_EQ(nss.toStringWithTenantId_forTest(), nssWithTenantStr);
+        ASSERT_EQ(nss.tenantId(), boost::none);
+    }
+
+    // '_' positioned after coll. Ex: 123_foo.bar_456
+    {
+        TenantId tenantId(OID::gen());
+        TenantId rightSideTenantId(OID::gen());
+        std::string nssWithTenantStr = str::stream()
+            << tenantId.toString() << "_foo.bar_" << rightSideTenantId.toString();
+        NamespaceString nss =
+            NamespaceStringUtil::parseFromStringExpectTenantIdInMultitenancyMode(nssWithTenantStr);
+        ASSERT_EQ(nss.ns_forTest(), nssWithTenantStr);
+        ASSERT_EQ(nss.toStringWithTenantId_forTest(), nssWithTenantStr);
+        ASSERT_EQ(nss.tenantId(), boost::none);
+    }
+}
+
+TEST(NamespaceStringUtilTest, ParseNSSWithTenantIdAndUnderscoreAfterDbPortionMultitenancyOn) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    // no tenant
+    {
+        NamespaceString nss =
+            NamespaceStringUtil::parseFromStringExpectTenantIdInMultitenancyMode("foo.bar");
+        ASSERT_EQ(nss.ns_forTest(), "foo.bar");
+        ASSERT_EQ(nss.toStringWithTenantId_forTest(), "foo.bar");
+        ASSERT_EQ(nss.tenantId(), boost::none);
+    }
+
+    // '_' positioned after db and '.'. Ex: 123_foo.456_bar
+    {
+        TenantId tenantId(OID::gen());
+        TenantId rightSideTenantId(OID::gen());
+        std::string nssWithTenantStr = str::stream()
+            << tenantId.toString() << "_foo." << rightSideTenantId.toString() << "_bar";
+        NamespaceString nss =
+            NamespaceStringUtil::parseFromStringExpectTenantIdInMultitenancyMode(nssWithTenantStr);
+        ASSERT_EQ(nss.ns_forTest(),
+                  (str::stream() << "foo." << rightSideTenantId.toString() << "_bar"));
+        ASSERT_EQ(nss.toStringWithTenantId_forTest(), nssWithTenantStr);
+        ASSERT_EQ(nss.tenantId(), tenantId);
+    }
+
+    // '_' positioned after tenantId. Ex: 123_456_foo.bar
+    {
+        TenantId tenantId(OID::gen());
+        TenantId rightSideTenantId(OID::gen());
+        std::string nssWithTenantStr = str::stream()
+            << tenantId.toString() << "_" << rightSideTenantId.toString() << "_foo.bar";
+        NamespaceString nss =
+            NamespaceStringUtil::parseFromStringExpectTenantIdInMultitenancyMode(nssWithTenantStr);
+        ASSERT_EQ(nss.ns_forTest(), (str::stream() << rightSideTenantId.toString() << "_foo.bar"));
+        ASSERT_EQ(nss.toStringWithTenantId_forTest(), nssWithTenantStr);
+        ASSERT_EQ(nss.tenantId(), tenantId);
+    }
+
+    // '_' positioned after db but before '.'. Ex: 123_foo_456.bar
+    {
+        TenantId tenantId(OID::gen());
+        TenantId rightSideTenantId(OID::gen());
+        std::string nssWithTenantStr = str::stream()
+            << tenantId.toString() << "_foo_" << rightSideTenantId.toString() << ".bar";
+        NamespaceString nss =
+            NamespaceStringUtil::parseFromStringExpectTenantIdInMultitenancyMode(nssWithTenantStr);
+        ASSERT_EQ(nss.ns_forTest(),
+                  (str::stream() << "foo_" << rightSideTenantId.toString() << ".bar"));
+        ASSERT_EQ(nss.toStringWithTenantId_forTest(), nssWithTenantStr);
+        ASSERT_EQ(nss.tenantId(), tenantId);
+    }
+
+    // '_' positioned after coll. Ex: 123_foo.bar_456
+    {
+        TenantId tenantId(OID::gen());
+        TenantId rightSideTenantId(OID::gen());
+        std::string nssWithTenantStr = str::stream()
+            << tenantId.toString() << "_foo.bar_" << rightSideTenantId.toString();
+        NamespaceString nss =
+            NamespaceStringUtil::parseFromStringExpectTenantIdInMultitenancyMode(nssWithTenantStr);
+        ASSERT_EQ(nss.ns_forTest(), (str::stream() << "foo.bar_" << rightSideTenantId.toString()));
+        ASSERT_EQ(nss.toStringWithTenantId_forTest(), nssWithTenantStr);
+        ASSERT_EQ(nss.tenantId(), tenantId);
+    }
+}
+
+TEST(NamespaceStringUtilTest, ParseFailPointData) {
+    // Test fail point data only has name space.
+    {
+        BSONObjBuilder bob;
+        bob.append("nss", "myDb.myColl");
+        const auto fpNss = NamespaceStringUtil::parseFailPointData(bob.obj(), "nss"_sd);
+        ASSERT_EQ(NamespaceString::createNamespaceString_forTest(boost::none, "myDb.myColl"),
+                  fpNss);
+    }
+    // Test fail point data is empty.
+    {
+        auto fpNss = NamespaceStringUtil::parseFailPointData(BSONObj(), "nss"_sd);
+        ASSERT_EQ(NamespaceString(), fpNss);
     }
 }
 
@@ -587,4 +617,15 @@ TEST(NamespaceStringUtilTest, SerializingEmptyNamespaceSting) {
         ASSERT_EQ(NamespaceStringUtil::serialize(emptyTenantIdDbNss, sc), expectedSerialization);
     }
 }
+
+TEST(NamespaceStringUtilTest, CheckEmptyCollectionSerialize) {
+    const auto serializeCtx = SerializationContext::stateDefault();
+    const TenantId tenantId(OID::gen());
+
+    const auto dbName = DatabaseName::createDatabaseName_forTest(tenantId, "dbTest");
+    const auto nssEmptyColl = NamespaceString::createNamespaceString_forTest(dbName, "");
+    const auto nssEmptySerialized = NamespaceStringUtil::serialize(nssEmptyColl, serializeCtx);
+    ASSERT_EQ(nssEmptySerialized, "dbTest");
+}
+
 }  // namespace mongo

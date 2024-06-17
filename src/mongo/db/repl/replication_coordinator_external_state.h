@@ -138,7 +138,7 @@ public:
      * SyncSourceFeedback thread that it needs to wake up and send a replSetUpdatePosition
      * command upstream.
      */
-    virtual void forwardSecondaryProgress() = 0;
+    virtual void forwardSecondaryProgress(bool prioritized = false) = 0;
 
     /**
      * Returns true if "host" is one of the network identities of this node.
@@ -299,10 +299,6 @@ public:
      */
     virtual double getElectionTimeoutOffsetLimitFraction() const = 0;
 
-    /**
-     * Returns true if the current storage engine supports read committed.
-     */
-    virtual bool isReadCommittedSupportedByStorageEngine(OperationContext* opCtx) const = 0;
 
     /**
      * Returns true if the current storage engine supports snapshot read concern.

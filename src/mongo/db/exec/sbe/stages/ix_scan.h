@@ -42,8 +42,8 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/ordering.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/db/admission/execution_admission_context.h"
 #include "mongo/db/catalog/index_catalog_entry.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/sbe/expressions/expression.h"
@@ -54,7 +54,6 @@
 #include "mongo/db/exec/sbe/values/slot.h"
 #include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/exec/sbe/vm/vm.h"
-#include "mongo/db/exec/trial_run_tracker.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/index_bounds.h"
 #include "mongo/db/query/plan_yield_policy.h"
@@ -63,6 +62,7 @@
 #include "mongo/db/storage/key_string.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo::sbe {
@@ -135,17 +135,15 @@ protected:
     void doRestoreState(bool relinquishCursor) final;
     void doDetachFromOperationContext() final;
     void doAttachToOperationContext(OperationContext* opCtx) final;
-    void doDetachFromTrialRunTracker() final;
-    TrialRunTrackerAttachResultMask doAttachToTrialRunTracker(
-        TrialRunTracker* tracker, TrialRunTrackerAttachResultMask childrenAttachResult) final;
+
     /**
      * When this stage is re-opened after being closed, or during yield recovery, called to verify
      * that the index (and the index's collection) remain valid. If any validity check fails, throws
      * a UserException that terminates execution of the query.
      */
     void restoreCollectionAndIndex();
-    // Bumps '_specificStats.numReads' and calls trackProgress() if '_tracker' is non-null.
-    void trackRead();
+    // Bumps '_specificStats.numReads' and calls base class trackRead().
+    void trackIndexRead();
     // Shares the common code for PlanStage::prepare() implementation.
     void prepareImpl(CompileCtx& ctx);
     // Shares the common code for PlanStage::open() implementation.
@@ -176,9 +174,9 @@ protected:
     value::OwnedValueAccessor _indexIdentAccessor;
     value::ViewOfValueAccessor _indexIdentViewAccessor;
 
-    // This field holds the latest snapshot ID that we've received from _opCtx->recoveryUnit().
-    // This field gets initialized by prepare(), and it gets updated each time doRestoreState() is
-    // called.
+    // This field holds the latest snapshot ID that we've received from the recovery unit of the
+    // operation. This field gets initialized by prepare(), and it gets updated each time
+    // doRestoreState() is called.
     uint64_t _latestSnapshotId{0};
 
     // One accessor and slot for each key component that this stage will bind from an index entry's
@@ -196,15 +194,12 @@ protected:
     BufBuilder _valuesBuffer;
 
     bool _open{false};
+    bool _uniqueIndex{false};
     ScanState _scanState = ScanState::kNeedSeek;
     IndexScanStats _specificStats;
 
     bool _lowPriority;
-    boost::optional<ScopedAdmissionPriorityForLock> _priority;
-
-    // If provided, used during a trial run to accumulate certain execution stats. Once the trial
-    // run is complete, this pointer is reset to nullptr.
-    TrialRunTracker* _tracker{nullptr};
+    boost::optional<ScopedAdmissionPriority<ExecutionAdmissionContext>> _priority;
 };
 
 /**
@@ -268,6 +263,8 @@ private:
 
     value::OwnedValueAccessor _seekKeyLowHolder;
     value::OwnedValueAccessor _seekKeyHighHolder;
+
+    bool _pointBound{false};
 };
 
 /**
@@ -325,5 +322,7 @@ protected:
     IndexSeekPoint _seekPoint;
     std::unique_ptr<vm::CodeFragment> _indexBoundsCode;
     boost::optional<IndexBoundsChecker> _checker;
+    // The end position for current range, empty if currently not in a valid range.
+    key_string::Builder _endKey;
 };
 }  // namespace mongo::sbe

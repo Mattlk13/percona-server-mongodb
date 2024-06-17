@@ -87,6 +87,11 @@ namespace mongo::projection_ast {
 class Projection;
 }
 
+namespace mongo {
+class AccumulationStatement;
+struct WindowFunctionStatement;
+}  // namespace mongo
+
 namespace mongo::stage_builder {
 
 class PlanStageSlots;
@@ -119,6 +124,17 @@ std::unique_ptr<sbe::EExpression> generateNullOrMissing(sbe::FrameId frameId,
                                                         sbe::value::SlotId slotId);
 
 std::unique_ptr<sbe::EExpression> generateNullOrMissing(std::unique_ptr<sbe::EExpression> arg);
+
+/**
+ * Generates an EExpression that checks if the input expression is null, missing, or undefined.
+ */
+std::unique_ptr<sbe::EExpression> generateNullMissingOrUndefined(const sbe::EVariable& var);
+
+std::unique_ptr<sbe::EExpression> generateNullMissingOrUndefined(sbe::FrameId frameId,
+                                                                 sbe::value::SlotId slotId);
+
+std::unique_ptr<sbe::EExpression> generateNullMissingOrUndefined(
+    std::unique_ptr<sbe::EExpression> arg);
 
 /**
  * Generates an EExpression that checks if the input expression is a non-numeric type _assuming
@@ -214,16 +230,12 @@ std::unique_ptr<sbe::EExpression> buildMultiBranchConditionalFromCaseValuePairs(
     std::vector<CaseValuePair> caseValuePairs, std::unique_ptr<sbe::EExpression> defaultValue);
 
 /**
- * Insert a limit stage on top of the 'input' stage.
- */
-std::unique_ptr<sbe::PlanStage> makeLimitTree(std::unique_ptr<sbe::PlanStage> inputStage,
-                                              PlanNodeId planNodeId,
-                                              long long limit = 1);
-
-/**
  * Create tree consisting of coscan stage followed by limit stage.
  */
 std::unique_ptr<sbe::PlanStage> makeLimitCoScanTree(PlanNodeId planNodeId, long long limit = 1);
+
+std::unique_ptr<sbe::EExpression> makeFillEmpty(std::unique_ptr<sbe::EExpression> expr,
+                                                std::unique_ptr<sbe::EExpression> altExpr);
 
 /**
  * Check if expression returns Nothing and return boolean false if so. Otherwise, return the
@@ -281,7 +293,7 @@ inline auto makeStrConstant(StringData str) {
     return sbe::makeE<sbe::EConstant>(tag, val);
 }
 
-std::unique_ptr<sbe::EExpression> makeVariable(sbe::value::SlotId slotId);
+std::unique_ptr<sbe::EExpression> makeVariable(SbSlot ts);
 
 std::unique_ptr<sbe::EExpression> makeVariable(sbe::FrameId frameId, sbe::value::SlotId slotId);
 
@@ -386,11 +398,12 @@ SbStage makeProject(SbStage stage, PlanNodeId nodeId, Ts&&... pack) {
 }
 
 SbStage makeHashAgg(SbStage stage,
-                    sbe::value::SlotVector gbs,
+                    const sbe::value::SlotVector& gbs,
                     sbe::AggExprVector aggs,
                     boost::optional<sbe::value::SlotId> collatorSlot,
                     bool allowDiskUse,
                     sbe::SlotExprPairVector mergingExprs,
+                    PlanYieldPolicy* yieldPolicy,
                     PlanNodeId planNodeId);
 
 std::unique_ptr<sbe::EExpression> makeIf(std::unique_ptr<sbe::EExpression> condExpr,
@@ -423,7 +436,8 @@ std::pair<sbe::value::SlotId, std::unique_ptr<sbe::PlanStage>> generateVirtualSc
     sbe::value::SlotIdGenerator* slotIdGenerator,
     sbe::value::TypeTags arrTag,
     sbe::value::Value arrVal,
-    PlanYieldPolicy* yieldPolicy = nullptr);
+    PlanYieldPolicy* yieldPolicy = nullptr,
+    PlanNodeId planNodeId = kEmptyPlanNodeId);
 
 /**
  * Make a mock scan with multiple output slots from an BSON array. This method does NOT assume
@@ -434,7 +448,8 @@ std::pair<sbe::value::SlotVector, std::unique_ptr<sbe::PlanStage>> generateVirtu
     int numSlots,
     sbe::value::TypeTags arrTag,
     sbe::value::Value arrVal,
-    PlanYieldPolicy* yieldPolicy = nullptr);
+    PlanYieldPolicy* yieldPolicy = nullptr,
+    PlanNodeId planNodeId = kEmptyPlanNodeId);
 
 /**
  * Helper functions for converting from BSONObj/BSONArray to SBE Object/Array. Caller owns the SBE
@@ -447,6 +462,71 @@ std::pair<sbe::value::TypeTags, sbe::value::Value> makeValue(const BSONArray& ba
  * Returns a BSON type mask of all data types coercible to date.
  */
 uint32_t dateTypeMask();
+
+struct BuildSortKeysPlan {
+    enum Type {
+        kTraverseFields,
+        kCallGenSortKey,
+        kCallGenCheapSortKey,
+    };
+
+    Type type = kCallGenSortKey;
+    bool needsResultObj = true;
+    std::vector<std::string> fieldsForSortKeys;
+};
+
+struct SortKeysExprs {
+    SbExpr::Vector keyExprs;
+    SbExpr parallelArraysCheckExpr;
+    SbExpr fullKeyExpr;
+};
+
+BuildSortKeysPlan makeSortKeysPlan(const SortPattern& sortPattern,
+                                   bool allowCallGenCheapSortKey = false);
+
+SortKeysExprs buildSortKeys(StageBuilderState& state,
+                            const BuildSortKeysPlan& plan,
+                            const SortPattern& sortPattern,
+                            const PlanStageSlots& outputs,
+                            SbExpr sortSpecExpr = {});
+
+/**
+ * Retrieves the accumulation op name from 'accStmt' and returns it.
+ */
+StringData getAccumulationOpName(const AccumulationStatement& accStmt);
+
+/**
+ * Retrieves the window function op name from 'accStmt' and returns it.
+ */
+StringData getWindowFunctionOpName(const WindowFunctionStatement& wfStmt);
+
+/**
+ * Return true iff 'name', 'accStmt', or 'wfStmt' is one of $topN, $bottomN, $minN, $maxN,
+ * $firstN, or $lastN.
+ */
+bool isAccumulatorN(StringData name);
+bool isAccumulatorN(const AccumulationStatement& accStmt);
+bool isAccumulatorN(const WindowFunctionStatement& wfStmt);
+
+/**
+ * Return true iff 'name', 'accStmt', or 'wfStmt' is $topN or $bottomN.
+ */
+bool isTopBottomN(StringData name);
+bool isTopBottomN(const AccumulationStatement& accStmt);
+bool isTopBottomN(const WindowFunctionStatement& wfStmt);
+
+/**
+ * Gets the internal pointer to the SortPattern (if there is one) inside 'accStmt' or 'wfStmt'.
+ */
+boost::optional<SortPattern> getSortPattern(const AccumulationStatement& accStmt);
+boost::optional<SortPattern> getSortPattern(const WindowFunctionStatement& wfStmt);
+
+/**
+ * Creates a SortSpec object from a SortPattern.
+ */
+std::unique_ptr<sbe::SortSpec> makeSortSpecFromSortPattern(const SortPattern& sortPattern);
+std::unique_ptr<sbe::SortSpec> makeSortSpecFromSortPattern(
+    const boost::optional<SortPattern>& sortPattern);
 
 /**
  * Constructs local binding with inner expression built by 'innerExprFunc' and variables assigned
@@ -484,15 +564,15 @@ std::unique_ptr<sbe::EExpression> makeLocalBind(sbe::value::FrameIdGenerator* fr
 }
 
 std::unique_ptr<sbe::PlanStage> makeLoopJoinForFetch(std::unique_ptr<sbe::PlanStage> inputStage,
-                                                     sbe::value::SlotId resultSlot,
-                                                     sbe::value::SlotId recordIdSlot,
+                                                     SbSlot resultSlot,
+                                                     SbSlot recordIdSlot,
                                                      std::vector<std::string> fields,
                                                      sbe::value::SlotVector fieldSlots,
-                                                     sbe::value::SlotId seekRecordIdSlot,
-                                                     sbe::value::SlotId snapshotIdSlot,
-                                                     sbe::value::SlotId indexIdentSlot,
-                                                     sbe::value::SlotId indexKeySlot,
-                                                     sbe::value::SlotId indexKeyPatternSlot,
+                                                     SbSlot seekRecordIdSlot,
+                                                     SbSlot snapshotIdSlot,
+                                                     SbSlot indexIdentSlot,
+                                                     SbSlot indexKeySlot,
+                                                     SbSlot indexKeyPatternSlot,
                                                      const CollectionPtr& collToFetch,
                                                      PlanNodeId planNodeId,
                                                      sbe::value::SlotVector slotsToForward);
@@ -1021,7 +1101,7 @@ public:
     };
     using Slice = std::pair<int32_t, boost::optional<int32_t>>;
 
-    using VariantType = stdx::variant<Bool, Expr, SbExpr, Slice>;
+    using VariantType = std::variant<Bool, Expr, SbExpr, Slice>;
 
     struct Keep {};
     struct Drop {};
@@ -1039,26 +1119,26 @@ public:
     ProjectNode(const ProjectionSliceASTNode* n) : _data(Slice{n->limit(), n->skip()}) {}
 
     ProjectNode clone() const {
-        return stdx::visit(OverloadedVisitor{[](const Bool& b) {
-                                                 return b.value ? ProjectNode(Keep{})
-                                                                : ProjectNode(Drop{});
-                                             },
-                                             [](const Expr& e) { return ProjectNode(e.expr); },
-                                             [](const SbExpr& e) { return ProjectNode(e.clone()); },
-                                             [](const Slice& s) {
-                                                 return ProjectNode(s);
-                                             }},
-                           _data);
+        return visit(OverloadedVisitor{[](const Bool& b) {
+                                           return b.value ? ProjectNode(Keep{})
+                                                          : ProjectNode(Drop{});
+                                       },
+                                       [](const Expr& e) { return ProjectNode(e.expr); },
+                                       [](const SbExpr& e) { return ProjectNode(e.clone()); },
+                                       [](const Slice& s) {
+                                           return ProjectNode(s);
+                                       }},
+                     _data);
     }
 
     Type type() const {
-        return stdx::visit(OverloadedVisitor{[](const Bool&) { return Type::kBool; },
-                                             [](const Expr&) { return Type::kExpr; },
-                                             [](const SbExpr&) { return Type::kSbExpr; },
-                                             [](const Slice&) {
-                                                 return Type::kSlice;
-                                             }},
-                           _data);
+        return visit(OverloadedVisitor{[](const Bool&) { return Type::kBool; },
+                                       [](const Expr&) { return Type::kExpr; },
+                                       [](const SbExpr&) { return Type::kSbExpr; },
+                                       [](const Slice&) {
+                                           return Type::kSlice;
+                                       }},
+                     _data);
     }
 
     bool isBool() const {
@@ -1076,30 +1156,30 @@ public:
 
     bool getBool() const {
         tassert(7580702, "getBool() expected type() to be kBool", isBool());
-        return stdx::get<Bool>(_data).value;
+        return get<Bool>(_data).value;
     }
     Expression* getExpr() const {
         tassert(7580703, "getExpr() expected type() to be kExpr", isExpr());
-        return stdx::get<Expr>(_data).expr;
+        return get<Expr>(_data).expr;
     }
     SbExpr getSbExpr() const {
         tassert(7580715, "getSbExpr() expected type() to be kSbExpr", isSbExpr());
-        return stdx::get<SbExpr>(_data).clone();
+        return get<SbExpr>(_data).clone();
     }
     SbExpr extractSbExpr() {
         tassert(7580716, "getSbExpr() expected type() to be kSbExpr", isSbExpr());
-        return std::move(stdx::get<SbExpr>(_data));
+        return std::move(get<SbExpr>(_data));
     }
     Slice getSlice() const {
         tassert(7580704, "getSlice() expected type() to be kSlice", isSlice());
-        return stdx::get<Slice>(_data);
+        return get<Slice>(_data);
     }
 
     bool isKeep() const {
-        return type() == Type::kBool && stdx::get<Bool>(_data).value == true;
+        return type() == Type::kBool && get<Bool>(_data).value == true;
     }
     bool isDrop() const {
-        return type() == Type::kBool && stdx::get<Bool>(_data).value == false;
+        return type() == Type::kBool && get<Bool>(_data).value == false;
     }
 
 private:
@@ -1122,10 +1202,10 @@ std::pair<std::vector<std::string>, std::vector<ProjectNode>> getProjectNodes(
  *
  * The order of slots in 'outSlots' will match the order of field paths in 'fields'.
  */
-std::pair<std::unique_ptr<sbe::PlanStage>, sbe::value::SlotVector> projectFieldsToSlots(
+std::pair<std::unique_ptr<sbe::PlanStage>, SbSlotVector> projectFieldsToSlots(
     std::unique_ptr<sbe::PlanStage> stage,
     const std::vector<std::string>& fields,
-    sbe::value::SlotId resultSlot,
+    SbSlot resultSlot,
     PlanNodeId nodeId,
     sbe::value::SlotIdGenerator* slotIdGenerator,
     StageBuilderState& state,
@@ -1137,7 +1217,7 @@ inline StringData getTopLevelField(const T& path) {
     return StringData(getRawStringData(path), idx != std::string::npos ? idx : path.size());
 }
 
-inline std::vector<std::string> getTopLevelFields(std::vector<std::string> setOfPaths) {
+inline std::vector<std::string> getTopLevelFields(const std::vector<std::string>& setOfPaths) {
     StringDataSet topLevelFieldsSet;
     std::vector<std::string> topLevelFields;
 
@@ -1147,11 +1227,7 @@ inline std::vector<std::string> getTopLevelFields(std::vector<std::string> setOf
 
         auto [_, inserted] = topLevelFieldsSet.insert(field);
         if (inserted) {
-            if (path.find('.') == std::string::npos) {
-                topLevelFields.emplace_back(std::move(path));
-            } else {
-                topLevelFields.emplace_back(field.toString());
-            }
+            topLevelFields.emplace_back(field.toString());
         }
     }
 
@@ -1234,7 +1310,7 @@ makeKeyStringPair(const BSONObj& lowKey,
 }
 
 /**
- * The 'ProjectionEffects' class is used to represented the "effects" that projection (either
+ * The 'ProjectionEffects' class is used to represented the "effects" that a projection (either
  * (a single projection or multiple projections combined together) has on the set of all possible
  * top-level field names.
  *
@@ -1248,12 +1324,11 @@ makeKeyStringPair(const BSONObj& lowKey,
  *
  * A ProjectionEffects object can be constructed from a projection, or it can be constructed
  * using a single FieldSet (a "keep" set), or it can be constructed using 3 FieldSets (a
- * "nonDropped" set, a "modifiedOrCreated" set, and a "created" set).
+ * "allowed" set, a "modifiedOrCreated" set, and a "created" set).
  *
  * Two ProjectionEffects objects can also be combined together using the merge() method (to
  * merge two ProjectionEffects) or the compose() method (to "compose" a parent ProjectionEffects
- * and a child ProjectionEffects). Two ProjectionEffects objects can also be compared using the
- * difference() method.
+ * and a child ProjectionEffects).
  */
 class ProjectionEffects {
 public:
@@ -1332,13 +1407,13 @@ public:
     /**
      * Creates a ProjectionEffects that has a Create Effect for fields in 'createdFieldSet',
      * that has a Modify Effect for fields in 'modifiedOrCreatedFieldSet' that are not present
-     * in 'createdFieldSet', that has a Keep Effect for fields in 'nonDroppedFieldSet' that are
+     * in 'createdFieldSet', that has a Keep Effect for fields in 'allowedFieldSet' that are
      * not present in 'modifiedOrCreatedFieldSet' or 'createdFieldSet', and that has a Drop
      * Effect for all other fields.
      *
      * Note that 'createdFieldSet' must be a "closed" FieldSet.
      */
-    ProjectionEffects(const FieldSet& nonDroppedFieldSet,
+    ProjectionEffects(const FieldSet& allowedFieldSet,
                       const FieldSet& modifiedOrCreatedFieldSet,
                       const FieldSet& createdFieldSet = FieldSet::makeEmptySet(),
                       std::vector<std::string> displayOrder = {});
@@ -1349,7 +1424,7 @@ public:
      *
      * Note that the second and third parameters will be treated as "closed" field lists.
      */
-    ProjectionEffects(const FieldSet& nonDroppedFieldSet,
+    ProjectionEffects(const FieldSet& allowedFieldSet,
                       const std::vector<std::string>& modifiedOrCreatedFields,
                       const std::vector<std::string>& createdFields = {},
                       std::vector<std::string> displayOrder = {});
@@ -1394,15 +1469,6 @@ public:
      *    (A*B)+(C*D) == (A+C)*(B+D)                    (where '+' is merge and '*' is compose)
      */
     ProjectionEffects& compose(const ProjectionEffects& child);
-
-    /**
-     * This method compares two ProjectionEffects objects and returns a pair that indicates
-     * what is different between the two objects. The first part of the pair is a list of all
-     * the fields present in '_fields' or 'other._fields' that have different Effects in
-     * '*this' vs. 'other'. The second part of the pair is a bool that indicates if the
-     * '_defaultEffect' is different from 'other._defaultEffect'.
-     */
-    std::pair<std::vector<std::string>, bool> difference(const ProjectionEffects& other) const;
 
     /**
      * Returns the list of fields whose Effect is not equal to the "default" Effect.
@@ -1461,7 +1527,7 @@ public:
      * If there are a _finite_ number of fields whose effect is not kDrop, then this function will
      * return a "closed" FieldSet, otherwise it will return an "open" FieldSet.
      */
-    FieldSet getNonDroppedFieldSet() const;
+    FieldSet getAllowedFieldSet() const;
 
     /**
      * Returns a FieldSet containing all the fields whose effect is kModify or kCreate.
@@ -1491,9 +1557,9 @@ private:
     Effect _defaultEffect = kKeep;
 };
 
-FieldSet makeNonDroppedFieldSet(bool isInclusion,
-                                const std::vector<std::string>& paths,
-                                const std::vector<ProjectNode>& nodes);
+FieldSet makeAllowedFieldSet(bool isInclusion,
+                             const std::vector<std::string>& paths,
+                             const std::vector<ProjectNode>& nodes);
 
 FieldSet makeModifiedOrCreatedFieldSet(bool isInclusion,
                                        const std::vector<std::string>& paths,

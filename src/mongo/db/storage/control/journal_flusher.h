@@ -77,7 +77,7 @@ public:
     static JournalFlusher* get(OperationContext* opCtx);
     static void set(ServiceContext* serviceCtx, std::unique_ptr<JournalFlusher> journalFlusher);
 
-    std::string name() const {
+    std::string name() const override {
         return "JournalFlusher";
     }
 
@@ -85,7 +85,7 @@ public:
      * Runs data flushes every 'storageGlobalParams.journalCommitIntervalMs' millis (unless
      * '_disablePeriodicFlushes' is set) or immediately if  waitForJournalFlush() is called.
      */
-    void run();
+    void run() override;
 
     /**
      * Signals the thread to quit and then waits until it does. The given 'reason' is returned to
@@ -118,6 +118,11 @@ public:
     void waitForJournalFlush(Interruptible* interruptible = Interruptible::notInterruptible());
 
     /**
+     * Signals an immediate journal flush and returns without waiting for completion.
+     */
+    void triggerJournalFlush();
+
+    /**
      * Interrupts the journal flusher thread via its operation context with an
      * InterruptedDueToReplStateChange error.
      */
@@ -132,12 +137,9 @@ private:
     };
 
     /**
-     * Signals an immediate journal flush and waits for it to complete before returning.
-     *
-     * Will throw ErrorCodes::isShutdownError if the flusher thread is being stopped.
-     * Will throw InterruptedDueToReplStateChange if a flusher round is interrupted by stepdown.
+     * Signals an immediate journal flush under mutex and returns without waiting for completion.
      */
-    void _waitForJournalFlushNoRetry(Interruptible* interruptible);
+    void _triggerJournalFlush(WithLock lk);
 
     // Serializes setting/resetting _uniqueCtx and marking _uniqueCtx killed.
     mutable Mutex _opCtxMutex = MONGO_MAKE_LATCH("JournalFlusherOpCtxMutex");

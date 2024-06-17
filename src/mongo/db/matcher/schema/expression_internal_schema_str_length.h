@@ -58,7 +58,7 @@ public:
                                            StringData name,
                                            clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
-    virtual ~InternalSchemaStrLengthMatchExpression() {}
+    ~InternalSchemaStrLengthMatchExpression() override {}
 
     virtual Validator getComparator() const = 0;
 
@@ -80,7 +80,10 @@ public:
 
     bool equivalent(const MatchExpression* other) const final;
 
-protected:
+    StringData getName() const {
+        return _name;
+    }
+
     long long strLen() const {
         return _strLen;
     }

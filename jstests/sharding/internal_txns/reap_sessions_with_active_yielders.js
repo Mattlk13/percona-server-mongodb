@@ -2,7 +2,11 @@
  * Test that the logical session cache reaper does not reap sessions with active TransactionRouter
  * yielders.
  *
- * @tags: [requires_fcv_60, uses_transactions]
+ * @tags: [
+ *    requires_fcv_60,
+ *    uses_transactions,
+ *    temp_disabled_embedded_router_known_issues,
+ * ]
  */
 import {configureFailPoint} from "jstests/libs/fail_point_util.js";
 import {Thread} from "jstests/libs/parallelTester.js";
@@ -17,8 +21,6 @@ const st = new ShardingTest({
     rs: {
         setParameter: {
             TransactionRecordMinimumLifetimeMinutes: 0,
-            // TODO (SERVER-67620): Lower log verbosity in reap_sessions_with_active_yielders.js
-            logComponentVerbosity: tojson({transaction: {verbosity: 5}})
         }
     }
 });

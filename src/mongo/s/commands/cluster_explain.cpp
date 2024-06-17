@@ -127,8 +127,20 @@ void throwOnBadARSResponse(const AsyncRequestsSender::Response& arsResponse) {
 }  // namespace
 
 // static
-BSONObj ClusterExplain::wrapAsExplain(const BSONObj& cmdObj, ExplainOptions::Verbosity verbosity) {
-    auto filtered = CommandHelpers::filterCommandRequestForPassthrough(cmdObj);
+BSONObj ClusterExplain::wrapAsExplain(const BSONObj& cmdObj,
+                                      ExplainOptions::Verbosity verbosity,
+                                      const BSONObj& querySettings) {
+    const auto filtered = [&]() {
+        BSONObjIterator cmdIter(cmdObj);
+        BSONObjBuilder explainBuilder;
+        CommandHelpers::filterCommandRequestForPassthrough(&cmdIter, &explainBuilder);
+
+        // Propagate query settings if there are any.
+        if (!querySettings.isEmpty()) {
+            explainBuilder.append("querySettings", querySettings);
+        }
+        return explainBuilder.obj();
+    }();
     BSONObjBuilder out;
     out.append("explain", filtered);
     out.append("verbosity", ExplainOptions::verbosityString(verbosity));
@@ -207,7 +219,6 @@ void ClusterExplain::buildPlannerInfo(OperationContext* opCtx,
                                       BSONObjBuilder* out) {
     BSONObjBuilder queryPlannerBob(out->subobjStart("queryPlanner"));
 
-    queryPlannerBob.appendNumber("mongosPlannerVersion", 1);
     BSONObjBuilder winningPlanBob(queryPlannerBob.subobjStart("winningPlan"));
 
     winningPlanBob.append("stage", mongosStageName);
@@ -220,6 +231,7 @@ void ClusterExplain::buildPlannerInfo(OperationContext* opCtx,
         BSONObj queryPlanner = responseData["queryPlanner"].Obj();
         BSONObj serverInfo = responseData["serverInfo"].Obj();
 
+        singleShardBob.append("explainVersion", responseData["explainVersion"].valueStringData());
         singleShardBob.append("shardName", shardResponses[i].shardId.toString());
         {
             const auto shard = uassertStatusOK(
@@ -334,8 +346,37 @@ void ClusterExplain::buildExecStats(const vector<AsyncRequestsSender::Response>&
 }
 
 // static
+void ClusterExplain::buildEOFExplainResult(OperationContext* opCtx,
+                                           const CanonicalQuery* cq,
+                                           const BSONObj& command,
+                                           BSONObjBuilder* out) {
+
+    BSONObjBuilder queryPlannerBob(out->subobjStart("queryPlanner"));
+    queryPlannerBob.append(
+        "namespace",
+        NamespaceStringUtil::serialize(cq->nss(), SerializationContext::stateDefault()));
+
+    BSONObjBuilder parsedQueryBob(queryPlannerBob.subobjStart("parsedQuery"));
+    cq->getPrimaryMatchExpression()->serialize(&parsedQueryBob, {});
+    parsedQueryBob.doneFast();
+
+    BSONObjBuilder winningPlanBob(queryPlannerBob.subobjStart("winningPlan"));
+    BSONObjBuilder queryPlanBob(winningPlanBob.subobjStart("queryPlan"));
+    queryPlanBob.append("stage", "EOF");
+    queryPlanBob.appendNumber("planNodeId", 1);
+    queryPlanBob.doneFast();
+    winningPlanBob.doneFast();
+
+    queryPlannerBob.doneFast();
+
+    explain_common::generateServerInfo(out);
+    explain_common::generateServerParameters(cq->getExpCtx(), out);
+    appendIfRoom(out, command, "command");
+}
+
+// static
 Status ClusterExplain::buildExplainResult(
-    OperationContext* opCtx,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const vector<AsyncRequestsSender::Response>& shardResponses,
     const char* mongosStageName,
     long long millisElapsed,
@@ -348,10 +389,10 @@ Status ClusterExplain::buildExplainResult(
         return ex.toStatus();
     }
 
-    buildPlannerInfo(opCtx, shardResponses, mongosStageName, out);
+    buildPlannerInfo(expCtx->opCtx, shardResponses, mongosStageName, out);
     buildExecStats(shardResponses, mongosStageName, millisElapsed, out);
     explain_common::generateServerInfo(out);
-    explain_common::generateServerParameters(opCtx, out);
+    explain_common::generateServerParameters(expCtx, out);
     appendIfRoom(out, command, "command");
 
     return Status::OK();

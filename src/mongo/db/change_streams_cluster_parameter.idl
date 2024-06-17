@@ -54,12 +54,15 @@ server_parameters:
   changeStreams:
     description: "The cluster-wide configuration parameter for the change stream in the serverless."
     set_at: cluster
+    omit_in_ftdc: false
     cpp_vartype: ChangeStreamsClusterParameterStorage
     cpp_varname: gChangeStreamsClusterParameter
     validator:
       callback: validateChangeStreamsClusterParameter
     condition:
       min_fcv: 6.2
+    redact: false
+
   changeCollectionExpiredDocumentsRemoverJobSleepSeconds:
     description: "Specifies the number of seconds for which the periodic change collection remover job will sleep between each cycle."
     set_at: [ startup ]
@@ -68,6 +71,8 @@ server_parameters:
     validator:
       gte: 1
     default: 10
+    redact: false
+
   changeCollectionTruncateMarkersMinBytes:
     description: "Server parameter that specifies the minimum number of bytes contained in each
     truncate marker for change collections. This is only used if
@@ -78,6 +83,8 @@ server_parameters:
     default: 33_554_432  # 32 MiB
     validator:
       gt: 0
+    redact: false
+
   disableExpiredChangeCollectionRemover:
       description: Disables the expired change collection remover.
       set_at: [ startup ]
@@ -85,3 +92,4 @@ server_parameters:
       cpp_varname: gChangeCollectionRemoverDisabled
       default: false
       test_only: true
+      redact: false

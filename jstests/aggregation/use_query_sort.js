@@ -7,9 +7,7 @@
 //   do_not_wrap_aggregations_in_facets,
 // ]
 import {
-    aggPlanHasStage,
     hasRejectedPlans,
-    isAggregationPlan,
     isQueryPlan,
     planHasStage,
 } from "jstests/libs/analyze_plan.js";

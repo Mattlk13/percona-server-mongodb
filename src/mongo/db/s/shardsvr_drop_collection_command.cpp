@@ -50,7 +50,6 @@
 #include "mongo/db/s/drop_collection_coordinator_document_gen.h"
 #include "mongo/db/s/sharding_ddl_coordinator_gen.h"
 #include "mongo/db/s/sharding_ddl_coordinator_service.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
@@ -58,6 +57,7 @@
 #include "mongo/s/collection_routing_info_targeter.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/future.h"
 #include "mongo/util/uuid.h"
@@ -91,7 +91,7 @@ public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
+            ShardingState::get(opCtx)->assertCanAcceptShardedCommands();
 
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
@@ -101,8 +101,9 @@ public:
             try {
                 const auto coll = Grid::get(opCtx)->catalogClient()->getCollection(opCtx, ns());
 
-                uassert(ErrorCodes::NotImplemented,
-                        "drop collection of a sharded time-series collection is not supported",
+                uassert(ErrorCodes::IllegalOperation,
+                        "Sharded time-series buckets collections cannot be dropped directly; drop "
+                        "the logical namespace instead",
                         !coll.getTimeseriesFields());
             } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
                 // The collection is not sharded or doesn't exist.

@@ -67,7 +67,7 @@
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/sharding_catalog_client_impl.h"
 #include "mongo/s/catalog/type_collection.h"
-#include "mongo/s/sharding_router_test_fixture.h"
+#include "mongo/s/sharding_mongos_test_fixture.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/unittest/bson_test_util.h"
@@ -100,7 +100,7 @@ const HostAndPort kTestHosts[] = {
 
 Status getMockDuplicateKeyError() {
     return {DuplicateKeyErrorInfo(
-                BSON("mock" << 1), BSON("" << 1), BSONObj{}, stdx::monostate{}, boost::none),
+                BSON("mock" << 1), BSON("" << 1), BSONObj{}, std::monostate{}, boost::none),
             "Mock duplicate key error"};
 }
 
@@ -173,7 +173,7 @@ TEST_F(InsertRetryTest, RetryOnNetworkErrorFails) {
 
 void assertFindRequestHasFilter(const RemoteCommandRequest& request, BSONObj filter) {
     // If there is no '$db', append it.
-    auto cmd = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj).body;
+    auto cmd = static_cast<OpMsgRequest>(request).body;
     auto query = query_request_helper::makeFromFindCommandForTests(cmd);
     ASSERT_BSONOBJ_EQ(filter, query->getFilter());
 }
@@ -302,7 +302,7 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterWriteConcernFailureMatch) {
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto opMsgRequest = static_cast<OpMsgRequest>(request);
         const auto insertOp = InsertOp::parse(opMsgRequest);
         ASSERT_EQUALS(kTestNamespace, insertOp.getNamespace());
 
@@ -359,7 +359,7 @@ TEST_F(UpdateRetryTest, Success) {
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto opMsgRequest = static_cast<OpMsgRequest>(request);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
         ASSERT_EQUALS(kTestNamespace, updateOp.getNamespace());
 
@@ -467,7 +467,7 @@ TEST_F(UpdateRetryTest, NotWritablePrimaryOnceSuccessAfterRetry) {
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto opMsgRequest = static_cast<OpMsgRequest>(request);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
         ASSERT_EQUALS(kTestNamespace, updateOp.getNamespace());
 
@@ -501,7 +501,7 @@ TEST_F(UpdateRetryTest, OperationInterruptedDueToPrimaryStepDown) {
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto opMsgRequest = static_cast<OpMsgRequest>(request);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
         ASSERT_EQUALS(kTestNamespace, updateOp.getNamespace());
 
@@ -514,7 +514,7 @@ TEST_F(UpdateRetryTest, OperationInterruptedDueToPrimaryStepDown) {
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto opMsgRequest = static_cast<OpMsgRequest>(request);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
         ASSERT_EQUALS(kTestNamespace, updateOp.getNamespace());
 
@@ -548,7 +548,7 @@ TEST_F(UpdateRetryTest, WriteConcernFailure) {
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto opMsgRequest = static_cast<OpMsgRequest>(request);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
         ASSERT_EQUALS(kTestNamespace, updateOp.getNamespace());
 
@@ -571,7 +571,7 @@ TEST_F(UpdateRetryTest, WriteConcernFailure) {
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto opMsgRequest = static_cast<OpMsgRequest>(request);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
         ASSERT_EQUALS(kTestNamespace, updateOp.getNamespace());
 

@@ -3,7 +3,7 @@
  * @tags: [
  *   assumes_read_preference_unchanged,
  *   assumes_read_concern_unchanged,
- *   not_allowed_with_security_token,
+ *   not_allowed_with_signed_security_token,
  *   assumes_unsharded_collection
  * ]
  */
@@ -54,8 +54,11 @@ coll2.insert({x: 1001, y: [1, 2, 3]});
     curs.close();
 }
 
-// // Tests that a index scan query reports an IXSCAN plan summary with the correct index.
-{
+// Tests that a index scan query reports an IXSCAN plan summary with the correct index.
+if (!TestData.isHintsToQuerySettingsSuite) {
+    // This guard excludes this test case from being run on the cursor_hints_to_query_settings
+    // suite. The suite replaces cursor hints with query settings. Query settings do not force
+    // indexes, and therefore empty filter will result in collection scans.
     coll.createIndex({x: 1});
     let curs = coll.find().hint({x: 1}).batchSize(2);
     curs.next();

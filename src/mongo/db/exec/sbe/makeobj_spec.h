@@ -47,17 +47,31 @@ struct MakeObjSpec {
     enum class NonObjInputBehavior { kReturnNothing, kReturnInput, kNewObj };
     enum class ActionType : uint8_t { kKeep, kDrop, kValueArg, kLambdaArg, kMakeObj };
 
-    struct Keep {};
-    struct Drop {};
+    struct Keep {
+        bool operator==(const Keep& other) const = default;
+    };
+
+    struct Drop {
+        bool operator==(const Drop& other) const = default;
+    };
+
     struct ValueArg {
         size_t argIdx;
+        bool operator==(const ValueArg& other) const = default;
     };
+
     struct LambdaArg {
         size_t argIdx;
         bool returnsNothingOnMissingInput;
+        bool operator==(const LambdaArg& other) const = default;
     };
+
     struct MakeObj {
         std::unique_ptr<MakeObjSpec> spec;
+
+        bool operator==(const MakeObj& other) const {
+            return *spec == *other.spec;
+        }
     };
 
     /**
@@ -77,7 +91,7 @@ struct MakeObjSpec {
     public:
         using Type = ActionType;
 
-        using VariantType = stdx::variant<Keep, Drop, ValueArg, LambdaArg, MakeObj>;
+        using VariantType = std::variant<Keep, Drop, ValueArg, LambdaArg, MakeObj>;
 
         FieldAction() = default;
         FieldAction(size_t valueArgIdx) : _data(ValueArg{valueArgIdx}) {}
@@ -92,40 +106,40 @@ struct MakeObjSpec {
         FieldAction clone() const;
 
         Type type() const {
-            return stdx::visit(OverloadedVisitor{[](Keep) { return Type::kKeep; },
-                                                 [](Drop) { return Type::kDrop; },
-                                                 [](ValueArg) { return Type::kValueArg; },
-                                                 [](LambdaArg) { return Type::kLambdaArg; },
-                                                 [](const MakeObj&) {
-                                                     return Type::kMakeObj;
-                                                 }},
-                               _data);
+            return visit(OverloadedVisitor{[](Keep) { return Type::kKeep; },
+                                           [](Drop) { return Type::kDrop; },
+                                           [](ValueArg) { return Type::kValueArg; },
+                                           [](LambdaArg) { return Type::kLambdaArg; },
+                                           [](const MakeObj&) {
+                                               return Type::kMakeObj;
+                                           }},
+                         _data);
         }
 
         bool isKeep() const {
-            return stdx::holds_alternative<Keep>(_data);
+            return holds_alternative<Keep>(_data);
         }
         bool isDrop() const {
-            return stdx::holds_alternative<Drop>(_data);
+            return holds_alternative<Drop>(_data);
         }
         bool isValueArg() const {
-            return stdx::holds_alternative<ValueArg>(_data);
+            return holds_alternative<ValueArg>(_data);
         }
         bool isLambdaArg() const {
-            return stdx::holds_alternative<LambdaArg>(_data);
+            return holds_alternative<LambdaArg>(_data);
         }
         bool isMakeObj() const {
-            return stdx::holds_alternative<MakeObj>(_data);
+            return holds_alternative<MakeObj>(_data);
         }
 
         size_t getValueArgIdx() const {
-            return stdx::get<ValueArg>(_data).argIdx;
+            return get<ValueArg>(_data).argIdx;
         }
         const LambdaArg& getLambdaArg() const {
-            return stdx::get<LambdaArg>(_data);
+            return get<LambdaArg>(_data);
         }
         MakeObjSpec* getMakeObjSpec() const {
-            return stdx::get<MakeObj>(_data).spec.get();
+            return get<MakeObj>(_data).spec.get();
         }
 
         bool isMandatory() const {
@@ -133,6 +147,11 @@ struct MakeObjSpec {
                 (isLambdaArg() && !getLambdaArg().returnsNothingOnMissingInput) ||
                 (isMakeObj() && !getMakeObjSpec()->returnsNothingOnMissingInput());
         }
+
+        bool operator==(const FieldAction& other) const = default;
+
+        template <typename H>
+        friend H AbslHashValue(H hashState, const FieldAction& fi);
 
     private:
         VariantType _data;
@@ -218,6 +237,8 @@ struct MakeObjSpec {
 
     std::string toString() const;
 
+    bool operator==(const MakeObjSpec& other) const = default;
+
     size_t getApproximateSize() const;
 
 private:
@@ -268,5 +289,42 @@ public:
 
     // Searchable vector of fields of interest.
     StringListSet fields;
+
+    template <typename H>
+    friend H AbslHashValue(H hashState, const MakeObjSpec& mos);
 };
+
+template <typename H>
+H AbslHashValue(H hashState, const MakeObjSpec& mos) {
+    hashState = H::combine(std::move(hashState), mos.fieldsScope, mos.nonObjInputBehavior);
+    if (mos.traversalDepth) {
+        hashState = H::combine(std::move(hashState), *mos.traversalDepth);
+    }
+    for (size_t i = 0; i < mos.fields.size(); i++) {
+        hashState = H::combine(std::move(hashState), mos.fields[i], mos.actions[i]);
+    }
+    return hashState;
+}
+
+template <typename H>
+H AbslHashValue(H hashState, const MakeObjSpec::FieldAction& fi) {
+    // Hash the index of the variant alternative to differentiate the different types in the hash.
+    hashState = H::combine(std::move(hashState), fi._data.index());
+
+    if (fi.isValueArg()) {
+        hashState = H::combine(std::move(hashState), fi.getValueArgIdx());
+
+    } else if (fi.isLambdaArg()) {
+        const auto& lambdaArg = fi.getLambdaArg();
+        hashState = H::combine(
+            std::move(hashState), lambdaArg.argIdx, lambdaArg.returnsNothingOnMissingInput);
+
+    } else if (fi.isMakeObj()) {
+        hashState = H::combine(std::move(hashState), *(fi.getMakeObjSpec()));
+    }
+
+    // If Keep{} or Drop{}, don't update hash state, as the variant index() will differentiate them.
+    return hashState;
+}
+
 }  // namespace mongo::sbe

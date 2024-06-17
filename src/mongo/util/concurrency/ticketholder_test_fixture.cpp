@@ -54,19 +54,19 @@ void TicketHolderTestFixture::basicTimeout(OperationContext* opCtx,
     ASSERT_EQ(holder->available(), 1);
     ASSERT_EQ(holder->outof(), 1);
 
-    AdmissionContext admCtx;
-    admCtx.setPriority(AdmissionContext::Priority::kNormal);
+    MockAdmissionContext admCtx{};
     {
         // Ignores deadline if there is a ticket instantly available.
-        auto ticket = holder->waitForTicketUntil(opCtx, &admCtx, Date_t::now() - Milliseconds(100));
+        auto ticket =
+            holder->waitForTicketUntil(*opCtx, &admCtx, Date_t::now() - Milliseconds(100));
         ASSERT(ticket);
         ASSERT_EQ(holder->used(), 1);
         ASSERT_EQ(holder->available(), 0);
         ASSERT_EQ(holder->outof(), 1);
 
         // Respects there are none available.
-        ASSERT_FALSE(holder->waitForTicketUntil(opCtx, &admCtx, Date_t::now()));
-        ASSERT_FALSE(holder->waitForTicketUntil(opCtx, &admCtx, Date_t::now() + Milliseconds(42)));
+        ASSERT_FALSE(holder->waitForTicketUntil(*opCtx, &admCtx, Date_t::now()));
+        ASSERT_FALSE(holder->waitForTicketUntil(*opCtx, &admCtx, Date_t::now() + Milliseconds(42)));
     }
 
     ASSERT_EQ(holder->used(), 0);
@@ -79,10 +79,8 @@ void TicketHolderTestFixture::resizeTest(OperationContext* opCtx,
                                          TickSourceMock<Microseconds>* tickSource) {
     Stats stats(holder.get());
 
-    AdmissionContext admCtx;
-    admCtx.setPriority(AdmissionContext::Priority::kNormal);
-
-    auto ticket = holder->waitForTicketUntil(opCtx, &admCtx, Date_t::now() + Milliseconds{500});
+    MockAdmissionContext admCtx{};
+    auto ticket = holder->waitForTicketUntil(*opCtx, &admCtx, Date_t::now() + Milliseconds{500});
 
     ASSERT_EQ(holder->used(), 1);
     ASSERT_EQ(holder->available(), 0);
@@ -91,7 +89,7 @@ void TicketHolderTestFixture::resizeTest(OperationContext* opCtx,
     auto currentStats = stats.getNonTicketStats();
 
     tickSource->advance(Microseconds{100});
-    holder->resize(10);
+    ASSERT_TRUE(holder->resize(10));
 
     ASSERT_EQ(holder->available(), 9);
     ASSERT_EQ(holder->outof(), 10);
@@ -109,44 +107,45 @@ void TicketHolderTestFixture::resizeTest(OperationContext* opCtx,
     ASSERT_EQ(stats["available"], 10);
     ASSERT_EQ(stats["totalTickets"], 10);
 
-    holder->resize(1);
+    ASSERT_TRUE(holder->resize(1));
     newStats = stats.getNonTicketStats();
     ASSERT_EQ(currentStats.woCompare(newStats), 0);
 
     tickSource->advance(Microseconds{100});
-    holder->resize(10);
+    ASSERT_TRUE(holder->resize(10));
     currentStats = stats.getNonTicketStats();
     ASSERT_EQ(currentStats.woCompare(newStats), 0);
 
-    holder->resize(6);
+    ASSERT_TRUE(holder->resize(6));
     std::array<boost::optional<Ticket>, 5> tickets;
     {
-        auto ticket = holder->waitForTicket(opCtx, &admCtx);
+        auto ticket = holder->waitForTicket(*opCtx, &admCtx);
         ASSERT_EQ(holder->used(), 1);
         ASSERT_EQ(holder->outof(), 6);
 
         for (int i = 0; i < 5; ++i) {
-            tickets[i] = holder->waitForTicket(opCtx, &admCtx);
+            tickets[i] = holder->waitForTicket(*opCtx, &admCtx);
             ASSERT_EQ(holder->used(), 2 + i);
             ASSERT_EQ(holder->outof(), 6);
         }
-
-        ASSERT_FALSE(holder->waitForTicketUntil(opCtx, &admCtx, Date_t::now() + Milliseconds(1)));
+        ASSERT_FALSE(holder->waitForTicketUntil(*opCtx, &admCtx, Date_t::now() + Milliseconds(1)));
     }
 
-    holder->resize(5);
+    ASSERT_TRUE(holder->resize(5));
     ASSERT_EQ(holder->used(), 5);
     ASSERT_EQ(holder->outof(), 5);
-    ASSERT_FALSE(holder->waitForTicketUntil(opCtx, &admCtx, Date_t::now() + Milliseconds(1)));
+    ASSERT_FALSE(holder->waitForTicketUntil(*opCtx, &admCtx, Date_t::now() + Milliseconds(1)));
+
+    ASSERT_FALSE(holder->resize(4, Date_t::now() + Milliseconds(1)));
 }
 
 void TicketHolderTestFixture::interruptTest(OperationContext* opCtx,
                                             std::unique_ptr<TicketHolder> holder) {
-    holder->resize(0);
+    ASSERT_TRUE(holder->resize(0));
 
     auto waiter = stdx::thread([&]() {
-        AdmissionContext admCtx;
-        ASSERT_THROWS_CODE(holder->waitForTicketUntil(opCtx, &admCtx, Date_t::max()),
+        MockAdmissionContext admCtx{};
+        ASSERT_THROWS_CODE(holder->waitForTicketUntil(*opCtx, &admCtx, Date_t::max()),
                            DBException,
                            ErrorCodes::Interrupted);
     });
@@ -159,6 +158,32 @@ void TicketHolderTestFixture::interruptTest(OperationContext* opCtx,
 
     opCtx->markKilled();
     waiter.join();
+}
+
+void TicketHolderTestFixture::priorityBookkeepingTest(
+    OperationContext* opCtx,
+    std::unique_ptr<TicketHolder> holder,
+    AdmissionContext::Priority oldPriority,
+    AdmissionContext::Priority newPriority,
+    std::function<void(BSONObj&, BSONObj&)> checks) {
+
+    MockAdmissionContext admCtx{};
+    ScopedAdmissionPriorityBase initialPriority{opCtx, admCtx, oldPriority};
+
+    Stats stats(holder.get());
+
+    boost::optional<ScopedAdmissionPriorityBase> priorityOverride;
+    priorityOverride.emplace(opCtx, admCtx, newPriority);
+
+    boost::optional<Ticket> ticket = holder->waitForTicket(*opCtx, &admCtx);
+
+    priorityOverride.reset();
+
+    auto statsWhileProcessing = stats.getStats();
+    ticket.reset();
+    auto statsWhenFinished = stats.getStats();
+
+    checks(statsWhileProcessing, statsWhenFinished);
 }
 
 }  // namespace mongo

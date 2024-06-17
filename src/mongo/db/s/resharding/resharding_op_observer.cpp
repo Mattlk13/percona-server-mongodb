@@ -43,7 +43,6 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/primary_only_service.h"
@@ -60,6 +59,7 @@
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
@@ -107,10 +107,10 @@ void assertCanExtractShardKeyFromDocs(OperationContext* opCtx,
                         ->getCollectionDescription(opCtx);
 
     // A user can manually create a 'db.system.resharding.' collection that isn't guaranteed to be
-    // sharded outside of running reshardCollection.
-    uassert(ErrorCodes::NamespaceNotSharded,
-            str::stream() << "Temporary resharding collection " << nss.toStringForErrorMsg()
-                          << " is not sharded",
+    // tracked outside of running reshardCollection.
+    uassert(ErrorCodes::NamespaceNotFound,
+            str::stream() << "Temporary resharding collection metadata for "
+                          << nss.toStringForErrorMsg() << " not found",
             collDesc.hasRoutingTable());
 
     const ShardKeyPattern shardKeyPattern(collDesc.getKeyPattern());
@@ -130,13 +130,13 @@ boost::optional<Timestamp> _calculatePin(OperationContext* opCtx) {
     // application, which already serializes these writes.
 
     invariant(!opCtx->isEnforcingConstraints() ||
-              opCtx->lockState()->isCollectionLockedForMode(
+              shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(
                   NamespaceString::kDonorReshardingOperationsNamespace, LockMode::MODE_X));
 
     // If the RecoveryUnit already had an open snapshot, keep the snapshot open. Otherwise abandon
     // the snapshot when exitting the function.
-    ScopeGuard scopeGuard([&] { opCtx->recoveryUnit()->abandonSnapshot(); });
-    if (opCtx->recoveryUnit()->isActive()) {
+    ScopeGuard scopeGuard([&] { shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot(); });
+    if (shard_role_details::getRecoveryUnit(opCtx)->isActive()) {
         scopeGuard.dismiss();
     }
 
@@ -218,6 +218,7 @@ void ReshardingOpObserver::onInserts(OperationContext* opCtx,
                                      const CollectionPtr& coll,
                                      std::vector<InsertStatement>::const_iterator begin,
                                      std::vector<InsertStatement>::const_iterator end,
+                                     const std::vector<RecordId>& recordIds,
                                      std::vector<bool> fromMigrate,
                                      bool defaultFromMigrate,
                                      OpStateAccumulator* opAccumulator) {
@@ -259,7 +260,7 @@ void ReshardingOpObserver::onUpdate(OperationContext* opCtx,
     if (args.coll->ns() == NamespaceString::kConfigReshardingOperationsNamespace) {
         auto newCoordinatorDoc = ReshardingCoordinatorDocument::parse(
             IDLParserContext("reshardingCoordinatorDoc"), args.updateArgs->updatedDoc);
-        opCtx->recoveryUnit()->onCommit(
+        shard_role_details::getRecoveryUnit(opCtx)->onCommit(
             [newCoordinatorDoc = std::move(newCoordinatorDoc)](OperationContext* opCtx,
                                                                boost::optional<Timestamp>) mutable {
                 try {

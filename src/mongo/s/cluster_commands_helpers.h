@@ -103,6 +103,25 @@ boost::intrusive_ptr<ExpressionContext> makeExpressionContextWithDefaultsForTarg
     const boost::optional<LegacyRuntimeConstants>& runtimeConstants);
 
 /**
+ * Builds requests for each given shard.
+ *
+ * Consults the routing info to build requests for specified list of shards:
+ *  - If it has a routing table, shards that own chunks for the namespace, or
+ *  - If it doesn't have a routing table, the primary shard for the database.
+ *
+ * If the command is eligible for sampling, attaches a unique sample id to one of the requests if
+ * the collection has query sampling enabled and the rate-limited sampler successfully generates a
+ * sample id for it.
+ */
+std::vector<AsyncRequestsSender::Request> buildVersionedRequests(
+    boost::intrusive_ptr<ExpressionContext> expCtx,
+    const NamespaceString& nss,
+    const CollectionRoutingInfo& cri,
+    const std::set<ShardId>& shardIds,
+    const BSONObj& cmdObj,
+    bool eligibleForSampling = false);
+
+/**
  * Dispatches all the specified requests in parallel and waits until all complete, returning a
  * vector of the same size and positions as that of 'requests'.
  *
@@ -268,20 +287,6 @@ scatterGatherVersionedTargetByRoutingTableNoThrowOnStaleShardVersionErrors(
     const boost::optional<LegacyRuntimeConstants>& runtimeConstants);
 
 /**
- * Utility for dispatching versioned commands on a namespace to a passed set of shards.
- */
-[[nodiscard]] std::vector<AsyncRequestsSender::Response> scatterGatherVersionedTargetSpecificShards(
-    boost::intrusive_ptr<ExpressionContext> expCtx,
-    const DatabaseName& dbName,
-    const NamespaceString& nss,
-    const CollectionRoutingInfo& cri,
-    const BSONObj& cmdObj,
-    const ReadPreferenceSetting& readPref,
-    Shard::RetryPolicy retryPolicy,
-    const std::set<ShardId>& shardIds,
-    bool eligibleForSampling = false);
-
-/**
  * Utility for dispatching commands against the primary of a database and attaching the appropriate
  * database version. Also attaches UNSHARDED to the command. Does not retry on stale version.
  */
@@ -294,8 +299,22 @@ AsyncRequestsSender::Response executeCommandAgainstDatabasePrimary(
     Shard::RetryPolicy retryPolicy);
 
 /**
- * Utility for dispatching commands against the shard with the MinKey chunk for the namespace and
- * attaching the appropriate shard version.
+ * Utility for dispatching ddl coordinators commands against the primary of a database and attaching
+ * the appropriate database version.
+ * NOTE: It only attaches the database version which is what is required by the DDL coordinators to
+ * ensure they are running on the current DB primary.
+ */
+AsyncRequestsSender::Response executeDDLCoordinatorCommandAgainstDatabasePrimary(
+    OperationContext* opCtx,
+    const DatabaseName& dbName,
+    const CachedDatabaseInfo& dbInfo,
+    const BSONObj& cmdObj,
+    const ReadPreferenceSetting& readPref,
+    Shard::RetryPolicy retryPolicy);
+
+/**
+ * Utility for dispatching commands against the shard with the MinKey chunk for the namespace
+ * and attaching the appropriate shard version.
  *
  * Does not retry on StaleConfig errors.
  */
@@ -333,19 +352,6 @@ RawResponsesResult appendRawResponses(
     bool appendWriteConcernError = true);
 
 /**
- * Extracts the query from a query-embedding command ('query' or 'q' fields). If the command does
- * not have an embedded query, returns an empty BSON object.
- */
-BSONObj extractQuery(const BSONObj& cmdObj);
-
-/**
- * Extracts the collation from a collation-embedding command ('collation' field). If the command
- * does not specify a collation, returns an empty BSON object. If the 'collation' field is of wrong
- * type, throws.
- */
-BSONObj extractCollation(const BSONObj& cmdObj);
-
-/**
  * Utility function to return an empty result set from a command.
  */
 bool appendEmptyResultSet(OperationContext* opCtx,
@@ -361,12 +367,18 @@ std::set<ShardId> getTargetedShardsForQuery(boost::intrusive_ptr<ExpressionConte
                                             const ChunkManager& cm,
                                             const BSONObj& query,
                                             const BSONObj& collation);
+/**
+ * Returns the shards that would be targeted for the given query according to the given routing
+ * info.
+ */
+std::set<ShardId> getTargetedShardsForCanonicalQuery(const CanonicalQuery& query,
+                                                     const ChunkManager& cm);
 
 /**
  * Determines the shard(s) to which the given query will be targeted, and builds a separate
  * versioned copy of the command object for each such shard.
  */
-std::vector<std::pair<ShardId, BSONObj>> getVersionedRequestsForTargetedShards(
+std::vector<AsyncRequestsSender::Request> getVersionedRequestsForTargetedShards(
     OperationContext* opCtx,
     const NamespaceString& nss,
     const CollectionRoutingInfo& cri,

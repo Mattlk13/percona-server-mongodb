@@ -2,11 +2,10 @@
  * Tests that writes are disallowed while in kCommitted.
  *
  * @tags: [
- *   multiversion_incompatible,
- *   requires_fcv_72,
+ *   requires_fcv_80,
  *   featureFlagReshardingImprovements,
  *   featureFlagMoveCollection,
- *   featureFlagTrackUnshardedCollectionsOnShardingCatalog,
+ *   # TODO (SERVER-87812) Remove multiversion_incompatible tag
  *   multiversion_incompatible,
  * ]
  */

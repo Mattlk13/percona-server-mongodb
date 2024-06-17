@@ -96,11 +96,10 @@ public:
      * 'oldName'. Also returns a bool indicating whether this entire project is extracted. In the
      * extracted $project, 'oldName' is renamed to 'newName'. 'oldName' should not be dotted.
      */
-    std::pair<BSONObj, bool> extractProjectOnFieldAndRename(const StringData& oldName,
-                                                            const StringData& newName);
+    std::pair<BSONObj, bool> extractProjectOnFieldAndRename(StringData oldName, StringData newName);
 
 protected:
-    std::unique_ptr<ProjectionNode> makeChild(const std::string& fieldName) const {
+    std::unique_ptr<ProjectionNode> makeChild(const std::string& fieldName) const override {
         return std::make_unique<ExclusionNode>(
             _policies, FieldPath::getFullyQualifiedPath(_pathToNode, fieldName));
     }
@@ -236,15 +235,38 @@ public:
 
         OrderedPathSet modifiedPaths;
         _root->reportProjectedPaths(&modifiedPaths);
-        return {DocumentSource::GetModPathsReturn::Type::kFiniteSet, std::move(modifiedPaths), {}};
+
+        OrderedPathSet computedPaths;
+        StringMap<std::string> renamedPaths;
+        StringMap<std::string> complexRenamedPaths;
+        _root->reportComputedPaths(&computedPaths, &renamedPaths, &complexRenamedPaths);
+
+        if (computedPaths.empty()) {
+            return {
+                DocumentSource::GetModPathsReturn::Type::kFiniteSet, std::move(modifiedPaths), {}};
+        } else {
+            // The only case where computedPaths would be non-empty is if there is a $meta
+            // expression in the exclude projection. This could result in dependencies for
+            // subsequent stages--e.g., a $match on the $meta field, in which case the $match should
+            // NOT be pushed in front of the $project. If $meta is not identified as a dependency,
+            // $match WOULD be pushed in front of $project during pipeline optimization.
+            //
+            // $meta is the only expression that is permitted in an exclusion pipeline, so, rather
+            // than establishing a dependency analysis workflow for exclusion projections just for
+            // this case, we simply return a kNotSupported type GetModPathsReturn so that pipeline
+            // optimization does not occur.
+            //
+            // TODO SERVER-86431 no longer allow $meta in exclusion projections
+            return {DocumentSource::GetModPathsReturn::Type::kNotSupported, {}, {}};
+        }
     }
 
-    boost::optional<std::set<FieldRef>> extractExhaustivePaths() const {
+    boost::optional<std::set<FieldRef>> extractExhaustivePaths() const override {
         return boost::none;
     }
 
-    std::pair<BSONObj, bool> extractProjectOnFieldAndRename(const StringData& oldName,
-                                                            const StringData& newName) final {
+    std::pair<BSONObj, bool> extractProjectOnFieldAndRename(StringData oldName,
+                                                            StringData newName) final {
         return _root->extractProjectOnFieldAndRename(oldName, newName);
     }
 

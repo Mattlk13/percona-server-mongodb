@@ -217,8 +217,10 @@ public:
         auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
         auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
-        txnParticipant.beginOrContinue(
-            opCtx, {txnNum}, boost::none /* autocommit */, boost::none /* startTransaction */);
+        txnParticipant.beginOrContinue(opCtx,
+                                       {txnNum},
+                                       boost::none /* autocommit */,
+                                       TransactionParticipant::TransactionActions::kNone);
     }
 
     void checkOplog(const repl::OplogEntry& originalOplog, const repl::OplogEntry& oplogToCheck) {
@@ -283,11 +285,15 @@ public:
             auto innerOpCtx = Client::getCurrent()->makeOperationContext();
 
             auto opMsgRequest = OpMsgRequestBuilder::create(
+                auth::ValidatedTenancyScope::kNotRequired,
                 DatabaseName::createDatabaseName_forTest(boost::none, "test_unused_dbname"),
                 insertBuilder.obj(),
                 BSONObj());
+            auto osi = OperationSessionInfoFromClient::parse(
+                IDLParserContext{"OperationSessionInfo"}, opMsgRequest.body);
             initializeOperationSessionInfo(innerOpCtx.get(),
-                                           opMsgRequest,
+                                           opMsgRequest.getValidatedTenantId(),
+                                           osi,
                                            true /* requiresAuth */,
                                            true /* attachToOpCtx */,
                                            true /* isReplSetMemberOrMongos */);
@@ -297,7 +303,7 @@ public:
             txnParticipant.beginOrContinue(innerOpCtx.get(),
                                            {*sessionInfo.getTxnNumber()},
                                            boost::none /* autocommit */,
-                                           boost::none /* startTransaction */);
+                                           TransactionParticipant::TransactionActions::kNone);
 
             const auto reply = write_ops_exec::performInserts(innerOpCtx.get(), insertRequest);
             ASSERT(reply.results.size() == 1);
@@ -336,7 +342,9 @@ private:
             StaticCatalogClient() = default;
 
             StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
-                OperationContext* opCtx, repl::ReadConcernLevel readConcern) override {
+                OperationContext* opCtx,
+                repl::ReadConcernLevel readConcern,
+                bool excludeDraining) override {
 
                 ShardType donorShard;
                 donorShard.setName(kDonorConnStr.getSetName());
@@ -1990,8 +1998,10 @@ TEST_F(SessionCatalogMigrationDestinationTest,
         auto txnParticipant = TransactionParticipant::get(opCtx);
 
         txnParticipant.refreshFromStorageIfNeeded(opCtx);
-        txnParticipant.beginOrContinue(
-            opCtx, {3}, boost::none /* autocommit */, boost::none /* startTransaction */);
+        txnParticipant.beginOrContinue(opCtx,
+                                       {3},
+                                       boost::none /* autocommit */,
+                                       TransactionParticipant::TransactionActions::kNone);
     }
 
     OperationSessionInfo sessionInfo2;

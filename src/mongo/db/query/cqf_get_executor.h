@@ -44,14 +44,20 @@
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/cqf_command_utils.h"
 #include "mongo/db/query/multiple_collection_accessor.h"
+#include "mongo/db/query/opt_counter_info.h"
 #include "mongo/db/query/optimizer/defs.h"
 #include "mongo/db/query/optimizer/explain.h"
 #include "mongo/db/query/optimizer/explain_interface.h"
+#include "mongo/db/query/optimizer/node_defs.h"
+#include "mongo/db/query/optimizer/opt_phase_manager.h"
+#include "mongo/db/query/optimizer/reference_tracker.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/db/query/plan_yield_policy_sbe.h"
 #include "mongo/db/query/query_solution.h"
+#include "mongo/db/query/sbe_plan_cache.h"
 #include "mongo/db/query/sbe_stage_builder_plan_data.h"
 
 namespace mongo {
@@ -68,6 +74,7 @@ struct ExecParams {
     bool planIsFromCache;
     bool generatedByBonsai;
     const boost::optional<MatchExpression*> pipelineMatchExpr;
+    OptimizerCounterInfo optCounterInfo;
 };
 
 /**
@@ -76,11 +83,21 @@ struct ExecParams {
 optimizer::QueryHints getHintsFromQueryKnobs();
 
 /**
+ * Enforce that unsupported command options don't run through Bonsai. Note these checks are already
+ * present in the Bonsai fallback mechansim, but those checks are skipped when Bonsai is forced.
+ * This function prevents us from accidently forcing Bonsai with an unsupported option.
+ */
+void validateCommandOptions(const CanonicalQuery* query,
+                            const CollectionPtr& collection,
+                            const boost::optional<BSONObj>& indexHint,
+                            const stdx::unordered_set<NamespaceString>& involvedCollections);
+
+/**
  * Returns a the arguments to create a PlanExecutor for the given Pipeline, except the
  * CanonicalQuery which must be provided by the caller.
  *
- * The CanonicalQuery parameter allows for code reuse between functions in this file and should not
- * be set by callers.
+ * The CanonicalQuery parameter allows for code reuse between functions in this file and should
+ * not be set by callers.
  */
 boost::optional<ExecParams> getSBEExecutorViaCascadesOptimizer(
     OperationContext* opCtx,
@@ -89,8 +106,48 @@ boost::optional<ExecParams> getSBEExecutorViaCascadesOptimizer(
     const MultipleCollectionAccessor& collections,
     optimizer::QueryHints queryHints,
     const boost::optional<BSONObj>& indexHint,
-    const Pipeline* pipeline,
+    BonsaiEligibility eligibility,
+    Pipeline* pipeline,
     const CanonicalQuery* = nullptr);
+
+struct PhaseManagerWithPlan {
+    optimizer::OptPhaseManager phaseManager;
+    boost::optional<optimizer::PlanAndProps> planAndProps;
+    OptimizerCounterInfo optCounterInfo;
+    boost::optional<MatchExpression*> pipelineMatchExpr;
+};
+
+PhaseManagerWithPlan getPhaseManager(
+    OperationContext* opCtx,
+    boost::intrusive_ptr<ExpressionContext> expCtx,
+    const NamespaceString& nss,
+    const CollectionPtr& collection,
+    const stdx::unordered_set<NamespaceString>& involvedCollections,
+    optimizer::QueryHints queryHints,
+    const boost::optional<BSONObj>& hint,
+    bool requireRID,
+    bool parameterizationOn,
+    Pipeline* pipeline,
+    const CanonicalQuery* canonicalQuery);
+
+struct PlanWithData {
+    bool fromCache;
+    std::unique_ptr<sbe::PlanStage> plan;
+    stage_builder::PlanStageData planData;
+};
+
+/*
+ * This function either creates a plan or fetches one from cache.
+ */
+PlanWithData plan(optimizer::OptPhaseManager& phaseManager,
+                  optimizer::PlanAndProps& planAndProps,
+                  OperationContext* opCtx,
+                  const MultipleCollectionAccessor& collections,
+                  bool requireRID,
+                  const std::unique_ptr<PlanYieldPolicySBE>& sbeYieldPolicy,
+                  boost::optional<MatchExpression*> pipelineMatchExpr,
+                  const boost::optional<sbe::PlanCacheKey>& planCacheKey,
+                  optimizer::VariableEnvironment& env);
 
 /**
  * Returns a PlanExecutor for the given CanonicalQuery.
@@ -98,12 +155,16 @@ boost::optional<ExecParams> getSBEExecutorViaCascadesOptimizer(
 boost::optional<ExecParams> getSBEExecutorViaCascadesOptimizer(
     const MultipleCollectionAccessor& collections,
     optimizer::QueryHints queryHints,
+    BonsaiEligibility eligibility,
     const CanonicalQuery* query);
 
 /**
  * Constructs a plan executor with the given CanonicalQuery and ExecParams.
  */
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> makeExecFromParams(
-    std::unique_ptr<CanonicalQuery> cq, ExecParams execArgs);
+    std::unique_ptr<CanonicalQuery> cq,
+    std::unique_ptr<Pipeline, PipelineDeleter> pipeline,
+    const MultipleCollectionAccessor& collections,
+    ExecParams execArgs);
 
 }  // namespace mongo

@@ -35,7 +35,7 @@
 #include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/op_observer/op_observer_impl.h"
 #include "mongo/db/op_observer/op_observer_registry.h"
-#include "mongo/db/op_observer/oplog_writer_impl.h"
+#include "mongo/db/op_observer/operation_logger_impl.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/service_context.h"
@@ -49,12 +49,12 @@
 namespace mongo {
 
 VectorClockTestFixture::VectorClockTestFixture()
-    : ShardingMongodTestFixture(Options{}.useMockClock(true), false /* setUpMajorityReads */) {}
+    : ShardingMongoDTestFixture(Options{}.useMockClock(true), false /* setUpMajorityReads */) {}
 
 VectorClockTestFixture::~VectorClockTestFixture() = default;
 
 void VectorClockTestFixture::setUp() {
-    ShardingMongodTestFixture::setUp();
+    ShardingMongoDTestFixture::setUp();
 
     auto service = getServiceContext();
 
@@ -67,7 +67,7 @@ void VectorClockTestFixture::setUp() {
 
 void VectorClockTestFixture::tearDown() {
     _dbDirectClient.reset();
-    ShardingMongodTestFixture::tearDown();
+    ShardingMongoDTestFixture::tearDown();
 }
 
 VectorClockMutable* VectorClockTestFixture::resetClock() {
@@ -109,7 +109,7 @@ void VectorClockTestFixture::setupOpObservers() {
     auto opObserverRegistry =
         checked_cast<OpObserverRegistry*>(getServiceContext()->getOpObserver());
     opObserverRegistry->addObserver(
-        std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterImpl>()));
+        std::make_unique<OpObserverImpl>(std::make_unique<OperationLoggerImpl>()));
 }
 
 }  // namespace mongo

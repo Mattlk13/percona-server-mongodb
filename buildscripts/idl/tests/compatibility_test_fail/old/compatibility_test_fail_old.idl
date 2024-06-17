@@ -39,6 +39,7 @@ types:
         description: "The bson_serialization_type changes from int in the old command's reply
                       field type to [int, string] in the new command's reply field type"
         cpp_type: "std::int32_t"
+        is_view: false
 
     intStringToIntStringBool:
         bson_serialization_type:
@@ -48,6 +49,7 @@ types:
                       reply field type to [int, string, bool] in the new command's reply field
                       type"
         cpp_type: "std::int32_t"
+        is_view: false
 
     oldBsonSerializationTypeAny:
         bson_serialization_type:
@@ -55,12 +57,14 @@ types:
                                 - any
         description: "The old bson_serialization_type contains 'any'"
         cpp_type: "std::int32_t"
+        is_view: false
 
     newBsonSerializationTypeAny:
         bson_serialization_type:
                                 - int
         description: "The new bson_serialization_type contains 'any'"
         cpp_type: "std::int32_t"
+        is_view: false
 
     bsonSerializationTypeAny:
         bson_serialization_type:
@@ -68,6 +72,7 @@ types:
                                 - any
         description: "The old and new bson_serialization_type contains 'any'"
         cpp_type: "std::int32_t"
+        is_view: false
 
     bsonSerializationTypeAnyCppTypeNotEqual:
         bson_serialization_type:
@@ -75,6 +80,7 @@ types:
                                 - any
         description: "The old and new bson_serialization_type contains 'any'"
         cpp_type: "std::int64_t"
+        is_view: false
 
     bsonSerializationTypeAnySerializerNotEqual:
         bson_serialization_type:
@@ -84,6 +90,7 @@ types:
                       field value here is different from the one defined in new."
         cpp_type: "std::int64_t"
         serializer: ::mongo::oldSerializer
+        is_view: false
 
     bsonSerializationTypeAnyDeserializerNotEqual:
         bson_serialization_type:
@@ -93,6 +100,7 @@ types:
                       field value here is different from the one defined in new."
         cpp_type: "std::int64_t"
         deserializer: ::mongo::oldDeserializer
+        is_view: false
 
     intStringBoolToIntString:
         bson_serialization_type:
@@ -103,6 +111,7 @@ types:
                       command's reply field type to [int, string] in the new command's reply
                       field type"
         cpp_type: "std::int32_t"
+        is_view: false
 
     intStringToInt:
         bson_serialization_type:
@@ -111,6 +120,7 @@ types:
         description: "The bson_serialization_type changes from [int, string] in the old command
                       parameter's type to [int] in the new command parameter's type"
         cpp_type: "std::int32_t"
+        is_view: false
 
 enums:
     NewReplyFieldEnumNotSubset:
@@ -712,10 +722,11 @@ structs:
 
     StableRequiredNoDefaultTypeFieldStruct:
         description: "This struct contains a field that is stable and required with no default value
-                      in the new version that was unstable in the old version"
+                      in the new version that was unstable and optional in the old version"
         fields:
             stableRequiredNoDefaultTypeField:
                 type: string
+                optional: true
                 stability: unstable
 
     StructCommandParameterTypeRecursive:
@@ -882,6 +893,13 @@ structs:
                 type: bool
                 stability: stable
 
+    StructWithNewRequiredUnstableField:
+        description: "contains a new, required unstable field"
+        fields:
+            oldField:
+                type: string
+                stability: stable
+
 commands:
     invalidAPIVersionOld:
         description: "old command fails because of invalid API version"
@@ -954,6 +972,15 @@ commands:
         api_version: "1"
         reply_type: OkReply
 
+    newUnstableRequiredParameterAdded:
+        description: "new command fails because it adds a new parameter as a required unstable field"
+        command_name: newUnstableRequiredParameterAdded
+        namespace: ignored
+        cpp_name: newUnstableRequiredParameterAdded
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+
     commandParameterUnstable:
         description: "new unstable command parameter fails because it is stable
                       in the corresponding old command"
@@ -984,7 +1011,7 @@ commands:
 
     commandParameterStableRequiredNoDefault:
         description: "new required stable command parameter with no default value fails
-                      because it is unstable in the corresponding old command"
+                      because it is unstable and optional in the corresponding old command"
         command_name: commandParameterStableRequiredNoDefault
         namespace: ignored
         cpp_name: commandParameterStableRequiredNoDefault
@@ -994,6 +1021,7 @@ commands:
         fields:
             newRequiredStableParam:
                 type: string
+                optional: true
                 stability: unstable
 
     commandParameterRequired:
@@ -2298,7 +2326,7 @@ commands:
         reply_type: VariantStructRecursiveReplyWithArray
 
     unstableToStableParamField:
-        description: "new command fails because contains a stable parameter that is unstable in the
+        description: "new command fails because contains a stable parameter that is unstable and optional in the
                       corresponding old command"
         command_name: unstableToStableParamField
         namespace: ignored
@@ -2310,6 +2338,7 @@ commands:
             stableNewParam:
                 type: string
                 unstable: true
+                optional: true
 
     newParamVariantNotSuperset:
         description: "new command fails because its parameter type is a variant type that is not
@@ -2810,6 +2839,36 @@ commands:
                 - check: checkOne
                 - check: checkTwo
 
+    complexCheckPrivilegesSupersetNoneAllowed:
+        description: "new command fails when privileges in the access check are a superset of the old
+                      privileges and none of the additional privileges are explicitly allowed."
+        command_name: complexCheckPrivilegesSupersetNoneAllowed
+        namespace: ignored
+        cpp_name: complexCheckPrivilegesSupersetNoneAllowed
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+        access_check:
+            complex:
+                - privilege:
+                    resource_pattern: resourcePatternOne
+                    action_type: [actionTypeOne]
+
+    complexCheckPrivilegesSupersetSomeAllowed:
+        description: "new command fails when privileges in the access check are a superset of the old
+                      privileges and not all of the additional privileges are explicitly allowed."
+        command_name: complexCheckPrivilegesSupersetSomeAllowed
+        namespace: ignored
+        cpp_name: complexCheckPrivilegesSupersetSomeAllowed
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+        access_check:
+            complex:
+                - privilege:
+                    resource_pattern: resourcePatternOne
+                    action_type: [actionTypeOne]
+
     complexChecksSupersetNoneAllowed:
         description: "new command fails when the the complex checks are a superset of the old
                       checks and none of the additional checks are explicitly allowed."
@@ -3171,3 +3230,13 @@ commands:
         strict: true
         api_version: "1"
         reply_type: BoolToOptionalBoolStruct
+
+    commandWithNewRequiredUnstableFieldInType:
+        description: "new command adds a required unstable field type"
+        command_name: commandWithNewRequiredUnstableFieldInType
+        namespace: type
+        type: StructWithNewRequiredUnstableField
+        cpp_name: commandWithNewRequiredUnstableFieldInType
+        strict: true
+        api_version: "1"
+        reply_type: OkReply

@@ -74,9 +74,23 @@ export var ClusteredCollectionUtil = class {
     static validateListIndexes(db, collName, createOptions) {
         const fullCreateOptions = ClusteredCollectionUtil.constructFullCreateOptions(createOptions);
         const listIndexes = assert.commandWorked(db[collName].runCommand("listIndexes"));
-        const expectedListIndexesOutput =
-            Object.extend({clustered: true}, fullCreateOptions.clusteredIndex);
-        assert.docEq(expectedListIndexesOutput, listIndexes.cursor.firstBatch[0]);
+        let extraData = {clustered: true};
+        // ttl is not stored on the clusteredIndex but on the collection info. Therefore, we have to
+        // add it back in this check to match the getIndexes output.
+        if (typeof (createOptions.expireAfterSeconds) !== 'undefined' &&
+            createOptions.expireAfterSeconds !== null) {
+            extraData.expireAfterSeconds = createOptions.expireAfterSeconds;
+        }
+        // TODO (SERVER-85312): Re-enable this after we branch for 8.1 so that multiversion
+        // will test 8.1 <> 8.0.
+        const version = db.version().split('.');
+        if (version[0] >= 8 || (version[0] == 7 && version[1] == 3) ||
+            typeof (extraData.expireAfterSeconds) === 'undefined' ||
+            extraData.expireAfterSeconds === null) {
+            const expectedListIndexesOutput =
+                Object.extend(extraData, fullCreateOptions.clusteredIndex);
+            assert.docEq(expectedListIndexesOutput, listIndexes.cursor.firstBatch[0]);
+        }
     }
 
     static testBasicClusteredCollection(db, collName, clusterKey) {
@@ -109,8 +123,6 @@ export var ClusteredCollectionUtil = class {
             }
         }
 
-        // This section is based on jstests/core/timeseries/clustered_index_crud.js with
-        // specific additions for general-purpose (non-timeseries) clustered collections
         assert.commandWorked(coll.insert({[clusterKey]: 0, a: 1}));
         assert.commandWorked(coll.insert({[clusterKey]: 1, a: 1}));
         assert.eq(1, coll.find({[clusterKey]: 0}).itcount());

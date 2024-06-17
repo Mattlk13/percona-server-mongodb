@@ -43,15 +43,16 @@
 
 namespace mongo {
 
+const ConnectionString ShardLocal::kLocalConnectionString = ConnectionString::forLocal();
+
 ShardLocal::ShardLocal(const ShardId& id) : Shard(id) {
     // Currently ShardLocal only works for config servers. If we ever start using ShardLocal on
     // shards we'll need to consider how to handle shards.
     invariant(serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
 }
 
-ConnectionString ShardLocal::getConnString() const {
-    return repl::ReplicationCoordinator::get(getGlobalServiceContext())
-        ->getConfigConnectionString();
+const ConnectionString& ShardLocal::getConnString() const {
+    return kLocalConnectionString;
 }
 
 std::shared_ptr<RemoteCommandTargeter> ShardLocal::getTargeter() const {
@@ -116,4 +117,24 @@ Status ShardLocal::runAggregation(
     return _rsLocalClient.runAggregation(opCtx, aggRequest, callback);
 }
 
+BatchedCommandResponse ShardLocal::runBatchWriteCommand(OperationContext* opCtx,
+                                                        const Milliseconds maxTimeMS,
+                                                        const BatchedCommandRequest& batchRequest,
+                                                        const WriteConcernOptions& writeConcern,
+                                                        RetryPolicy retryPolicy) {
+    // A request dispatched through a local client is served within the same thread that submits it
+    // (so that the opCtx needs to be used as the vehicle to pass the WC to the ServiceEntryPoint).
+    const auto originalWC = opCtx->getWriteConcern();
+    ScopeGuard resetWCGuard([&] { opCtx->setWriteConcern(originalWC); });
+    opCtx->setWriteConcern(writeConcern);
+
+    const DatabaseName dbName = batchRequest.getNS().dbName();
+    const BSONObj cmdObj = [&] {
+        BSONObjBuilder cmdObjBuilder;
+        batchRequest.serialize(&cmdObjBuilder);
+        return cmdObjBuilder.obj();
+    }();
+
+    return _submitBatchWriteCommand(opCtx, cmdObj, dbName, maxTimeMS, retryPolicy);
+}
 }  // namespace mongo

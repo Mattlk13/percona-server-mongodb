@@ -46,7 +46,6 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/rpc/op_msg.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/uuid.h"
 
@@ -65,7 +64,7 @@ class CmdRenameCollection final : public TypedCommand<CmdRenameCollection> {
 public:
     using Request = RenameCollectionCommand;
 
-    virtual bool adminOnly() const {
+    bool adminOnly() const override {
         return true;
     }
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
@@ -88,6 +87,10 @@ public:
     public:
         using InvocationBase::InvocationBase;
 
+        bool isSubjectToIngressAdmissionControl() const override {
+            return true;
+        }
+
         void typedRun(OperationContext* opCtx) {
             const auto& fromNss = ns();
             const auto& toNss = request().getTo();
@@ -99,14 +102,14 @@ public:
             RenameCollectionOptions options;
             options.stayTemp = request().getStayTemp();
             options.expectedSourceUUID = request().getCollectionUUID();
-            stdx::visit(OverloadedVisitor{
-                            [&options](bool dropTarget) { options.dropTarget = dropTarget; },
-                            [&options](const UUID& uuid) {
-                                options.dropTarget = true;
-                                options.expectedTargetUUID = uuid;
-                            },
-                        },
-                        request().getDropTarget());
+            visit(OverloadedVisitor{
+                      [&options](bool dropTarget) { options.dropTarget = dropTarget; },
+                      [&options](const UUID& uuid) {
+                          options.dropTarget = true;
+                          options.expectedTargetUUID = uuid;
+                      },
+                  },
+                  request().getDropTarget());
 
             validateAndRunRenameCollection(opCtx, fromNss, toNss, options);
         }

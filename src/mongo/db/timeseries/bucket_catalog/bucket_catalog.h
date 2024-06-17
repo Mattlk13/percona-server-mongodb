@@ -29,7 +29,7 @@
 
 #pragma once
 
-#include <boost/container/small_vector.hpp>
+#include <absl/container/inlined_vector.h>
 #include <boost/container/static_vector.hpp>
 #include <boost/move/utility_core.hpp>
 #include <boost/optional/optional.hpp>
@@ -53,7 +53,6 @@
 #include "mongo/bson/unordered_fields_bsonobj_comparator.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/database_name.h"
-#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/single_write_result_gen.h"
 #include "mongo/db/service_context.h"
@@ -76,11 +75,12 @@
 #include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/string_map.h"
 #include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo::timeseries::bucket_catalog {
 
 using StripeNumber = std::uint8_t;
-using ShouldClearFn = std::function<bool(const NamespaceString&)>;
+using ShouldClearFn = std::function<bool(const UUID&)>;
 
 /**
  * Whether to allow inserts to be batched together with those from other clients.
@@ -115,13 +115,13 @@ public:
  * outstanding 'ReopeningRequest' or a prepared 'WriteBatch' for a bucket in the series (same
  * metaField value), that represents a conflict.
  */
-using InsertWaiter = stdx::variant<std::shared_ptr<WriteBatch>, std::shared_ptr<ReopeningRequest>>;
+using InsertWaiter = std::variant<std::shared_ptr<WriteBatch>, std::shared_ptr<ReopeningRequest>>;
 
 /**
  * Variant representing the possible outcomes of 'tryInsert' or 'insert'. See 'tryInsert' and
  * 'insert' for more details.
  */
-using InsertResult = stdx::variant<SuccessfulInsertion, ReopeningContext, InsertWaiter>;
+using InsertResult = std::variant<SuccessfulInsertion, ReopeningContext, InsertWaiter>;
 
 /**
  * Struct to hold a portion of the buckets managed by the catalog.
@@ -135,14 +135,14 @@ struct Stripe {
 
     // All buckets currently open in the catalog, including buckets which are full or pending
     // closure but not yet committed, indexed by BucketId. Owning pointers.
-    stdx::unordered_map<BucketId, std::unique_ptr<Bucket>, BucketHasher> openBucketsById;
+    tracked_unordered_map<BucketId, unique_tracked_ptr<Bucket>, BucketHasher> openBucketsById;
 
     // All buckets currently open in the catalog, including buckets which are full or pending
     // closure but not yet committed, indexed by BucketKey. Non-owning pointers.
-    stdx::unordered_map<BucketKey, std::set<Bucket*>, BucketHasher> openBucketsByKey;
+    tracked_unordered_map<BucketKey, tracked_set<Bucket*>, BucketHasher> openBucketsByKey;
 
     // Open buckets that do not have any outstanding writes.
-    using IdleList = std::list<Bucket*>;
+    using IdleList = tracked_list<Bucket*>;
     IdleList idleBuckets;
 
     // Buckets that are not currently in the catalog, but which are eligible to receive more
@@ -151,15 +151,21 @@ struct Stripe {
     //
     // We invert the key comparison in the inner map so that we can use lower_bound to efficiently
     // find an archived bucket that is a candidate for an incoming measurement.
-    stdx::unordered_map<BucketKey::Hash,
-                        std::map<Date_t, ArchivedBucket, std::greater<Date_t>>,
-                        BucketHasher>
+    tracked_unordered_map<BucketKey::Hash,
+                          tracked_map<Date_t, ArchivedBucket, std::greater<Date_t>>,
+                          BucketHasher>
         archivedBuckets;
 
     // All series currently with outstanding reopening operations. Used to coordinate disk access
     // between reopenings and regular writes to prevent stale reads and corrupted updates.
-    stdx::unordered_map<BucketKey, std::shared_ptr<ReopeningRequest>, BucketHasher>
+    static constexpr int kInlinedVectorSize = 4;
+    tracked_unordered_map<
+        BucketKey,
+        tracked_inlined_vector<shared_tracked_ptr<ReopeningRequest>, kInlinedVectorSize>,
+        BucketHasher>
         outstandingReopeningRequests;
+
+    Stripe(TrackingContext& trackingContext);
 };
 
 /**
@@ -170,15 +176,14 @@ public:
     static BucketCatalog& get(ServiceContext* svcCtx);
     static BucketCatalog& get(OperationContext* opCtx);
 
-    BucketCatalog()
-        : stripes(numberOfStripes),
-          memoryUsageThreshold(getTimeseriesIdleBucketExpiryMemoryUsageThresholdBytes) {}
-    BucketCatalog(size_t numberOfStripes, std::function<uint64_t()> memoryUsageThreshold)
-        : numberOfStripes(numberOfStripes),
-          stripes(numberOfStripes),
-          memoryUsageThreshold(memoryUsageThreshold) {}
+    BucketCatalog();
+    BucketCatalog(size_t numberOfStripes, std::function<uint64_t()> memoryUsageThreshold);
     BucketCatalog(const BucketCatalog&) = delete;
     BucketCatalog operator=(const BucketCatalog&) = delete;
+
+    // Stores an accurate count of the bytes allocated and deallocated for all the data held by
+    // tracked members of the BucketCatalog.
+    TrackingContext trackingContext;
 
     // Stores state information about all buckets managed by the catalog, across stripes.
     BucketStateRegistry bucketStateRegistry;
@@ -187,19 +192,16 @@ public:
     // independently locked and operated on in parallel. The size of the stripe vector should not be
     // changed after initialization.
     const std::size_t numberOfStripes = 32;
-    std::vector<Stripe> stripes;
+    tracked_vector<unique_tracked_ptr<Stripe>> stripes;
 
     // Per-namespace execution stats. This map is protected by 'mutex'. Once you complete your
     // lookup, you can keep the shared_ptr to an individual namespace's stats object and release the
     // lock. The object itself is thread-safe (using atomics).
     mutable Mutex mutex = MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "BucketCatalog::mutex");
-    stdx::unordered_map<NamespaceString, std::shared_ptr<ExecutionStats>> executionStats;
+    tracked_unordered_map<UUID, shared_tracked_ptr<ExecutionStats>> executionStats;
 
     // Global execution stats used to report aggregated metrics in server status.
     ExecutionStats globalExecutionStats;
-
-    // Approximate memory usage of the bucket catalog across all stripes.
-    AtomicWord<uint64_t> memoryUsage;
 
     // Memory usage threshold in bytes after which idle buckets will be expired.
     std::function<uint64_t()> memoryUsageThreshold;
@@ -219,6 +221,12 @@ public:
 BSONObj getMetadata(BucketCatalog& catalog, const BucketHandle& bucket);
 
 /**
+ * Returns the memory usage of the bucket catalog across all stripes from the approximated memory
+ * usage, and the tracked memory usage from the TrackingAllocator.
+ */
+uint64_t getMemoryUsage(const BucketCatalog& catalog);
+
+/**
  * Tries to insert 'doc' into a suitable bucket. If an open bucket is full (or has incompatible
  * schema), but is otherwise suitable, we will close it and open a new bucket. If we find no bucket
  * with matching data and a time range that can accommodate 'doc', we will not open a new bucket,
@@ -234,13 +242,14 @@ BSONObj getMetadata(BucketCatalog& catalog, const BucketHandle& bucket);
  *
  * If a 'ReopeningContext' is returned, it contains either a bucket ID, corresponding to an archived
  * bucket which should be fetched, an aggregation pipeline that can be used to search for a
- * previously-closed bucket that can accommodate 'doc', or (in hopefully rare cases) a monostate
- * which requires no intermediate action, The caller should then proceed to call 'insert' to insert
- * 'doc', passing any fetched bucket back as a member of the 'ReopeningContext'.
+ * previously-closed bucket that can accommodate 'doc', or (in hopefully rare cases) a
+ * std::monostate which requires no intermediate action, The caller should then proceed to call
+ * 'insert' to insert 'doc', passing any fetched bucket back as a member of the 'ReopeningContext'.
  */
 StatusWith<InsertResult> tryInsert(OperationContext* opCtx,
                                    BucketCatalog& catalog,
-                                   const NamespaceString& ns,
+                                   const NamespaceString& nss,
+                                   const UUID& collectionUUID,
                                    const StringDataComparator* comparator,
                                    const TimeseriesOptions& options,
                                    const BSONObj& doc,
@@ -251,18 +260,35 @@ StatusWith<InsertResult> tryInsert(OperationContext* opCtx,
  * closed in order to make space to insert the document. Any caller who receives the same batch may
  * commit or abort the batch after claiming commit rights. See WriteBatch for more details.
  *
- * If 'reopeningContext' is passed with a bucket, we will reopen that bucket and attempt to add
+ * We will attempt to reopen the bucket passed via 'reopeningContext' and attempt to add
  * 'doc' to that bucket. Otherwise we will attempt to find a suitable open bucket, or open a new
  * bucket if none exists.
  */
+StatusWith<InsertResult> insertWithReopeningContext(OperationContext* opCtx,
+                                                    BucketCatalog& catalog,
+                                                    const NamespaceString& nss,
+                                                    const UUID& collectionUUID,
+                                                    const StringDataComparator* comparator,
+                                                    const TimeseriesOptions& options,
+                                                    const BSONObj& doc,
+                                                    CombineWithInsertsFromOtherClients combine,
+                                                    ReopeningContext& reopeningContext);
+
+/**
+ * Returns the WriteBatch into which the document was inserted and a list of any buckets that were
+ * closed in order to make space to insert the document. Any caller who receives the same batch may
+ * commit or abort the batch after claiming commit rights. See WriteBatch for more details.
+ *
+ * We will attempt to find a suitable open bucket, or open a new bucket if none exists.
+ */
 StatusWith<InsertResult> insert(OperationContext* opCtx,
                                 BucketCatalog& catalog,
-                                const NamespaceString& ns,
+                                const NamespaceString& nss,
+                                const UUID& collectionUUID,
                                 const StringDataComparator* comparator,
                                 const TimeseriesOptions& options,
                                 const BSONObj& doc,
-                                CombineWithInsertsFromOtherClients combine,
-                                ReopeningContext* reopeningContext = nullptr);
+                                CombineWithInsertsFromOtherClients combine);
 
 /**
  * If a 'tryInsert' call returns a 'InsertWaiter' object, the caller should use this function to
@@ -277,7 +303,9 @@ void waitToInsert(InsertWaiter* waiter);
  * on the same bucket, or there is an outstanding 'ReopeningRequest' for the same series (metaField
  * value), this operation will block waiting for it to complete.
  */
-Status prepareCommit(BucketCatalog& catalog, std::shared_ptr<WriteBatch> batch);
+Status prepareCommit(BucketCatalog& catalog,
+                     const NamespaceString& nss,
+                     std::shared_ptr<WriteBatch> batch);
 
 /**
  * Records the result of a batch commit. Caller must already have commit rights on batch, and batch
@@ -289,6 +317,7 @@ Status prepareCommit(BucketCatalog& catalog, std::shared_ptr<WriteBatch> batch);
  */
 boost::optional<ClosedBucket> finish(OperationContext* opCtx,
                                      BucketCatalog& catalog,
+                                     const NamespaceString& nss,
                                      std::shared_ptr<WriteBatch> batch,
                                      const CommitInfo& info);
 
@@ -305,7 +334,7 @@ void abort(BucketCatalog& catalog, std::shared_ptr<WriteBatch> batch, const Stat
  * This should be followed by a call to 'directWriteFinish' after the write has been committed,
  * rolled back, or otherwise finished.
  */
-void directWriteStart(BucketStateRegistry& registry, const NamespaceString& ns, const OID& oid);
+void directWriteStart(BucketStateRegistry& registry, const UUID& collectionUUID, const OID& oid);
 
 /**
  * Notifies the catalog that a pending direct write to the bucket document with the specified ID has
@@ -313,25 +342,24 @@ void directWriteStart(BucketStateRegistry& registry, const NamespaceString& ns, 
  * in-memory representation of the on-disk bucket data from before the direct write should have been
  * cleared from the catalog, and it may be safely reopened from the on-disk state.
  */
-void directWriteFinish(BucketStateRegistry& registry, const NamespaceString& ns, const OID& oid);
+void directWriteFinish(BucketStateRegistry& registry, const UUID& collectionUUID, const OID& oid);
 
 /**
- * Clears any bucket whose namespace satisfies the predicate by removing the bucket from the catalog
+ * Clears any bucket whose collection UUID has been cleared by removing the bucket from the catalog
  * asynchronously through the BucketStateRegistry.
  */
-void clear(BucketCatalog& catalog, ShouldClearFn&& shouldClear);
+void clear(BucketCatalog& catalog, tracked_vector<UUID> clearedCollectionUUIDs);
 
 /**
- * Clears the buckets for the given namespace by removing the bucket from the catalog asynchronously
- * through the BucketStateRegistry.
+ * Clears the buckets for the given collection UUID by removing the bucket from the catalog
+ * asynchronously through the BucketStateRegistry.
  */
-void clear(BucketCatalog& catalog, const NamespaceString& ns);
+void clear(BucketCatalog& catalog, const UUID& collectionUUID);
 
 /**
- * Clears the buckets for the given database by removing the bucket from the catalog asynchronously
- * through the BucketStateRegistry.
+ * Freezes the given bucket in the registry so that this bucket will never be used in the future.
  */
-void clear(BucketCatalog& catalog, const DatabaseName& dbName);
+void freeze(BucketCatalog&, const UUID&, const OID&);
 
 /**
  * Resets the counter used for bucket OID generation. Should be called after a bucket _id collision.
@@ -342,7 +370,7 @@ void resetBucketOIDCounter();
  * Appends the execution stats for the given namespace to the builder.
  */
 void appendExecutionStats(const BucketCatalog& catalog,
-                          const NamespaceString& ns,
+                          const UUID& collectionUUID,
                           BSONObjBuilder& builder);
 
 /**
@@ -351,7 +379,7 @@ void appendExecutionStats(const BucketCatalog& catalog,
  * commit".
  */
 void reportMeasurementsGroupCommitted(BucketCatalog& catalog,
-                                      const NamespaceString& ns,
+                                      const UUID& collectionUUID,
                                       int64_t count);
 
 

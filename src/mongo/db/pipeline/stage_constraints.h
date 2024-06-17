@@ -75,16 +75,14 @@ struct StageConstraints {
         // router to a shard to execute if some other stage in the pipeline needs to run on a
         // shard. The stage provides its own data and is independent of any collection.
         kRunOnceAnyNode,
-        // Indicates that the stage must run on the primary shard.
-        kPrimaryShard,
         // Indicates that the stage must run on any participating shard.
         kAnyShard,
         // Indicates that the stage can only run on mongoS.
         kMongoS,
-        // Indicates that the stage should run on all data-bearing nodes, primary and secondary, for
+        // Indicates that the stage should run on all data-bearing hosts, primary and secondary, for
         // the participating shards. This is useful for stages like $currentOp which generate
         // node-specific metadata.
-        kAllShardServers,
+        kAllShardHosts,
     };
 
     /**
@@ -198,8 +196,7 @@ struct StageConstraints {
         // shard, since it needs to be able to run on mongoS in a cluster.
         invariant(!(changeStreamRequirement == ChangeStreamRequirement::kAllowlist &&
                     (hostRequirement == HostTypeRequirement::kAnyShard ||
-                     hostRequirement == HostTypeRequirement::kPrimaryShard ||
-                     hostRequirement == HostTypeRequirement::kAllShardServers)));
+                     hostRequirement == HostTypeRequirement::kAllShardHosts)));
 
         // A stage which is allowlisted for $changeStream cannot have a position requirement.
         invariant(!(changeStreamRequirement == ChangeStreamRequirement::kAllowlist &&
@@ -223,7 +220,7 @@ struct StageConstraints {
             7355706,
             "Stage can only broadcast to all shard servers if it must be the first stage in the "
             "pipeline.",
-            hostRequirement != HostTypeRequirement::kAllShardServers ||
+            hostRequirement != HostTypeRequirement::kAllShardHosts ||
                 (requiredPosition == PositionRequirement::kFirst));
     }
 
@@ -363,9 +360,9 @@ struct StageConstraints {
     //   documents because our implementation of $sample shuffles the order
     bool canSwapWithSkippingOrLimitingStage = false;
 
-    // If true, then any stage of kind 'DocumentSourceSingleDocumentTransformation' can be swapped
-    // ahead of this stage.
-    bool canSwapWithSingleDocTransform = false;
+    // If true, then any stage of kind 'DocumentSourceSingleDocumentTransformation' or $redact can
+    // be swapped ahead of this stage.
+    bool canSwapWithSingleDocTransformOrRedact = false;
 
     // Indicates that a stage is allowed within a pipeline-style update.
     bool isAllowedWithinUpdatePipeline = false;
@@ -397,7 +394,7 @@ struct StageConstraints {
             isIndependentOfAnyCollection == other.isIndependentOfAnyCollection &&
             canSwapWithMatch == other.canSwapWithMatch &&
             canSwapWithSkippingOrLimitingStage == other.canSwapWithSkippingOrLimitingStage &&
-            canSwapWithSingleDocTransform == other.canSwapWithSingleDocTransform &&
+            canSwapWithSingleDocTransformOrRedact == other.canSwapWithSingleDocTransformOrRedact &&
             canAppearOnlyOnceInPipeline == other.canAppearOnlyOnceInPipeline &&
             isAllowedWithinUpdatePipeline == other.isAllowedWithinUpdatePipeline &&
             unionRequirement == other.unionRequirement &&

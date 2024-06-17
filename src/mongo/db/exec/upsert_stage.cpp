@@ -62,6 +62,7 @@
 #include "mongo/db/session/logical_session_id.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/update/storage_validation.h"
 #include "mongo/db/update/update_driver.h"
 #include "mongo/db/update/update_util.h"
@@ -149,7 +150,8 @@ PlanStage::StageState UpsertStage::doWork(WorkingSetID* out) {
         BSONObj newObj = _specificStats.objInserted;
         *out = _ws->allocate();
         WorkingSetMember* member = _ws->get(*out);
-        member->resetDocument(opCtx()->recoveryUnit()->getSnapshotId(), newObj.getOwned());
+        member->resetDocument(shard_role_details::getRecoveryUnit(opCtx())->getSnapshotId(),
+                              newObj.getOwned());
         member->transitionToOwnedObj();
         return PlanStage::ADVANCED;
     }
@@ -179,7 +181,7 @@ void UpsertStage::_performInsert(BSONObj newDocument) {
                 // will be able to start an internal transaction to handle the
                 // wouldChangeOwningShard error thrown below.
                 if (!feature_flags::gFeatureFlagUpdateDocumentShardKeyUsingTransactionApi.isEnabled(
-                        serverGlobalParams.featureCompatibility)) {
+                        serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
                     uassert(
                         ErrorCodes::IllegalOperation,
                         "The upsert document could not be inserted onto the shard targeted by the "

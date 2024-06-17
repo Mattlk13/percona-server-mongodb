@@ -96,7 +96,8 @@ BSONObj makeOplogEntryDoc(OpTime opTime,
     builder.append(OplogEntryBase::kVersionFieldName, version);
     builder.append(OplogEntryBase::kOpTypeFieldName, OpType_serializer(opType));
     if (nss.tenantId() && gMultitenancySupport &&
-        gFeatureFlagRequireTenantID.isEnabled(serverGlobalParams.featureCompatibility)) {
+        gFeatureFlagRequireTenantID.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
         nss.tenantId()->serializeToBSON(OplogEntryBase::kTidFieldName, &builder);
     }
     builder.append(OplogEntryBase::kNssFieldName,
@@ -151,54 +152,9 @@ BSONObj makeOplogEntryDoc(OpTime opTime,
 }
 }  // namespace
 
-DurableOplogEntry::CommandType parseCommandType(const BSONObj& objectField) {
-    StringData commandString(objectField.firstElementFieldName());
-    if (commandString == "create") {
-        return DurableOplogEntry::CommandType::kCreate;
-    } else if (commandString == "renameCollection") {
-        return DurableOplogEntry::CommandType::kRenameCollection;
-    } else if (commandString == "drop") {
-        return DurableOplogEntry::CommandType::kDrop;
-    } else if (commandString == "collMod") {
-        return DurableOplogEntry::CommandType::kCollMod;
-    } else if (commandString == "applyOps") {
-        return DurableOplogEntry::CommandType::kApplyOps;
-    } else if (commandString == "dbCheck") {
-        return DurableOplogEntry::CommandType::kDbCheck;
-    } else if (commandString == "dropDatabase") {
-        return DurableOplogEntry::CommandType::kDropDatabase;
-    } else if (commandString == "emptycapped") {
-        return DurableOplogEntry::CommandType::kEmptyCapped;
-    } else if (commandString == "createIndexes") {
-        return DurableOplogEntry::CommandType::kCreateIndexes;
-    } else if (commandString == "startIndexBuild") {
-        return DurableOplogEntry::CommandType::kStartIndexBuild;
-    } else if (commandString == "commitIndexBuild") {
-        return DurableOplogEntry::CommandType::kCommitIndexBuild;
-    } else if (commandString == "abortIndexBuild") {
-        return DurableOplogEntry::CommandType::kAbortIndexBuild;
-    } else if (commandString == "dropIndexes") {
-        return DurableOplogEntry::CommandType::kDropIndexes;
-    } else if (commandString == "deleteIndexes") {
-        return DurableOplogEntry::CommandType::kDropIndexes;
-    } else if (commandString == "commitTransaction") {
-        return DurableOplogEntry::CommandType::kCommitTransaction;
-    } else if (commandString == "abortTransaction") {
-        return DurableOplogEntry::CommandType::kAbortTransaction;
-    } else if (commandString == "importCollection") {
-        return DurableOplogEntry::CommandType::kImportCollection;
-    } else if (commandString == kShardingIndexCatalogOplogEntryName) {
-        return DurableOplogEntry::CommandType::kModifyCollectionShardingIndexCatalog;
-    } else if (commandString == "createGlobalIndex") {
-        return DurableOplogEntry::CommandType::kCreateGlobalIndex;
-    } else if (commandString == "dropGlobalIndex") {
-        return DurableOplogEntry::CommandType::kDropGlobalIndex;
-    } else {
-        uasserted(ErrorCodes::BadValue,
-                  str::stream() << "Unknown oplog entry command type: " << commandString
-                                << " Object field: " << redact(objectField));
-    }
-    MONGO_UNREACHABLE;
+CommandTypeEnum parseCommandType(const BSONObj& objectField) {
+    return CommandType_parse(IDLParserContext("commandString"),
+                             objectField.firstElementFieldNameStringData());
 }
 
 void ReplOperation::extractPrePostImageForTransaction(boost::optional<ImageBundle>* image) const {
@@ -231,7 +187,8 @@ void ReplOperation::extractPrePostImageForTransaction(boost::optional<ImageBundl
 
 void ReplOperation::setTid(boost::optional<mongo::TenantId> value) & {
     if (gMultitenancySupport &&
-        gFeatureFlagRequireTenantID.isEnabled(serverGlobalParams.featureCompatibility))
+        gFeatureFlagRequireTenantID.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot()))
         DurableReplOperation::setTid(value);
 }
 
@@ -361,7 +318,15 @@ StatusWith<MutableOplogEntry> MutableOplogEntry::parse(const BSONObj& object) {
 
     try {
         MutableOplogEntry oplogEntry;
-        oplogEntry.parseProtected(IDLParserContext("OplogEntryBase", false /* apiStrict */, tid),
+        const auto vts = tid
+            ? boost::make_optional(auth::ValidatedTenancyScopeFactory::create(
+                  *tid, auth::ValidatedTenancyScopeFactory::TrustedForInnerOpMsgRequestTag{}))
+            : boost::none;
+        oplogEntry.parseProtected(IDLParserContext("OplogEntryBase",
+                                                   false /* apiStrict */,
+                                                   vts,
+                                                   tid,
+                                                   SerializationContext::stateDefault()),
                                   object);
         return oplogEntry;
     } catch (...) {
@@ -375,8 +340,10 @@ ReplOperation MutableOplogEntry::toReplOperation() const noexcept {
 }
 
 void MutableOplogEntry::setTid(boost::optional<mongo::TenantId> value) & {
-    if (gMultitenancySupport &&
-        gFeatureFlagRequireTenantID.isEnabled(serverGlobalParams.featureCompatibility))
+    // Only set Tid if we have a TenantId value and the server parameter and feature flag are on.
+    if (value && gMultitenancySupport &&
+        gFeatureFlagRequireTenantID.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot()))
         getDurableReplOperation().setTid(std::move(value));
 }
 
@@ -395,7 +362,7 @@ OpTime MutableOplogEntry::getOpTime() const {
 }
 
 size_t DurableOplogEntry::getDurableReplOperationSize(const DurableReplOperation& op) {
-    const auto stmtIds = variant_util::toVector<StmtId>(op.getStatementIds());
+    const auto& stmtIds = op.getStatementIds();
     return sizeof(op) + (op.getTid() ? op.getTid()->toString().size() : 0) + op.getNss().size() +
         op.getObject().objsize() + (op.getObject2() ? op.getObject2()->objsize() : 0) +
         (sizeof(std::vector<StmtId>) + (sizeof(StmtId) * stmtIds.size()));
@@ -417,7 +384,16 @@ DurableOplogEntry::DurableOplogEntry(BSONObj rawInput) : _raw(std::move(rawInput
     if (_raw.hasElement("tid"))
         tid = TenantId::parseFromBSON(_raw["tid"]);
 
-    parseProtected(IDLParserContext("OplogEntryBase", false /* apiStrict */, tid), _raw);
+    const auto vts = tid
+        ? boost::make_optional(auth::ValidatedTenancyScopeFactory::create(
+              *tid, auth::ValidatedTenancyScopeFactory::TrustedForInnerOpMsgRequestTag{}))
+        : boost::none;
+    parseProtected(IDLParserContext("OplogEntryBase",
+                                    false /* apiStrict */,
+                                    vts,
+                                    tid,
+                                    SerializationContext::stateDefault()),
+                   _raw);
 
     // Parse command type from 'o' and 'o2' fields.
     if (isCommand()) {
@@ -514,17 +490,38 @@ bool DurableOplogEntry::isUpdateOrDelete() const {
 }
 
 bool DurableOplogEntry::shouldPrepare() const {
-    return getCommandType() == CommandType::kApplyOps &&
+    return getCommandType() == CommandTypeEnum::kApplyOps &&
         getObject()[ApplyOpsCommandInfoBase::kPrepareFieldName].booleanSafe();
 }
 
+bool DurableOplogEntry::applyOpsIsLinkedTransactionally() const {
+    // An applyOps with a prevWriteOpTime is part of a transaction, unless multiOpType is
+    // kApplyOpsAppliedSeparately.
+    return bool(getPrevWriteOpTimeInTransaction()) &&
+        getMultiOpType().value_or(MultiOplogEntryType::kLegacyMultiOpType) !=
+        MultiOplogEntryType::kApplyOpsAppliedSeparately;
+}
+
+bool DurableOplogEntry::isInTransaction() const {
+    if (getCommandType() == CommandTypeEnum::kAbortTransaction ||
+        getCommandType() == CommandTypeEnum::kCommitTransaction)
+        return true;
+    if (!getTxnNumber() || !getSessionId())
+        return false;
+    if (getCommandType() != CommandTypeEnum::kApplyOps)
+        return false;
+    return applyOpsIsLinkedTransactionally();
+}
+
 bool DurableOplogEntry::isSingleOplogEntryTransaction() const {
-    if (getCommandType() != CommandType::kApplyOps || !getTxnNumber() || !getSessionId() ||
+    if (getCommandType() != CommandTypeEnum::kApplyOps || !getTxnNumber() || !getSessionId() ||
         getObject()[ApplyOpsCommandInfoBase::kPartialTxnFieldName].booleanSafe()) {
         return false;
     }
     auto prevOptimeOpt = getPrevWriteOpTimeInTransaction();
-    if (!prevOptimeOpt) {
+    if (!prevOptimeOpt ||
+        getMultiOpType().value_or(MultiOplogEntryType::kLegacyMultiOpType) ==
+            MultiOplogEntryType::kApplyOpsAppliedSeparately) {
         // If there is no prevWriteOptime, then this oplog entry is not a part of a transaction.
         return false;
     }
@@ -532,21 +529,23 @@ bool DurableOplogEntry::isSingleOplogEntryTransaction() const {
 }
 
 bool DurableOplogEntry::isEndOfLargeTransaction() const {
-    if (getCommandType() != CommandType::kApplyOps) {
-        // If the oplog entry is neither commit nor abort, then it must be an applyOps. Otherwise,
-        // it cannot be a termainal oplog entry of a large transaction.
-        return false;
-    }
-    auto prevOptimeOpt = getPrevWriteOpTimeInTransaction();
-    if (!prevOptimeOpt) {
+    if (getCommandType() != CommandTypeEnum::kApplyOps) {
         // If the oplog entry is neither commit nor abort, then it must be an applyOps. Otherwise,
         // it cannot be a terminal oplog entry of a large transaction.
         return false;
     }
+    auto prevOptimeOpt = getPrevWriteOpTimeInTransaction();
+    if (!prevOptimeOpt) {
+        // If there is no prevWriteOptime, then this oplog entry is not a part of a transaction.
+        return false;
+    }
     // There should be a previous oplog entry in a multiple oplog entry transaction if this is
     // supposed to be the last one. The first oplog entry in a large transaction will have a null
-    // ts.
-    return !prevOptimeOpt->isNull() && !isPartialTransaction();
+    // ts.  The end of a large transaction should not have a partialTxn field, nor should
+    // multiOpType be set to kApplyOpsAppliedSeparately
+    return !prevOptimeOpt->isNull() && !isPartialTransaction() &&
+        getMultiOpType().value_or(MultiOplogEntryType::kLegacyMultiOpType) !=
+        MultiOplogEntryType::kApplyOpsAppliedSeparately;
 }
 
 bool DurableOplogEntry::isSingleOplogEntryTransactionWithCommand() const {
@@ -579,11 +578,12 @@ bool DurableOplogEntry::isSingleOplogEntryTransactionWithCommand() const {
 
 bool DurableOplogEntry::isIndexCommandType() const {
     return getOpType() == OpTypeEnum::kCommand &&
-        ((getCommandType() == CommandType::kCreateIndexes) ||
-         (getCommandType() == CommandType::kStartIndexBuild) ||
-         (getCommandType() == CommandType::kCommitIndexBuild) ||
-         (getCommandType() == CommandType::kAbortIndexBuild) ||
-         (getCommandType() == CommandType::kDropIndexes));
+        ((getCommandType() == CommandTypeEnum::kCreateIndexes) ||
+         (getCommandType() == CommandTypeEnum::kStartIndexBuild) ||
+         (getCommandType() == CommandTypeEnum::kCommitIndexBuild) ||
+         (getCommandType() == CommandTypeEnum::kAbortIndexBuild) ||
+         (getCommandType() == CommandTypeEnum::kDropIndexes) ||
+         (getCommandType() == CommandTypeEnum::kDeleteIndexes));
 }
 
 BSONElement DurableOplogEntry::getIdElement() const {
@@ -612,7 +612,7 @@ BSONObj DurableOplogEntry::getObjectContainingDocumentKey() const {
     }
 }
 
-DurableOplogEntry::CommandType DurableOplogEntry::getCommandType() const {
+CommandTypeEnum DurableOplogEntry::getCommandType() const {
     return _commandType;
 }
 
@@ -690,7 +690,7 @@ const boost::optional<mongo::Value>& OplogEntry::get_id() const& {
     return _entry.get_id();
 }
 
-std::vector<StmtId> OplogEntry::getStatementIds() const& {
+const std::vector<StmtId>& OplogEntry::getStatementIds() const& {
     return _entry.getStatementIds();
 }
 
@@ -789,6 +789,10 @@ const boost::optional<mongo::repl::OpTime>& OplogEntry::getPostImageOpTime() con
     return _entry.getPostImageOpTime();
 }
 
+boost::optional<mongo::repl::MultiOplogEntryType> OplogEntry::getMultiOpType() const& {
+    return _entry.getMultiOpType();
+}
+
 boost::optional<RetryImageEnum> OplogEntry::getNeedsRetryImage() const {
     return _needsRetryImage;
 }
@@ -803,6 +807,14 @@ OpTime OplogEntry::getOpTime() const {
 
 bool OplogEntry::isCommand() const {
     return _entry.isCommand();
+}
+
+bool OplogEntry::applyOpsIsLinkedTransactionally() const {
+    return _entry.applyOpsIsLinkedTransactionally();
+}
+
+bool OplogEntry::isInTransaction() const {
+    return _entry.isInTransaction();
 }
 
 bool OplogEntry::isPartialTransaction() const {

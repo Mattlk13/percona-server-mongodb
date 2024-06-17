@@ -37,23 +37,31 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/util/tracked_types.h"
+#include "mongo/util/tracking_context.h"
 
 namespace mongo::timeseries::bucket_catalog {
 
 struct BucketMetadata {
 public:
-    BucketMetadata() = default;
     BucketMetadata(BSONElement elem,
+                   const StringDataComparator* comparator,
+                   boost::optional<StringData> trueMetaFieldName);
+    BucketMetadata(TrackingContext&,
+                   BSONElement elem,
                    const StringDataComparator* comparator,
                    boost::optional<StringData> trueMetaFieldName);
 
     bool operator==(const BucketMetadata& other) const;
     bool operator!=(const BucketMetadata& other) const;
 
-    const BSONObj& toBSON() const;
-    const BSONElement& element() const;
+    BucketMetadata cloneAsUntracked() const;
+    BucketMetadata cloneAsTracked(TrackingContext&) const;
 
-    StringData getMetaField() const;
+    BSONObj toBSON() const;
+    BSONElement element() const;
+
+    boost::optional<StringData> getMetaField() const;
 
     const StringDataComparator* getComparator() const;
 
@@ -66,11 +74,17 @@ public:
     }
 
 private:
-    // Only the value of '_metadataElement' is used for hashing and comparison.
-    BSONElement _metadataElement;
+    BucketMetadata(BSONObj metadata, BSONElement metadataElement, const StringDataComparator*);
+    BucketMetadata(TrackingContext&,
+                   BSONObj metadata,
+                   BSONElement metadataElement,
+                   const StringDataComparator*);
 
     // Empty if metadata field isn't present, owns a copy otherwise.
-    BSONObj _metadata;
+    std::variant<BSONObj, TrackedBSONObj> _metadata;
+
+    // Only the value of '_metadataElement' is used for hashing and comparison.
+    BSONElement _metadataElement;
 
     const StringDataComparator* _comparator = nullptr;
 };

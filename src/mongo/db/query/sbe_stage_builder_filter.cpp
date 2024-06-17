@@ -85,6 +85,7 @@
 #include "mongo/db/matcher/schema/expression_internal_schema_xor.h"
 #include "mongo/db/query/bson_typemask.h"
 #include "mongo/db/query/optimizer/syntax/expr.h"
+#include "mongo/db/query/sbe_shared_helpers.h"
 #include "mongo/db/query/sbe_stage_builder.h"
 #include "mongo/db/query/sbe_stage_builder_abt_helpers.h"
 #include "mongo/db/query/sbe_stage_builder_abt_holder_impl.h"
@@ -150,7 +151,7 @@ struct MatchExpressionVisitorContext {
     };
 
     MatchExpressionVisitorContext(StageBuilderState& state,
-                                  boost::optional<TypedSlot> rootSlot,
+                                  boost::optional<SbSlot> rootSlot,
                                   const MatchExpression* root,
                                   const PlanStageSlots* slots,
                                   bool isFilterOverIxscan)
@@ -159,7 +160,7 @@ struct MatchExpressionVisitorContext {
             7097201, "Expected 'rootSlot' or 'slots' to be defined", rootSlot || slots != nullptr);
 
         // Set up the top-level MatchFrame.
-        emplaceFrame(state, rootSlot ? rootSlot->slotId : boost::optional<sbe::value::SlotId>());
+        emplaceFrame(state, SbExpr{rootSlot});
     }
 
     SbExpr done() {
@@ -203,7 +204,7 @@ struct MatchExpressionVisitorContext {
 
     // The current context must be initialized either with a slot that contains the root
     // document ('rootSlot') or with the set of kField slots ('slots').
-    boost::optional<TypedSlot> rootSlot;
+    boost::optional<SbSlot> rootSlot;
     const PlanStageSlots* slots = nullptr;
     bool isFilterOverIxscan = false;
 };
@@ -220,7 +221,7 @@ enum class LeafTraversalMode {
 };
 
 SbExpr generateTraverseF(SbExpr inputExpr,
-                         boost::optional<TypedSlot> topLevelFieldSlot,
+                         boost::optional<SbSlot> topLevelFieldSlot,
                          const sbe::MatchPath& fp,
                          FieldIndex level,
                          sbe::value::FrameIdGenerator* frameIdGenerator,
@@ -239,17 +240,26 @@ SbExpr generateTraverseF(SbExpr inputExpr,
     // will be false.
     const bool childIsLeafWithEmptyName =
         (level == fp.numParts() - 2u) && fp.isPathComponentEmpty(level + 1);
-
+    int arrayIndex = 0;
+    const bool isNumericField = (level < fp.FieldRef::numParts()) &&
+        fp.isNumericPathComponentStrict(level) &&
+        NumberParser{}(fp.getPart(level), &arrayIndex).isOK();
+    int arrayIndexNext = 0;
+    const bool isNumericFieldNext = (level + 1 < fp.FieldRef::numParts()) &&
+        fp.isNumericPathComponentStrict(level + 1) &&
+        NumberParser{}(fp.getPart(level + 1), &arrayIndexNext).isOK();
     const bool isLeafField = (level == fp.numParts() - 1u) || childIsLeafWithEmptyName;
-    const bool needsArrayCheck = isLeafField && mode == LeafTraversalMode::kArrayAndItsElements;
+    const bool needsArrayCheck = (isLeafField && mode == LeafTraversalMode::kArrayAndItsElements);
     const bool needsNothingCheck = !isLeafField && matchesNothing;
+    const bool isLeafNumeric =
+        (isNumericField && (!isNumericFieldNext || mode == LeafTraversalMode::kDoNotTraverseLeaf));
 
     auto lambdaFrameId = frameIdGenerator->generate();
     auto lambdaParam = SbExpr{SbVar{lambdaFrameId, 0}};
-
+    auto getFieldName = isNumericField ? "getFieldOrElement"_sd : "getField"_sd;
     SbExpr fieldExpr = topLevelFieldSlot
-        ? b.makeVariable(topLevelFieldSlot->slotId)
-        : b.makeFunction("getField", inputExpr.clone(), b.makeStrConstant(fp.getPart(level)));
+        ? SbExpr{*topLevelFieldSlot}
+        : b.makeFunction(getFieldName, inputExpr.clone(), b.makeStrConstant(fp.getPart(level)));
 
     if (childIsLeafWithEmptyName) {
         auto frameId = frameIdGenerator->generate();
@@ -273,7 +283,8 @@ SbExpr generateTraverseF(SbExpr inputExpr,
                                                       matchesNothing,
                                                       mode);
 
-    if (isLeafField && mode == LeafTraversalMode::kDoNotTraverseLeaf) {
+    if ((isLeafField && mode == LeafTraversalMode::kDoNotTraverseLeaf) ||
+        (!isNumericField && isNumericFieldNext)) {
         return b.makeLet(
             lambdaFrameId, SbExpr::makeSeq(std::move(fieldExpr)), std::move(resultExpr));
     }
@@ -302,8 +313,20 @@ SbExpr generateTraverseF(SbExpr inputExpr,
 
     // traverseF() can return Nothing only when the lambda returns Nothing. All expressions that we
     // generate return Boolean, so there is no need for explicit fillEmpty here.
-    auto traverseFExpr = b.makeFunction(
-        "traverseF", fieldExpr.clone(), std::move(lambdaExpr), b.makeBoolConstant(needsArrayCheck));
+    auto traverseFExpr = isNumericField
+        ? b.makeFunction(
+              "magicTraverseF",
+              inputExpr.clone(),
+              b.makeStrConstant(fp.getPart(level)),
+              b.makeInt32Constant(arrayIndex),
+              std::move(lambdaExpr),
+              b.makeInt32Constant(
+                  (isLeafNumeric ? sbe::vm::MagicTraverse::kPreTraverse : 0) +
+                  (isNumericFieldNext || isLeafField ? 0 : sbe::vm::MagicTraverse::kPostTraverse)))
+        : b.makeFunction("traverseF",
+                         fieldExpr.clone(),
+                         std::move(lambdaExpr),
+                         b.makeBoolConstant(needsArrayCheck));
 
     // When the predicate can match Nothing, we need to do some extra work for non-leaf fields.
     if (needsNothingCheck) {
@@ -357,16 +380,16 @@ void generatePredicate(MatchExpressionVisitorContext* context,
     const bool isFieldPathOnRootDoc = context->framesCount() == 1;
     auto* slots = context->slots;
 
-    boost::optional<TypedSlot> topLevelFieldSlot;
+    boost::optional<SbSlot> topLevelFieldSlot;
     if (isFieldPathOnRootDoc && slots) {
         // If we are generating a filter over an index scan, search for a kField slot that
         // corresponds to the full path 'path'.
         if (context->isFilterOverIxscan && !path.empty()) {
             auto name = std::make_pair(PlanStageSlots::kField, path.dottedField());
-            if (auto slot = slots->getIfExists(name); slot) {
+            if (auto slot = slots->getIfExists(name)) {
                 // We found a kField slot that matches. We don't need to perform any traversal;
                 // we can just evaluate the predicate on the slot directly and return.
-                frame.pushExpr(makePredicate(slot->slotId));
+                frame.pushExpr(makePredicate(*slot));
                 return;
             }
         }
@@ -375,14 +398,16 @@ void generatePredicate(MatchExpressionVisitorContext* context,
         // navigation of the full path has been made available via the dedicated slot type; in this
         // case generate a special version of traverseF that doesn't have a runtime counterpart and
         // can only be processed by the block vectorizer.
+
+        // TODO : Remove "&& !matchesNothing" when SERVER-87238 and SERVER-87243 have been resolved.
         if (auto slot = slots->getIfExists(
                 std::make_pair(PlanStageSlots::kFilterCellField, path.dottedField()));
-            slot && mode == LeafTraversalMode::kArrayElementsOnly) {
+            slot && mode == LeafTraversalMode::kArrayElementsOnly && !matchesNothing) {
             SbExprBuilder b(context->state);
             auto lambdaFrameId = context->state.frameIdGenerator->generate();
             auto traverseFExpr = b.makeFunction(
                 "blockTraverseFPlaceholder"_sd,
-                b.makeVariable(slot->slotId),
+                SbExpr{*slot},
                 b.makeLocalLambda(lambdaFrameId, makePredicate(SbExpr{SbVar{lambdaFrameId, 0}})));
             frame.pushExpr(std::move(traverseFExpr));
             return;
@@ -864,8 +889,10 @@ public:
         auto& frame = _context->topFrame();
 
         // The $expr expression is always applied to the current $$ROOT document.
-        auto expr = generateExpression(
-            _context->state, matchExpr->getExpression().get(), _context->rootSlot, _context->slots);
+        auto expr = generateExpression(_context->state,
+                                       matchExpr->getExpression().get(),
+                                       _context->rootSlot,
+                                       *_context->slots);
 
         // Convert the result of the '{$expr: ..}' expression to a boolean value.
         frame.pushExpr(b.makeFillEmptyFalse(b.makeFunction("coerceToBool"_sd, std::move(expr))));
@@ -896,8 +923,7 @@ public:
 
         if (exprIsParameterized || expr->getRegexes().size() == 0) {
             auto makePredicate = [&, hasNull = hasNull](SbExpr inputExpr) {
-                // We have to match nulls and undefined if a 'null' is present in
-                // equalities.
+                // We have to match nulls and missing if a 'null' is present in equalities.
                 auto valueExpr = !hasNull ? std::move(inputExpr)
                                           : b.makeIf(b.generateNullOrMissing(inputExpr.clone()),
                                                      b.makeNullConstant(),
@@ -954,7 +980,7 @@ public:
                     "regexMatch", std::move(pcreRegexesConstant), inputExpr.clone())));
 
             if (expr->getEqualities().size() > 0) {
-                // We have to match nulls and undefined if a 'null' is present in equalities.
+                // We have to match nulls and missing if a 'null' is present in equalities.
                 if (hasNull) {
                     inputExpr = b.makeIf(b.generateNullOrMissing(inputExpr.clone()),
                                          b.makeNullConstant(),
@@ -973,18 +999,7 @@ public:
         generatePredicate(_context, *expr->fieldRef(), makePredicate, traversalMode, hasNull);
     }
 
-    void translateExprComparison(const ComparisonMatchExpressionBase* expr, bool mustExecute) {
-        /**
-         * Since InternalExpr* are permitted to return false positives, we simply compile this to an
-         * always "true" expression. In practice, most of the time when an InternalExpr is not
-         * marked with 'mustExecute' it is accompanied by a more precise check which removes the
-         * false positives.
-         */
-        if (!mustExecute) {
-            generateAlwaysBoolean(_context, true);
-            return;
-        }
-
+    void translateExprComparison(const ComparisonMatchExpressionBase* expr) {
         ExpressionCompare::CmpOp cmp = [&]() {
             switch (expr->matchType()) {
                 case MatchExpression::MatchType::INTERNAL_EXPR_EQ:
@@ -1006,51 +1021,88 @@ public:
         auto expCtx = _context->state.expCtx;
         invariant(expCtx);
 
-        auto fieldPathExpr = ExpressionFieldPath::createPathFromString(
-            expCtx.get(), expr->fieldRef()->dottedField().toString(), expCtx->variablesParseState);
-        auto translatedFieldPathExpr = generateExpression(
-            _context->state, fieldPathExpr.get(), _context->rootSlot, _context->slots);
+        // We want to translate this into an SBE expression that returns 'true' any time '$a.b.c'
+        // is an array, and {<cmpExpr>: ["$a.b.c", <rhs>]} otherwise. (<cmpExpr> is $eq, $lt, $gt
+        // etc).
+        // First we're going to create an agg expression that of the form:
+        // {$eq: ['$$INTERNAL_FIELD_PATH_EXPR_FOR_INTERNAL_EXPR_*', <rhs>]}
+        // We'll then translate this into an SBE expression, placing the result of the LHS field
+        // path expression into the internal variable.
+        //
+        // '$$INTERNAL_FIELD_PATH_EXPR_FOR_INTERNAL_EXPR' <=== the output of '$a.b.c'
+        //
+        // We can then generate an expression of the form:
+        //
+        // let l1 = <expression for '$a.b.c.'>
+        //   if (isArray(l1)) true // Return true any time we see an array
+        //   else <expression for $eq: [l1, <rhs>]>
+        //
+        // We then coerce this to boolean, and we're done.
+        auto& state = _context->state;
 
-        SbExprBuilder b(_context->state);
-        auto frameId = _context->state.frameIdGenerator->generate();
-        auto newVar = b.makeVariable(frameId, 0);
+        // Generate a variable name that won't conflict with anything else. Note that in agg, all
+        // variable names starting with a capital letter are reserved for internal use, so there is
+        // no risk of conflict with a user-chosen variable name.
+        const std::string aggVarName = str::stream()
+            << "INTERNAL_FIELD_PATH_EXPR_FOR_INTERNAL_EXPR_"
+            << std::to_string(state.slotIdGenerator->generate());
+        auto aggVarId = expCtx->variablesParseState.defineVariable(aggVarName);
 
-        auto cmpExpr = ExpressionCompare::create(
+        SbExprBuilder b(state);
+        const auto frameId = state.frameIdGenerator->generate();
+        const sbe::value::SlotId frameSlotId = 0;
+        auto lhsVar = b.makeVariable(frameId, frameSlotId);
+
+        // Inject the internal variable into the stage builder state, so that the expression stage
+        // builder knows that INTERNAL_FIELD_PATH_EXPR* points to the frameId/slot we generated.
+        state.data->injectedVariables.emplace(aggVarId, std::pair(frameId, frameSlotId));
+        ON_BLOCK_EXIT([&]() { state.data->injectedVariables.erase(aggVarId); });
+
+        // Generate an agg expression which does the comparison, referencing the internal variable.
+        auto cmpAggExpr = ExpressionCompare::create(
             expCtx.get(),
             cmp,
-            fieldPathExpr,
+            ExpressionFieldPath::createVarFromString(
+                expCtx.get(), aggVarName, expCtx->variablesParseState),
             ExpressionConstant::create(expCtx.get(), Value(expr->getData())));
 
-        auto translatedCmpExpr =
-            generateExpression(_context->state, cmpExpr.get(), _context->rootSlot, _context->slots);
+        // Translate the agg expression to SBE.
+        auto translatedCmpExpr = generateExpression(
+            _context->state, cmpAggExpr.get(), _context->rootSlot, *_context->slots);
 
-        auto isArrayExpr = b.makeIf(b.makeFillEmptyTrue(b.makeFunction("isArray", newVar.clone())),
+        auto isArrayExpr = b.makeIf(b.makeFillEmptyTrue(b.makeFunction("isArray", lhsVar.clone())),
                                     b.makeBoolConstant(true),
                                     std::move(translatedCmpExpr));
 
+        // Now generate the actual field path expression for the LHS.
+        auto fieldPathExpr = ExpressionFieldPath::createPathFromString(
+            expCtx.get(), expr->fieldRef()->dottedField().toString(), expCtx->variablesParseState);
+        auto translatedFieldPathExpr = generateExpression(
+            _context->state, fieldPathExpr.get(), _context->rootSlot, *_context->slots);
+
+        // Put the LHS into the slot we generated in a let statement.
         auto cmpWArrayCheckExpr = b.makeLet(
             frameId, SbExpr::makeSeq(std::move(translatedFieldPathExpr)), std::move(isArrayExpr));
 
-        auto& frame = _context->topFrame();
         // Convert the result of the '{$expr: ..}' expression to a boolean value.
-        frame.pushExpr(
+        _context->topFrame().pushExpr(
             b.makeFillEmptyFalse(b.makeFunction("coerceToBool"_sd, std::move(cmpWArrayCheckExpr))));
     }
 
     void visit(const InternalExprEqMatchExpression* expr) final {
-        translateExprComparison(expr, expr->mustExecute());
+        translateExprComparison(expr);
     }
     void visit(const InternalExprGTMatchExpression* expr) final {
-        translateExprComparison(expr, expr->mustExecute());
+        translateExprComparison(expr);
     }
     void visit(const InternalExprGTEMatchExpression* expr) final {
-        translateExprComparison(expr, expr->mustExecute());
+        translateExprComparison(expr);
     }
     void visit(const InternalExprLTMatchExpression* expr) final {
-        translateExprComparison(expr, expr->mustExecute());
+        translateExprComparison(expr);
     }
     void visit(const InternalExprLTEMatchExpression* expr) final {
-        translateExprComparison(expr, expr->mustExecute());
+        translateExprComparison(expr);
     }
 
     void visit(const InternalEqHashedKey* expr) final {}
@@ -1259,8 +1311,8 @@ private:
 
 SbExpr generateFilter(StageBuilderState& state,
                       const MatchExpression* root,
-                      boost::optional<TypedSlot> rootSlot,
-                      const PlanStageSlots* slots,
+                      boost::optional<SbSlot> rootSlot,
+                      const PlanStageSlots& slots,
                       const std::vector<std::string>& keyFields,
                       bool isFilterOverIxscan) {
     // The planner adds an $and expression without the operands if the query was empty. We can bail
@@ -1269,7 +1321,7 @@ SbExpr generateFilter(StageBuilderState& state,
         return SbExpr{};
     }
 
-    MatchExpressionVisitorContext context{state, rootSlot, root, slots, isFilterOverIxscan};
+    MatchExpressionVisitorContext context{state, rootSlot, root, &slots, isFilterOverIxscan};
 
     MatchExpressionPreVisitor preVisitor{&context};
     MatchExpressionInVisitor inVisitor{&context};
@@ -1319,81 +1371,17 @@ SbExpr generateComparisonExpr(StageBuilderState& state,
     auto [tagView, valView] = sbe::bson::convertFrom<true>(
         rhs.rawdata(), rhs.rawdata() + rhs.size(), rhs.fieldNameSize() - 1);
 
-    // Most commonly the comparison does not do any kind of type conversions (i.e. 12 > "10" does
-    // not evaluate to true as we do not try to convert a string to a number). Internally, SBE
-    // returns Nothing for mismatched types. However, there is a wrinkle with MQL (and there always
-    // is one). We can compare any type to MinKey or MaxKey type and expect a true/false answer.
-    if (tagView == sbe::value::TypeTags::MinKey) {
-        switch (binaryOp) {
-            case sbe::EPrimBinary::eq:
-            case sbe::EPrimBinary::neq:
-                break;
-            case sbe::EPrimBinary::greater:
-                return b.makeFillEmptyFalse(
-                    b.makeNot(b.makeFunction("isMinKey", std::move(inputExpr))));
-            case sbe::EPrimBinary::greaterEq:
-                return b.makeFunction("exists", std::move(inputExpr));
-            case sbe::EPrimBinary::less:
-                return b.makeBoolConstant(false);
-            case sbe::EPrimBinary::lessEq:
-                return b.makeFillEmptyFalse(b.makeFunction("isMinKey", std::move(inputExpr)));
-            default:
-                break;
-        }
-    } else if (tagView == sbe::value::TypeTags::MaxKey) {
-        switch (binaryOp) {
-            case sbe::EPrimBinary::eq:
-            case sbe::EPrimBinary::neq:
-                break;
-            case sbe::EPrimBinary::greater:
-                return b.makeBoolConstant(false);
-            case sbe::EPrimBinary::greaterEq:
-                return b.makeFillEmptyFalse(b.makeFunction("isMaxKey", std::move(inputExpr)));
-            case sbe::EPrimBinary::less:
-                return b.makeFillEmptyFalse(
-                    b.makeNot(b.makeFunction("isMaxKey", std::move(inputExpr))));
-            case sbe::EPrimBinary::lessEq:
-                return b.makeFunction("exists", std::move(inputExpr));
-            default:
-                break;
-        }
-    } else if (tagView == sbe::value::TypeTags::Null) {
-        // When comparing to null we have to consider missing and undefined.
-        inputExpr = b.buildMultiBranchConditional(
-            SbExpr::CaseValuePair{b.generateNullOrMissing(inputExpr.clone()), b.makeNullConstant()},
-            inputExpr.clone());
-
-        return b.makeFillEmptyFalse(
-            b.makeBinaryOpWithCollation(binaryOp, std::move(inputExpr), b.makeNullConstant()));
-    } else if (sbe::value::isNaN(tagView, valView)) {
-        // Construct an expression to perform a NaN check.
-        switch (binaryOp) {
-            case sbe::EPrimBinary::eq:
-            case sbe::EPrimBinary::greaterEq:
-            case sbe::EPrimBinary::lessEq:
-                // If 'rhs' is NaN, then return whether the lhs is NaN.
-                return b.makeFillEmptyFalse(b.makeFunction("isNaN", std::move(inputExpr)));
-            case sbe::EPrimBinary::less:
-            case sbe::EPrimBinary::greater:
-                // Always return false for non-equality operators.
-                return b.makeBoolConstant(false);
-            default:
-                tasserted(5449400,
-                          str::stream() << "Could not construct expression for comparison op "
-                                        << expr->toString());
-        }
-    }
-
-    auto valExpr = [&](sbe::value::TypeTags typeTag, sbe::value::Value value) -> SbExpr {
+    sbe_helper::ValueExpressionFn<SbExpr> makeValExpr = [&](sbe::value::TypeTags tag,
+                                                            sbe::value::Value val) {
         if (auto inputParam = expr->getInputParamId()) {
             return b.makeVariable(state.registerInputParamSlot(*inputParam));
         }
-        auto [tag, val] = sbe::value::copyValue(typeTag, value);
-        return b.makeConstant(tag, val);
-    }(tagView, valView);
+        auto [copyTag, copyVal] = sbe::value::copyValue(tag, val);
+        return b.makeConstant(copyTag, copyVal);
+    };
 
-    return b.makeFillEmptyFalse(
-        b.makeBinaryOpWithCollation(binaryOp, std::move(inputExpr), std::move(valExpr)));
+    return sbe_helper::generateComparisonExpr(
+        b, tagView, valView, binaryOp, std::move(inputExpr), std::move(makeValExpr));
 }
 
 SbExpr generateInExpr(StageBuilderState& state, const InMatchExpression* expr, SbExpr inputExpr) {
@@ -1446,17 +1434,6 @@ SbExpr generateBitTestExpr(StageBuilderState& state,
         MONGO_UNREACHABLE_TASSERT(5610200);
     }();
 
-    // We round NumberDecimal values to the nearest integer to match the classic execution engine's
-    // behavior for now. Note that this behavior is _not_ consistent with MongoDB's documentation.
-    // At some point, we should consider removing this call to round() to make SBE's behavior
-    // consistent with MongoDB's documentation.
-    auto numericBitTestInputExpr = b.makeIf(
-        b.makeFunction("typeMatch",
-                       inputExpr.clone(),
-                       b.makeInt32Constant(getBSONTypeMask(sbe::value::TypeTags::NumberDecimal))),
-        b.makeFunction("round"_sd, inputExpr.clone()),
-        inputExpr.clone());
-
     SbExpr bitMaskExpr = [&]() -> SbExpr {
         if (auto bitMaskParamId = expr->getBitMaskParamId()) {
             auto bitMaskSlotId = state.registerInputParamSlot(*bitMaskParamId);
@@ -1471,8 +1448,7 @@ SbExpr generateBitTestExpr(StageBuilderState& state,
     auto numericBitTestExpr =
         b.makeFunction(numericBitTestFnName,
                        std::move(bitMaskExpr),
-                       b.makeNumericConvert(std::move(numericBitTestInputExpr),
-                                            sbe::value::TypeTags::NumberInt64));
+                       b.makeNumericConvert(inputExpr.clone(), sbe::value::TypeTags::NumberInt64));
 
     // For the AnyClear and AnySet cases, negate the output of the bit-test function.
     if (bitOp == sbe::BitTestBehavior::AnyClear || bitOp == sbe::BitTestBehavior::AnySet) {

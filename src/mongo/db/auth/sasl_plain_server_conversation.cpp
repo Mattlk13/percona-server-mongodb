@@ -93,7 +93,7 @@ StatusWith<std::tuple<bool, std::string>> SASLPlainServerMechanism::stepImpl(
                       "PLAIN mechanism must be used with internal users");
     }
 
-    AuthorizationManager* authManager = AuthorizationManager::get(opCtx->getServiceContext());
+    AuthorizationManager* authManager = AuthorizationManager::get(opCtx->getService());
 
     // Expecting user input on the form: [authz-id]\0authn-id\0pwd
     std::string input = inputData.toString();
@@ -141,7 +141,7 @@ StatusWith<std::tuple<bool, std::string>> SASLPlainServerMechanism::stepImpl(
 
     // The authentication database is also the source database for the user.
     auto swUser = [&]() {
-        if (gEnableDetailedConnectionHealthMetricLogLines) {
+        if (gEnableDetailedConnectionHealthMetricLogLines.load()) {
             ScopedCallbackTimer timer([&](Microseconds elapsed) {
                 LOGV2(6788606,
                       "Auth metrics report",

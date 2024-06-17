@@ -463,6 +463,10 @@ Status AsyncResultsMerger::_askForNextBatch(WithLock, size_t remoteIndex) {
         getMoreRequest.setMaxTimeMS(
             static_cast<std::int64_t>(durationCount<Milliseconds>(*_awaitDataTimeout)));
     }
+
+    if (_params.getRequestQueryStatsFromRemotes()) {
+        getMoreRequest.setIncludeQueryStatsMetrics(true);
+    }
     BSONObj cmdObj = getMoreRequest.toBSON({});
 
     if (_params.getSessionId()) {
@@ -786,6 +790,9 @@ void AsyncResultsMerger::_processBatchResults(WithLock lk,
     }
 
     CursorResponse cursorResponse = std::move(cursorResponseStatus.getValue());
+    if (const auto& remoteMetrics = cursorResponse.getCursorMetrics()) {
+        _metrics.aggregateCursorMetrics(*remoteMetrics);
+    }
 
     // Update the cursorId; it is sent as '0' when the cursor has been exhausted on the shard.
     remote.cursorId = cursorResponse.getCursorId();
@@ -935,6 +942,13 @@ stdx::shared_future<void> AsyncResultsMerger::kill(OperationContext* opCtx) {
         }
     }
     return _killCompleteInfo->getFuture();
+}
+
+query_stats::DataBearingNodeMetrics AsyncResultsMerger::takeMetrics() {
+    stdx::lock_guard<Latch> lk(_mutex);
+    auto metrics = _metrics;
+    _metrics = {};
+    return metrics;
 }
 
 //

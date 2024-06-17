@@ -67,8 +67,8 @@ namespace mongo {
  */
 class DocumentSourceSingleDocumentTransformation final : public DocumentSource {
 public:
-    virtual boost::intrusive_ptr<DocumentSource> clone(
-        const boost::intrusive_ptr<ExpressionContext>& newExpCtx) const {
+    boost::intrusive_ptr<DocumentSource> clone(
+        const boost::intrusive_ptr<ExpressionContext>& newExpCtx) const override {
         auto list = DocumentSource::parse(newExpCtx ? newExpCtx : pExpCtx,
                                           serialize().getDocument().toBson());
         invariant(list.size() == 1);
@@ -85,7 +85,7 @@ public:
     const char* getSourceName() const final;
 
     boost::intrusive_ptr<DocumentSource> optimize() final;
-    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final override;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
     void addVariableRefs(std::set<Variables::Id>* refs) const final;
     GetModPathsReturn getModifiedPaths() const final;
@@ -144,8 +144,8 @@ public:
      * The function has no effect for exclusion projections, or if there are no computed
      * projections, or the computed expression depends on other fields than the oldName.
      */
-    std::pair<BSONObj, bool> extractComputedProjections(const StringData& oldName,
-                                                        const StringData& newName,
+    std::pair<BSONObj, bool> extractComputedProjections(StringData oldName,
+                                                        StringData newName,
                                                         const std::set<StringData>& reservedNames) {
         return _transformationProcessor->getTransformer().extractComputedProjections(
             oldName, newName, reservedNames);
@@ -157,8 +157,8 @@ public:
      * entire project is extracted. In the extracted $project, 'oldName' is renamed to 'newName'.
      * 'oldName' should not be dotted.
      */
-    std::pair<BSONObj, bool> extractProjectOnFieldAndRename(const StringData& oldName,
-                                                            const StringData& newName) {
+    std::pair<BSONObj, bool> extractProjectOnFieldAndRename(StringData oldName,
+                                                            StringData newName) {
         return _transformationProcessor->getTransformer().extractProjectOnFieldAndRename(oldName,
                                                                                          newName);
     }

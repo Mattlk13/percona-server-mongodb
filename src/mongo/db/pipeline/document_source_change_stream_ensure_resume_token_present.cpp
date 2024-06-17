@@ -81,13 +81,14 @@ StageConstraints DocumentSourceChangeStreamEnsureResumeTokenPresent::constraints
                                  UnionRequirement::kNotAllowed,
                                  ChangeStreamRequirement::kChangeStreamStage};
 
-    // The '$match' and 'DocumentSourceSingleDocumentTransformation' stages can swap with this
-    // stage, allowing filtering and reshaping to occur earlier in the pipeline. For sharded cluster
-    // pipelines, swaps can allow $match and 'DocumentSourceSingleDocumentTransformation' stages to
-    // execute on the shards, providing inter-node parallelism and potentially reducing the amount
-    // of data sent form each shard to the mongoS.
+    // The '$match', '$redact', and 'DocumentSourceSingleDocumentTransformation' stages can swap
+    // with this stage, allowing filtering and reshaping to occur earlier in the pipeline. For
+    // sharded cluster pipelines, swaps can allow $match, $redact and
+    // 'DocumentSourceSingleDocumentTransformation' stages to execute on the shards, providing
+    // inter-node parallelism and potentially reducing the amount of data sent form each shard to
+    // the mongoS.
     constraints.canSwapWithMatch = true;
-    constraints.canSwapWithSingleDocTransform = true;
+    constraints.canSwapWithSingleDocTransformOrRedact = true;
 
     return constraints;
 }
@@ -167,13 +168,11 @@ Value DocumentSourceChangeStreamEnsureResumeTokenPresent::serialize(
     if (opts.verbosity) {
         BSONObjBuilder sub(builder.subobjStart(DocumentSourceChangeStream::kStageName));
         sub.append("stage"_sd, kStageName);
-        opts.serializeLiteral(ResumeToken(_tokenFromClient).toDocument())
-            .addToBsonObj(&sub, "resumeToken"_sd);
+        sub << "resumeToken"_sd << Value(ResumeToken(_tokenFromClient).toDocument(opts));
         sub.done();
     } else {
         BSONObjBuilder sub(builder.subobjStart(kStageName));
-        opts.serializeLiteral(ResumeToken(_tokenFromClient).toDocument())
-            .addToBsonObj(&sub, "resumeToken"_sd);
+        sub << "resumeToken"_sd << Value(ResumeToken(_tokenFromClient).toDocument(opts));
         sub.done();
     }
     return Value(builder.obj());

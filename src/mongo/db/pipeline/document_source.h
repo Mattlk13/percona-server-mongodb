@@ -77,6 +77,7 @@
 #include "mongo/db/query/explain_options.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/query/util/deferred.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/basic.h"
 #include "mongo/platform/compiler.h"
@@ -170,7 +171,8 @@ class Document;
         if (!__VA_ARGS__ ||                                                                       \
             (boost::optional<FeatureFlag>(featureFlag) != boost::none &&                          \
              !boost::optional<FeatureFlag>(featureFlag)                                           \
-                  ->isEnabledAndIgnoreFCVUnsafeAtStartup())) {                                    \
+                  ->isEnabledUseLatestFCVWhenUninitialized(                                       \
+                      serverGlobalParams.featureCompatibility.acquireFCVSnapshot()))) {           \
             DocumentSource::registerParser("$" #key, DocumentSource::parseDisabled, featureFlag); \
             LiteParsedDocumentSource::registerParser("$" #key,                                    \
                                                      LiteParsedDocumentSource::parseDisabled,     \
@@ -341,7 +343,7 @@ public:
         };
     };
 
-    virtual ~DocumentSource() {}
+    ~DocumentSource() override {}
 
     /**
      * Makes a deep clone of the DocumentSource by serializing and re-parsing it. DocumentSources
@@ -390,7 +392,7 @@ public:
         auto serviceCtx = pExpCtx->opCtx->getServiceContext();
         dassert(serviceCtx);
 
-        ScopedTimer timer(_commonStats.executionTime.get_ptr(), serviceCtx->getFastClockSource());
+        auto timer = getOptTimer(serviceCtx);
 
         ++_commonStats.works;
 
@@ -548,31 +550,40 @@ public:
      */
     virtual BSONObj getQuery() const;
 
+    /**
+     * Utility which allows for accessing and computing a ShardId to act as a merger.
+     */
+    boost::optional<ShardId> getMergeShardId() const {
+        return mergeShardId.get();
+    }
+
 private:
     /**
-     * Attempt to push a match stage from directly ahead of the current stage given by itr to before
-     * the current stage. Returns whether the optimization was performed.
+     * itr is pointing to some stage `A`. Fetch stage `B`, the stage after A in itr. If B is a
+     * $match stage, attempt to push B before A. Returns whether this optimization was
+     * performed.
      */
     bool pushMatchBefore(Pipeline::SourceContainer::iterator itr,
                          Pipeline::SourceContainer* container);
 
     /**
-     * Attempt to push a sample stage from directly ahead of the current stage given by itr to
-     * before the current stage. Returns whether the optimization was performed.
+     * itr is pointing to some stage `A`. Fetch stage `B`, the stage after A in itr. If B is a
+     * $sample stage, attempt to push B before A. Returns whether this optimization was
+     * performed.
      */
     bool pushSampleBefore(Pipeline::SourceContainer::iterator itr,
                           Pipeline::SourceContainer* container);
 
     /**
-     * Attempts to push any kind of 'DocumentSourceSingleDocumentTransformation' stage directly
-     * ahead of the stage present at the 'itr' position if matches the constraints. Returns true if
-     * optimization was performed, false otherwise.
+     * Attempts to push any kind of 'DocumentSourceSingleDocumentTransformation' stage or a $redact
+     * stage directly ahead of the stage present at the 'itr' position if matches the constraints.
+     * Returns true if optimization was performed, false otherwise.
      *
      * Note that this optimization is oblivious to the transform function. The only stages that are
      * eligible to swap are those that can safely swap with any transform.
      */
-    bool pushSingleDocumentTransformBefore(Pipeline::SourceContainer::iterator itr,
-                                           Pipeline::SourceContainer* container);
+    bool pushSingleDocumentTransformOrRedactBefore(Pipeline::SourceContainer::iterator itr,
+                                                   Pipeline::SourceContainer* container);
 
     /**
      * Wraps various optimization methods and returns the call immediately if any one of them
@@ -585,7 +596,30 @@ private:
         }
 
         return pushMatchBefore(itr, container) || pushSampleBefore(itr, container) ||
-            pushSingleDocumentTransformBefore(itr, container);
+            pushSingleDocumentTransformOrRedactBefore(itr, container);
+    }
+
+    /**
+     * Returns an optional timer which is used to collect the execution time.
+     * May return boost::none if it is not necessary to collect timing info.
+     */
+    boost::optional<ScopedTimer> getOptTimer(ServiceContext* serviceCtx) {
+        if (serviceCtx &&
+            _commonStats.executionTime.precision != QueryExecTimerPrecision::kNoTiming) {
+            if (MONGO_likely(_commonStats.executionTime.precision ==
+                             QueryExecTimerPrecision::kMillis)) {
+                return boost::optional<ScopedTimer>(
+                    boost::in_place_init,
+                    &_commonStats.executionTime.executionTimeEstimate,
+                    serviceCtx->getFastClockSource());
+            } else {
+                return boost::optional<ScopedTimer>(
+                    boost::in_place_init,
+                    &_commonStats.executionTime.executionTimeEstimate,
+                    serviceCtx->getTickSource());
+            }
+        }
+        return boost::none;
     }
 
 public:
@@ -623,6 +657,9 @@ public:
     //
 
     struct GetModPathsReturn {
+        // Note that renaming a path does NOT count as a modification (see `renames` struct member).
+        // Modification can be, in the context of the query: the removal of a path, the creation of
+        // a new path, etc.
         enum class Type {
             // No information is available about which paths are modified.
             kNotSupported,
@@ -633,12 +670,13 @@ public:
 
             // A finite set of paths will be modified by this stage. This is true for something like
             // {$project: {a: 0, b: 0}}, which will only modify 'a' and 'b', and leave all other
-            // paths unmodified.
+            // paths unmodified. Other examples include: $lookup, $unwind.
             kFiniteSet,
 
             // This stage will modify an infinite set of paths, but we know which paths it will not
             // modify. For example, the stage {$project: {_id: 1, a: 1}} will leave only the fields
-            // '_id' and 'a' unmodified, but all other fields will be projected out.
+            // '_id' and 'a' unmodified, but all other fields will be projected out. Other examples
+            // include: $group.
             kAllExcept,
         };
 
@@ -813,6 +851,13 @@ protected:
      */
     virtual void doDispose() {}
 
+    /**
+     * Utility which describes when a stage needs to nominate a merging shard.
+     */
+    virtual boost::optional<ShardId> computeMergeShardId() const {
+        return boost::none;
+    }
+
     /*
       Most DocumentSources have an underlying source they get their data
       from.  This is a convenience for them.
@@ -824,6 +869,13 @@ protected:
     DocumentSource* pSource;
 
     boost::intrusive_ptr<ExpressionContext> pExpCtx;
+
+    /**
+     * Tracks this stage's merge ShardId, if one exists.
+     */
+    DeferredFn<boost::optional<ShardId>> mergeShardId{[this]() -> boost::optional<ShardId> {
+        return this->computeMergeShardId();
+    }};
 
 private:
     CommonStats _commonStats;

@@ -133,18 +133,6 @@ struct MultikeynessTrie {
 };
 
 /**
- * Metadata for indexed field paths. Allows fast index path lookup with an unordered set.
- */
-class IndexedFieldPaths {
-public:
-    void add(const ABT& path);
-    bool isIndexed(const ABT& path) const;
-
-private:
-    IndexPathSet _indexPathSet;
-};
-
-/**
  * Metadata associated with an index. Holds the index specification (index fields and their
  * collations), its version (0 or 1), the collations as a bit mask, multikeyness info, and
  * distribution info. This is a convenient structure for the query planning process.
@@ -254,7 +242,8 @@ public:
                    bool exists,
                    boost::optional<CEType> ce,
                    ShardingMetadata shardingMetadata,
-                   IndexedFieldPaths indexedFieldPaths);
+                   IndexPathOccurrences indexPathOccurrences,
+                   ScanOrder scanOrder);
 
     const ScanDefOptions& getOptionsMap() const;
 
@@ -269,7 +258,7 @@ public:
 
     const MultikeynessTrie& getMultikeynessTrie() const;
 
-    const IndexedFieldPaths& getIndexedFieldPaths() const;
+    const IndexPathOccurrences& getIndexPathOccurrences() const;
 
     bool exists() const;
 
@@ -279,6 +268,10 @@ public:
     ShardingMetadata& shardingMetadata();
 
     const NamespaceStringOrUUID& getNamespaceStringOrUUID() const;
+
+    ScanOrder getScanOrder() const;
+
+    void setScanOrder(ScanOrder newScanOrder);
 
 private:
     ScanDefOptions _options;
@@ -293,7 +286,7 @@ private:
 
     MultikeynessTrie _multikeynessTrie;
 
-    IndexedFieldPaths _indexedFieldPaths;
+    IndexPathOccurrences _indexPathOccurrences;
 
     /**
      * True if the collection exists.
@@ -304,6 +297,13 @@ private:
     boost::optional<CEType> _ce;
 
     ShardingMetadata _shardingMetadata;
+
+    /**
+     * This is only applicable if we are doing a collection scan over the collection. The scan order
+     * represents the order in which the collection scan will occur: forwards, backwards, etc. A
+     * specific scan order can be hinted by the user with a $natural hint.
+     */
+    ScanOrder _scanOrder;
 };
 
 /**

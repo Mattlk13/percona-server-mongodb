@@ -79,7 +79,7 @@
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
 
 namespace mongo {
-
+using namespace fmt::literals;
 const char* TimeseriesModifyStage::kStageType = "TS_MODIFY";
 
 TimeseriesModifyStage::TimeseriesModifyStage(ExpressionContext* expCtx,
@@ -142,7 +142,7 @@ TimeseriesModifyStage::TimeseriesModifyStage(ExpressionContext* expCtx,
 
 TimeseriesModifyStage::~TimeseriesModifyStage() {
     if (_sideBucketCatalog && !_insertedBucketIds.empty()) {
-        auto [viewNs, collStats] =
+        auto [collectionUUID, collStats] =
             timeseries::bucket_catalog::internal::getSideBucketCatalogCollectionStats(
                 *_sideBucketCatalog);
         // Finishes tracking the newly inserted buckets in the main bucket catalog as direct
@@ -150,11 +150,11 @@ TimeseriesModifyStage::~TimeseriesModifyStage() {
         auto& bucketCatalog = timeseries::bucket_catalog::BucketCatalog::get(opCtx());
         for (const auto bucketId : _insertedBucketIds) {
             timeseries::bucket_catalog::directWriteFinish(
-                bucketCatalog.bucketStateRegistry, viewNs, bucketId);
+                bucketCatalog.bucketStateRegistry, collectionUUID, bucketId);
         }
         // Merges the execution stats of the side bucket catalog to the main one.
         timeseries::bucket_catalog::internal::mergeExecutionStatsToBucketCatalog(
-            bucketCatalog, collStats, viewNs);
+            bucketCatalog, collStats, collectionUUID);
     }
 }
 
@@ -300,7 +300,7 @@ void TimeseriesModifyStage::_checkRestrictionsOnUpdatingShardKeyAreNotViolated(
     // retryable write or in a transaction.
     if (_params.allowShardKeyUpdatesWithoutFullShardKeyInQuery &&
         feature_flags::gFeatureFlagUpdateOneWithoutShardKey.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
         bool isInternalThreadOrClient = !cc().session() || cc().isInternalClient();
         uassert(ErrorCodes::InvalidOptions,
                 "$_allowShardKeyUpdatesWithoutFullShardKeyInQuery is an internal parameter",
@@ -313,7 +313,7 @@ void TimeseriesModifyStage::_checkRestrictionsOnUpdatingShardKeyAreNotViolated(
         // wouldChangeOwningShard error thrown below. If this node is a replica set secondary node,
         // we can skip validation.
         if (!feature_flags::gFeatureFlagUpdateDocumentShardKeyUsingTransactionApi.isEnabled(
-                serverGlobalParams.featureCompatibility)) {
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
             uassert(ErrorCodes::IllegalOperation,
                     "Must run update to shard key field in a multi-statement transaction or with "
                     "retryWrites: true.",
@@ -338,7 +338,7 @@ void TimeseriesModifyStage::_checkRestrictionsOnUpdatingShardKeyAreNotViolated(
         // wouldChangeOwningShard error thrown below. If this node is a replica set secondary node,
         // we can skip validation.
         if (!feature_flags::gFeatureFlagUpdateDocumentShardKeyUsingTransactionApi.isEnabled(
-                serverGlobalParams.featureCompatibility)) {
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
             uassert(ErrorCodes::IllegalOperation,
                     "Must run update to shard key field in a multi-statement transaction or with "
                     "retryWrites: true.",
@@ -476,6 +476,7 @@ TimeseriesModifyStage::_writeToTimeseriesBuckets(ScopeGuard<F>& bucketFreer,
         _checkUpdateChangesShardKeyFields(
             timeseries::makeBucketDocument({modifiedMeasurements[0]},
                                            collectionPtr()->ns(),
+                                           collectionPtr()->uuid(),
                                            *collectionPtr()->getTimeseriesOptions(),
                                            collectionPtr()->getDefaultCollator()),
             _bucketUnpacker.bucket(),
@@ -545,7 +546,9 @@ TimeseriesModifyStage::_writeToTimeseriesBuckets(ScopeGuard<F>& bucketFreer,
                                                              *_sideBucketCatalog,
                                                              bucketFromMigrate,
                                                              _params.stmtId,
-                                                             &_insertedBucketIds);
+                                                             &_insertedBucketIds,
+                                                             /*compressAndWriteBucketFunc=*/
+                                                             nullptr);
                 } else {
                     timeseries::performAtomicWritesForDelete(opCtx(),
                                                              collectionPtr(),
@@ -599,12 +602,17 @@ TimeseriesModifyStage::_writeToTimeseriesBuckets(ScopeGuard<F>& bucketFreer,
         // it in memory.
         [&] { /* noop */ });
 
-    if (status == NEED_YIELD && isEOF()) {
+    if (status == NEED_YIELD && isEOF() &&
+        !shard_role_details::getLocker(opCtx())->inAWriteUnitOfWork()) {
         // If this stage is already exhausted it won't use its children stages anymore and therefore
         // it's okay if we failed to restore them. Avoid requesting a yield to the plan executor.
         // Restoring from yield could fail due to a sharding placement change. Throwing a
         // StaleConfig error is undesirable after an "update one" operation has already performed a
         // write because the router would retry.
+        //
+        // If this plan is part of a larger encompassing WUOW it would be illegal to skip returning
+        // NEED_YIELD, so we don't skip it. In this case, such as multi-doc transactions, this is
+        // okay as the PlanExecutor is not allowed to auto-yield.
         status = PlanStage::NEED_TIME;
     }
 

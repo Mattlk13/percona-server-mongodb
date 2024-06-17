@@ -53,8 +53,78 @@ export var FixtureHelpers = (function() {
      * sharded.
      */
     function isSharded(coll) {
-        const db = coll.getDB();
-        return db.getSiblingDB("config").collections.find({_id: coll.getFullName()}).count() > 0;
+        const collEntry =
+            coll.getDB().getSiblingDB("config").collections.findOne({_id: coll.getFullName()});
+        if (collEntry === null) {
+            return false;
+        }
+        return collEntry.unsplittable === null || !collEntry.unsplittable;
+    }
+
+    /**
+     * Looks for an entry in the sharding catalog for the given collection, to check whether it's
+     * unsplittable.
+     */
+    function isUnsplittable(coll) {
+        const collEntry =
+            coll.getDB().getSiblingDB("config").collections.findOne({_id: coll.getFullName()});
+        if (collEntry === null) {
+            return false;
+        }
+        return collEntry.unsplittable !== null && collEntry.unsplittable;
+    }
+
+    /**
+     * Looks for an entry in the sharding catalog for the given collection to check whether it is
+     * present.
+     *
+     * TODO (SERVER-86443): remove this utility once all collections are tracked.
+     */
+    function isTracked(coll) {
+        return isSharded(coll) || isUnsplittable(coll);
+    }
+
+    /**
+     * Returns an array with the shardIds that own data for the given collection.
+     */
+    function getShardsOwningDataForCollection(coll) {
+        if (isSharded(coll) || isUnsplittable(coll)) {
+            const res = db.getSiblingDB('config')
+                .collections
+                .aggregate([
+                    {$match: {_id: coll.getFullName()}},
+                    {
+                        $lookup:
+                            {from: 'chunks', localField: 'uuid', foreignField: 'uuid', as: 'chunks'}
+                    },
+                    {$group: {_id: '$chunks.shard'}}
+                ])
+                .toArray();
+            return res.map((x) => x._id);
+        } else {
+            const dbMetadata =
+                db.getSiblingDB('config').databases.findOne({_id: coll.getDB().getName()});
+            return dbMetadata ? [dbMetadata.primary] : [];
+        }
+    }
+
+    /**
+     * Utility to determine whether the collections in 'collList' are colocated or not.
+     */
+    function areCollectionsColocated(collList) {
+        if (!FixtureHelpers.isMongos(db)) {
+            return true;
+        }
+        let set = new Set();
+        for (const coll of collList) {
+            for (const shard of getShardsOwningDataForCollection(coll)) {
+                set.add(shard);
+                if (set.size > 1) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     /**
@@ -187,9 +257,20 @@ export var FixtureHelpers = (function() {
         return primaryInfo.hasOwnProperty('setName');
     }
 
+    /**
+     * Returns true if we have a standalone mongod.
+     */
+    function isStandalone(db) {
+        return !isMongos(db) && !isReplSet(db);
+    }
+
     return {
         isMongos: isMongos,
         isSharded: isSharded,
+        isUnsplittable: isUnsplittable,
+        isTracked: isTracked,
+        areCollectionsColocated: areCollectionsColocated,
+        getShardsOwningDataForCollection: getShardsOwningDataForCollection,
         getViewDefinition: getViewDefinition,
         numberOfShardsForCollection: numberOfShardsForCollection,
         awaitReplication: awaitReplication,
@@ -202,5 +283,6 @@ export var FixtureHelpers = (function() {
         getSecondaries: getSecondaries,
         getPrimaryForNodeHostingDatabase: getPrimaryForNodeHostingDatabase,
         isReplSet: isReplSet,
+        isStandalone: isStandalone,
     };
 })();

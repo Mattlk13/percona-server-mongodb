@@ -53,7 +53,8 @@ TraverseStage::TraverseStage(std::unique_ptr<PlanStage> outer,
                              PlanNodeId planNodeId,
                              boost::optional<size_t> nestedArraysDepth,
                              bool participateInTrialRunTracking)
-    : PlanStage("traverse"_sd, planNodeId, participateInTrialRunTracking),
+    : PlanStage(
+          "traverse"_sd, nullptr /* yieldPolicy */, planNodeId, participateInTrialRunTracking),
       _inField(inField),
       _outField(outField),
       _outFieldInner(outFieldInner),
@@ -80,7 +81,7 @@ std::unique_ptr<PlanStage> TraverseStage::clone() const {
                                            _final ? _final->clone() : nullptr,
                                            _commonStats.nodeId,
                                            _nestedArraysDepth,
-                                           _participateInTrialRunTracking);
+                                           participateInTrialRunTracking());
 }
 
 void TraverseStage::prepare(CompileCtx& ctx) {
@@ -226,11 +227,11 @@ bool TraverseStage::traverse(value::SlotAccessor* inFieldAccessor,
                         // We have to copy (or move optimization) the value to the array
                         // as by definition all composite values (arrays, objects) own their
                         // constituents.
-                        auto [tag, val] = _outFieldInputAccessor->copyOrMoveValue();
+                        auto [tag, val] = _outFieldInputAccessor->getCopyOfValue();
                         arrOut->push_back(tag, val);
                     } else {
                         if (firstValue) {
-                            auto [tag, val] = _outFieldInputAccessor->copyOrMoveValue();
+                            auto [tag, val] = _outFieldInputAccessor->getCopyOfValue();
                             outFieldOutputAccessor->reset(true, tag, val);
                             firstValue = false;
                         } else {

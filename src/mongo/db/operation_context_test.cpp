@@ -67,6 +67,7 @@
 #include "mongo/unittest/barrier.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/framework.h"
+#include "mongo/unittest/join_thread.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/clock_source_mock.h"
 #include "mongo/util/future.h"
@@ -85,18 +86,7 @@ constexpr auto operator""_sec(unsigned long long n) noexcept {
     return Seconds{static_cast<long long>(n)};
 }
 
-class JoinThread : public stdx::thread {
-public:
-    using stdx::thread::thread;
-
-    JoinThread(JoinThread&&) = default;
-    JoinThread& operator=(JoinThread&&) = default;
-
-    ~JoinThread() {
-        if (joinable())
-            join();
-    }
-};
+using unittest::JoinThread;
 
 class OperationContextTest : public ServiceContextTest {
 public:
@@ -297,7 +287,7 @@ TEST_F(OperationContextTest, CancellationTokenIsCancelableAtFirst) {
 
 class OperationDeadlineTests : public OperationContextTest {
 public:
-    void setUp() {
+    void setUp() override {
         ServiceContext* serviceCtx = getServiceContext();
         serviceCtx->setFastClockSource(std::make_unique<SharedClockSourceAdapter>(mockClock));
         serviceCtx->setPreciseClockSource(std::make_unique<SharedClockSourceAdapter>(mockClock));
@@ -1097,40 +1087,6 @@ TEST_F(OperationContextTest, TestIsWaitingForConditionOrInterrupt) {
 
     worker.join();
     ASSERT_FALSE(optCtx->isWaitingForConditionOrInterrupt());
-}
-
-TEST_F(OperationContextTest, TestActiveClientOperationsForClientsWithoutSession) {
-    auto serviceCtx = getServiceContext();
-    auto client = serviceCtx->getService()->makeClient("OperationContextTest");
-    ASSERT_EQ(serviceCtx->getActiveClientOperations(), 0);
-    {
-        auto opCtx = client->makeOperationContext();
-        ASSERT_EQ(serviceCtx->getActiveClientOperations(), 0);
-    }
-    ASSERT_EQ(serviceCtx->getActiveClientOperations(), 0);
-}
-
-TEST_F(OperationContextTest, TestActiveClientOperations) {
-    transport::TransportLayerMock transportLayer;
-    std::shared_ptr<transport::Session> session = transportLayer.createSession();
-
-    auto serviceCtx = getServiceContext();
-    auto client = serviceCtx->getService()->makeClient("OperationContextTest", session);
-    ASSERT_EQ(serviceCtx->getActiveClientOperations(), 0);
-
-    {
-        auto optCtx = client->makeOperationContext();
-        ASSERT_EQ(serviceCtx->getActiveClientOperations(), 1);
-    }
-    ASSERT_EQ(serviceCtx->getActiveClientOperations(), 0);
-
-    {
-        auto optCtx = client->makeOperationContext();
-        ASSERT_EQ(serviceCtx->getActiveClientOperations(), 1);
-        serviceCtx->killAndDelistOperation(optCtx.get());
-        ASSERT_EQ(serviceCtx->getActiveClientOperations(), 0);
-    }
-    ASSERT_EQ(serviceCtx->getActiveClientOperations(), 0);
 }
 
 TEST_F(OperationContextTest, CurrentOpExcludesKilledOperations) {

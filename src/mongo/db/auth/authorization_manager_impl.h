@@ -76,9 +76,9 @@ public:
         explicit InstallMockForTestingOrAuthImpl() = default;
     };
 
-    AuthorizationManagerImpl(ServiceContext* service,
+    AuthorizationManagerImpl(Service* service,
                              std::unique_ptr<AuthzManagerExternalState> externalState);
-    ~AuthorizationManagerImpl();
+    ~AuthorizationManagerImpl() override;
 
 
     std::unique_ptr<AuthorizationSession> makeAuthorizationSession() override;
@@ -136,12 +136,11 @@ public:
     /**
      * Invalidate a user, and repin it if necessary.
      */
-    void invalidateUserByName(OperationContext* opCtx, const UserName& user) override;
+    void invalidateUserByName(const UserName& user) override;
 
-    void invalidateUsersFromDB(OperationContext* opCtx, const DatabaseName& dbname) override;
+    void invalidateUsersFromDB(const DatabaseName& dbname) override;
 
-    void invalidateUsersByTenant(OperationContext* opCtx,
-                                 const boost::optional<TenantId>& tenant) override;
+    void invalidateUsersByTenant(const boost::optional<TenantId>& tenant) override;
 
     /**
      * Verify role information for users in the $external database and insert updated information
@@ -154,7 +153,7 @@ public:
     /**
      * Invalidate the user cache, and repin all pinned users.
      */
-    void invalidateUserCache(OperationContext* opCtx) override;
+    void invalidateUserCache() override;
 
     void logOp(OperationContext* opCtx,
                StringData opstr,
@@ -197,7 +196,7 @@ private:
      */
     class AuthSchemaVersionCache : public ReadThroughCache<int, int> {
     public:
-        AuthSchemaVersionCache(ServiceContext* service,
+        AuthSchemaVersionCache(Service* service,
                                ThreadPoolInterface& threadPool,
                                AuthzManagerExternalState* externalState);
 
@@ -220,7 +219,7 @@ private:
      */
     class UserCacheImpl : public UserCache {
     public:
-        UserCacheImpl(ServiceContext* service,
+        UserCacheImpl(Service* service,
                       ThreadPoolInterface& threadPool,
                       int cacheSize,
                       AuthSchemaVersionCache* authSchemaVersionCache,

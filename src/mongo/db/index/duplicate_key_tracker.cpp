@@ -37,7 +37,6 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/index/duplicate_key_tracker.h"
 #include "mongo/db/index/index_access_method.h"
@@ -49,6 +48,7 @@
 #include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -78,7 +78,7 @@ DuplicateKeyTracker::DuplicateKeyTracker(OperationContext* opCtx,
                                          StringData ident) {
     _keyConstraintsTable =
         opCtx->getServiceContext()->getStorageEngine()->makeTemporaryRecordStoreFromExistingIdent(
-            opCtx, ident);
+            opCtx, ident, KeyFormat::Long);
 
     invariant(entry->descriptor()->unique(),
               str::stream() << "Duplicate key tracker table exists on disk with ident: " << ident
@@ -92,7 +92,7 @@ void DuplicateKeyTracker::keepTemporaryTable() {
 Status DuplicateKeyTracker::recordKey(OperationContext* opCtx,
                                       const IndexCatalogEntry* indexCatalogEntry,
                                       const key_string::Value& key) {
-    invariant(opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
     LOGV2_DEBUG(20676,
                 1,
@@ -119,7 +119,7 @@ Status DuplicateKeyTracker::recordKey(OperationContext* opCtx,
         return status.getStatus();
 
     auto numDuplicates = _duplicateCounter.addAndFetch(1);
-    opCtx->recoveryUnit()->onRollback(
+    shard_role_details::getRecoveryUnit(opCtx)->onRollback(
         [this](OperationContext*) { _duplicateCounter.fetchAndAdd(-1); });
 
     if (numDuplicates % 1000 == 0) {
@@ -134,7 +134,7 @@ Status DuplicateKeyTracker::recordKey(OperationContext* opCtx,
 
 Status DuplicateKeyTracker::checkConstraints(OperationContext* opCtx,
                                              const IndexCatalogEntry* indexCatalogEntry) const {
-    invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
     auto constraintsCursor = _keyConstraintsTable->rs()->getCursor(opCtx);
     auto record = constraintsCursor->next();

@@ -59,6 +59,7 @@
 #include "mongo/db/query/optimizer/utils/utils.h"
 #include "mongo/util/assert_util.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQueryOptimizer
 
 namespace mongo::optimizer::cascades {
 
@@ -410,15 +411,18 @@ private:
 Memo::Context::Context(const Metadata* metadata,
                        const DebugInfo* debugInfo,
                        const LogicalPropsInterface* logicalPropsDerivation,
-                       const CardinalityEstimator* cardinalityEstimator)
+                       const CardinalityEstimator* cardinalityEstimator,
+                       const QueryParameterMap* queryParameters)
     : _metadata(metadata),
       _debugInfo(debugInfo),
       _logicalPropsDerivation(logicalPropsDerivation),
-      _cardinalityEstimator(cardinalityEstimator) {
+      _cardinalityEstimator(cardinalityEstimator),
+      _queryParameters(queryParameters) {
     invariant(_metadata != nullptr);
     invariant(_debugInfo != nullptr);
     invariant(_logicalPropsDerivation != nullptr);
     invariant(_cardinalityEstimator != nullptr);
+    invariant(_queryParameters != nullptr);
 }
 
 size_t Memo::GroupIdVectorHash::operator()(const Memo::GroupIdVector& v) const {
@@ -503,11 +507,19 @@ void Memo::estimateCE(const Context& ctx, const GroupIdType groupId) {
     props.merge(logicalProps);
 
     const bool simpleIdLookup = isSimpleIdLookup(nodeRef);
-    const CEType estimate = simpleIdLookup
-        ? CEType{1.0}
-        : ctx._cardinalityEstimator->deriveCE(*ctx._metadata, *this, props, nodeRef);
+    const CERecord estimate = simpleIdLookup
+        ? CERecord{1.0, "simpleIdLookup"}
+        : ctx._cardinalityEstimator->deriveCE(
+              *ctx._metadata, *this, props, *ctx._queryParameters, nodeRef);
+    LOGV2_DEBUG_OPTIONS(8324800,
+                        5,
+                        {logv2::LogComponent::kQueryCE},
+                        "Estimated node cardinality",
+                        "mode"_attr = estimate._mode,
+                        "ce"_attr = estimate._ce._value,
+                        "explain"_attr = ExplainGenerator::explainV2(nodeRef));
 
-    auto ceProp = properties::CardinalityEstimate(estimate);
+    auto ceProp = properties::CardinalityEstimate(estimate._ce);
 
     if (auto sargablePtr = nodeRef.cast<SargableNode>()) {
         auto& partialSchemaKeyCE = ceProp.getPartialSchemaKeyCE();
@@ -531,10 +543,17 @@ void Memo::estimateCE(const Context& ctx, const GroupIdType groupId) {
                                                      ScanParams{},
                                                      sargablePtr->getTarget(),
                                                      sargablePtr->getChild());
-                const CEType singularEst = simpleIdLookup
-                    ? CEType{1.0}
+                const CERecord singularEst = simpleIdLookup
+                    ? CERecord{1.0, "simpleIdLookup"}
                     : ctx._cardinalityEstimator->deriveCE(
-                          *ctx._metadata, *this, props, singularReq.ref());
+                          *ctx._metadata, *this, props, *ctx._queryParameters, singularReq.ref());
+                LOGV2_DEBUG_OPTIONS(8324801,
+                                    5,
+                                    {logv2::LogComponent::kQueryCE},
+                                    "Estimated single-predicate cardinality",
+                                    "mode"_attr = singularEst._mode,
+                                    "ce"_attr = singularEst._ce._value,
+                                    "explain"_attr = ExplainGenerator::explainV2(singularReq));
                 partialSchemaKeyCE.emplace_back(e.first, singularEst);
                 _estimatesCache.emplace(cacheKey, singularEst);
             });
@@ -675,6 +694,13 @@ void Memo::clear() {
 
 const Memo::Stats& Memo::getStats() const {
     return _stats;
+}
+void Memo::setStatsCE(const CEType& ce) {
+    _stats._ce = ce;
+}
+
+void Memo::setStatsEstimatedCost(const CostType& cost) {
+    _stats._estimatedCost = cost;
 }
 
 size_t Memo::getLogicalNodeCount() const {

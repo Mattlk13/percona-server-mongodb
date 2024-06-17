@@ -78,6 +78,8 @@ inline auto makeABTConstant(StringData str) {
     return makeABTConstant(tag, value);
 }
 
+optimizer::ABT makeFillEmpty(optimizer::ABT expr, optimizer::ABT altExpr);
+
 /**
  * Check if expression returns Nothing and return boolean false if so. Otherwise, return the
  * expression.
@@ -105,6 +107,9 @@ optimizer::ABT makeBinaryOp(optimizer::Operations binaryOp, optimizer::ABT lhs, 
 
 optimizer::ABT generateABTNullOrMissing(optimizer::ProjectionName var);
 optimizer::ABT generateABTNullOrMissing(optimizer::ABT var);
+
+optimizer::ABT generateABTNullMissingOrUndefined(optimizer::ProjectionName var);
+optimizer::ABT generateABTNullMissingOrUndefined(optimizer::ABT var);
 
 /**
  * Generates an ABT that checks if the input expression is negative assuming that it has already

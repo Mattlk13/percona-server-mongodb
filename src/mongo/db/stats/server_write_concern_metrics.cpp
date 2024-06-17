@@ -42,7 +42,6 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/server_write_concern_metrics.h"
 #include "mongo/db/stats/server_write_concern_metrics_gen.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/decorable.h"
 
 namespace mongo {
@@ -116,7 +115,7 @@ BSONObj ServerWriteConcernMetrics::toBSON() const {
 
 void ServerWriteConcernMetrics::WriteConcernCounters::recordWriteConcern(
     const WriteConcernOptions& writeConcernOptions, size_t numOps) {
-    if (auto wMode = stdx::get_if<std::string>(&writeConcernOptions.w)) {
+    if (auto wMode = get_if<std::string>(&writeConcernOptions.w)) {
         if (writeConcernOptions.isMajority()) {
             wMajorityCount += numOps;
             return;
@@ -126,12 +125,12 @@ void ServerWriteConcernMetrics::WriteConcernCounters::recordWriteConcern(
         return;
     }
 
-    if (stdx::holds_alternative<WTags>(writeConcernOptions.w)) {
+    if (holds_alternative<WTags>(writeConcernOptions.w)) {
         // wTags is an internal feature that we don't track metrics for
         return;
     }
 
-    wNumCounts[stdx::get<int64_t>(writeConcernOptions.w)] += numOps;
+    wNumCounts[std::get<int64_t>(writeConcernOptions.w)] += numOps;
 }
 
 void ServerWriteConcernMetrics::WriteConcernMetricsForOperationType::recordWriteConcern(
@@ -142,17 +141,25 @@ void ServerWriteConcernMetrics::WriteConcernMetricsForOperationType::recordWrite
         } else {
             // Provenance is either:
             //  - "implicitDefault" : implicit default WC (w:1 or w:"majority") is used.
-            //  - "clientSupplied"  : set without "w" value, so implicit default WC (w:1) is used.
             //  - "internalWriteDefault" : if internal command sets empty WC ({writeConcern: {}}),
             //    then default constructed WC (w:1) is used.
             implicitDefaultWC.recordWriteConcern(writeConcernOptions, numOps);
         }
 
         notExplicitWCount += numOps;
-        return;
+    } else {
+        // Supplied write concern contains 'w' field, the provenance can still be default if it is
+        // being set by mongos.
+        if (writeConcernOptions.getProvenance().isCustomDefault()) {
+            cWWC.recordWriteConcern(writeConcernOptions, numOps);
+            notExplicitWCount += numOps;
+        } else if (writeConcernOptions.getProvenance().isImplicitDefault()) {
+            implicitDefaultWC.recordWriteConcern(writeConcernOptions, numOps);
+            notExplicitWCount += numOps;
+        } else {
+            explicitWC.recordWriteConcern(writeConcernOptions, numOps);
+        }
     }
-
-    explicitWC.recordWriteConcern(writeConcernOptions, numOps);
 }
 
 void ServerWriteConcernMetrics::WriteConcernCounters::toBSON(BSONObjBuilder* builder) const {
@@ -194,7 +201,7 @@ void ServerWriteConcernMetrics::WriteConcernMetricsForOperationType::toBSON(
 namespace {
 class OpWriteConcernCountersSSS : public ServerStatusSection {
 public:
-    OpWriteConcernCountersSSS() : ServerStatusSection("opWriteConcernCounters") {}
+    using ServerStatusSection::ServerStatusSection;
 
     ~OpWriteConcernCountersSSS() override = default;
 
@@ -209,8 +216,9 @@ public:
                             const BSONElement& configElement) const override {
         return ServerWriteConcernMetrics::get(opCtx)->toBSON();
     }
-
-} opWriteConcernCountersSSS;
+};
+auto& opWriteConcernCountersSSS =
+    *ServerStatusSectionBuilder<OpWriteConcernCountersSSS>("opWriteConcernCounters").forShard();
 }  // namespace
 
 }  // namespace mongo

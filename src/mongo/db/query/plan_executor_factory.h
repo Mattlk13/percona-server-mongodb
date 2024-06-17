@@ -36,6 +36,7 @@
 #include <utility>
 
 #include "mongo/base/status_with.h"
+#include "mongo/db/exec/multi_plan.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/namespace_string.h"
@@ -82,12 +83,13 @@ namespace mongo::plan_executor_factory {
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
     std::unique_ptr<CanonicalQuery> cq,
     std::unique_ptr<WorkingSet> ws,
-    std::unique_ptr<PlanStage> rt,
+    std::unique_ptr<PlanStage> rootStage,
     VariantCollectionPtrOrAcquisition collection,
     PlanYieldPolicy::YieldPolicy yieldPolicy,
     size_t plannerOptions,
     NamespaceString nss = NamespaceString::kEmpty,
-    std::unique_ptr<QuerySolution> qs = nullptr);
+    std::unique_ptr<QuerySolution> qs = nullptr,
+    boost::optional<size_t> cachedPlanHash = boost::none);
 
 /**
  * This overload is provided for executors that do not need a CanonicalQuery. For example, the
@@ -99,33 +101,38 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     std::unique_ptr<WorkingSet> ws,
-    std::unique_ptr<PlanStage> rt,
+    std::unique_ptr<PlanStage> rootStage,
     VariantCollectionPtrOrAcquisition collection,
     PlanYieldPolicy::YieldPolicy yieldPolicy,
     size_t plannerOptions,
     NamespaceString nss = NamespaceString::kEmpty,
     std::unique_ptr<QuerySolution> qs = nullptr);
 
+// TODO SERVER-81556 Remove the `StatusWith` type since this can no longer fail.
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
     OperationContext* opCtx,
     std::unique_ptr<WorkingSet> ws,
-    std::unique_ptr<PlanStage> rt,
+    std::unique_ptr<PlanStage> rootStage,
     std::unique_ptr<QuerySolution> qs,
     std::unique_ptr<CanonicalQuery> cq,
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     VariantCollectionPtrOrAcquisition collection,
     size_t plannerOptions,
     NamespaceString nss,
-    PlanYieldPolicy::YieldPolicy yieldPolicy);
+    PlanYieldPolicy::YieldPolicy yieldPolicy,
+    boost::optional<size_t> cachedPlanHash = boost::none);
 
 /**
  * Constructs a PlanExecutor for the query 'cq' which will execute the SBE plan 'root'. A yield
  * policy can optionally be provided if the plan should automatically yield during execution.
- * "optimizerData" is used to print optimizer ABT plans, and may be empty.
+ * "optimizerData" is used to print optimizer ABT plans, and may be empty. If a
+ * classicRuntimePlannerStage is passed in, the PlanStage will be eventually passed to a
+ * PlanExplainer and which will in turn extract relevant explain data from the classic multiplanner.
  */
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
     OperationContext* opCtx,
     std::unique_ptr<CanonicalQuery> cq,
+    std::unique_ptr<Pipeline, PipelineDeleter> pipeline,
     std::unique_ptr<QuerySolution> solution,
     std::pair<std::unique_ptr<sbe::PlanStage>, stage_builder::PlanStageData> root,
     std::unique_ptr<optimizer::AbstractABTPrinter> optimizerData,
@@ -133,9 +140,12 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
     NamespaceString nss,
     std::unique_ptr<PlanYieldPolicySBE> yieldPolicy,
     bool isFromPlanCache,
+    boost::optional<size_t> cachedPlanHash,
     bool generatedByBonsai,
+    OptimizerCounterInfo optCounterInfo = {},
     std::unique_ptr<RemoteCursorMap> remoteCursors = nullptr,
-    std::unique_ptr<RemoteExplainVector> remoteExplains = nullptr);
+    std::unique_ptr<RemoteExplainVector> remoteExplains = nullptr,
+    std::unique_ptr<MultiPlanStage> classicRuntimePlannerStage = nullptr);
 
 /**
  * Similar to the factory function above in that it also constructs an executor for the winning SBE
@@ -149,7 +159,10 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
     const MultipleCollectionAccessor& collections,
     size_t plannerOptions,
     NamespaceString nss,
-    std::unique_ptr<PlanYieldPolicySBE> yieldPolicy);
+    std::unique_ptr<PlanYieldPolicySBE> yieldPolicy,
+    std::unique_ptr<RemoteCursorMap> remoteCursors,
+    std::unique_ptr<RemoteExplainVector> remoteExplains,
+    boost::optional<size_t> cachedPlanHash = boost::none);
 
 /**
  * Constructs a plan executor for executing the given 'pipeline'.

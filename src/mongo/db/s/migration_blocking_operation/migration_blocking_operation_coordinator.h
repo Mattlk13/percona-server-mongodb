@@ -35,34 +35,48 @@
 
 namespace mongo {
 
-class MigrationBlockingOperationCoordinatorImpl;
-
 class MigrationBlockingOperationCoordinator
     : public RecoverableShardingDDLCoordinator<MigrationBlockingOperationCoordinatorDocument,
                                                MigrationBlockingOperationCoordinatorPhaseEnum> {
 public:
     using Phase = MigrationBlockingOperationCoordinatorPhaseEnum;
+    using UUIDSet = stdx::unordered_set<UUID, UUID::Hash>;
+    using StateDoc = MigrationBlockingOperationCoordinatorDocument;
+    using ShardingDDLCoordinator::getOrCreate;
+
+    static std::shared_ptr<MigrationBlockingOperationCoordinator> getOrCreate(
+        OperationContext* opCtx, const NamespaceString& nss);
+    static boost::optional<std::shared_ptr<MigrationBlockingOperationCoordinator>> get(
+        OperationContext* opCtx, const NamespaceString& nss);
 
     MigrationBlockingOperationCoordinator(ShardingDDLCoordinatorService* service,
                                           const BSONObj& initialState);
 
-    virtual void checkIfOptionsConflict(const BSONObj& stateDoc) const override;
+    void checkIfOptionsConflict(const BSONObj& stateDoc) const override;
+
+    void beginOperation(OperationContext* opCtx, const UUID& operationUUID);
+    void endOperation(OperationContext* opCtx, const UUID& operationUUID);
 
 private:
-    virtual StringData serializePhase(const Phase& phase) const override;
-    virtual ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
-                                          const CancellationToken& token) noexcept override;
+    StringData serializePhase(const Phase& phase) const override;
+    ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
+                                  const CancellationToken& token) noexcept override;
 
-    std::unique_ptr<MigrationBlockingOperationCoordinatorImpl> _impl;
-};
+    Phase _getCurrentPhase() const;
+    bool _isFirstOperation(WithLock lk) const;
+    void _throwIfCleaningUp(WithLock lk);
+    void _recoverIfNecessary(WithLock lk, OperationContext* opCtx, bool isBeginOperation);
 
-class MigrationBlockingOperationCoordinatorImpl {
-public:
-    SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
-                         const CancellationToken& token);
+    void _insertOrUpdateStateDocument(WithLock lk,
+                                      OperationContext* opCtx,
+                                      StateDoc newStateDocument);
 
-private:
-    SharedPromise<void> _completionPromise;
+    mutable Mutex _mutex =
+        MONGO_MAKE_LATCH("MigrationBlockingOperationCoordinatorInstance::_mutex");
+
+    UUIDSet _operations;
+    SharedPromise<void> _beginCleanupPromise;
+    bool _needsRecovery;
 };
 
 }  // namespace mongo

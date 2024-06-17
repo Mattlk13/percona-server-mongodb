@@ -148,20 +148,22 @@ RecipientShardEntry makeRecipientShard(ShardId shardId,
     return RecipientShardEntry{std::move(shardId), std::move(recipientCtx)};
 }
 
-NamespaceString constructTemporaryReshardingNss(StringData db, const UUID& sourceUuid) {
+NamespaceString constructTemporaryReshardingNss(const NamespaceString& nss,
+                                                const UUID& sourceUuid) {
+    auto tempCollPrefix = nss.isTimeseriesBucketsCollection()
+        ? NamespaceString::kTemporaryTimeseriesReshardingCollectionPrefix
+        : NamespaceString::kTemporaryReshardingCollectionPrefix;
     return NamespaceStringUtil::deserialize(
         boost::none,
-        db,
-        fmt::format(
-            "{}{}", NamespaceString::kTemporaryReshardingCollectionPrefix, sourceUuid.toString()),
+        nss.db_forSharding(),
+        fmt::format("{}{}", tempCollPrefix, sourceUuid.toString()),
         SerializationContext::stateDefault());
 }
 
 std::set<ShardId> getRecipientShards(OperationContext* opCtx,
                                      const NamespaceString& sourceNss,
                                      const UUID& reshardingUUID) {
-    const auto& tempNss =
-        constructTemporaryReshardingNss(sourceNss.db_forSharding(), reshardingUUID);
+    const auto& tempNss = constructTemporaryReshardingNss(sourceNss, reshardingUUID);
     auto* catalogCache = Grid::get(opCtx)->catalogCache();
     auto [cm, _] = catalogCache->getTrackedCollectionRoutingInfo(opCtx, tempNss);
 
@@ -395,7 +397,7 @@ NamespaceString getLocalConflictStashNamespace(UUID existingUUID, ShardId donorS
 
 void doNoopWrite(OperationContext* opCtx, StringData opStr, const NamespaceString& nss) {
     writeConflictRetry(opCtx, opStr, NamespaceString::kRsOplogNamespace, [&] {
-        AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
+        AutoGetOplogFastPath oplogWrite(opCtx, OplogAccessMode::kWrite);
 
         const std::string msg = str::stream() << opStr << " on " << nss.toStringForErrorMsg();
         WriteUnitOfWork wuow(opCtx);
@@ -506,6 +508,21 @@ bool isMoveCollection(boost::optional<ProvenanceEnum> provenance) {
     return provenance &&
         (provenance.get() == ProvenanceEnum::kMoveCollection ||
          provenance.get() == ProvenanceEnum::kBalancerMoveCollection);
+}
+
+std::shared_ptr<ThreadPool> makeThreadPoolForMarkKilledExecutor(const std::string& poolName) {
+    return std::make_shared<ThreadPool>([&] {
+        ThreadPool::Options options;
+        options.poolName = poolName;
+        options.minThreads = 0;
+        options.maxThreads = 1;
+        return options;
+    }());
+}
+
+boost::optional<Status> coordinatorAbortedError() {
+    return Status{ErrorCodes::ReshardCollectionAborted,
+                  "Recieved abort from the resharding coordinator"};
 }
 
 }  // namespace resharding

@@ -62,9 +62,11 @@
 #include "mongo/crypto/fle_crypto.h"
 #include "mongo/crypto/fle_data_frames.h"
 #include "mongo/crypto/fle_field_schema_gen.h"
+#include "mongo/crypto/fle_numeric.h"
 #include "mongo/crypto/symmetric_crypto.h"
 #include "mongo/db/basic_types.h"
 #include "mongo/idl/idl_parser.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -102,7 +104,7 @@ std::vector<char> decode(StringData sd) {
     return std::vector<char>(s.data(), s.data() + s.length());
 }
 
-PrfBlock blockToArray(std::string block) {
+PrfBlock blockToArray(StringData block) {
     PrfBlock data;
     ASSERT_EQ(block.size(), data.size());
     for (size_t i = 0; i < data.size(); ++i) {
@@ -191,7 +193,7 @@ public:
 
     BSONObj getEncryptedKey(const UUID& uuid) override;
 
-    SymmetricKey& getKMSLocalKey() {
+    SymmetricKey& getKMSLocalKey() override {
         return _localKey;
     }
 
@@ -367,6 +369,26 @@ TEST(FLETokens, TestVectors) {
     ASSERT_EQUALS(ECCTwiceDerivedValueToken(decodePrf(
                       "EFA5746DB796DAC6FAACB7E5F28DB53B333588A43131F0C026B19D2B1215EAE2"_sd)),
                   eccTwiceValueToken);
+
+
+    // Anchor Padding
+    auto anchorPaddingTokenRoot =
+        FLEAnchorPaddingGenerator::generateAnchorPaddingRootToken(escToken);
+    ASSERT_EQUALS(AnchorPaddingRootToken(decodePrf(
+                      "4312890F621FE3CA7497C3405DFD8AAF46A578C77F7404D28C12BA853A4D3327"_sd)),
+                  anchorPaddingTokenRoot);
+
+    auto anchorPaddingTokenKey =
+        FLEAnchorPaddingDerivedGenerator::generateAnchorPaddingKeyToken(anchorPaddingTokenRoot);
+    ASSERT_EQUALS(AnchorPaddingKeyToken(decodePrf(
+                      "EF6D80379C462FC724CE8C245DC177ED507154B4EBB04DED780FA0DDAF1A2247"_sd)),
+                  anchorPaddingTokenKey);
+
+    auto anchorPaddingTokenValue =
+        FLEAnchorPaddingDerivedGenerator::generateAnchorPaddingValueToken(anchorPaddingTokenRoot);
+    ASSERT_EQUALS(AnchorPaddingValueToken(decodePrf(
+                      "A3308597F3C5271D5BAB640F749E619E9272A2C33F4CD372680F55F84CC4DF7F"_sd)),
+                  anchorPaddingTokenValue);
 }
 
 TEST(FLETokens, TestVectorUnindexedValueDecryption) {
@@ -1171,6 +1193,7 @@ std::vector<char> generatePlaceholder(
     edgesInfo.setUbIncluded(true);
     edgesInfo.setIndexMin(lowerDoc.firstElement());
     edgesInfo.setIndexMax(upperDoc.firstElement());
+    edgesInfo.setTrimFactor(1);
 
     findSpec.setEdgesInfo(edgesInfo);
 
@@ -1707,8 +1730,9 @@ TEST(FLE_EDC, ServerSide_Equality_Payloads_V2) {
     iupayload.setServerDerivedFromDataToken(serverDerivedFromDataToken.toCDR());
 
     auto swEncryptedTokens =
-        EncryptedStateCollectionTokensV2(escDataCounterkey).serialize(ecocToken);
+        EncryptedStateCollectionTokensV2(escDataCounterkey, boost::none).serialize(ecocToken);
     uassertStatusOK(swEncryptedTokens);
+    ASSERT_EQ(swEncryptedTokens.getValue().size(), crypto::aesCTRIVSize + sizeof(PrfBlock));
     iupayload.setEncryptedTokens(swEncryptedTokens.getValue());
     iupayload.setIndexKeyId(indexKeyId);
 
@@ -1989,9 +2013,10 @@ TEST(FLE_EDC, ServerSide_Range_Payloads_V2) {
     iupayload.setServerEncryptionToken(serverEncryptToken.toCDR());
     iupayload.setServerDerivedFromDataToken(serverDerivedFromDataToken.toCDR());
 
-    auto swEncryptedTokens =
-        EncryptedStateCollectionTokensV2(escDataCounterkey).serialize(ecocToken);
+    auto swEncryptedTokens = EncryptedStateCollectionTokensV2(escDataCounterkey, false /* isLeaf */)
+                                 .serialize(ecocToken);
     uassertStatusOK(swEncryptedTokens);
+    ASSERT_EQ(swEncryptedTokens.getValue().size(), crypto::aesCTRIVSize + sizeof(PrfBlock) + 1);
     iupayload.setEncryptedTokens(swEncryptedTokens.getValue());
     iupayload.setIndexKeyId(indexKeyId);
 
@@ -2145,15 +2170,26 @@ TEST(FLE_ECOC, EncryptedTokensRoundTrip) {
     auto escContentionToken = FLEDerivedFromDataTokenAndContentionFactorTokenGenerator::
         generateESCDerivedFromDataTokenAndContentionFactorToken(escDataToken, 1);
 
-    EncryptedStateCollectionTokensV2 encryptor{escContentionToken};
-    auto swEncryptedTokens = encryptor.serialize(ecocToken);
-    ASSERT_OK(swEncryptedTokens.getStatus());
+    std::vector<boost::optional<bool>> isLeafValues({boost::none, true, false});
+    for (auto optIsLeaf : isLeafValues) {
+        EncryptedStateCollectionTokensV2 encryptor{escContentionToken, optIsLeaf};
+        auto swEncryptedTokens = encryptor.serialize(ecocToken);
+        ASSERT_OK(swEncryptedTokens.getStatus());
+        ASSERT_EQ(swEncryptedTokens.getValue().size(),
+                  crypto::aesCTRIVSize + sizeof(PrfBlock) + (optIsLeaf ? 1 : 0));
 
-    auto rawEcocDoc = ECOCCollection::generateDocument("foo", swEncryptedTokens.getValue());
+        auto decoded = uassertStatusOK(EncryptedStateCollectionTokensV2::decryptAndParse(
+            ecocToken, swEncryptedTokens.getValue()));
+        ASSERT_EQ(encryptor.esc, decoded.esc);
+        ASSERT_EQ(encryptor.isLeaf, decoded.isLeaf);
 
-    auto ecocDoc = ECOCCollection::parseAndDecryptV2(rawEcocDoc, ecocToken);
-    ASSERT_EQ(ecocDoc.fieldName, "foo");
-    ASSERT_EQ(ecocDoc.esc, escContentionToken);
+        auto rawEcocDoc = ECOCCollection::generateDocument("foo", swEncryptedTokens.getValue());
+
+        auto ecocDoc = ECOCCollection::parseAndDecryptV2(rawEcocDoc, ecocToken);
+        ASSERT_EQ(ecocDoc.fieldName, "foo");
+        ASSERT_EQ(ecocDoc.esc, escContentionToken);
+        ASSERT_EQ(ecocDoc.isLeaf, optIsLeaf);
+    }
 }
 
 template <typename T, typename Func>
@@ -2429,104 +2465,6 @@ TEST(EDC, UnindexedEncryptDecrypt) {
         ASSERT_EQ(type, element.type());
         ASSERT_TRUE(
             std::equal(plainText.begin(), plainText.end(), elementData.begin(), elementData.end()));
-    }
-}
-
-TEST(EDC, ValidateDocument) {
-    EncryptedFieldConfig efc = getTestEncryptedFieldConfig();
-
-    TestKeyVault keyVault;
-
-    BSONObjBuilder builder;
-    builder.append("plainText", "sample");
-    {
-        auto doc = BSON("a"
-                        << "secret");
-        auto element = doc.firstElement();
-        auto buf = generatePlaceholder(element, Operation::kInsert);
-        builder.appendBinData("encrypted", buf.size(), BinDataType::Encrypt, buf.data());
-    }
-
-    BSONObjBuilder sub(builder.subobjStart("nested"));
-    {
-        auto doc = BSON("a"
-                        << "top secret");
-        auto element = doc.firstElement();
-
-        auto buf = generatePlaceholder(
-            element, Operation::kInsert, Fle2AlgorithmInt::kEquality, indexKey2Id);
-        builder.appendBinData("encrypted", buf.size(), BinDataType::Encrypt, buf.data());
-    }
-    {
-        auto doc = BSON("a"
-                        << "bottom secret");
-        auto element = doc.firstElement();
-
-        auto buf = generatePlaceholder(element, Operation::kInsert, Fle2AlgorithmInt::kUnindexed);
-        builder.appendBinData("notindexed", buf.size(), BinDataType::Encrypt, buf.data());
-    }
-    sub.done();
-
-    auto doc1 = builder.obj();
-    auto finalDoc = encryptDocument(doc1, &keyVault, &efc);
-
-    // Positive - Encrypted Doc
-    FLEClientCrypto::validateDocument(finalDoc, efc, &keyVault);
-
-    // Positive - Unencrypted Doc
-    auto unencryptedDocument = BSON("a" << 123);
-    FLEClientCrypto::validateDocument(unencryptedDocument, efc, &keyVault);
-
-    // Remove all tags
-    {
-        auto testDoc = finalDoc.removeField(kSafeContent);
-
-        ASSERT_THROWS_CODE(
-            FLEClientCrypto::validateDocument(testDoc, efc, &keyVault), DBException, 6371506);
-    }
-
-    // Remove an encrypted field
-    {
-        auto testDoc = finalDoc.removeField("encrypted");
-        ASSERT_THROWS_CODE(
-            FLEClientCrypto::validateDocument(testDoc, efc, &keyVault), DBException, 6371510);
-    }
-
-    // Remove a tag
-    {
-        BSONObj sc2 = BSON(kSafeContent << BSON_ARRAY(finalDoc[kSafeContent].Array()[0]));
-        auto testDoc = finalDoc.addFields(sc2);
-        ASSERT_THROWS_CODE(
-            FLEClientCrypto::validateDocument(testDoc, efc, &keyVault), DBException, 6371516);
-    }
-
-    // Make safecontent an int
-    {
-        BSONObj sc2 = BSON(kSafeContent << 1234);
-        auto testDoc = finalDoc.addFields(sc2);
-        ASSERT_THROWS_CODE(
-            FLEClientCrypto::validateDocument(testDoc, efc, &keyVault), DBException, 6371507);
-    }
-
-    // Replace a tag
-    {
-        PrfBlock block;
-        BSONObj sc2 = BSON(kSafeContent
-                           << BSON_ARRAY(finalDoc[kSafeContent].Array()[0] << BSONBinData(
-                                             &block, sizeof(block), BinDataType::BinDataGeneral)));
-        auto testDoc = finalDoc.addFields(sc2);
-
-        ASSERT_THROWS_CODE(
-            FLEClientCrypto::validateDocument(testDoc, efc, &keyVault), DBException, 6371510);
-    }
-
-    // Wrong tag type
-    {
-        BSONObj sc2 = BSON(kSafeContent << BSON_ARRAY(123));
-        auto testDoc = finalDoc.addFields(sc2);
-
-        ASSERT_THROWS_CODE(
-            FLEClientCrypto::validateDocument(testDoc, efc, &keyVault), DBException, 6371515);
     }
 }
 
@@ -2821,31 +2759,100 @@ TEST(FLE_Update, GenerateUpdateToRemoveTags) {
     ASSERT_THROWS_CODE(EDCServerCollection::generateUpdateToRemoveTags({}), DBException, 7293203);
 }
 
-TEST(CompactionHelpersTest, parseCompactionTokensTest) {
-    auto result = CompactionHelpers::parseCompactionTokens(BSONObj());
+TEST(CompactionHelpersTest, parseCompactionTokensTestEmpty) {
+    const auto result = CompactionHelpers::parseCompactionTokens(BSONObj());
     ASSERT(result.empty());
+}
 
-    ECOCToken token1(
+TEST(CompactionHelpersTest, parseCompactionTokensTest) {
+    const ECOCToken token1(
         decodePrf("7076c7b05fb4be4fe585eed930b852a6d088a0c55f3c96b50069e8a26ebfb347"_sd));
-    ECOCToken token2(
+    const ECOCToken token2(
         decodePrf("6ebfb347576b4be4fe585eed96d088a0c55f3c96b50069e8a230b852a05fb4be"_sd));
-    BSONObjBuilder builder;
-    builder.appendBinData(
-        "a.b.c", token1.toCDR().length(), BinDataType::BinDataGeneral, token1.toCDR().data());
-    builder.appendBinData(
-        "x.y", token2.toCDR().length(), BinDataType::BinDataGeneral, token2.toCDR().data());
-    result = CompactionHelpers::parseCompactionTokens(builder.obj());
+    const AnchorPaddingRootToken anchor2(
+        decodePrf("7df988a08052e24dbe938c58b91ab00c812f58eabb3d4db1b047c3187d57f668"_sd));
 
-    ASSERT(result.size() == 2);
-    ASSERT(result[0].fieldPathName == "a.b.c");
-    ASSERT(result[0].token == token1);
-    ASSERT(result[1].fieldPathName == "x.y");
-    ASSERT(result[1].token == token2);
+    for (const bool ffEnabled : {false, true}) {
+        RAIIServerParameterControllerForTest featureFlagController("featureFlagQERangeV2",
+                                                                   ffEnabled);
+        for (const bool includePaddingToken : {false, true}) {
+            BSONObjBuilder builder;
+            builder.appendBinData("a.b.c",
+                                  token1.toCDR().length(),
+                                  BinDataType::BinDataGeneral,
+                                  token1.toCDR().data());
+            if (includePaddingToken) {
+                BSONObjBuilder xy(builder.subobjStart("x.y"));
+                xy.appendBinData("ecoc",
+                                 token2.toCDR().length(),
+                                 BinDataType::BinDataGeneral,
+                                 token2.toCDR().data());
+                xy.appendBinData("anchorPaddingToken",
+                                 anchor2.toCDR().length(),
+                                 BinDataType::BinDataGeneral,
+                                 anchor2.toCDR().data());
+                xy.doneFast();
+            }
 
+            const bool expectSuccess = ffEnabled || !includePaddingToken;
+            if (!expectSuccess) {
+                ASSERT_THROWS_CODE(
+                    CompactionHelpers::parseCompactionTokens(builder.obj()), DBException, 6346801);
+                continue;
+            }
+
+            const auto result = CompactionHelpers::parseCompactionTokens(builder.obj());
+            ASSERT_EQ(result.size(), includePaddingToken ? 2UL : 1UL);
+
+            ASSERT_EQ(result[0].fieldPathName, "a.b.c");
+            ASSERT(result[0].token == token1);
+            ASSERT(result[0].anchorPaddingToken == boost::none);
+
+            if (includePaddingToken) {
+                ASSERT_EQ(result[1].fieldPathName, "x.y");
+                ASSERT(result[1].token == token2);
+                ASSERT(result[1].anchorPaddingToken == anchor2);
+            }
+        }
+    }
+}
+
+TEST(CompactionHelpersTest, parseCompactionTokensTestInvalidType) {
     ASSERT_THROWS_CODE(CompactionHelpers::parseCompactionTokens(BSON("foo"
                                                                      << "bar")),
                        DBException,
                        6346801);
+}
+
+TEST(CompactionHelpersTest, parseCompactionTokensTestInvalidSubType) {
+    const std::array<std::uint8_t, 16> kUUID = {
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+    BSONObjBuilder builder;
+    builder.appendBinData("a.b.c", kUUID.size(), BinDataType::newUUID, kUUID.data());
+    ASSERT_THROWS_CODE(
+        CompactionHelpers::parseCompactionTokens(builder.obj()), DBException, 6346801);
+}
+
+TEST(CompactionHelpersTest, parseCompactionTokensTestTooShort) {
+    const auto kBadToken =
+        hexblob::decode("7076c7b05fb4be4fe585eed930b852a6d088a0c55f3c96b50069e8a26ebfb3"_sd);
+    constexpr auto kInvalidPrfLength = 6373501;
+
+    BSONObjBuilder builder;
+    builder.appendBinData("a.b.c", kBadToken.size(), BinDataType::BinDataGeneral, kBadToken.data());
+    ASSERT_THROWS_CODE(
+        CompactionHelpers::parseCompactionTokens(builder.obj()), DBException, kInvalidPrfLength);
+}
+
+TEST(CompactionHelpersTest, parseCompactionTokensTestTooLong) {
+    const auto kBadToken =
+        hexblob::decode("7076c7b05fb4be4fe585eed930b852a6d088a0c55f3c96b50069e8a26ebfb34701"_sd);
+    constexpr auto kInvalidPrfLength = 6373501;
+
+    BSONObjBuilder builder;
+    builder.appendBinData("a.b.c", kBadToken.size(), BinDataType::BinDataGeneral, kBadToken.data());
+    ASSERT_THROWS_CODE(
+        CompactionHelpers::parseCompactionTokens(builder.obj()), DBException, kInvalidPrfLength);
 }
 
 TEST(CompactionHelpersTest, validateCompactionTokensTest) {
@@ -3209,20 +3216,69 @@ TEST(RangeTest, Double_Errors) {
 
 
 TEST(EdgeCalcTest, SparsityConstraints) {
-    ASSERT_THROWS_CODE(getEdgesInt32(1, 0, 8, 0), AssertionException, 6775101);
-    ASSERT_THROWS_CODE(getEdgesInt32(1, 0, 8, -1), AssertionException, 6775101);
-    ASSERT_THROWS_CODE(getEdgesInt64(1, 0, 8, 0), AssertionException, 6775101);
-    ASSERT_THROWS_CODE(getEdgesInt64(1, 0, 8, -1), AssertionException, 6775101);
-    ASSERT_THROWS_CODE(getEdgesDouble(1.0, 0.0, 8.0, 5, 0), AssertionException, 6775101);
-    ASSERT_THROWS_CODE(getEdgesDouble(1.0, 0.0, 8.0, 5, -1), AssertionException, 6775101);
+    ASSERT_THROWS_CODE(getEdgesInt32(1, 0, 8, 0, 0), AssertionException, 6775101);
+    ASSERT_THROWS_CODE(getEdgesInt32(1, 0, 8, -1, 0), AssertionException, 6775101);
+    ASSERT_THROWS_CODE(getEdgesInt64(1, 0, 8, 0, 0), AssertionException, 6775101);
+    ASSERT_THROWS_CODE(getEdgesInt64(1, 0, 8, -1, 0), AssertionException, 6775101);
+    ASSERT_THROWS_CODE(getEdgesDouble(1.0, 0.0, 8.0, 5, 0, 0), AssertionException, 6775101);
+    ASSERT_THROWS_CODE(getEdgesDouble(1.0, 0.0, 8.0, 5, -1, 0), AssertionException, 6775101);
+}
+
+TEST(EdgeCalcTest, TrimFactorConstraints) {
+    ASSERT_THROWS_CODE(getEdgesInt32(1, 0, 7, 1, -1), AssertionException, 8574105);
+    ASSERT_THROWS_CODE(getEdgesInt32(1, 0, 7, 1, 3), AssertionException, 8574105);
+    ASSERT_THROWS_CODE(getEdgesInt64(1, 0, 7, 1, -1), AssertionException, 8574105);
+    ASSERT_THROWS_CODE(getEdgesInt64(1, 0, 7, 1, 3), AssertionException, 8574105);
+    ASSERT_THROWS_CODE(getEdgesDouble(1.0, 0.0, 5.0, 1, 1, -1), AssertionException, 8574105);
+    ASSERT_THROWS_CODE(getEdgesDouble(1.0, 0.0, 5.0, 1, 1, 6), AssertionException, 8574105);
+}
+
+void doEdgeCalcTestIdentifyLeaf(std::unique_ptr<Edges> edges, StringData expectLeaf) {
+    ASSERT_EQ(edges->getLeaf(), expectLeaf);
+    auto edgeSet = edges->get();
+    ASSERT_EQ(std::count_if(edgeSet.cbegin(),
+                            edgeSet.cend(),
+                            [expectLeaf](const auto& leaf) { return leaf == expectLeaf; }),
+              1);
+}
+
+TEST(EdgeCalcTest, IdentifyLeaf) {
+    constexpr auto k42Leaf64 =
+        "1000000000000000000000000000000000000000000000000000000000101010"_sd;
+    doEdgeCalcTestIdentifyLeaf(getEdgesInt64(42, {}, {}, 1, 0), k42Leaf64);
+    doEdgeCalcTestIdentifyLeaf(getEdgesInt64(42, {}, {}, 7, 0), k42Leaf64);
+    doEdgeCalcTestIdentifyLeaf(getEdgesInt64(42, {}, {}, 1, 10), k42Leaf64);
+    doEdgeCalcTestIdentifyLeaf(getEdgesInt64(42, {}, {}, 7, 10), k42Leaf64);
+    doEdgeCalcTestIdentifyLeaf(getEdgesInt64(42, {}, {}, 15, 10), k42Leaf64);
+    constexpr auto k42Leaf32 = "10000000000000000000000000101010"_sd;
+    doEdgeCalcTestIdentifyLeaf(getEdgesInt32(42, {}, {}, 2, 0), k42Leaf32);
+    doEdgeCalcTestIdentifyLeaf(getEdgesInt32(42, {}, {}, 11, 0), k42Leaf32);
+    doEdgeCalcTestIdentifyLeaf(getEdgesInt32(42, {}, {}, 2, 9), k42Leaf32);
+    doEdgeCalcTestIdentifyLeaf(getEdgesInt32(42, {}, {}, 11, 9), k42Leaf32);
+    constexpr auto k42LeafDouble =
+        "1100000001000101000000000000000000000000000000000000000000000000"_sd;
+    doEdgeCalcTestIdentifyLeaf(getEdgesDouble(42, {}, {}, {}, 3, 0), k42LeafDouble);
+    doEdgeCalcTestIdentifyLeaf(getEdgesDouble(42, {}, {}, {}, 13, 0), k42LeafDouble);
+    doEdgeCalcTestIdentifyLeaf(getEdgesDouble(42, {}, {}, {}, 3, 8), k42LeafDouble);
+    doEdgeCalcTestIdentifyLeaf(getEdgesDouble(42, {}, {}, {}, 13, 8), k42LeafDouble);
+    constexpr auto k42LeafDecimal128 =
+        "10101110001110011011100011110011101110001010011010111110001110010011001110111000101010110010100111111111111111111110100000000000"_sd;
+    doEdgeCalcTestIdentifyLeaf(getEdgesDecimal128(Decimal128(42), {}, {}, {}, 5, 0),
+                               k42LeafDecimal128);
+    doEdgeCalcTestIdentifyLeaf(getEdgesDecimal128(Decimal128(42), {}, {}, {}, 17, 0),
+                               k42LeafDecimal128);
+    doEdgeCalcTestIdentifyLeaf(getEdgesDecimal128(Decimal128(42), {}, {}, {}, 5, 7),
+                               k42LeafDecimal128);
+    doEdgeCalcTestIdentifyLeaf(getEdgesDecimal128(Decimal128(42), {}, {}, {}, 17, 7),
+                               k42LeafDecimal128);
 }
 
 TEST(MinCoverCalcTest, MinCoverConstraints) {
-    ASSERT(minCoverInt32(2, true, 1, true, 0, 7, 1).empty());
-    ASSERT(minCoverInt64(2, true, 1, true, 0, 7, 1).empty());
-    ASSERT(minCoverDouble(2, true, 1, true, 0, 7, boost::none, 1).empty());
+    ASSERT(minCoverInt32(2, true, 1, true, 0, 7, 1, 0).empty());
+    ASSERT(minCoverInt64(2, true, 1, true, 0, 7, 1, 0).empty());
+    ASSERT(minCoverDouble(2, true, 1, true, 0, 7, boost::none, 1, 0).empty());
     ASSERT(minCoverDecimal128(
-               Decimal128(2), true, Decimal128(1), true, Decimal128(0), Decimal128(7), 5, 1)
+               Decimal128(2), true, Decimal128(1), true, Decimal128(0), Decimal128(7), 5, 1, 0)
                .empty());
 }
 
@@ -3527,6 +3583,7 @@ void assertMinCoverResult(A lb,
                           C min,
                           D max,
                           int sparsity,
+                          int trimFactor,
                           std::initializer_list<std::string> expectedList) {
     std::vector<std::string> expected{expectedList};
     std::vector<BSONElement> elems;
@@ -3541,6 +3598,7 @@ void assertMinCoverResult(A lb,
     edgesInfo.setUbIncluded(ubIncluded);
     edgesInfo.setIndexMin(elems[2]);
     edgesInfo.setIndexMax(elems[3]);
+    edgesInfo.setTrimFactor(trimFactor);
 
     FLE2RangeFindSpec spec;
     spec.setEdgesInfo(edgesInfo);
@@ -3564,6 +3622,7 @@ void assertMinCoverResultPrecision(A lb,
                                    D max,
                                    int sparsity,
                                    int precision,
+                                   int trimFactor,
                                    std::initializer_list<std::string> expectedList) {
     std::vector<std::string> expected{expectedList};
     std::vector<BSONElement> elems;
@@ -3579,6 +3638,7 @@ void assertMinCoverResultPrecision(A lb,
     edgesInfo.setIndexMin(elems[2]);
     edgesInfo.setIndexMax(elems[3]);
     edgesInfo.setPrecision(precision);
+    edgesInfo.setTrimFactor(trimFactor);
 
     FLE2RangeFindSpec spec;
     spec.setEdgesInfo(edgesInfo);
@@ -3594,10 +3654,36 @@ void assertMinCoverResultPrecision(A lb,
 }
 
 TEST(MinCoverInterfaceTest, Int32_Basic) {
-    assertMinCoverResult(7, true, 32, true, 0, 32, 1, {"000111", "001", "01", "100000"});
-    assertMinCoverResult(7, false, 32, false, 0, 32, 1, {"001", "01"});
-    assertMinCoverResult(7, true, 32, false, 0, 32, 1, {"000111", "001", "01"});
-    assertMinCoverResult(7, true, 32, false, 0, 32, 1, {"000111", "001", "01"});
+    assertMinCoverResult(7, true, 32, true, 0, 32, 1, 0, {"000111", "001", "01", "100000"});
+    assertMinCoverResult(7, false, 32, false, 0, 32, 1, 0, {"001", "01"});
+    assertMinCoverResult(7, true, 32, false, 0, 32, 1, 0, {"000111", "001", "01"});
+    assertMinCoverResult(7, true, 32, false, 0, 32, 1, 0, {"000111", "001", "01"});
+
+    assertMinCoverResult(7, true, 32, true, 0, 32, 1, 3, {"000111", "001", "010", "011", "100000"});
+    assertMinCoverResult(
+        7, false, 32, false, 0, 32, 1, 4, {"0010", "0011", "0100", "0101", "0110", "0111"});
+    assertMinCoverResult(7, true, 32, false, 0, 32, 1, 2, {"000111", "001", "01"});
+    assertMinCoverResult(7,
+                         true,
+                         32,
+                         false,
+                         0,
+                         32,
+                         1,
+                         5,
+                         {"000111",
+                          "00100",
+                          "00101",
+                          "00110",
+                          "00111",
+                          "01000",
+                          "01001",
+                          "01010",
+                          "01011",
+                          "01100",
+                          "01101",
+                          "01110",
+                          "01111"});
 }
 
 TEST(MinCoverInterfaceTest, Int64_Basic) {
@@ -3608,6 +3694,7 @@ TEST(MinCoverInterfaceTest, Int64_Basic) {
                          -1000000000000000LL,
                          8070450532247928832LL,
                          2,
+                         0,
                          {
                              "000000000000011100011010111111010100100110001101000000",
                              "00000000000001110001101011111101010010011000110100000100",
@@ -3625,6 +3712,7 @@ TEST(MinCoverInterfaceTest, Int64_Basic) {
                          -1000000000000000LL,
                          8070450532247928832LL,
                          2,
+                         0,
                          {
                              "000000000000011100011010111111010100100110001101000000000000001",
                              "00000000000001110001101011111101010010011000110100000000000001",
@@ -3657,6 +3745,7 @@ TEST(MinCoverInterfaceTest, Int64_Basic) {
                          -1000000000000000LL,
                          8070450532247928832LL,
                          2,
+                         0,
                          {
                              "000000000000011100011010111111010100100110001101000000",
                              "00000000000001110001101011111101010010011000110100000100",
@@ -3677,6 +3766,7 @@ TEST(MinCoverInterfaceTest, Int64_Basic) {
                          -1000000000000000LL,
                          8070450532247928832LL,
                          2,
+                         0,
                          {
                              "000000000000011100011010111111010100100110001101000000000000001",
                              "00000000000001110001101011111101010010011000110100000000000001",
@@ -3697,6 +3787,51 @@ TEST(MinCoverInterfaceTest, Int64_Basic) {
                              "000000000000011100011010111111010100100110001101000001100100",
                              "000000000000011100011010111111010100100110001101000001100101",
                              "000000000000011100011010111111010100100110001101000001100110",
+                         });
+
+    assertMinCoverResult(0LL,
+                         true,
+                         823LL,
+                         false,
+                         -1000000000000000LL,
+                         8070450532247928832LL,
+                         2,
+                         54,
+                         {
+                             "000000000000011100011010111111010100100110001101000000",
+                             "00000000000001110001101011111101010010011000110100000100",
+                             "00000000000001110001101011111101010010011000110100000101",
+                             "0000000000000111000110101111110101001001100011010000011000",
+                             "000000000000011100011010111111010100100110001101000001100100",
+                             "000000000000011100011010111111010100100110001101000001100101",
+                             "00000000000001110001101011111101010010011000110100000110011000",
+                             "00000000000001110001101011111101010010011000110100000110011001",
+                             "00000000000001110001101011111101010010011000110100000110011010",
+                             "000000000000011100011010111111010100100110001101000001100110110",
+                         });
+
+    assertMinCoverResult(0LL,
+                         true,
+                         823LL,
+                         false,
+                         -1000000000000000LL,
+                         8070450532247928832LL,
+                         2,
+                         55,
+                         {
+                             "00000000000001110001101011111101010010011000110100000000",
+                             "00000000000001110001101011111101010010011000110100000001",
+                             "00000000000001110001101011111101010010011000110100000010",
+                             "00000000000001110001101011111101010010011000110100000011",
+                             "00000000000001110001101011111101010010011000110100000100",
+                             "00000000000001110001101011111101010010011000110100000101",
+                             "0000000000000111000110101111110101001001100011010000011000",
+                             "000000000000011100011010111111010100100110001101000001100100",
+                             "000000000000011100011010111111010100100110001101000001100101",
+                             "00000000000001110001101011111101010010011000110100000110011000",
+                             "00000000000001110001101011111101010010011000110100000110011001",
+                             "00000000000001110001101011111101010010011000110100000110011010",
+                             "000000000000011100011010111111010100100110001101000001100110110",
                          });
 }
 
@@ -3708,6 +3843,7 @@ TEST(MinCoverInterfaceTest, Double_Basic) {
                          0.0,
                          1000.0,
                          1,
+                         0,
                          {
                              "11000000001101111",
                              "1100000000111",
@@ -3724,6 +3860,7 @@ TEST(MinCoverInterfaceTest, Double_Basic) {
                          0.0,
                          1000.0,
                          1,
+                         0,
                          {
                              "1100000000110111100000000000000000000000000000000000000000000001",
                              "110000000011011110000000000000000000000000000000000000000000001",
@@ -3784,6 +3921,7 @@ TEST(MinCoverInterfaceTest, Double_Basic) {
                          0.0,
                          1000.0,
                          1,
+                         0,
                          {
                              "11000000001101111",
                              "1100000000111",
@@ -3798,6 +3936,7 @@ TEST(MinCoverInterfaceTest, Double_Basic) {
                          0.0,
                          1000.0,
                          1,
+                         0,
                          {
                              "1100000000110111100000000000000000000000000000000000000000000001",
                              "110000000011011110000000000000000000000000000000000000000000001",
@@ -3851,6 +3990,37 @@ TEST(MinCoverInterfaceTest, Double_Basic) {
                              "11000000010000010",
                              "1100000001000001100",
                              "1100000001000001101000000000000000000000000000000000000000000000",
+                         });
+    assertMinCoverResult(23.5,
+                         true,
+                         35.25,
+                         false,
+                         0.0,
+                         1000.0,
+                         1,
+                         13,
+                         {
+                             "11000000001101111",
+                             "1100000000111",
+                             "1100000001000000",
+                             "11000000010000010",
+                             "1100000001000001100",
+                         });
+    assertMinCoverResult(23.5,
+                         true,
+                         35.25,
+                         false,
+                         0.0,
+                         1000.0,
+                         1,
+                         14,
+                         {
+                             "11000000001101111",
+                             "11000000001110",
+                             "11000000001111",
+                             "1100000001000000",
+                             "11000000010000010",
+                             "1100000001000001100",
                          });
 }
 
@@ -3863,6 +4033,7 @@ TEST(MinCoverInterfaceTest, Decimal_Basic) {
         Decimal128(0.0),
         Decimal128(1000.0),
         1,
+        0,
         {
             "10101110001110010101110110111101011100000100000110000101000111000000101010111001010111"
             "0001010111011111111111111111101",
@@ -4003,6 +4174,7 @@ TEST(MinCoverInterfaceTest, Decimal_Basic) {
         Decimal128(0.0),
         Decimal128(1000.0),
         1,
+        0,
         {
             "10101110001110010101110110111101011100000100000110000101000111000000101010111001010111"
             "000101011101111111111111111110100000000001",
@@ -4160,6 +4332,7 @@ TEST(MinCoverInterfaceTest, Decimal_Basic) {
         Decimal128(0.0),
         Decimal128(1000.0),
         1,
+        0,
         {
             "10101110001110010101110110111101011100000100000110000101000111000000101010111001010111"
             "0001010111011111111111111111101",
@@ -4297,6 +4470,7 @@ TEST(MinCoverInterfaceTest, Decimal_Basic) {
         Decimal128(0.0),
         Decimal128(1000.0),
         1,
+        0,
         {
             "10101110001110010101110110111101011100000100000110000101000111000000101010111001010111"
             "000101011101111111111111111110100000000001",
@@ -4370,6 +4544,287 @@ TEST(MinCoverInterfaceTest, Decimal_Basic) {
             "10101110001110010101110111",
             "10101110001110010101111",
             "1010111000111001011",
+            "10101110001110011000",
+            "1010111000111001100100",
+            "10101110001110011001010",
+            "101011100011100110010110",
+            "1010111000111001100101110",
+            "101011100011100110010111100",
+            "10101110001110011001011110100",
+            "101011100011100110010111101010",
+            "10101110001110011001011110101100000000",
+            "101011100011100110010111101011000000010",
+            "1010111000111001100101111010110000000110000000",
+            "101011100011100110010111101011000000011000000100",
+            "10101110001110011001011110101100000001100000010100",
+            "101011100011100110010111101011000000011000000101010000",
+            "10101110001110011001011110101100000001100000010101000100",
+            "1010111000111001100101111010110000000110000001010100010100000",
+            "10101110001110011001011110101100000001100000010101000101000010",
+            "101011100011100110010111101011000000011000000101010001010000110",
+            "1010111000111001100101111010110000000110000001010100010100001110",
+            "101011100011100110010111101011000000011000000101010001010000111100",
+            "1010111000111001100101111010110000000110000001010100010100001111010",
+            "101011100011100110010111101011000000011000000101010001010000111101100",
+            "1010111000111001100101111010110000000110000001010100010100001111011010",
+            "101011100011100110010111101011000000011000000101010001010000111101101100",
+            "10101110001110011001011110101100000001100000010101000101000011110110110100",
+            "101011100011100110010111101011000000011000000101010001010000111101101101010",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101100",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101000",
+            "1010111000111001100101111010110000000110000001010100010100001111011011010110100100",
+            "101011100011100110010111101011000000011000000101010001010000111101101101011010010100",
+            "1010111000111001100101111010110000000110000001010100010100001111011011010110100101010",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "0",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "100",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "101000000",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "1010000010",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "1010000011000",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "10100000110010",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "101000001100110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "1010000011001110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "10100000110011110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "101000001100111110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "1010000011001111110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "10100000110011111110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "101000001100111111110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "1010000011001111111110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "10100000110011111111110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "101000001100111111111110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "1010000011001111111111110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "10100000110011111111111110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "101000001100111111111111110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "1010000011001111111111111110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "10100000110011111111111111110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "1010000011001111111111111111100",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "101000001100111111111111111110100000000000",
+        });
+    assertMinCoverResult(
+        Decimal128(23.5),
+        true,
+        Decimal128(35.25),
+        true,
+        Decimal128(0.0),
+        Decimal128(1000.0),
+        1,
+        19,
+        {
+            "10101110001110010101110110111101011100000100000110000101000111000000101010111001010111"
+            "0001010111011111111111111111101",
+            "10101110001110010101110110111101011100000100000110000101000111000000101010111001010111"
+            "000101011101111111111111111111",
+            "10101110001110010101110110111101011100000100000110000101000111000000101010111001010111"
+            "00010101111",
+            "10101110001110010101110110111101011100000100000110000101000111000000101010111001010111"
+            "0001011",
+            "10101110001110010101110110111101011100000100000110000101000111000000101010111001010111"
+            "00011",
+            "10101110001110010101110110111101011100000100000110000101000111000000101010111001010111"
+            "001",
+            "10101110001110010101110110111101011100000100000110000101000111000000101010111001010111"
+            "01",
+            "10101110001110010101110110111101011100000100000110000101000111000000101010111001010111"
+            "1",
+            "10101110001110010101110110111101011100000100000110000101000111000000101010111001011",
+            "101011100011100101011101101111010111000001000001100001010001110000001010101110011",
+            "1010111000111001010111011011110101110000010000011000010100011100000010101011101",
+            "101011100011100101011101101111010111000001000001100001010001110000001010101111",
+            "10101110001110010101110110111101011100000100000110000101000111000000101011",
+            "101011100011100101011101101111010111000001000001100001010001110000001011",
+            "1010111000111001010111011011110101110000010000011000010100011100000011",
+            "10101110001110010101110110111101011100000100000110000101000111000001",
+            "1010111000111001010111011011110101110000010000011000010100011100001",
+            "101011100011100101011101101111010111000001000001100001010001110001",
+            "10101110001110010101110110111101011100000100000110000101000111001",
+            "1010111000111001010111011011110101110000010000011000010100011101",
+            "101011100011100101011101101111010111000001000001100001010001111",
+            "10101110001110010101110110111101011100000100000110000101001",
+            "1010111000111001010111011011110101110000010000011000010101",
+            "101011100011100101011101101111010111000001000001100001011",
+            "1010111000111001010111011011110101110000010000011000011",
+            "10101110001110010101110110111101011100000100000110001",
+            "1010111000111001010111011011110101110000010000011001",
+            "101011100011100101011101101111010111000001000001101",
+            "10101110001110010101110110111101011100000100000111",
+            "10101110001110010101110110111101011100000100001",
+            "1010111000111001010111011011110101110000010001",
+            "101011100011100101011101101111010111000001001",
+            "10101110001110010101110110111101011100000101",
+            "1010111000111001010111011011110101110000011",
+            "10101110001110010101110110111101011100001",
+            "1010111000111001010111011011110101110001",
+            "101011100011100101011101101111010111001",
+            "10101110001110010101110110111101011101",
+            "1010111000111001010111011011110101111",
+            "101011100011100101011101101111011",
+            "1010111000111001010111011011111",
+            "10101110001110010101110111",
+            "10101110001110010101111",
+            "1010111000111001011",
+            "10101110001110011000",
+            "1010111000111001100100",
+            "10101110001110011001010",
+            "101011100011100110010110",
+            "1010111000111001100101110",
+            "101011100011100110010111100",
+            "10101110001110011001011110100",
+            "101011100011100110010111101010",
+            "10101110001110011001011110101100000000",
+            "101011100011100110010111101011000000010",
+            "1010111000111001100101111010110000000110000000",
+            "101011100011100110010111101011000000011000000100",
+            "10101110001110011001011110101100000001100000010100",
+            "101011100011100110010111101011000000011000000101010000",
+            "10101110001110011001011110101100000001100000010101000100",
+            "1010111000111001100101111010110000000110000001010100010100000",
+            "10101110001110011001011110101100000001100000010101000101000010",
+            "101011100011100110010111101011000000011000000101010001010000110",
+            "1010111000111001100101111010110000000110000001010100010100001110",
+            "101011100011100110010111101011000000011000000101010001010000111100",
+            "1010111000111001100101111010110000000110000001010100010100001111010",
+            "101011100011100110010111101011000000011000000101010001010000111101100",
+            "1010111000111001100101111010110000000110000001010100010100001111011010",
+            "101011100011100110010111101011000000011000000101010001010000111101101100",
+            "10101110001110011001011110101100000001100000010101000101000011110110110100",
+            "101011100011100110010111101011000000011000000101010001010000111101101101010",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101100",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101000",
+            "1010111000111001100101111010110000000110000001010100010100001111011011010110100100",
+            "101011100011100110010111101011000000011000000101010001010000111101101101011010010100",
+            "1010111000111001100101111010110000000110000001010100010100001111011011010110100101010",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "0",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "100",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "101000000",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "1010000010",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "1010000011000",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "10100000110010",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "101000001100110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "1010000011001110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "10100000110011110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "101000001100111110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "1010000011001111110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "10100000110011111110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "101000001100111111110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "1010000011001111111110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "10100000110011111111110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "101000001100111111111110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "1010000011001111111111110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "10100000110011111111111110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "101000001100111111111111110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "1010000011001111111111111110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "10100000110011111111111111110",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "1010000011001111111111111111100",
+            "10101110001110011001011110101100000001100000010101000101000011110110110101101001010110"
+            "101000001100111111111111111110100000000000",
+        });
+    assertMinCoverResult(
+        Decimal128(23.5),
+        true,
+        Decimal128(35.25),
+        true,
+        Decimal128(0.0),
+        Decimal128(1000.0),
+        1,
+        20,
+        {
+            "10101110001110010101110110111101011100000100000110000101000111000000101010111001010111"
+            "0001010111011111111111111111101",
+            "10101110001110010101110110111101011100000100000110000101000111000000101010111001010111"
+            "000101011101111111111111111111",
+            "10101110001110010101110110111101011100000100000110000101000111000000101010111001010111"
+            "00010101111",
+            "10101110001110010101110110111101011100000100000110000101000111000000101010111001010111"
+            "0001011",
+            "10101110001110010101110110111101011100000100000110000101000111000000101010111001010111"
+            "00011",
+            "10101110001110010101110110111101011100000100000110000101000111000000101010111001010111"
+            "001",
+            "10101110001110010101110110111101011100000100000110000101000111000000101010111001010111"
+            "01",
+            "10101110001110010101110110111101011100000100000110000101000111000000101010111001010111"
+            "1",
+            "10101110001110010101110110111101011100000100000110000101000111000000101010111001011",
+            "101011100011100101011101101111010111000001000001100001010001110000001010101110011",
+            "1010111000111001010111011011110101110000010000011000010100011100000010101011101",
+            "101011100011100101011101101111010111000001000001100001010001110000001010101111",
+            "10101110001110010101110110111101011100000100000110000101000111000000101011",
+            "101011100011100101011101101111010111000001000001100001010001110000001011",
+            "1010111000111001010111011011110101110000010000011000010100011100000011",
+            "10101110001110010101110110111101011100000100000110000101000111000001",
+            "1010111000111001010111011011110101110000010000011000010100011100001",
+            "101011100011100101011101101111010111000001000001100001010001110001",
+            "10101110001110010101110110111101011100000100000110000101000111001",
+            "1010111000111001010111011011110101110000010000011000010100011101",
+            "101011100011100101011101101111010111000001000001100001010001111",
+            "10101110001110010101110110111101011100000100000110000101001",
+            "1010111000111001010111011011110101110000010000011000010101",
+            "101011100011100101011101101111010111000001000001100001011",
+            "1010111000111001010111011011110101110000010000011000011",
+            "10101110001110010101110110111101011100000100000110001",
+            "1010111000111001010111011011110101110000010000011001",
+            "101011100011100101011101101111010111000001000001101",
+            "10101110001110010101110110111101011100000100000111",
+            "10101110001110010101110110111101011100000100001",
+            "1010111000111001010111011011110101110000010001",
+            "101011100011100101011101101111010111000001001",
+            "10101110001110010101110110111101011100000101",
+            "1010111000111001010111011011110101110000011",
+            "10101110001110010101110110111101011100001",
+            "1010111000111001010111011011110101110001",
+            "101011100011100101011101101111010111001",
+            "10101110001110010101110110111101011101",
+            "1010111000111001010111011011110101111",
+            "101011100011100101011101101111011",
+            "1010111000111001010111011011111",
+            "10101110001110010101110111",
+            "10101110001110010101111",
+            "10101110001110010110",
+            "10101110001110010111",
             "10101110001110011000",
             "1010111000111001100100",
             "10101110001110011001010",
@@ -4458,6 +4913,7 @@ TEST(MinCoverInterfaceTest, InfiniteRangeBounds) {
                          0.0,
                          32.0,
                          1,
+                         0,
                          {
                              "11000000000111",
                              "11000000001",
@@ -4470,6 +4926,7 @@ TEST(MinCoverInterfaceTest, InfiniteRangeBounds) {
                          0.0,
                          32.0,
                          1,
+                         0,
                          {
                              "10",
                              "11000000000",
@@ -4482,31 +4939,52 @@ TEST(MinCoverInterfaceTest, InfiniteRangeBounds) {
                          0.0,
                          32.0,
                          1,
+                         0,
                          {
                              "10",
+                             "11000000000",
+                             "1100000000100000000000000000000000000000000000000000000000000000",
+                         });
+    assertMinCoverResult(-std::numeric_limits<double>::infinity(),
+                         true,
+                         8.0,
+                         true,
+                         0.0,
+                         32.0,
+                         1,
+                         3,
+                         {
+                             "100",
+                             "101",
                              "11000000000",
                              "1100000000100000000000000000000000000000000000000000000000000000",
                          });
 }
 
 TEST(MinCoverInteraceTest, InvalidBounds) {
-    assertMinCoverResult(7, true, 7, false, 0, 32, 1, {});
-    assertMinCoverResult(7LL, true, 7LL, false, 0LL, 32LL, 1, {});
-    assertMinCoverResult(7.0, true, 7.0, false, 0.0, 32.0, 1, {});
+    assertMinCoverResult(7, true, 7, false, 0, 32, 1, 0, {});
+    assertMinCoverResult(7LL, true, 7LL, false, 0LL, 32LL, 1, 0, {});
+    assertMinCoverResult(7.0, true, 7.0, false, 0.0, 32.0, 1, 0, {});
 
-    assertMinCoverResult(7, false, 7, true, 0, 32, 1, {});
-    assertMinCoverResult(7LL, false, 7LL, true, 0LL, 32LL, 1, {});
-    assertMinCoverResult(7.0, false, 7.0, true, 0.0, 32.0, 1, {});
+    assertMinCoverResult(7, false, 7, true, 0, 32, 1, 0, {});
+    assertMinCoverResult(7LL, false, 7LL, true, 0LL, 32LL, 1, 0, {});
+    assertMinCoverResult(7.0, false, 7.0, true, 0.0, 32.0, 1, 0, {});
 
     ASSERT_THROWS_CODE(
-        assertMinCoverResult(1, false, 1, false, 0, 1, 1, {}), AssertionException, 6901316);
+        assertMinCoverResult(1, false, 1, false, 0, 1, 1, 0, {}), AssertionException, 6901316);
     ASSERT_THROWS_CODE(
-        assertMinCoverResult(0, true, 0, false, 0, 7, 1, {}), AssertionException, 6901317);
+        assertMinCoverResult(0, true, 0, false, 0, 7, 1, 0, {}), AssertionException, 6901317);
+
+
+    ASSERT_THROWS(assertMinCoverResult(1, true, 2, true, 0, 7, 1, -1, {}), AssertionException);
+    ASSERT_THROWS_CODE(
+        assertMinCoverResult(1, true, 2, true, 0, 7, 1, 3, {}), AssertionException, 8574106);
 }
 
 // Test point queries and that trimming bitstrings is correct in precision mode
 TEST(MinCoverInteraceTest, Precision_Equal) {
-    assertMinCoverResultPrecision(3.14159, true, 3.14159, true, 0.0, 10.0, 1, 2, {"00100111010"});
+    assertMinCoverResultPrecision(
+        3.14159, true, 3.14159, true, 0.0, 10.0, 1, 2, 0, {"00100111010"});
     assertMinCoverResultPrecision(Decimal128(3.14159),
                                   true,
                                   Decimal128(3.14159),
@@ -4515,9 +4993,10 @@ TEST(MinCoverInteraceTest, Precision_Equal) {
                                   Decimal128(10.0),
                                   1,
                                   2,
+                                  0,
                                   {"00100111010"});
 
-    assertMinCoverResultPrecision(3.1, true, 3.1, true, 0.0, 12.0, 1, 1, {"00011111"});
+    assertMinCoverResultPrecision(3.1, true, 3.1, true, 0.0, 12.0, 1, 1, 0, {"00011111"});
     assertMinCoverResultPrecision(Decimal128(3.1),
                                   true,
                                   Decimal128(3.1),
@@ -4526,6 +5005,18 @@ TEST(MinCoverInteraceTest, Precision_Equal) {
                                   Decimal128(12.0),
                                   1,
                                   1,
+                                  0,
+                                  {"00011111"});
+    assertMinCoverResultPrecision(3.1, true, 3.1, true, 0.0, 12.0, 1, 1, 7, {"00011111"});
+    assertMinCoverResultPrecision(Decimal128(3.1),
+                                  true,
+                                  Decimal128(3.1),
+                                  true,
+                                  Decimal128(0.0),
+                                  Decimal128(12.0),
+                                  1,
+                                  1,
+                                  7,
                                   {"00011111"});
 }
 
@@ -4551,4 +5042,238 @@ DEATH_TEST_REGEX(MinCoverInterfaceTest, Error_MinMaxTypeMismatch, "Tripwire asse
 
     getMinCover(spec, 1);
 }
+
+class EdgeTestFixture : public unittest::Test {
+public:
+    static constexpr int kMaxPrecisionDouble = 15;
+    static constexpr int kMaxPrecisionDecimal128 = 34;
+
+    template <typename T>
+    static QueryTypeConfig makeRangeQueryTypeConfig(T lb,
+                                                    T ub,
+                                                    const boost::optional<uint32_t>& precision,
+                                                    int sparsity) {
+        QueryTypeConfig config;
+        config.setQueryType(QueryTypeEnum::Range);
+        if constexpr (std::is_same_v<T, long>) {
+            // Type aliasing gets a little weird. int64_t -> long, but Value(long) = delete, and
+            // int64_t ~= long long anyway. Ignore the distinction for the purposes of this test.
+            config.setMin(Value(static_cast<long long>(lb)));
+            config.setMax(Value(static_cast<long long>(ub)));
+        } else {
+            config.setMin(Value(lb));
+            config.setMax(Value(ub));
+        }
+        config.setSparsity(sparsity);
+        if (precision) {
+            config.setPrecision(*precision);
+        }
+        return config;
+    }
+
+    template <typename T, typename GetEdges>
+    static void assertEdgesLengthMatch(const T& lb,
+                                       const T& ub,
+                                       const boost::optional<std::uint32_t>& precision,
+                                       int sparsity,
+                                       GetEdges getEdges) {
+        const auto edges = [&] {
+            if constexpr (std::is_same_v<T, double> || std::is_same_v<T, Decimal128>) {
+                return getEdges(lb, lb, ub, precision, sparsity, 0);
+            } else {
+                return getEdges(lb, lb, ub, sparsity, 0);
+            }
+        }();
+        const auto expect = edges->get().size();
+        const auto calculated =
+            getEdgesLength(makeRangeQueryTypeConfig(lb, ub, precision, sparsity));
+        if (expect != calculated) {
+            // Context for the exception we're about to throw.
+            LOGV2(8574790,
+                  "Mismatched edge length prediction",
+                  "lb"_attr = lb,
+                  "ub"_attr = ub,
+                  "sparsity"_attr = sparsity,
+                  "precision"_attr = precision.get_value_or(-1),
+                  "leafSize"_attr = edges->getLeaf().size(),
+                  "expect"_attr = expect,
+                  "calculated"_attr = calculated);
+        }
+        ASSERT_EQ(expect, calculated);
+    }
+
+    template <typename T, typename GetEdges>
+    static void runEdgesLengthTestForFunamentalType(GetEdges getEdges) {
+        constexpr auto low = std::numeric_limits<T>::lowest();
+        constexpr auto max = std::numeric_limits<T>::max();
+
+        std::vector<T> testVals{low,
+                                low / 2,
+                                -1000000,
+                                -65537,
+                                -1000,
+                                -10,
+                                -1,
+                                0,
+                                1,
+                                10,
+                                1000,
+                                65537,
+                                1000000,
+                                max / 2,
+                                max};
+        std::vector<boost::optional<uint32_t>> testPrecisions = {boost::none};
+        if constexpr (std::is_same_v<T, double>) {
+            constexpr auto min = std::numeric_limits<T>::min();
+            testVals.push_back(min);
+            testVals.push_back(-min);
+            testVals.push_back(1.1);
+            testVals.push_back(-1.1);
+            testVals.push_back(2.71828182);
+            testVals.push_back(3.14159265);
+
+            testPrecisions.clear();
+            for (int i = 1; i <= kMaxPrecisionDouble; ++i) {
+                testPrecisions.push_back(i);
+            }
+        }
+
+        for (int sparsity = 1; sparsity <= 4; ++sparsity) {
+            for (const T lb : testVals) {
+                for (const T ub : testVals) {
+                    if (lb >= ub) {
+                        // getEdgesT has a check for min < max, tested elsewhere.
+                        continue;
+                    }
+                    for (const auto& precision : testPrecisions) {
+                        assertEdgesLengthMatch(lb, ub, precision, sparsity, getEdges);
+                    }
+                }
+            }
+        }
+    }
+};
+
+TEST_F(EdgeTestFixture, getEdgesLengthInt32) {
+    runEdgesLengthTestForFunamentalType<int32_t>(getEdgesInt32);
+}
+
+TEST_F(EdgeTestFixture, getEdgesLengthInt64) {
+    runEdgesLengthTestForFunamentalType<int64_t>(getEdgesInt64);
+}
+
+TEST_F(EdgeTestFixture, getEdgesLengthDouble) {
+    runEdgesLengthTestForFunamentalType<double>(getEdgesDouble);
+}
+
+// Decimal128 is less well templated than the fundamental types,
+// Check a smaller, but still representative sample of values.
+// Additionally, when Decimal128 is used in EncryptionInformation
+TEST_F(EdgeTestFixture, getEdgesLengthDecimal128) {
+    const Decimal128 kUInt128Max("340282366920938463463374607431768211455");
+
+    const std::vector<Decimal128> testVals{
+        Decimal128::kLargestNegative,
+        -kUInt128Max,
+        Decimal128(-1000000),
+        Decimal128(-1000),
+        Decimal128(-10),
+        Decimal128::kNormalizedZero,
+        Decimal128(10),
+        Decimal128(1000),
+        Decimal128(1000000),
+        kUInt128Max,
+        Decimal128::kLargestPositive,
+    };
+
+    for (int sparsity = 1; sparsity <= 4; ++sparsity) {
+        for (const auto& lb : testVals) {
+            for (const auto& ub : testVals) {
+                if (lb >= ub) {
+                    continue;
+                }
+                for (std::uint32_t precision = 1; precision <= kMaxPrecisionDecimal128;
+                     ++precision) {
+                    assertEdgesLengthMatch(lb, ub, precision, sparsity, getEdgesDecimal128);
+                }
+            }
+        }
+    }
+}
+
+TEST_F(EdgeTestFixture, getEdgesLengthDate) {
+    const std::vector<Date_t> testVals{
+        Date_t::min(),
+        Date_t::now() - Days{7},
+        Date_t::now(),
+        Date_t::now() + Days{7},
+        Date_t::max(),
+    };
+
+    for (int sparsity = 1; sparsity <= 4; ++sparsity) {
+        for (const auto& lb : testVals) {
+            for (const auto& ub : testVals) {
+                if (lb >= ub) {
+                    continue;
+                }
+                assertEdgesLengthMatch(lb.toMillisSinceEpoch(),
+                                       ub.toMillisSinceEpoch(),
+                                       boost::none,
+                                       sparsity,
+                                       getEdgesInt64);
+            }
+        }
+    }
+}
+
+class AnchorPaddingFixture : public unittest::Test {
+public:
+    static constexpr auto kAnchorPaddingRootHex =
+        "4312890F621FE3CA7497C3405DFD8AAF46A578C77F7404D28C12BA853A4D3327"_sd;
+
+    const AnchorPaddingRootToken _rootToken{decodePrf(kAnchorPaddingRootHex)};
+    const AnchorPaddingKeyToken _keyToken =
+        FLEAnchorPaddingDerivedGenerator::generateAnchorPaddingKeyToken(_rootToken);
+    const AnchorPaddingValueToken _valueToken =
+        FLEAnchorPaddingDerivedGenerator::generateAnchorPaddingValueToken(_rootToken);
+};
+
+TEST_F(AnchorPaddingFixture, generatePaddingDocument) {
+    constexpr std::uint64_t kId = 42;
+    auto doc = ESCCollectionAnchorPadding::generatePaddingDocument(_keyToken, _valueToken, kId);
+    ASSERT_EQ(doc.nFields(), 2UL);
+
+    // _id := F_k(bot || id)
+    {
+        // kHashOf042 = SHA256_HMAC(Key, 0 || 42), numbers as 64bit LE integers
+        constexpr auto kHashOf042 =
+            "0564ba5c84f27f20dd5a0ed69cace035983c50ccb4fa94244a475ab7c1e891ee"_sd;
+        auto expectId = decodePrf(kHashOf042);
+
+        auto idElem = doc["_id"_sd];
+        ASSERT_EQ(idElem.type(), BinData);
+        ASSERT_EQ(idElem.binDataType(), BinDataGeneral);
+
+        int actualIdLen = 0;
+        const char* actualIdPtr = idElem.binData(actualIdLen);
+        ASSERT_EQ(actualIdLen, expectId.size());
+
+        PrfBlock actualId = blockToArray(StringData(actualIdPtr, actualIdLen));
+        ASSERT(expectId == actualId);
+    }
+
+    // value := Enc(0 || 0)
+    {
+        auto valueElem = doc["value"_sd];
+        ASSERT_EQ(valueElem.type(), BinData);
+        ASSERT_EQ(valueElem.binDataType(), BinDataGeneral);
+        int len = 0;
+        const char* value = valueElem.binData(len);
+        auto swDecrypt = FLEUtil::decryptData(_valueToken.toCDR(), ConstDataRange(value, len));
+        ASSERT_OK(swDecrypt.getStatus());
+        auto dec = std::move(swDecrypt.getValue());
+        ASSERT_TRUE(std::all_of(dec.begin(), dec.end(), [](auto b) { return b == 0; }));
+    }
+}
+
 }  // namespace mongo

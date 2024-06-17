@@ -214,9 +214,10 @@ void logShutdown(Client* client) {
 void logLogout(Client* client,
                StringData reason,
                const BSONArray& initialUsers,
-               const BSONArray& updatedUsers) {
+               const BSONArray& updatedUsers,
+               const boost::optional<Date_t>& loginTime) {
     AuditInterface::get(client->getServiceContext())
-        ->logLogout(client, reason, initialUsers, updatedUsers);
+        ->logLogout(client, reason, initialUsers, updatedUsers, loginTime);
 }
 
 void logCreateIndex(Client* client,
@@ -319,7 +320,7 @@ void logRemoveOperation(Client* client, const NamespaceString& nss, const BSONOb
 
 void logGetClusterParameter(
     Client* client,
-    const stdx::variant<std::string, std::vector<std::string>>& requestedParameters) {
+    const std::variant<std::string, std::vector<std::string>>& requestedParameters) {
     AuditInterface::get(client->getServiceContext())
         ->logGetClusterParameter(client, requestedParameters);
 }

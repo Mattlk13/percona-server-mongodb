@@ -29,13 +29,13 @@
 
 #pragma once
 
-#include <bitset>
 #include <initializer_list>
 #include <iosfwd>
 #include <string>
 #include <vector>
 
 #include "mongo/base/string_data.h"
+#include "mongo/util/dynamic_bitset.h"
 
 namespace mongo::boolean_simplification {
 
@@ -46,32 +46,80 @@ namespace mongo::boolean_simplification {
  * children conjunctive terms.
  */
 
-constexpr size_t kBitsetNumberOfBits = 64;
-using Bitset = std::bitset<kBitsetNumberOfBits>;
+using Bitset = DynamicBitset<size_t, 1>;
 
 inline Bitset operator""_b(const char* bits, size_t len) {
-    return Bitset{std::string{bits, len}};
+    return Bitset{StringData{bits, len}};
 }
 
 /**
  * Represent a conjunctive or disjunctive term in a condensed bitset form.
  */
 struct BitsetTerm {
-    explicit BitsetTerm() : predicates(0ul), mask(0ul) {}
+    explicit BitsetTerm(size_t nbits) : predicates(nbits), mask(nbits) {}
 
     BitsetTerm(Bitset bitset, Bitset mask) : predicates(bitset), mask(mask) {}
 
-    BitsetTerm(size_t bitIndex, bool val) : predicates(0ul), mask(0ul) {
+    BitsetTerm(StringData bits, StringData mask)
+        : BitsetTerm{Bitset{bits.toString()}, Bitset{mask.toString()}} {}
+
+    BitsetTerm(size_t nbits, size_t bitIndex, bool val) : predicates(nbits), mask(nbits) {
         set(bitIndex, val);
     }
 
+    /**
+     * Flip the value of every predicate in the minterm.
+     */
+    void flip();
+
     void set(size_t bitIndex, bool value) {
+        if (mask.size() <= bitIndex) {
+            // This is fine from the performance perspective, because DynamicBitset will increase
+            // the size by 1 block, not 1 bit.
+            resize(bitIndex + 1);
+        }
+
         mask.set(bitIndex, true);
         predicates.set(bitIndex, value);
     }
 
     size_t size() const {
         return mask.size();
+    }
+
+    void resize(size_t newSize) {
+        predicates.resize(newSize);
+        mask.resize(newSize);
+    }
+
+    /**
+     * Returns true if the given terms have conflicting bits. The bits of two terms are conflicting
+     * if in one term the bit is set to 1 and in another to 0.
+     */
+    inline bool hasConflicts(const BitsetTerm& other) const {
+        return anyOf(
+            [](auto predicatesBlock,
+               auto maskBlock,
+               auto otherPredicatesBlock,
+               auto otherMaskBlock) {
+                return (predicatesBlock ^ otherPredicatesBlock) & (maskBlock & otherMaskBlock);
+            },
+            predicates,
+            mask,
+            other.predicates,
+            other.mask);
+    }
+
+    /**
+     * Returns true if the current term can absorb the other term. For example, 'a' absorbs 'a & b'
+     * (or 'a | b'). See Absorption law for details.
+     */
+    MONGO_COMPILER_ALWAYS_INLINE bool canAbsorb(const BitsetTerm& other) const {
+        return mask.isSubsetOf(other.mask) && predicates.isEqualToMasked(other.predicates, mask);
+    }
+
+    bool isConjunctionAlwaysTrue() const {
+        return mask.none();
     }
 
     /**
@@ -86,23 +134,45 @@ struct BitsetTerm {
     Bitset mask;
 };
 
-struct Minterm;
+/**
+ * Minterms represent a conjunction of an expression in Disjunctive Normal Form.
+ */
+using Minterm = BitsetTerm;
 
 /**
  * Maxterm represents top disjunction of an expression in Disjunctive Normal Form and consists of a
  * list of children conjunctions. Each child conjunction is represented as a Minterm.
  */
 struct Maxterm {
-    Maxterm() = default;
+    explicit Maxterm(size_t size);
     Maxterm(std::initializer_list<Minterm> init);
 
-    Maxterm& operator|=(const Minterm& rhs);
-    Maxterm& operator|=(const Maxterm& rhs);
-    Maxterm& operator&=(const Maxterm& rhs);
-    Maxterm operator~() const;
+    MONGO_COMPILER_ALWAYS_INLINE Maxterm& operator|=(const Maxterm& rhs) {
+        minterms.reserve(minterms.size() + rhs.minterms.size());
+        for (auto& right : rhs.minterms) {
+            minterms.emplace_back(right);
+        }
+        return *this;
+    }
 
+    MONGO_COMPILER_ALWAYS_INLINE Maxterm& operator&=(const Maxterm& rhs) {
+        Maxterm result = *this & rhs;
+        minterms.swap(result.minterms);
+        return *this;
+    }
+
+    /**
+     * Returns true if the expression is trivially true. It is recommended to call
+     * removeRedundancies() before this call to make sure that always true expressions is converted
+     * into trivially true one.
+     */
     bool isAlwaysTrue() const;
 
+    /**
+     * Returns true if the expression is trivially false. It is recommended to call
+     * removeRedundancies() before this call to make sure that always false expressions is converted
+     * into trivially false one.
+     */
     bool isAlwaysFalse() const;
 
     /**
@@ -121,11 +191,26 @@ struct Maxterm {
      */
     void appendEmpty();
 
+    /**
+     * Returns the number of bits that each individual minterm in the maxterm contains.
+     */
+    size_t numberOfBits() const {
+        return _numberOfBits;
+    }
+
     std::string toString() const;
 
+    /**
+     * Minterms represent a conjunction of an expression in Disjunctive Normal Form and consists of
+     * predicates which can be in true (for a predicate A, true form is just A) of false forms (for
+     * a predicate A the false form is the negation of A: ~A). Every predicate is represented by a
+     * bit in the predicates bitset.
+     */
     std::vector<Minterm> minterms;
 
 private:
+    size_t _numberOfBits;
+
     friend Maxterm operator&(const Maxterm& lhs, const Maxterm& rhs);
 };
 
@@ -136,64 +221,15 @@ private:
  */
 std::pair<Minterm, Maxterm> extractCommonPredicates(Maxterm maxterm);
 
-/**
- * Minterms represent a conjunction of an expression in Disjunctive Normal Form and consists of
- * predicates which can be in true (for a predicate A, true form is just A) of false forms (for
- * a predicate A the false form is the negation of A: ~A). Every predicate is represented by a
- * bit in the predicates bitset.
- */
-struct Minterm : private BitsetTerm {
-    using BitsetTerm::BitsetTerm;
-    using BitsetTerm::mask;
-    using BitsetTerm::predicates;
-    using BitsetTerm::set;
-    using BitsetTerm::size;
-
-    Minterm(StringData bits, StringData mask)
-        : Minterm{Bitset{bits.toString()}, Bitset{mask.toString()}} {}
-
-    /**
-     * Returns the set of bits in which the conflicting bits of the minterms are set. The bits
-     * of two minterms are conflicting if in one minterm the bit is set to 1 and in another to
-     * 0.
-     */
-    inline Bitset getConflicts(const Minterm& other) const {
-        return (predicates ^ other.predicates) & (mask & other.mask);
-    }
-
-    Maxterm operator~() const;
-
-    /**
-     * Returns true if the current minterm can absorb the other minterm. For example, 'a' absorbs 'a
-     * & b'. See Absorption law for details.
-     */
-    bool canAbsorb(const Minterm& other) const {
-        return mask == (mask & other.mask) && predicates == (mask & other.predicates);
-    }
-
-    bool isAlwaysTrue() const {
-        return mask.none();
-    }
-
-    /**
-     * Flip the value of every predicate in the minterm.
-     */
-    void flip();
-};
-
-inline Maxterm operator&(const Minterm& lhs, const Minterm& rhs) {
-    if (lhs.getConflicts(rhs).any()) {
-        return Maxterm{};
-    }
-    return {{Minterm(lhs.predicates | rhs.predicates, lhs.mask | rhs.mask)}};
-}
-
 inline Maxterm operator&(const Maxterm& lhs, const Maxterm& rhs) {
-    Maxterm result{};
+    Maxterm result{lhs._numberOfBits};
     result.minterms.reserve(lhs.minterms.size() * rhs.minterms.size());
     for (const auto& left : lhs.minterms) {
         for (const auto& right : rhs.minterms) {
-            result |= left & right;
+            if (!left.hasConflicts(right)) {
+                result.minterms.emplace_back(left.predicates | right.predicates,
+                                             left.mask | right.mask);
+            }
         }
     }
     return result;
@@ -201,13 +237,11 @@ inline Maxterm operator&(const Maxterm& lhs, const Maxterm& rhs) {
 
 bool operator==(const BitsetTerm& lhs, const BitsetTerm& rhs);
 std::ostream& operator<<(std::ostream& os, const BitsetTerm& term);
-bool operator==(const Minterm& lhs, const Minterm& rhs);
-std::ostream& operator<<(std::ostream& os, const Minterm& minterm);
 bool operator==(const Maxterm& lhs, const Maxterm& rhs);
 std::ostream& operator<<(std::ostream& os, const Maxterm& maxterm);
 
 template <typename H>
-H AbslHashValue(H h, const Minterm& mt) {
-    return H::combine(std::move(h), mt.predicates, mt.mask);
+H AbslHashValue(H h, const BitsetTerm& term) {
+    return H::combine(std::move(h), term.predicates, term.mask);
 }
 }  // namespace mongo::boolean_simplification

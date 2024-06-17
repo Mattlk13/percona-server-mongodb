@@ -1,6 +1,10 @@
 /**
-@tags: [multiversion_incompatible]
-*/
+ * @tags: [
+ *    multiversion_incompatible,
+ *    # This tests needs to stop mongoS, which is impossible with an embedded router.
+ *    embedded_router_incompatible,
+ * ]
+ */
 
 // Don't check for UUID index consistency,orphans and routine table across the cluster at the end,
 // since the test shuts down a mongos

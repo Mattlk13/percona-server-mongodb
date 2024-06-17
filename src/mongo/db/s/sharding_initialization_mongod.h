@@ -40,8 +40,6 @@
 #include "mongo/client/replica_set_change_notifier.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replica_set_aware_service.h"
-#include "mongo/db/s/add_shard_cmd_gen.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/mutex.h"
@@ -64,29 +62,16 @@ public:
         std::function<void(OperationContext* opCtx, const ShardIdentity& shardIdentity)>;
 
     ShardingInitializationMongoD();
-    ~ShardingInitializationMongoD();
+    ~ShardingInitializationMongoD() override;
 
     static ShardingInitializationMongoD* get(OperationContext* opCtx);
     static ShardingInitializationMongoD* get(ServiceContext* service);
 
     /**
-     * If on a node capabale of serving as a shard, initializes sharding awareness from the
-     * shardIdentity document on disk, if there is one.
-     *
-     * If started with --shardsvr in queryableBackupMode, initializes sharding awareness from the
-     * shardIdentity document passed through the --overrideShardIdentity startup parameter.
-     *
-     * If it returns true, the '_initFunc' was called, meaning all the core classes for sharding
-     * were initialized, but no networking calls were made yet (with the exception of the duplicate
-     * ShardRegistry reload in ShardRegistry::startup() (see SERVER-26123). Outgoing networking
-     * calls to cluster members can now be made.
-     *
-     * If it returns false, this means the node is not yet sharding aware.
-     *
-     * NOTE: this function might be called more than once.
-     * NOTE: this function briefly takes the global lock to determine primary/secondary state.
+     * Returns the shard identity document for this shard if it exists. This method
+     * will also take into account the --overrideShardIdentity startup parameter
      */
-    bool initializeShardingAwarenessIfNeeded(OperationContext* opCtx);
+    static boost::optional<ShardIdentity> getShardIdentityDoc(OperationContext* opCtx);
 
     /**
      * Initializes the sharding state of this server from the shard identity document argument and
@@ -125,20 +110,20 @@ private:
                                                      const ShardIdentity& shardIdentity);
 
     // Virtual methods coming from the ReplicaSetAwareService
-    void onStartup(OperationContext* opCtx) override final {}
-    void onSetCurrentConfig(OperationContext* opCtx) override final;
-    void onInitialDataAvailable(OperationContext* opCtx,
-                                bool isMajorityDataAvailable) override final;
-    void onShutdown() override final {}
-    void onStepUpBegin(OperationContext* opCtx, long long term) override final {}
-    void onStepUpComplete(OperationContext* opCtx, long long term) override final {}
-    void onStepDown() override final {}
-    void onRollback() override final {}
-    void onBecomeArbiter() override final {}
-    inline std::string getServiceName() const override final {
+    void onStartup(OperationContext* opCtx) final {}
+    void onSetCurrentConfig(OperationContext* opCtx) final;
+    void onInitialDataAvailable(OperationContext* opCtx, bool isMajorityDataAvailable) final;
+    void onShutdown() final {}
+    void onStepUpBegin(OperationContext* opCtx, long long term) final;
+    void onStepUpComplete(OperationContext* opCtx, long long term) final {}
+    void onStepDown() final;
+    void onRollback() final {}
+    void onBecomeArbiter() final {}
+    inline std::string getServiceName() const final {
         return "ShardingInitializationMongoD";
     }
 
+    AtomicWord<bool> _isPrimary;
 
     // This mutex ensures that only one thread at a time executes the sharding
     // initialization/teardown sequence
@@ -152,18 +137,10 @@ private:
 };
 
 /**
- * Initialize the sharding components of this server. This can be used on both shard and config
- * servers.
- *
- * NOTE: This does not initialize ShardingState, which should only be done for shard servers.
+ * Initialize the sharding components for a mongod running as a config server (if they haven't
+ * already been set up).
  */
-void initializeGlobalShardingStateForMongoD(OperationContext* opCtx,
-                                            const boost::optional<ConnectionString>& configCS);
-
-/**
- * Initialize the sharding components for a config server, if they haven't already been set up.
- */
-void initializeGlobalShardingStateForConfigServerIfNeeded(OperationContext* opCtx);
+void initializeGlobalShardingStateForConfigServer(OperationContext* opCtx);
 
 /**
  * Helper method to initialize sharding awareness from the shard identity document if it can be
@@ -173,7 +150,9 @@ void initializeGlobalShardingStateForConfigServerIfNeeded(OperationContext* opCt
  * this function into one single builder that records the time elapsed during startup. Its default
  * value is nullptr because we only want to time this function when it is called during startup.
  */
-void initializeShardingAwarenessIfNeededAndLoadGlobalSettings(
-    OperationContext* opCtx, BSONObjBuilder* startupTimeElapsedBuilder = nullptr);
+void initializeShardingAwarenessAndLoadGlobalSettings(
+    OperationContext* opCtx,
+    const ShardIdentity& shardIdentity,
+    BSONObjBuilder* startupTimeElapsedBuilder = nullptr);
 
 }  // namespace mongo

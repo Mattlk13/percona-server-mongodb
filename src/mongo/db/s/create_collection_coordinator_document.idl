@@ -38,22 +38,29 @@ imports:
     - "mongo/s/request_types/sharded_ddl_commands.idl"
 
 enums:
+    # TODO (SERVER-79304): Remove once 8.0 becomes last LTS.
     CreateCollectionCoordinatorPhaseLegacy:
         description: "Current create collection coordinator's operation state."
         type: string
         values:
             kUnset: "unset"
             kCommit: "commit"
+    
     CreateCollectionCoordinatorPhase:
         description: "Current create collection coordinator's operation state."
         type: string
         values:
             kUnset: "unset"
-            kAcquireCSOnCoordinator: "acquireCSOnCoordinator"
-            kTranslateRequest: "translateRequest"
-            kAcquireCSOnParticipants: "acquireCSOnParticipants"
-            kCommit: "commit"
-            kReleaseAllCS: "releaseAllCS"
+            kEnterWriteCriticalSectionOnCoordinator: "enterWriteCriticalSectionOnCoordinator"
+            kTranslateRequestParameters: "translateRequestParameters"
+            kEnterWriteCSOnDataShardAndCheckEmpty: "enterWriteCSOnDataShardAndCheckEmpty"
+            kSyncIndexesOnCoordinator: "syncIndexesOnCoordinator"
+            kCreateCollectionOnCoordinator: "createCollectionOnCoordinator"
+            kEnterCriticalSection: "enterCriticalSection"
+            kCreateCollectionOnParticipants: "createCollectionOnParticipants"
+            kCommitOnShardingCatalog: "commitOnShardingCatalog"
+            kSetPostCommitMetadata: "setPostCommitMetadata"
+            kExitCriticalSection: "exitCriticalSection"
 
 structs:
     TranslatedRequestParams:
@@ -73,9 +80,14 @@ structs:
                 type: object_owned
                 description: "Collation value from the targeted unsharded collection if this exists; otherwise, simple-collation"
                 optional: false
+            timeseries:
+                type: TimeseriesOptions
+                description: "The options to create the time-series collection with."
+                optional: true
 
+    # TODO (SERVER-79304): Remove once 8.0 becomes last LTS.
     CreateCollectionCoordinatorDocumentLegacy:
-        description: "Object with neccessary fields to create a collection"
+        description: "Object with necessary fields to create a collection"
         generate_comparison_operators: false
         strict: false
         chained_structs:
@@ -90,6 +102,7 @@ structs:
                 type: TranslatedRequestParams
                 description: "The field is populated only once the kTranslateRequest phase is completed"
                 optional: true
+
     CreateCollectionCoordinatorDocument:
         description: "Object with neccessary fields to create a collection"
         generate_comparison_operators: false
@@ -104,5 +117,20 @@ structs:
                 default: kUnset
             translatedRequestParams:
                 type: TranslatedRequestParams
-                description: "The field is populated only once the kTranslateRequest phase is completed"
+                description: "The field is populated only once the kTranslateRequest phase is completed."
+                optional: true
+            collectionIsEmpty:
+                type: bool
+                description: "True if the collection has no data or does not exist. False otherwise."
+                optional: true
+            shardIds:
+                type: array<shard_id>
+                description: "The list of shards involved in the create collection operation."
+                optional: true
+            originalDataShard:
+                type: shard_id
+                description: >-
+                    The current data shard that the collection lives on. Will be the coordinator
+                    shard if the collection does not yet exist. Only guaranteed to be set after the
+                    enterWriteCSOnDataShardAndCheckEmpty phase completes.
                 optional: true

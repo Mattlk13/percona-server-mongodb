@@ -41,10 +41,10 @@
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/admission/execution_admission_context.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/apply_ops_gen.h"
 #include "mongo/db/repl/oplog.h"
@@ -53,6 +53,7 @@
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
@@ -73,12 +74,12 @@ MONGO_FAIL_POINT_DEFINE(skipOplogBatcherWaitForData);
 MONGO_FAIL_POINT_DEFINE(oplogBatcherPauseAfterSuccessfulPeek);
 
 OplogBatcher::OplogBatcher(OplogApplier* oplogApplier, OplogBuffer* oplogBuffer)
-    : _oplogApplier(oplogApplier), _oplogBuffer(oplogBuffer), _ops(0) {}
+    : _oplogApplier(oplogApplier), _oplogBuffer(oplogBuffer), _ops() {}
 OplogBatcher::~OplogBatcher() {
     invariant(!_thread);
 }
 
-OplogBatch OplogBatcher::getNextBatch(Seconds maxWaitTime) {
+OplogApplierBatch OplogBatcher::getNextBatch(Seconds maxWaitTime) {
     stdx::unique_lock<Latch> lk(_mutex);
     // _ops can indicate the following cases:
     // 1. A new batch is ready to consume.
@@ -95,8 +96,8 @@ OplogBatch OplogBatcher::getNextBatch(Seconds maxWaitTime) {
         (void)_cv.wait_for(lk, maxWaitTime.toSystemDuration());
     }
 
-    OplogBatch ops = std::move(_ops);
-    _ops = OplogBatch(0);
+    OplogApplierBatch ops = std::move(_ops);
+    _ops = OplogApplierBatch();
     _cv.notify_all();
     return ops;
 }
@@ -130,8 +131,9 @@ std::size_t OplogBatcher::getOpCount(const OplogEntry& entry) {
     return 1U;
 }
 
-StatusWith<std::vector<OplogEntry>> OplogBatcher::getNextApplierBatch(
-    OperationContext* opCtx, const BatchLimits& batchLimits, Milliseconds waitToFillBatch) {
+StatusWith<OplogApplierBatch> OplogBatcher::getNextApplierBatch(OperationContext* opCtx,
+                                                                const BatchLimits& batchLimits,
+                                                                Milliseconds waitToFillBatch) {
     if (batchLimits.ops == 0) {
         return Status(ErrorCodes::InvalidOptions, "Batch size must be greater than 0.");
     }
@@ -148,25 +150,28 @@ StatusWith<std::vector<OplogEntry>> OplogBatcher::getNextApplierBatch(
         oplogBatcherPauseAfterSuccessfulPeek.pauseWhileSet();
         auto entry = OplogEntry(op);
 
-        if (entry.shouldLogAsDDLOperation()) {
+        if (entry.shouldLogAsDDLOperation() && !serverGlobalParams.quiet.load()) {
             LOGV2(7360109,
                   "Processing DDL command oplog entry in OplogBatcher",
                   "oplogEntry"_attr = entry.toBSONForLogging());
         }
 
-        // Check for oplog version change.
-        if (entry.getVersion() != OplogEntry::kOplogVersion) {
-            static constexpr char message[] = "Unexpected oplog version";
-            LOGV2_FATAL_CONTINUE(21240,
-                                 message,
-                                 "expectedVersion"_attr = OplogEntry::kOplogVersion,
-                                 "foundVersion"_attr = entry.getVersion(),
-                                 "oplogEntry"_attr = redact(entry.toBSONForLogging()));
-            return {ErrorCodes::BadValue,
-                    str::stream() << message << ", expected oplog version "
-                                  << OplogEntry::kOplogVersion << ", found version "
-                                  << entry.getVersion()
-                                  << ", oplog entry: " << redact(entry.toBSONForLogging())};
+        if (!feature_flags::gReduceMajorityWriteLatency.isEnabled(
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+            // Check for oplog version change.
+            if (entry.getVersion() != OplogEntry::kOplogVersion) {
+                static constexpr char message[] = "Unexpected oplog version";
+                LOGV2_FATAL_CONTINUE(8539100,
+                                     message,
+                                     "expectedVersion"_attr = OplogEntry::kOplogVersion,
+                                     "foundVersion"_attr = entry.getVersion(),
+                                     "oplogEntry"_attr = redact(entry.toBSONForLogging()));
+                return {ErrorCodes::BadValue,
+                        str::stream()
+                            << message << ", expected oplog version " << OplogEntry::kOplogVersion
+                            << ", found version " << entry.getVersion()
+                            << ", oplog entry: " << redact(entry.toBSONForLogging())};
+            }
         }
 
         if (batchLimits.secondaryDelaySecsLatestTimestamp) {
@@ -178,7 +183,7 @@ StatusWith<std::vector<OplogEntry>> OplogBatcher::getNextApplierBatch(
                     // reconfigs and shutdown to occur.
                     sleepsecs(1);
                 }
-                return std::move(ops);
+                return OplogApplierBatch(std::move(ops), batchStats.totalBytes);
             }
         }
 
@@ -188,7 +193,7 @@ StatusWith<std::vector<OplogEntry>> OplogBatcher::getNextApplierBatch(
                 break;
             case BatchAction::kStartNewBatch:
                 if (!ops.empty()) {
-                    return std::move(ops);
+                    return OplogApplierBatch(std::move(ops), batchStats.totalBytes);
                 }
                 break;
             case BatchAction::kProcessIndividually:
@@ -196,7 +201,7 @@ StatusWith<std::vector<OplogEntry>> OplogBatcher::getNextApplierBatch(
                     ops.push_back(std::move(entry));
                     _consume(opCtx, _oplogBuffer);
                 }
-                return std::move(ops);
+                return OplogApplierBatch(std::move(ops), batchStats.totalBytes);
         }
 
         // Apply replication batch limits. Avoid returning an empty batch.
@@ -205,7 +210,7 @@ StatusWith<std::vector<OplogEntry>> OplogBatcher::getNextApplierBatch(
         if (batchStats.totalOps > 0) {
             if (batchStats.totalOps + opCount > batchLimits.ops ||
                 batchStats.totalBytes + opBytes > batchLimits.bytes) {
-                return std::move(ops);
+                return OplogApplierBatch(std::move(ops), batchStats.totalBytes);
             }
         }
 
@@ -213,7 +218,7 @@ StatusWith<std::vector<OplogEntry>> OplogBatcher::getNextApplierBatch(
         if (batchStats.totalOps > 0 && !batchLimits.forceBatchBoundaryAfter.isNull() &&
             entry.getOpTime().getTimestamp() > batchLimits.forceBatchBoundaryAfter &&
             ops.back().getOpTime().getTimestamp() <= batchLimits.forceBatchBoundaryAfter) {
-            return std::move(ops);
+            return OplogApplierBatch(std::move(ops), batchStats.totalBytes);
         }
 
         // Add op to buffer.
@@ -244,7 +249,8 @@ StatusWith<std::vector<OplogEntry>> OplogBatcher::getNextApplierBatch(
             }
         }
     }
-    return std::move(ops);
+
+    return OplogApplierBatch(std::move(ops), batchStats.totalBytes);
 }
 
 /**
@@ -285,6 +291,13 @@ OplogBatcher::BatchAction OplogBatcher::_getBatchActionForEntry(const OplogEntry
             return batchStats.commitOrAbortOps == 0 ? OplogBatcher::BatchAction::kStartNewBatch
                                                     : OplogBatcher::BatchAction::kContinueBatch;
         }
+    }
+
+    // The DBCheck oplog shouldn't be batched with any preceding oplog to ensure that DBCheck is
+    // reading from a consistent snapshot. However, it can be batched with any subsequent oplog that
+    // is batchable.
+    if (entry.getCommandType() == OplogEntry::CommandType::kDbCheck) {
+        return OplogBatcher::BatchAction::kStartNewBatch;
     }
 
     bool processIndividually = (entry.getCommandType() != OplogEntry::CommandType::kApplyOps) ||
@@ -335,19 +348,23 @@ void OplogBatcher::_run(StorageInterface* storageInterface) {
     BatchLimits batchLimits;
 
     while (true) {
-        globalFailPointRegistry().find("rsSyncApplyStop")->pauseWhileSet();
-
-        batchLimits.secondaryDelaySecsLatestTimestamp =
-            _calculateSecondaryDelaySecsLatestTimestamp();
+        // When featureFlagReduceMajorityWriteLatency is enabled, OplogWriter takes care of this.
+        if (!feature_flags::gReduceMajorityWriteLatency.isEnabled(
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+            globalFailPointRegistry().find("rsSyncApplyStop")->pauseWhileSet();
+            batchLimits.secondaryDelaySecsLatestTimestamp =
+                _calculateSecondaryDelaySecsLatestTimestamp();
+        }
 
         // Check the limits once per batch since users can change them at runtime.
         batchLimits.ops = getBatchLimitOplogEntries();
 
         // Use the OplogBuffer to populate a local OplogBatch. Note that the buffer may be empty.
-        OplogBatch ops(batchLimits.ops);
+        OplogApplierBatch ops;
         try {
             auto opCtx = cc().makeOperationContext();
-            opCtx->lockState()->setAdmissionPriority(AdmissionContext::Priority::kImmediate);
+            ScopedAdmissionPriority<ExecutionAdmissionContext> admissionPriority(
+                opCtx.get(), AdmissionContext::Priority::kExempt);
 
             // During storage change operations, we may shut down storage under a global lock
             // and wait for any storage-using opCtxs to exit.  This results in a deadlock with
@@ -361,17 +378,15 @@ void OplogBatcher::_run(StorageInterface* storageInterface) {
             // UninterruptibleLockGuard in batch application because the only cause of
             // interruption would be shutdown, and the ReplBatcher thread has its own shutdown
             // handling.
-            UninterruptibleLockGuard noInterrupt(opCtx->lockState());  // NOLINT.
+            UninterruptibleLockGuard noInterrupt(  // NOLINT.
+                shard_role_details::getLocker(opCtx.get()));
 
             // Locks the oplog to check its max size, do this in the UninterruptibleLockGuard.
             batchLimits.bytes = getBatchLimitOplogBytes(opCtx.get(), storageInterface);
 
-            auto oplogEntries = fassertNoTrace(
+            ops = fassertNoTrace(
                 31004,
                 getNextApplierBatch(opCtx.get(), batchLimits, Milliseconds(oplogBatchDelayMillis)));
-            for (const auto& oplogEntry : oplogEntries) {
-                ops.emplace_back(oplogEntry);
-            }
         } catch (const ExceptionForCat<ErrorCategory::CancellationError>& e) {
             LOGV2_DEBUG(6133400,
                         1,
@@ -398,23 +413,27 @@ void OplogBatcher::_run(StorageInterface* storageInterface) {
         // draining the OplogBuffer and should notify the OplogApplier to signal draining is
         // complete.
         if (ops.empty() && !ops.mustShutdown()) {
-            // Store the current term. It's checked in signalDrainComplete() to detect if the node
-            // has stepped down and stepped back up again. See the declaration of
-            // signalDrainComplete() for more details.
-            auto replCoord = ReplicationCoordinator::get(cc().getServiceContext());
-            auto termWhenBufferIsEmpty = replCoord->getTerm();
-
             // Draining state guarantees the producer has already been fully stopped and no more
             // operations will be pushed in to the oplog buffer until the applier state changes.
-            auto isDraining =
-                replCoord->getApplierState() == ReplicationCoordinator::ApplierState::Draining ||
-                replCoord->getApplierState() ==
-                    ReplicationCoordinator::ApplierState::DrainingForShardSplit;
-
             // Check the oplog buffer after the applier state to ensure the producer is stopped.
-            if (isDraining && _oplogBuffer->isEmpty()) {
-                ops.setTermWhenExhausted(termWhenBufferIsEmpty);
-                LOGV2(21239, "Oplog buffer has been drained", "term"_attr = termWhenBufferIsEmpty);
+            if (_oplogBuffer->inDrainModeAndEmpty()) {
+                // Store the current term. It's checked in signalDrainComplete() to detect if the
+                // node has stepped down and stepped back up again. See the declaration of
+                // signalDrainComplete() for more details.
+                auto replCoord = ReplicationCoordinator::get(cc().getServiceContext());
+                auto termWhenExhausted = replCoord->getTerm();
+                auto applierState = replCoord->getApplierState();
+
+                // Normally checking the oplog buffer in drain mode and empty is sufficient, but
+                // when featureFlagReduceMajorityWriteLatency is enabled, the OplogWriter might
+                // take up to 1 second to notify this buffer to exit drain mode. So we check the
+                // source of truth here as well to avoid unnecessarily setting termWhenExhausted
+                // that causes a flood of log lines and signalDrainComplete() calls.
+                if (applierState == ReplicationCoordinator::ApplierState::Draining ||
+                    applierState == ReplicationCoordinator::ApplierState::DrainingForShardSplit) {
+                    ops.setTermWhenExhausted(termWhenExhausted);
+                    LOGV2(21239, "Oplog buffer has been drained", "term"_attr = termWhenExhausted);
+                }
             } else {
                 // Don't emit empty batches.
                 continue;
@@ -438,7 +457,7 @@ std::size_t getBatchLimitOplogEntries() {
 
 std::size_t getBatchLimitOplogBytes(OperationContext* opCtx, StorageInterface* storageInterface) {
     // We can't change the timestamp source within a write unit of work.
-    invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
     auto oplogMaxSizeResult = storageInterface->getOplogMaxSize(opCtx);
     auto oplogMaxSize = fassert(40301, oplogMaxSizeResult);
     return std::min(oplogMaxSize / 10, std::size_t(replBatchLimitBytes.load()));

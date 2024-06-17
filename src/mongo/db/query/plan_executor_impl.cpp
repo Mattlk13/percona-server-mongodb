@@ -67,10 +67,10 @@
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/shard_role.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_component.h"
 #include "mongo/platform/compiler.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/decorable.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/future.h"
@@ -81,7 +81,7 @@
 
 
 namespace mongo {
-
+using namespace fmt::literals;
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
@@ -94,37 +94,6 @@ const OperationContext::Decoration<boost::optional<repl::OpTime>> clientsLastKno
 // namespace.
 MONGO_FAIL_POINT_DEFINE(planExecutorHangBeforeShouldWaitForInserts);
 
-namespace {
-
-/**
- * Constructs a PlanYieldPolicy based on 'policy'.
- */
-std::unique_ptr<PlanYieldPolicy> makeYieldPolicy(
-    PlanExecutorImpl* exec,
-    PlanYieldPolicy::YieldPolicy policy,
-    stdx::variant<const Yieldable*, PlanYieldPolicy::YieldThroughAcquisitions> yieldable) {
-    switch (policy) {
-        case PlanYieldPolicy::YieldPolicy::YIELD_AUTO:
-        case PlanYieldPolicy::YieldPolicy::YIELD_MANUAL:
-        case PlanYieldPolicy::YieldPolicy::WRITE_CONFLICT_RETRY_ONLY:
-        case PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY: {
-            return std::make_unique<PlanYieldPolicyImpl>(
-                exec, policy, yieldable, std::make_unique<YieldPolicyCallbacksImpl>(exec->nss()));
-        }
-        case PlanYieldPolicy::YieldPolicy::ALWAYS_TIME_OUT: {
-            return std::make_unique<AlwaysTimeOutYieldPolicy>(
-                exec->getOpCtx(), exec->getOpCtx()->getServiceContext()->getFastClockSource());
-        }
-        case PlanYieldPolicy::YieldPolicy::ALWAYS_MARK_KILLED: {
-            return std::make_unique<AlwaysPlanKilledYieldPolicy>(
-                exec->getOpCtx(), exec->getOpCtx()->getServiceContext()->getFastClockSource());
-        }
-        default:
-            MONGO_UNREACHABLE;
-    }
-}
-}  // namespace
-
 PlanExecutorImpl::PlanExecutorImpl(OperationContext* opCtx,
                                    unique_ptr<WorkingSet> ws,
                                    unique_ptr<PlanStage> rt,
@@ -134,14 +103,15 @@ PlanExecutorImpl::PlanExecutorImpl(OperationContext* opCtx,
                                    VariantCollectionPtrOrAcquisition collection,
                                    bool returnOwnedBson,
                                    NamespaceString nss,
-                                   PlanYieldPolicy::YieldPolicy yieldPolicy)
+                                   PlanYieldPolicy::YieldPolicy yieldPolicy,
+                                   boost::optional<size_t> cachedPlanHash)
     : _opCtx(opCtx),
       _cq(std::move(cq)),
       _expCtx(_cq ? _cq->getExpCtx() : expCtx),
       _workingSet(std::move(ws)),
       _qs(std::move(qs)),
       _root(std::move(rt)),
-      _planExplainer(plan_explainer_factory::make(_root.get())),
+      _planExplainer(plan_explainer_factory::make(_root.get(), cachedPlanHash)),
       _mustReturnOwnedBson(returnOwnedBson),
       _nss(std::move(nss)) {
     invariant(!_expCtx || _expCtx->opCtx == _opCtx);
@@ -164,34 +134,20 @@ PlanExecutorImpl::PlanExecutorImpl(OperationContext* opCtx,
         }
     }
 
-    // There's no point in yielding if the collection doesn't exist.
-    const stdx::variant<const Yieldable*, PlanYieldPolicy::YieldThroughAcquisitions> yieldable =
-        stdx::visit(
-            OverloadedVisitor{[](const CollectionPtr* coll) {
-                                  return stdx::variant<const Yieldable*,
-                                                       PlanYieldPolicy::YieldThroughAcquisitions>(
-                                      *coll ? coll : nullptr);
-                              },
-                              [](const CollectionAcquisition& coll) {
-                                  return stdx::variant<const Yieldable*,
-                                                       PlanYieldPolicy::YieldThroughAcquisitions>(
-                                      PlanYieldPolicy::YieldThroughAcquisitions{});
-                              }},
-            collection.get());
-
-    _yieldPolicy = makeYieldPolicy(this,
-                                   collectionExists ? yieldPolicy
-                                                    : PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
-                                   yieldable);
-
-    uassertStatusOK(_pickBestPlan());
+    _yieldPolicy = makeClassicYieldPolicy(
+        _opCtx,
+        _nss,
+        this,
+        collectionExists ? yieldPolicy : PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
+        collection);
 
     if (_qs) {
+        _planExplainer->setQuerySolution(_qs.get());
         _planExplainer->updateEnumeratorExplainInfo(_qs->_enumeratorExplainInfo);
     } else if (const MultiPlanStage* mps = getMultiPlanStage()) {
         const QuerySolution* soln = mps->bestSolution();
+        _planExplainer->setQuerySolution(soln);
         _planExplainer->updateEnumeratorExplainInfo(soln->_enumeratorExplainInfo);
-
     } else if (auto subplan = getStageByType(_root.get(), STAGE_SUBPLAN)) {
         auto subplanStage = static_cast<SubplanStage*>(subplan);
         _planExplainer->updateEnumeratorExplainInfo(
@@ -204,46 +160,6 @@ PlanExecutorImpl::PlanExecutorImpl(OperationContext* opCtx,
     if (auto collectionScan = getStageByType(_root.get(), STAGE_COLLSCAN)) {
         _collScanStage = static_cast<CollectionScan*>(collectionScan);
     }
-}
-
-Status PlanExecutorImpl::_pickBestPlan() {
-    invariant(_currentState == kUsable);
-
-    // First check if we need to do subplanning.
-    PlanStage* foundStage = getStageByType(_root.get(), STAGE_SUBPLAN);
-    if (foundStage) {
-        SubplanStage* subplan = static_cast<SubplanStage*>(foundStage);
-        return subplan->pickBestPlan(_yieldPolicy.get());
-    }
-
-    // If we didn't have to do subplanning, we might still have to do regular
-    // multi plan selection...
-    foundStage = getStageByType(_root.get(), STAGE_MULTI_PLAN);
-    if (foundStage) {
-        MultiPlanStage* mps = static_cast<MultiPlanStage*>(foundStage);
-        return mps->pickBestPlan(_yieldPolicy.get());
-    }
-
-    // ...or, we might have to run a plan from the cache for a trial period, falling back on
-    // regular planning if the cached plan performs poorly.
-    foundStage = getStageByType(_root.get(), STAGE_CACHED_PLAN);
-    if (foundStage) {
-        CachedPlanStage* cachedPlan = static_cast<CachedPlanStage*>(foundStage);
-        return cachedPlan->pickBestPlan(_yieldPolicy.get());
-    }
-
-    // Finally, we might have an explicit TrialPhase. This specifies exactly two candidate
-    // plans, one of which is to be evaluated. If it fails the trial, then the backup plan is
-    // adopted.
-    foundStage = getStageByType(_root.get(), STAGE_TRIAL);
-    if (foundStage) {
-        TrialStage* trialStage = static_cast<TrialStage*>(foundStage);
-        return trialStage->pickBestPlan(_yieldPolicy.get());
-    }
-
-    // Either we chose a plan, or no plan selection was required. In both cases,
-    // our work has been successfully completed.
-    return Status::OK();
 }
 
 PlanExecutorImpl::~PlanExecutorImpl() {
@@ -473,7 +389,7 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<Document>* ob
             // This result didn't have the data the caller wanted, try again.
         } else if (PlanStage::NEED_YIELD == code) {
             invariant(id == WorkingSet::INVALID_ID);
-            invariant(_opCtx->recoveryUnit());
+            invariant(shard_role_details::getRecoveryUnit(_opCtx));
 
             if (_expCtx->getTemporarilyUnavailableException()) {
                 _expCtx->setTemporarilyUnavailableException(false);
@@ -524,7 +440,11 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<Document>* ob
                 planExecutorHangBeforeShouldWaitForInserts.pauseWhileSet();
             }
 
-            if (!insert_listener::shouldWaitForInserts(_opCtx, _cq.get(), _yieldPolicy.get())) {
+            // The !notifier check is necessary because shouldWaitForInserts can return 'true' when
+            // shouldListenForInserts returned 'false' (above) in the case of a deadline becoming
+            // "unexpired" due to the system clock going backwards.
+            if (!notifier ||
+                !insert_listener::shouldWaitForInserts(_opCtx, _cq.get(), _yieldPolicy.get())) {
                 return PlanExecutor::IS_EOF;
             }
 

@@ -28,70 +28,48 @@
  */
 #pragma once
 
-#if defined(__linux__)
-#include <semaphore.h>
-#endif
-
-#include <algorithm>
 #include <boost/optional/optional.hpp>
-#include <cstdint>
-#include <queue>
 
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
-#include "mongo/platform/atomic_word.h"
-#include "mongo/platform/mutex.h"
-#include "mongo/stdx/condition_variable.h"
+#include "mongo/platform/random.h"
+#include "mongo/platform/waitable_atomic.h"
 #include "mongo/util/concurrency/admission_context.h"
-#include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/concurrency/ticketholder.h"
-#include "mongo/util/hierarchical_acquisition.h"
-#include "mongo/util/time_support.h"
 
 namespace mongo {
 
 class SemaphoreTicketHolder final : public TicketHolder {
 public:
-    explicit SemaphoreTicketHolder(int numTickets, ServiceContext* serviceContext);
-    ~SemaphoreTicketHolder() override final;
+    explicit SemaphoreTicketHolder(ServiceContext* serviceContext,
+                                   int numTickets,
+                                   bool trackPeakUsed);
 
-    int32_t available() const override final;
+    int32_t available() const final;
 
-    int64_t queued() const override final {
+    int64_t queued() const final {
         auto removed = _semaphoreStats.totalRemovedQueue.loadRelaxed();
         auto added = _semaphoreStats.totalAddedQueue.loadRelaxed();
         return std::max(added - removed, (int64_t)0);
     };
 
-    int64_t numFinishedProcessing() const override final;
+    int64_t numFinishedProcessing() const final;
 
 private:
-    boost::optional<Ticket> _waitForTicketUntilImpl(OperationContext* opCtx,
+    boost::optional<Ticket> _waitForTicketUntilImpl(Interruptible& interruptible,
                                                     AdmissionContext* admCtx,
-                                                    Date_t until) override final;
+                                                    Date_t until) final;
 
-    boost::optional<Ticket> _tryAcquireImpl(AdmissionContext* admCtx) override final;
-    void _releaseToTicketPoolImpl(AdmissionContext* admCtx) noexcept override final;
+    boost::optional<Ticket> _tryAcquireImpl(AdmissionContext* admCtx) final;
+    void _releaseToTicketPoolImpl(AdmissionContext* admCtx) noexcept final;
 
-    void _appendImplStats(BSONObjBuilder& b) const override final;
+    void _appendImplStats(BSONObjBuilder& b) const final;
 
-    void _resize(int32_t newSize, int32_t oldSize) noexcept override final;
-
-    QueueStats& _getQueueStatsToUse(const AdmissionContext* admCtx) noexcept override final {
+    QueueStats& _getQueueStatsToUse(AdmissionContext::Priority priority) noexcept final {
         return _semaphoreStats;
     }
-#if defined(__linux__)
-    mutable sem_t _sem;
 
-#else
-    bool _tryAcquire();
-
-    int32_t _numTickets;
-    Mutex _mutex =
-        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "SemaphoreTicketHolder::_mutex");
-    stdx::condition_variable _newTicket;
-#endif
+    BasicWaitableAtomic<uint32_t> _tickets;
     QueueStats _semaphoreStats;
 };
 

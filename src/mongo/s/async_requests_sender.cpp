@@ -101,7 +101,9 @@ AsyncRequestsSender::AsyncRequestsSender(OperationContext* opCtx,
         auto designatedHost = designatedHostIter != designatedHostsMap.end()
             ? designatedHostIter->second
             : HostAndPort();
-        _remotes.emplace_back(this, request.shardId, request.cmdObj, std::move(designatedHost))
+        _remotes
+            .emplace_back(
+                this, request.shardId, request.cmdObj, std::move(designatedHost), request.shard)
             .executeRequest();
     }
 
@@ -194,19 +196,44 @@ bool AsyncRequestsSender::done() noexcept {
     return !_remotesLeft;
 }
 
-AsyncRequestsSender::Request::Request(ShardId shardId, BSONObj cmdObj)
-    : shardId(shardId), cmdObj(cmdObj) {}
+AsyncRequestsSender::Request::Request(ShardId shardId, BSONObj cmdObj, std::shared_ptr<Shard> shard)
+    : shardId(shardId), cmdObj(cmdObj), shard(std::move(shard)) {}
+
+Status AsyncRequestsSender::Response::getEffectiveStatus(
+    const AsyncRequestsSender::Response& response) {
+    if (!response.swResponse.isOK()) {
+        return response.swResponse.getStatus();
+    }
+
+    const auto& cmdResponse = response.swResponse.getValue().data;
+    auto commandStatus = getStatusFromCommandResult(cmdResponse);
+    if (!commandStatus.isOK()) {
+        return commandStatus;
+    }
+    auto writeConcernStatus = getWriteConcernStatusFromCommandResult(cmdResponse);
+    return writeConcernStatus;
+}
 
 AsyncRequestsSender::RemoteData::RemoteData(AsyncRequestsSender* ars,
                                             ShardId shardId,
                                             BSONObj cmdObj,
-                                            HostAndPort designatedHostAndPort)
+                                            HostAndPort designatedHostAndPort,
+                                            std::shared_ptr<Shard> shard)
     : _ars(ars),
       _shardId(std::move(shardId)),
       _cmdObj(std::move(cmdObj)),
-      _designatedHostAndPort(std::move(designatedHostAndPort)) {}
+      _designatedHostAndPort(std::move(designatedHostAndPort)),
+      _shard(std::move(shard)) {}
 
 SemiFuture<std::shared_ptr<Shard>> AsyncRequestsSender::RemoteData::getShard() noexcept {
+    if (_shard) {
+        // Clear the cached shard so any retries will look up the shard again, in case its state has
+        // changed.
+        using std::swap;
+        std::shared_ptr<Shard> temp;
+        swap(_shard, temp);
+        return temp;
+    }
     return Grid::get(getGlobalServiceContext())
         ->shardRegistry()
         ->getShard(*_ars->_subBaton, _shardId);

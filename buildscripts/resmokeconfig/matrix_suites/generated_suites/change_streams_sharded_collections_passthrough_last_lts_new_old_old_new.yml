@@ -20,6 +20,7 @@ executor:
         TestData:
           defaultReadConcernLevel: null
           enableMajorityReadConcern: ''
+          nonClusteredConfigTransactions: true
   fixture:
     class: ShardedClusterFixture
     mixed_bin_versions: new_old_old_new
@@ -48,6 +49,7 @@ selector:
   - assumes_write_concern_unchanged
   - assumes_against_mongod_not_mongos
   - assumes_unsharded_collection
+  - assumes_no_implicit_collection_creation_on_get_collection
   roots:
   - jstests/change_streams/**/*.js
 test_kind: js_test

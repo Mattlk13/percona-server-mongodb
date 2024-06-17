@@ -710,7 +710,7 @@ public:
     }
 };
 
-class IndexUpdateTests : public OldStyleSuiteSpecification {
+class IndexUpdateTests : public unittest::OldStyleSuiteSpecification {
 public:
     IndexUpdateTests() : OldStyleSuiteSpecification("indexupdate") {}
 
@@ -719,7 +719,7 @@ public:
         addNameCallback(nameForTestClass<T>(), [] { T().run(); });
     }
 
-    void setupTests() {
+    void setupTests() override {
         // These tests check that index creation ignores the unique constraint when told to.
         // The mobile storage engine does not support duplicate keys in unique indexes so these
         // tests are disabled.
@@ -751,7 +751,7 @@ public:
     }
 };
 
-OldStyleSuiteInitializer<IndexUpdateTests> indexUpdateTests;
+unittest::OldStyleSuiteInitializer<IndexUpdateTests> indexUpdateTests;
 
 }  // namespace IndexUpdateTests
 }  // namespace mongo

@@ -50,7 +50,6 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/value.h"
@@ -72,6 +71,7 @@
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/shard_authoritative_catalog_gen.h"
 #include "mongo/db/s/sharding_recovery_service.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
@@ -199,7 +199,7 @@ void ShardingRecoveryService::acquireRecoverableCriticalSectionBlockWrites(
                         "reason '{}' while holding locks",
                         nss.toStringForErrorMsg(),
                         reason.toString()),
-            !opCtx->lockState()->isLocked());
+            !shard_role_details::getLocker(opCtx)->isLocked());
 
     {
         Lock::GlobalLock lk(opCtx, MODE_IX);
@@ -319,7 +319,7 @@ void ShardingRecoveryService::promoteRecoverableCriticalSectionToBlockAlsoReads(
                         "reason '{}' while holding locks",
                         nss.toStringForErrorMsg(),
                         reason.toString()),
-            !opCtx->lockState()->isLocked());
+            !shard_role_details::getLocker(opCtx)->isLocked());
 
     {
         boost::optional<AutoGetDb> dbLock;
@@ -446,7 +446,7 @@ void ShardingRecoveryService::releaseRecoverableCriticalSection(
                         "reason '{}' while holding locks",
                         nss.toStringForErrorMsg(),
                         reason.toString()),
-            !opCtx->lockState()->isLocked());
+            !shard_role_details::getLocker(opCtx)->isLocked());
 
     {
         boost::optional<AutoGetDb> dbLock;

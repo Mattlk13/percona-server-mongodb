@@ -47,6 +47,7 @@
 #include "mongo/db/database_name.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/query/query_settings/query_settings_manager.h"
 #include "mongo/db/service_context.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/s/client/shard.h"
@@ -82,11 +83,16 @@ public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            // TODO SERVER-78803: Handle concurrent cluster parameter updates correctly in sharded
-            // clusters.
             auto service = opCtx->getService();
             invariant(service->role().hasExclusively(ClusterRole::RouterServer),
                       "Attempted to run a router-only command directly from the shard role.");
+            uassert(
+                ErrorCodes::NoSuchKey,
+                str::stream()
+                    << "Unknown server parameter: "
+                    << query_settings::QuerySettingsManager::kQuerySettingsClusterParameterName,
+                !request().getCommandParameter()
+                     [query_settings::QuerySettingsManager::kQuerySettingsClusterParameterName]);
             static auto impl = getSetClusterParameterImpl(service);
             impl(opCtx,
                  request(),

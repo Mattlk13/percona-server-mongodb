@@ -30,9 +30,7 @@
 
 #include "mongo/s/grid.h"
 
-#include <mutex>
 #include <utility>
-
 
 #include "mongo/base/error_codes.h"
 #include "mongo/db/operation_context.h"
@@ -42,7 +40,6 @@
 #include "mongo/util/decorable.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
-
 
 namespace mongo {
 namespace {
@@ -128,6 +125,7 @@ void Grid::clearForUnitTests() {
     _executorPool.reset();
     _network = nullptr;
     _isGridInitialized.store(false);
+    _shardingInitialized.store(false);
 }
 
 }  // namespace mongo
